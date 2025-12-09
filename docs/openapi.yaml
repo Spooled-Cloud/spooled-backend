@@ -1,0 +1,2915 @@
+openapi: 3.1.0
+info:
+  title: Spooled Cloud API
+  description: |
+    Production-ready webhook queue service API.
+    
+    Spooled Cloud provides a reliable, multi-tenant job queue system with:
+    - Webhook ingestion (GitHub, Stripe, custom)
+    - Job queue with retry logic and dead-letter queue
+    - Worker coordination with heartbeat and lease management
+    - Real-time job status updates via WebSocket/SSE
+    - Workflow orchestration with job dependencies
+    - Cron-based job scheduling
+    
+    ## Authentication
+    
+    All API endpoints (except health checks) require authentication via API key.
+    Include your API key in the `Authorization` header:
+    
+    ```
+    Authorization: Bearer sk_live_your_api_key_here
+    ```
+    
+    ## Security
+    
+    - **Multi-tenant isolation**: All operations are scoped to your organization
+    - **API key verification**: Keys verified using bcrypt with caching
+    - **Webhook signatures**: HMAC-SHA256 with constant-time comparison
+    - **Rate limiting**: Per-key limits with graceful degradation
+    - **Input validation**: All inputs sanitized and size-limited
+    - **SSRF protection**: Webhook URLs validated in production
+    
+    ## Rate Limiting
+    
+    Rate limits are applied per API key. Default limits:
+    - Free tier: 100 requests/second
+    - Pro tier: 1000 requests/second
+    - Enterprise: Custom limits
+    
+    Rate limit headers included in all responses:
+    - `X-RateLimit-Limit`: Maximum requests per window
+    - `X-RateLimit-Remaining`: Remaining requests in current window
+    - `X-RateLimit-Reset`: Unix timestamp when the window resets
+    
+  version: 1.0.0
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+  contact:
+    name: Spooled Cloud Support
+    url: https://spooled.cloud/support
+    email: support@spooled.cloud
+
+servers:
+  - url: https://api.spooled.cloud
+    description: Production API
+  - url: https://api.staging.spooled.cloud
+    description: Staging API
+  - url: http://localhost:8080
+    description: Local development
+
+tags:
+  - name: Health
+    description: Health check endpoints
+  - name: Authentication
+    description: JWT authentication and token management
+  - name: Organizations
+    description: Organization management
+  - name: Jobs
+    description: Job queue operations
+  - name: Queues
+    description: Queue configuration and statistics
+  - name: Workers
+    description: Worker registration and management
+  - name: API Keys
+    description: API key management
+  - name: Webhooks
+    description: Webhook ingestion endpoints
+  - name: Workflows
+    description: Workflow and job dependency management
+  - name: Schedules
+    description: Cron-based recurring job schedules
+  - name: Real-time
+    description: WebSocket and Server-Sent Events for real-time updates
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: Health check
+      description: Returns the health status of the service and its dependencies
+      operationId: healthCheck
+      security: []
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              example:
+                status: healthy
+                version: "1.0.0"
+                database: true
+                cache: true
+
+  /health/live:
+    get:
+      tags: [Health]
+      summary: Liveness probe
+      description: Kubernetes liveness probe - returns 200 if the service is running
+      operationId: liveness
+      security: []
+      responses:
+        '200':
+          description: Service is alive
+
+  /health/ready:
+    get:
+      tags: [Health]
+      summary: Readiness probe
+      description: Kubernetes readiness probe - returns 200 if the service can accept traffic
+      operationId: readiness
+      security: []
+      responses:
+        '200':
+          description: Service is ready
+        '503':
+          description: Service is not ready
+
+  /api/v1/dashboard:
+    get:
+      tags: [Dashboard]
+      summary: Dashboard data
+      description: |
+        Returns comprehensive dashboard data including system info, job statistics,
+        queue summaries, worker status, and recent activity.
+        
+        Requires authentication. Data is scoped to the authenticated organization.
+      operationId: dashboardData
+      security:
+        - BearerAuth: []
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: Dashboard data retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DashboardData'
+
+  /metrics:
+    get:
+      tags: [Health]
+      summary: Prometheus metrics
+      description: |
+        Returns application metrics in Prometheus text format.
+        
+        Metrics include:
+        - `spooled_jobs_enqueued_total`: Total jobs enqueued
+        - `spooled_jobs_completed_total`: Total jobs completed
+        - `spooled_jobs_failed_total`: Total jobs failed
+        - `spooled_jobs_pending`: Current pending jobs
+        - `spooled_jobs_processing`: Current processing jobs
+        - `spooled_job_duration_seconds`: Job processing duration histogram
+        - `spooled_workers_active`: Active workers
+        - `spooled_api_requests_total`: Total API requests
+      operationId: prometheusMetrics
+      security: []
+      responses:
+        '200':
+          description: Prometheus metrics
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: |
+                # HELP spooled_jobs_enqueued_total Total jobs enqueued
+                # TYPE spooled_jobs_enqueued_total counter
+                spooled_jobs_enqueued_total 1234
+                # HELP spooled_jobs_pending Number of pending jobs
+                # TYPE spooled_jobs_pending gauge
+                spooled_jobs_pending 42
+
+  # Authentication Endpoints
+  /api/v1/auth/login:
+    post:
+      tags: [Authentication]
+      summary: Login with API key
+      description: Exchange an API key for JWT access and refresh tokens
+      operationId: login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '401':
+          description: Invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/auth/refresh:
+    post:
+      tags: [Authentication]
+      summary: Refresh access token
+      description: Exchange a valid refresh token for a new access token
+      operationId: refreshToken
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshTokenRequest'
+      responses:
+        '200':
+          description: Token refreshed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RefreshTokenResponse'
+        '401':
+          description: Invalid or expired refresh token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/auth/logout:
+    post:
+      tags: [Authentication]
+      summary: Logout
+      description: Invalidate the current access token
+      operationId: logout
+      responses:
+        '204':
+          description: Logged out successfully
+        '401':
+          description: Not authenticated
+
+  /api/v1/auth/me:
+    get:
+      tags: [Authentication]
+      summary: Get current user info
+      description: Returns information about the authenticated user from the JWT token
+      operationId: getCurrentUser
+      responses:
+        '200':
+          description: Current user info
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CurrentUserResponse'
+        '401':
+          description: Not authenticated
+
+  /api/v1/auth/validate:
+    post:
+      tags: [Authentication]
+      summary: Validate a token
+      description: Check if a JWT token is valid and not blacklisted
+      operationId: validateToken
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ValidateTokenRequest'
+      responses:
+        '200':
+          description: Token validation result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidateTokenResponse'
+
+  /api/v1/organizations:
+    get:
+      tags: [Organizations]
+      summary: List organizations
+      description: List all organizations accessible to the authenticated user
+      operationId: listOrganizations
+      responses:
+        '200':
+          description: List of organizations
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/OrganizationSummary'
+    post:
+      tags: [Organizations]
+      summary: Create organization
+      description: Create a new organization
+      operationId: createOrganization
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrganizationRequest'
+      responses:
+        '201':
+          description: Organization created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Organization'
+        '409':
+          description: Organization with this slug already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/organizations/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Organization ID
+    get:
+      tags: [Organizations]
+      summary: Get organization
+      operationId: getOrganization
+      responses:
+        '200':
+          description: Organization details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Organization'
+        '404':
+          description: Organization not found
+    put:
+      tags: [Organizations]
+      summary: Update organization
+      operationId: updateOrganization
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateOrganizationRequest'
+      responses:
+        '200':
+          description: Organization updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Organization'
+        '404':
+          description: Organization not found
+    delete:
+      tags: [Organizations]
+      summary: Delete organization
+      operationId: deleteOrganization
+      responses:
+        '204':
+          description: Organization deleted
+        '404':
+          description: Organization not found
+
+  /api/v1/jobs:
+    get:
+      tags: [Jobs]
+      summary: List jobs
+      description: List jobs with optional filtering
+      operationId: listJobs
+      parameters:
+        - name: queue_name
+          in: query
+          schema:
+            type: string
+          description: Filter by queue name
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, scheduled, processing, completed, failed, deadletter, cancelled]
+          description: Filter by status
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+            maximum: 1000
+          description: Maximum number of results
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+          description: Offset for pagination
+      responses:
+        '200':
+          description: List of jobs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/JobSummary'
+    post:
+      tags: [Jobs]
+      summary: Create job
+      description: |
+        Create a new job in the specified queue.
+        
+        If an `idempotency_key` is provided and a job with the same key exists,
+        the existing job ID is returned (idempotent behavior).
+      operationId: createJob
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateJobRequest'
+      responses:
+        '201':
+          description: Job created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateJobResponse'
+        '200':
+          description: Existing job returned (idempotent)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateJobResponse'
+
+  /api/v1/jobs/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Job ID
+    get:
+      tags: [Jobs]
+      summary: Get job
+      operationId: getJob
+      responses:
+        '200':
+          description: Job details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '404':
+          description: Job not found
+    delete:
+      tags: [Jobs]
+      summary: Cancel job
+      description: Cancel a pending or scheduled job
+      operationId: cancelJob
+      responses:
+        '204':
+          description: Job cancelled
+        '404':
+          description: Job not found
+        '409':
+          description: Job cannot be cancelled (not in pending/scheduled state)
+
+  /api/v1/jobs/{id}/retry:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      tags: [Jobs]
+      summary: Retry job
+      description: Retry a failed or dead-lettered job
+      operationId: retryJob
+      responses:
+        '200':
+          description: Job queued for retry
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '409':
+          description: Job cannot be retried
+
+  /api/v1/jobs/stats:
+    get:
+      tags: [Jobs]
+      summary: Get job statistics
+      operationId: getJobStats
+      responses:
+        '200':
+          description: Job statistics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobStats'
+
+  /api/v1/jobs/status:
+    get:
+      tags: [Jobs]
+      summary: Batch job status lookup
+      description: |
+        Get the status of multiple jobs in a single request.
+        Maximum 100 job IDs per request.
+      operationId: batchJobStatus
+      parameters:
+        - name: ids
+          in: query
+          required: true
+          description: Comma-separated list of job IDs
+          schema:
+            type: string
+          example: "job-1,job-2,job-3"
+      responses:
+        '200':
+          description: Job statuses retrieved
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/BatchJobStatus'
+        '400':
+          description: Too many job IDs (max 100)
+
+  /api/v1/jobs/bulk:
+    post:
+      tags: [Jobs]
+      summary: Bulk enqueue jobs
+      description: |
+        Enqueue multiple jobs in a single request. 
+        Maximum 100 jobs per request.
+        Jobs are processed atomically where possible.
+      operationId: bulkEnqueueJobs
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BulkEnqueueRequest'
+            example:
+              queue_name: emails
+              default_priority: 0
+              default_max_retries: 3
+              jobs:
+                - payload: {to: "user@example.com", subject: "Hello"}
+                - payload: {to: "user2@example.com", subject: "Welcome"}
+                  priority: 10
+      responses:
+        '200':
+          description: Bulk enqueue results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BulkEnqueueResponse'
+
+  /api/v1/jobs/{id}/priority:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    put:
+      tags: [Jobs]
+      summary: Boost job priority
+      description: Update the priority of a pending or scheduled job
+      operationId: boostJobPriority
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BoostPriorityRequest'
+      responses:
+        '200':
+          description: Priority updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BoostPriorityResponse'
+        '404':
+          description: Job not found or not in pending/scheduled state
+
+  /api/v1/jobs/dlq:
+    get:
+      tags: [Jobs]
+      summary: List dead-letter queue
+      description: List jobs in the dead-letter queue
+      operationId: listDeadLetterQueue
+      parameters:
+        - name: queue_name
+          in: query
+          schema:
+            type: string
+          description: Filter by queue name
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+            maximum: 1000
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: List of dead-letter jobs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/JobSummary'
+
+  /api/v1/jobs/dlq/retry:
+    post:
+      tags: [Jobs]
+      summary: Retry dead-letter jobs
+      description: Move jobs from dead-letter queue back to pending
+      operationId: retryDeadLetterJobs
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RetryDlqRequest'
+      responses:
+        '200':
+          description: Retry results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RetryDlqResponse'
+
+  /api/v1/jobs/dlq/purge:
+    post:
+      tags: [Jobs]
+      summary: Purge dead-letter queue
+      description: Permanently delete jobs from dead-letter queue
+      operationId: purgeDeadLetterQueue
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PurgeDlqRequest'
+            example:
+              queue_name: emails
+              confirm: true
+      responses:
+        '200':
+          description: Purge results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PurgeDlqResponse'
+        '400':
+          description: Must confirm purge operation
+
+  /api/v1/queues:
+    get:
+      tags: [Queues]
+      summary: List queues
+      operationId: listQueues
+      responses:
+        '200':
+          description: List of queue configurations
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/QueueConfigSummary'
+
+  /api/v1/queues/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Queue name
+    get:
+      tags: [Queues]
+      summary: Get queue configuration
+      operationId: getQueueConfig
+      responses:
+        '200':
+          description: Queue configuration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueueConfig'
+        '404':
+          description: Queue not found
+
+  /api/v1/queues/{name}/config:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+    put:
+      tags: [Queues]
+      summary: Update queue configuration
+      operationId: updateQueueConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpsertQueueConfigRequest'
+      responses:
+        '200':
+          description: Queue configuration updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueueConfig'
+
+  /api/v1/queues/{name}/stats:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      tags: [Queues]
+      summary: Get queue statistics
+      operationId: getQueueStats
+      responses:
+        '200':
+          description: Queue statistics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueueStats'
+
+  /api/v1/queues/{name}/pause:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      tags: [Queues]
+      summary: Pause queue
+      description: |
+        Pause job processing for this queue.
+        New jobs can still be enqueued but won't be processed until resumed.
+      operationId: pauseQueue
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PauseQueueRequest'
+      responses:
+        '200':
+          description: Queue paused
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PauseQueueResponse'
+
+  /api/v1/queues/{name}/resume:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      tags: [Queues]
+      summary: Resume queue
+      description: Resume job processing for a paused queue
+      operationId: resumeQueue
+      responses:
+        '200':
+          description: Queue resumed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResumeQueueResponse'
+        '404':
+          description: Queue not found
+
+  /api/v1/workers:
+    get:
+      tags: [Workers]
+      summary: List workers
+      operationId: listWorkers
+      responses:
+        '200':
+          description: List of workers
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/WorkerSummary'
+
+  /api/v1/workers/register:
+    post:
+      tags: [Workers]
+      summary: Register worker
+      operationId: registerWorker
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterWorkerRequest'
+      responses:
+        '201':
+          description: Worker registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegisterWorkerResponse'
+
+  /api/v1/workers/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      tags: [Workers]
+      summary: Get worker
+      operationId: getWorker
+      responses:
+        '200':
+          description: Worker details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Worker'
+        '404':
+          description: Worker not found
+
+  /api/v1/workers/{id}/heartbeat:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      tags: [Workers]
+      summary: Send heartbeat
+      operationId: workerHeartbeat
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WorkerHeartbeatRequest'
+      responses:
+        '200':
+          description: Heartbeat received
+        '404':
+          description: Worker not found
+
+  /api/v1/workers/{id}/deregister:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      tags: [Workers]
+      summary: Deregister worker
+      operationId: deregisterWorker
+      responses:
+        '204':
+          description: Worker deregistered
+        '404':
+          description: Worker not found
+
+  /api/v1/api-keys:
+    get:
+      tags: [API Keys]
+      summary: List API keys
+      operationId: listApiKeys
+      responses:
+        '200':
+          description: List of API keys (without secret values)
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ApiKeySummary'
+    post:
+      tags: [API Keys]
+      summary: Create API key
+      description: |
+        Create a new API key. The raw key value is only returned once in the response.
+        Store it securely - it cannot be retrieved later.
+      operationId: createApiKey
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateApiKeyRequest'
+      responses:
+        '201':
+          description: API key created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateApiKeyResponse'
+
+  /api/v1/api-keys/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      tags: [API Keys]
+      summary: Get API key
+      operationId: getApiKey
+      responses:
+        '200':
+          description: API key details (without secret)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiKeySummary'
+        '404':
+          description: API key not found
+    put:
+      tags: [API Keys]
+      summary: Update API key
+      operationId: updateApiKey
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateApiKeyRequest'
+      responses:
+        '200':
+          description: API key updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiKeySummary'
+        '404':
+          description: API key not found
+    delete:
+      tags: [API Keys]
+      summary: Revoke API key
+      operationId: revokeApiKey
+      responses:
+        '204':
+          description: API key revoked
+        '404':
+          description: API key not found
+
+  /api/v1/webhooks/{org_id}/github:
+    parameters:
+      - name: org_id
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Organization ID
+    post:
+      tags: [Webhooks]
+      summary: GitHub webhook
+      description: |
+        Receive GitHub webhook events for the specified organization.
+        
+        The webhook signature is verified using HMAC-SHA256 with the organization's
+        configured GitHub webhook secret.
+      operationId: githubWebhook
+      security: []
+      parameters:
+        - name: X-Hub-Signature-256
+          in: header
+          required: true
+          schema:
+            type: string
+          description: GitHub webhook signature (sha256=...)
+        - name: X-GitHub-Event
+          in: header
+          required: true
+          schema:
+            type: string
+          description: GitHub event type (e.g., push, pull_request)
+        - name: X-GitHub-Delivery
+          in: header
+          schema:
+            type: string
+          description: Unique delivery ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Webhook received and job created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookResponse'
+        '401':
+          description: Invalid signature
+        '404':
+          description: Organization not found
+
+  /api/v1/webhooks/{org_id}/stripe:
+    parameters:
+      - name: org_id
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Organization ID
+    post:
+      tags: [Webhooks]
+      summary: Stripe webhook
+      description: |
+        Receive Stripe webhook events for the specified organization.
+        
+        The webhook signature is verified using Stripe's signature scheme with
+        the organization's configured Stripe webhook secret. Timestamps older
+        than 5 minutes are rejected to prevent replay attacks.
+      operationId: stripeWebhook
+      security: []
+      parameters:
+        - name: Stripe-Signature
+          in: header
+          required: true
+          schema:
+            type: string
+          description: Stripe webhook signature (t=...,v1=...)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Webhook received and job created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookResponse'
+        '401':
+          description: Invalid signature or timestamp too old
+        '404':
+          description: Organization not found
+
+  /api/v1/webhooks/{org_id}/custom:
+    parameters:
+      - name: org_id
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Organization ID
+    post:
+      tags: [Webhooks]
+      summary: Custom webhook
+      description: |
+        Receive custom webhook events for the specified organization.
+        
+        Optionally validates X-Webhook-Token header if configured for the organization.
+      operationId: customWebhook
+      security: []
+      parameters:
+        - name: X-Webhook-Token
+          in: header
+          schema:
+            type: string
+          description: Optional webhook authentication token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustomWebhookRequest'
+      responses:
+        '200':
+          description: Webhook received and job created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookResponse'
+        '401':
+          description: Invalid webhook token
+        '404':
+          description: Organization not found
+
+  # Workflow Endpoints
+  /api/v1/workflows:
+    get:
+      tags: [Workflows]
+      summary: List workflows
+      description: List all workflows for the organization
+      operationId: listWorkflows
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, running, completed, failed, cancelled]
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+            maximum: 100
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: List of workflows
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/WorkflowResponse'
+    post:
+      tags: [Workflows]
+      summary: Create workflow
+      description: |
+        Create a new workflow with multiple jobs and dependencies.
+        Jobs within a workflow can have dependencies on other jobs,
+        creating a DAG of job execution.
+      operationId: createWorkflow
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWorkflowRequest'
+      responses:
+        '201':
+          description: Workflow created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateWorkflowResponse'
+        '400':
+          description: Invalid workflow definition (e.g., circular dependency)
+
+  /api/v1/workflows/{id}:
+    get:
+      tags: [Workflows]
+      summary: Get workflow
+      description: Get workflow details including progress
+      operationId: getWorkflow
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Workflow details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkflowResponse'
+        '404':
+          description: Workflow not found
+
+  /api/v1/workflows/{id}/cancel:
+    post:
+      tags: [Workflows]
+      summary: Cancel workflow
+      description: Cancel a workflow and all its pending jobs
+      operationId: cancelWorkflow
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Workflow cancelled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkflowResponse'
+
+  /api/v1/jobs/{id}/dependencies:
+    get:
+      tags: [Workflows]
+      summary: Get job dependencies
+      description: Get the dependencies and dependents of a job
+      operationId: getJobDependencies
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Job dependencies
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobWithDependencies'
+    post:
+      tags: [Workflows]
+      summary: Add job dependencies
+      description: Add dependencies to an existing job
+      operationId: addJobDependencies
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddDependenciesRequest'
+      responses:
+        '200':
+          description: Dependencies added
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AddDependenciesResponse'
+
+  # Real-time Endpoints
+  /api/v1/ws:
+    get:
+      tags: [Real-time]
+      summary: WebSocket connection
+      description: |
+        Establish a WebSocket connection for real-time updates.
+        
+        ## Authentication
+        **Required**: Pass your JWT token in the `token` query parameter.
+        WebSocket connections cannot use headers for authentication.
+        
+        ```
+        wss://api.spooled.cloud/api/v1/ws?token=eyJ...
+        ```
+        
+        ## Connection
+        Connect to this endpoint and upgrade to WebSocket protocol.
+        
+        ## Events
+        The server will send events for:
+        - Job status changes
+        - Queue statistics updates
+        - Worker heartbeats
+        - System health updates
+        
+        ## Filtering
+        Use query parameters to filter events:
+        - `queue`: Filter by queue name
+        - `job_id`: Filter by specific job
+        - `events`: Comma-separated event types
+        
+        ## Client Commands
+        Send JSON messages to subscribe/unsubscribe:
+        ```json
+        {"cmd": "Subscribe", "queue": "emails", "job_id": null}
+        {"cmd": "Unsubscribe", "queue": "emails", "job_id": null}
+        {"cmd": "Ping"}
+        ```
+      operationId: websocketHandler
+      parameters:
+        - name: token
+          in: query
+          required: true
+          description: JWT authentication token
+          schema:
+            type: string
+        - name: queue
+          in: query
+          schema:
+            type: string
+        - name: job_id
+          in: query
+          schema:
+            type: string
+        - name: events
+          in: query
+          description: Comma-separated event types
+          schema:
+            type: string
+      responses:
+        '101':
+          description: Switching to WebSocket protocol
+
+  /api/v1/events:
+    get:
+      tags: [Real-time]
+      summary: Server-Sent Events stream
+      description: Subscribe to all system events via SSE
+      operationId: sseEventsHandler
+      parameters:
+        - name: queue
+          in: query
+          schema:
+            type: string
+        - name: events
+          in: query
+          description: Comma-separated event types to filter
+          schema:
+            type: string
+      responses:
+        '200':
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/RealtimeEvent'
+
+  /api/v1/events/jobs/{id}:
+    get:
+      tags: [Real-time]
+      summary: Job status SSE stream
+      description: Subscribe to status updates for a specific job
+      operationId: sseJobHandler
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: SSE stream for job status
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/RealtimeEvent'
+
+  /api/v1/events/queues/{name}:
+    get:
+      tags: [Real-time]
+      summary: Queue stats SSE stream
+      description: Subscribe to statistics updates for a specific queue
+      operationId: sseQueueHandler
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: SSE stream for queue stats
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/RealtimeEvent'
+
+  # Schedule (Cron) Endpoints
+  /api/v1/schedules:
+    get:
+      tags: [Schedules]
+      summary: List schedules
+      description: List all cron-based job schedules
+      operationId: listSchedules
+      parameters:
+        - name: organization_id
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+      responses:
+        '200':
+          description: List of schedules
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Schedule'
+    post:
+      tags: [Schedules]
+      summary: Create schedule
+      description: Create a new cron-based recurring job schedule
+      operationId: createSchedule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateScheduleRequest'
+      responses:
+        '201':
+          description: Schedule created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateScheduleResponse'
+        '400':
+          description: Invalid cron expression or validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/schedules/{id}:
+    get:
+      tags: [Schedules]
+      summary: Get schedule
+      description: Get a schedule by ID
+      operationId: getSchedule
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Schedule details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Schedule'
+        '404':
+          description: Schedule not found
+    put:
+      tags: [Schedules]
+      summary: Update schedule
+      description: Update an existing schedule
+      operationId: updateSchedule
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateScheduleRequest'
+      responses:
+        '200':
+          description: Schedule updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Schedule'
+        '404':
+          description: Schedule not found
+    delete:
+      tags: [Schedules]
+      summary: Delete schedule
+      description: Delete a schedule
+      operationId: deleteSchedule
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Schedule deleted
+        '404':
+          description: Schedule not found
+
+  /api/v1/schedules/{id}/pause:
+    post:
+      tags: [Schedules]
+      summary: Pause schedule
+      description: Temporarily pause a schedule from creating jobs
+      operationId: pauseSchedule
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Schedule paused
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Schedule'
+        '404':
+          description: Schedule not found
+
+  /api/v1/schedules/{id}/resume:
+    post:
+      tags: [Schedules]
+      summary: Resume schedule
+      description: Resume a paused schedule
+      operationId: resumeSchedule
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Schedule resumed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Schedule'
+        '404':
+          description: Schedule not found
+
+  /api/v1/schedules/{id}/trigger:
+    post:
+      tags: [Schedules]
+      summary: Trigger schedule
+      description: Manually trigger a schedule to create a job immediately
+      operationId: triggerSchedule
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Schedule triggered, job created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TriggerScheduleResponse'
+        '404':
+          description: Schedule not found
+
+  /api/v1/schedules/{id}/history:
+    get:
+      tags: [Schedules]
+      summary: Schedule history
+      description: Get the execution history of a schedule
+      operationId: getScheduleHistory
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+      responses:
+        '200':
+          description: Schedule run history
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ScheduleRun'
+        '404':
+          description: Schedule not found
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: API key in Bearer token format
+
+  schemas:
+    HealthResponse:
+      type: object
+      required: [status, version, database, cache]
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded]
+        version:
+          type: string
+        database:
+          type: boolean
+        cache:
+          type: boolean
+
+    # Authentication Schemas
+    LoginRequest:
+      type: object
+      required: [api_key]
+      properties:
+        api_key:
+          type: string
+          description: API key to exchange for JWT tokens
+          minLength: 10
+
+    LoginResponse:
+      type: object
+      required: [access_token, refresh_token, token_type, expires_in, refresh_expires_in]
+      properties:
+        access_token:
+          type: string
+          description: JWT access token (short-lived)
+        refresh_token:
+          type: string
+          description: JWT refresh token (long-lived)
+        token_type:
+          type: string
+          enum: [Bearer]
+        expires_in:
+          type: integer
+          description: Access token expiration in seconds
+        refresh_expires_in:
+          type: integer
+          description: Refresh token expiration in seconds
+
+    RefreshTokenRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token:
+          type: string
+          description: Valid refresh token
+
+    RefreshTokenResponse:
+      type: object
+      required: [access_token, token_type, expires_in]
+      properties:
+        access_token:
+          type: string
+          description: New JWT access token
+        token_type:
+          type: string
+          enum: [Bearer]
+        expires_in:
+          type: integer
+          description: Access token expiration in seconds
+
+    CurrentUserResponse:
+      type: object
+      required: [organization_id, api_key_id, queues, issued_at, expires_at]
+      properties:
+        organization_id:
+          type: string
+        api_key_id:
+          type: string
+        queues:
+          type: array
+          items:
+            type: string
+        issued_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+
+    ValidateTokenRequest:
+      type: object
+      required: [token]
+      properties:
+        token:
+          type: string
+          description: JWT token to validate
+
+    ValidateTokenResponse:
+      type: object
+      required: [valid]
+      properties:
+        valid:
+          type: boolean
+        error:
+          type: string
+          description: Error message if token is invalid
+        claims:
+          type: object
+          description: Token claims if valid
+
+    # Schedule Schemas
+    Schedule:
+      type: object
+      required: [id, organization_id, name, cron_expression, timezone, queue_name, is_active, created_at]
+      properties:
+        id:
+          type: string
+        organization_id:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        cron_expression:
+          type: string
+          description: 6-field cron expression (second minute hour day month weekday)
+          example: "0 */5 * * * *"
+        timezone:
+          type: string
+          default: UTC
+        queue_name:
+          type: string
+        payload_template:
+          type: object
+        priority:
+          type: integer
+          default: 0
+        max_retries:
+          type: integer
+          default: 3
+        timeout_seconds:
+          type: integer
+          default: 300
+        is_active:
+          type: boolean
+        last_run_at:
+          type: string
+          format: date-time
+        next_run_at:
+          type: string
+          format: date-time
+        run_count:
+          type: integer
+        tags:
+          type: object
+        metadata:
+          type: object
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    CreateScheduleRequest:
+      type: object
+      required: [name, cron_expression, queue_name, payload_template]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+        description:
+          type: string
+          maxLength: 1000
+        cron_expression:
+          type: string
+          description: 6-field cron expression
+        timezone:
+          type: string
+          default: UTC
+        queue_name:
+          type: string
+        payload_template:
+          type: object
+        priority:
+          type: integer
+          minimum: -100
+          maximum: 100
+        max_retries:
+          type: integer
+          minimum: 0
+          maximum: 100
+        timeout_seconds:
+          type: integer
+          minimum: 1
+          maximum: 86400
+        tags:
+          type: object
+        metadata:
+          type: object
+
+    CreateScheduleResponse:
+      type: object
+      required: [id, name, cron_expression]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        cron_expression:
+          type: string
+        next_run_at:
+          type: string
+          format: date-time
+
+    UpdateScheduleRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        cron_expression:
+          type: string
+        timezone:
+          type: string
+        payload_template:
+          type: object
+        priority:
+          type: integer
+        max_retries:
+          type: integer
+        timeout_seconds:
+          type: integer
+        is_active:
+          type: boolean
+        tags:
+          type: object
+        metadata:
+          type: object
+
+    TriggerScheduleResponse:
+      type: object
+      required: [job_id, triggered_at]
+      properties:
+        job_id:
+          type: string
+        triggered_at:
+          type: string
+          format: date-time
+
+    ScheduleRun:
+      type: object
+      required: [id, schedule_id, status, started_at]
+      properties:
+        id:
+          type: string
+        schedule_id:
+          type: string
+        job_id:
+          type: string
+        status:
+          type: string
+          enum: [pending, running, completed, failed]
+        error_message:
+          type: string
+        started_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+
+    ErrorResponse:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: Machine-readable error code
+        message:
+          type: string
+          description: Human-readable error message
+        details:
+          type: object
+          description: Additional error details
+
+    Organization:
+      type: object
+      required: [id, name, slug, plan_tier, settings, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        slug:
+          type: string
+        plan_tier:
+          type: string
+          enum: [free, starter, pro, enterprise]
+        billing_email:
+          type: string
+          format: email
+        settings:
+          type: object
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    OrganizationSummary:
+      type: object
+      required: [id, name, slug, plan_tier, created_at]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        slug:
+          type: string
+        plan_tier:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    CreateOrganizationRequest:
+      type: object
+      required: [name, slug]
+      properties:
+        name:
+          type: string
+          minLength: 3
+          maxLength: 100
+        slug:
+          type: string
+          minLength: 3
+          maxLength: 50
+          pattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+        billing_email:
+          type: string
+          format: email
+
+    UpdateOrganizationRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 3
+          maxLength: 100
+        billing_email:
+          type: string
+          format: email
+        settings:
+          type: object
+
+    Job:
+      type: object
+      required: [id, organization_id, queue_name, status, payload, retry_count, max_retries, timeout_seconds, priority, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        organization_id:
+          type: string
+        queue_name:
+          type: string
+        status:
+          type: string
+          enum: [pending, scheduled, processing, completed, failed, deadletter, cancelled]
+        payload:
+          type: object
+        result:
+          type: object
+        retry_count:
+          type: integer
+        max_retries:
+          type: integer
+        last_error:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        scheduled_at:
+          type: string
+          format: date-time
+        started_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        priority:
+          type: integer
+        tags:
+          type: object
+        timeout_seconds:
+          type: integer
+        parent_job_id:
+          type: string
+        completion_webhook:
+          type: string
+          format: uri
+        assigned_worker_id:
+          type: string
+        lease_id:
+          type: string
+        lease_expires_at:
+          type: string
+          format: date-time
+        idempotency_key:
+          type: string
+        updated_at:
+          type: string
+          format: date-time
+
+    JobSummary:
+      type: object
+      required: [id, queue_name, status, priority, retry_count, created_at]
+      properties:
+        id:
+          type: string
+        queue_name:
+          type: string
+        status:
+          type: string
+        priority:
+          type: integer
+        retry_count:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        scheduled_at:
+          type: string
+          format: date-time
+        started_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+
+    CreateJobRequest:
+      type: object
+      required: [queue_name, payload]
+      properties:
+        queue_name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        payload:
+          type: object
+        priority:
+          type: integer
+          minimum: -100
+          maximum: 100
+          default: 0
+        max_retries:
+          type: integer
+          minimum: 0
+          maximum: 100
+          default: 3
+        timeout_seconds:
+          type: integer
+          minimum: 1
+          maximum: 86400
+          default: 300
+        scheduled_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        tags:
+          type: object
+        parent_job_id:
+          type: string
+        completion_webhook:
+          type: string
+          format: uri
+        idempotency_key:
+          type: string
+          maxLength: 255
+
+    CreateJobResponse:
+      type: object
+      required: [id, created]
+      properties:
+        id:
+          type: string
+          description: Job ID (new or existing if idempotent)
+        created:
+          type: boolean
+          description: Whether this was a new job or existing
+
+    JobStats:
+      type: object
+      required: [pending, scheduled, processing, completed, failed, deadletter, cancelled, total]
+      properties:
+        pending:
+          type: integer
+        scheduled:
+          type: integer
+        processing:
+          type: integer
+        completed:
+          type: integer
+        failed:
+          type: integer
+        deadletter:
+          type: integer
+        cancelled:
+          type: integer
+        total:
+          type: integer
+
+    QueueConfig:
+      type: object
+      required: [id, organization_id, queue_name, max_retries, default_timeout, enabled, settings, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        organization_id:
+          type: string
+        queue_name:
+          type: string
+        max_retries:
+          type: integer
+        default_timeout:
+          type: integer
+        rate_limit:
+          type: integer
+        enabled:
+          type: boolean
+        settings:
+          type: object
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    QueueConfigSummary:
+      type: object
+      required: [queue_name, max_retries, default_timeout, enabled]
+      properties:
+        queue_name:
+          type: string
+        max_retries:
+          type: integer
+        default_timeout:
+          type: integer
+        rate_limit:
+          type: integer
+        enabled:
+          type: boolean
+
+    UpsertQueueConfigRequest:
+      type: object
+      required: [queue_name]
+      properties:
+        queue_name:
+          type: string
+        max_retries:
+          type: integer
+          minimum: 0
+          maximum: 100
+        default_timeout:
+          type: integer
+          minimum: 1
+          maximum: 86400
+        rate_limit:
+          type: integer
+          minimum: 1
+          maximum: 100000
+        enabled:
+          type: boolean
+        settings:
+          type: object
+
+    QueueStats:
+      type: object
+      required: [queue_name, pending_jobs, processing_jobs, completed_jobs_24h, failed_jobs_24h, active_workers]
+      properties:
+        queue_name:
+          type: string
+        pending_jobs:
+          type: integer
+        processing_jobs:
+          type: integer
+        completed_jobs_24h:
+          type: integer
+        failed_jobs_24h:
+          type: integer
+        avg_processing_time_ms:
+          type: number
+        max_job_age_seconds:
+          type: integer
+        active_workers:
+          type: integer
+
+    Worker:
+      type: object
+      required: [id, organization_id, queue_name, hostname, max_concurrency, current_jobs, status, last_heartbeat, metadata, registered_at]
+      properties:
+        id:
+          type: string
+        organization_id:
+          type: string
+        queue_name:
+          type: string
+        hostname:
+          type: string
+        worker_type:
+          type: string
+        max_concurrency:
+          type: integer
+        current_jobs:
+          type: integer
+        status:
+          type: string
+          enum: [healthy, degraded, offline, draining]
+        last_heartbeat:
+          type: string
+          format: date-time
+        metadata:
+          type: object
+        version:
+          type: string
+        registered_at:
+          type: string
+          format: date-time
+
+    WorkerSummary:
+      type: object
+      required: [id, queue_name, hostname, status, current_jobs, max_concurrency, last_heartbeat]
+      properties:
+        id:
+          type: string
+        queue_name:
+          type: string
+        hostname:
+          type: string
+        status:
+          type: string
+        current_jobs:
+          type: integer
+        max_concurrency:
+          type: integer
+        last_heartbeat:
+          type: string
+          format: date-time
+
+    RegisterWorkerRequest:
+      type: object
+      required: [queue_name, hostname]
+      properties:
+        queue_name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        hostname:
+          type: string
+          minLength: 1
+          maxLength: 255
+        worker_type:
+          type: string
+          maxLength: 50
+        max_concurrency:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 5
+        metadata:
+          type: object
+        version:
+          type: string
+          maxLength: 50
+
+    RegisterWorkerResponse:
+      type: object
+      required: [id, queue_name, lease_duration_secs, heartbeat_interval_secs]
+      properties:
+        id:
+          type: string
+        queue_name:
+          type: string
+        lease_duration_secs:
+          type: integer
+        heartbeat_interval_secs:
+          type: integer
+
+    WorkerHeartbeatRequest:
+      type: object
+      required: [current_jobs]
+      properties:
+        current_jobs:
+          type: integer
+        status:
+          type: string
+        metadata:
+          type: object
+
+    ApiKeySummary:
+      type: object
+      required: [id, name, queues, is_active, created_at]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        queues:
+          type: array
+          items:
+            type: string
+        rate_limit:
+          type: integer
+        is_active:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        last_used:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+
+    CreateApiKeyRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        queues:
+          type: array
+          items:
+            type: string
+        rate_limit:
+          type: integer
+          minimum: 1
+          maximum: 10000
+        expires_at:
+          type: string
+          format: date-time
+
+    CreateApiKeyResponse:
+      type: object
+      required: [id, key, name, created_at]
+      properties:
+        id:
+          type: string
+        key:
+          type: string
+          description: The raw API key (only shown once)
+        name:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+
+    UpdateApiKeyRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        queues:
+          type: array
+          items:
+            type: string
+        rate_limit:
+          type: integer
+          minimum: 1
+          maximum: 10000
+        is_active:
+          type: boolean
+
+    CustomWebhookRequest:
+      type: object
+      required: [queue_name, payload]
+      properties:
+        queue_name:
+          type: string
+        event_type:
+          type: string
+        payload:
+          type: object
+        idempotency_key:
+          type: string
+        priority:
+          type: integer
+
+    WebhookResponse:
+      type: object
+      properties:
+        job_id:
+          type: string
+          description: ID of the created job
+        queue_name:
+          type: string
+          description: Name of the queue the job was enqueued to
+        status:
+          type: string
+          description: Job status (pending, scheduled)
+
+    # Bulk Operations
+    BulkEnqueueRequest:
+      type: object
+      required: [queue_name, jobs]
+      properties:
+        queue_name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        jobs:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/BulkJobItem'
+        default_priority:
+          type: integer
+          default: 0
+        default_max_retries:
+          type: integer
+          default: 3
+        default_timeout_seconds:
+          type: integer
+          default: 300
+
+    BulkJobItem:
+      type: object
+      required: [payload]
+      properties:
+        payload:
+          type: object
+        priority:
+          type: integer
+        idempotency_key:
+          type: string
+          maxLength: 255
+        scheduled_at:
+          type: string
+          format: date-time
+
+    BulkEnqueueResponse:
+      type: object
+      required: [succeeded, failed, total, success_count, failure_count]
+      properties:
+        succeeded:
+          type: array
+          items:
+            $ref: '#/components/schemas/BulkJobResult'
+        failed:
+          type: array
+          items:
+            $ref: '#/components/schemas/BulkJobError'
+        total:
+          type: integer
+        success_count:
+          type: integer
+        failure_count:
+          type: integer
+
+    BulkJobResult:
+      type: object
+      required: [index, job_id, created]
+      properties:
+        index:
+          type: integer
+        job_id:
+          type: string
+        created:
+          type: boolean
+
+    BulkJobError:
+      type: object
+      required: [index, error]
+      properties:
+        index:
+          type: integer
+        error:
+          type: string
+
+    # Priority Boost
+    BoostPriorityRequest:
+      type: object
+      required: [priority]
+      properties:
+        priority:
+          type: integer
+          minimum: -100
+          maximum: 100
+
+    BoostPriorityResponse:
+      type: object
+      required: [job_id, old_priority, new_priority]
+      properties:
+        job_id:
+          type: string
+        old_priority:
+          type: integer
+        new_priority:
+          type: integer
+
+    # Dead-Letter Queue Operations
+    RetryDlqRequest:
+      type: object
+      properties:
+        job_ids:
+          type: array
+          items:
+            type: string
+        queue_name:
+          type: string
+          maxLength: 100
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          default: 100
+
+    RetryDlqResponse:
+      type: object
+      required: [retried_count, retried_jobs]
+      properties:
+        retried_count:
+          type: integer
+        retried_jobs:
+          type: array
+          items:
+            type: string
+
+    PurgeDlqRequest:
+      type: object
+      required: [confirm]
+      properties:
+        queue_name:
+          type: string
+          maxLength: 100
+        older_than:
+          type: string
+          format: date-time
+        confirm:
+          type: boolean
+          description: Must be true to execute purge
+
+    PurgeDlqResponse:
+      type: object
+      required: [purged_count]
+      properties:
+        purged_count:
+          type: integer
+
+    # Queue Control
+    PauseQueueRequest:
+      type: object
+      properties:
+        reason:
+          type: string
+          description: Optional reason for pausing
+
+    PauseQueueResponse:
+      type: object
+      required: [queue_name, paused, paused_at]
+      properties:
+        queue_name:
+          type: string
+        paused:
+          type: boolean
+        paused_at:
+          type: string
+          format: date-time
+        reason:
+          type: string
+
+    ResumeQueueResponse:
+      type: object
+      required: [queue_name, resumed, paused_duration_secs]
+      properties:
+        queue_name:
+          type: string
+        resumed:
+          type: boolean
+        paused_duration_secs:
+          type: integer
+
+    # Workflow Models
+    CreateWorkflowRequest:
+      type: object
+      required: [name, jobs]
+      properties:
+        name:
+          type: string
+          maxLength: 255
+        description:
+          type: string
+          maxLength: 1000
+        jobs:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorkflowJobDefinition'
+          minItems: 1
+          maxItems: 1000
+        metadata:
+          type: object
+
+    WorkflowJobDefinition:
+      type: object
+      required: [key, queue_name, payload]
+      properties:
+        key:
+          type: string
+          description: Unique key for this job within the workflow
+          maxLength: 100
+        queue_name:
+          type: string
+          maxLength: 255
+        payload:
+          type: object
+        depends_on:
+          type: array
+          items:
+            type: string
+          description: Keys of jobs this job depends on
+        dependency_mode:
+          type: string
+          enum: [all, any]
+          default: all
+        priority:
+          type: integer
+          default: 0
+        max_retries:
+          type: integer
+        timeout_seconds:
+          type: integer
+
+    CreateWorkflowResponse:
+      type: object
+      required: [workflow_id, job_ids, status]
+      properties:
+        workflow_id:
+          type: string
+          format: uuid
+        job_ids:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorkflowJobMapping'
+        status:
+          type: string
+
+    WorkflowJobMapping:
+      type: object
+      required: [key, job_id]
+      properties:
+        key:
+          type: string
+        job_id:
+          type: string
+          format: uuid
+
+    WorkflowResponse:
+      type: object
+      required: [id, name, status, total_jobs, completed_jobs, failed_jobs, progress_percent, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        description:
+          type: string
+        status:
+          type: string
+          enum: [pending, running, completed, failed, cancelled]
+        total_jobs:
+          type: integer
+        completed_jobs:
+          type: integer
+        failed_jobs:
+          type: integer
+        progress_percent:
+          type: number
+        created_at:
+          type: string
+          format: date-time
+        started_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+        metadata:
+          type: object
+
+    AddDependenciesRequest:
+      type: object
+      required: [depends_on]
+      properties:
+        depends_on:
+          type: array
+          items:
+            type: string
+          minItems: 1
+          maxItems: 100
+        dependency_mode:
+          type: string
+          enum: [all, any]
+          default: all
+
+    AddDependenciesResponse:
+      type: object
+      required: [dependencies_added, dependencies_met]
+      properties:
+        dependencies_added:
+          type: integer
+        dependencies_met:
+          type: boolean
+
+    JobWithDependencies:
+      type: object
+      required: [job_id, dependencies, dependents, dependencies_met]
+      properties:
+        job_id:
+          type: string
+        dependencies:
+          type: array
+          items:
+            $ref: '#/components/schemas/DependencyInfo'
+        dependents:
+          type: array
+          items:
+            $ref: '#/components/schemas/DependencyInfo'
+        dependencies_met:
+          type: boolean
+
+    DependencyInfo:
+      type: object
+      required: [job_id, queue_name, status]
+      properties:
+        job_id:
+          type: string
+        queue_name:
+          type: string
+        status:
+          type: string
+
+    # Dashboard Models
+    DashboardData:
+      type: object
+      required: [system, jobs, queues, workers, recent_activity]
+      properties:
+        system:
+          $ref: '#/components/schemas/SystemInfo'
+        jobs:
+          $ref: '#/components/schemas/JobSummaryStats'
+        queues:
+          type: array
+          items:
+            $ref: '#/components/schemas/QueueSummary'
+        workers:
+          $ref: '#/components/schemas/WorkerSummary'
+        recent_activity:
+          $ref: '#/components/schemas/RecentActivity'
+
+    SystemInfo:
+      type: object
+      required: [version, uptime_seconds, started_at, database_status, cache_status, environment]
+      properties:
+        version:
+          type: string
+        uptime_seconds:
+          type: integer
+        started_at:
+          type: string
+          format: date-time
+        database_status:
+          type: string
+        cache_status:
+          type: string
+        environment:
+          type: string
+
+    JobSummaryStats:
+      type: object
+      required: [total, pending, processing, completed_24h, failed_24h, deadletter]
+      properties:
+        total:
+          type: integer
+        pending:
+          type: integer
+        processing:
+          type: integer
+        completed_24h:
+          type: integer
+        failed_24h:
+          type: integer
+        deadletter:
+          type: integer
+        avg_wait_time_ms:
+          type: number
+        avg_processing_time_ms:
+          type: number
+
+    QueueSummary:
+      type: object
+      required: [name, pending, processing, paused]
+      properties:
+        name:
+          type: string
+        pending:
+          type: integer
+        processing:
+          type: integer
+        paused:
+          type: boolean
+
+    WorkerSummary:
+      type: object
+      required: [total, healthy, unhealthy]
+      properties:
+        total:
+          type: integer
+        healthy:
+          type: integer
+        unhealthy:
+          type: integer
+
+    RecentActivity:
+      type: object
+      required: [jobs_created_1h, jobs_completed_1h, jobs_failed_1h]
+      properties:
+        jobs_created_1h:
+          type: integer
+        jobs_completed_1h:
+          type: integer
+        jobs_failed_1h:
+          type: integer
+
+    # Batch Status
+    BatchJobStatus:
+      type: object
+      required: [id, status, queue_name, retry_count, created_at]
+      properties:
+        id:
+          type: string
+        status:
+          type: string
+        queue_name:
+          type: string
+        retry_count:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+
+    # Real-time Events
+    RealtimeEvent:
+      type: object
+      required: [type, data]
+      properties:
+        type:
+          type: string
+          enum:
+            - job.status
+            - job.created
+            - job.completed
+            - job.failed
+            - queue.stats
+            - worker.heartbeat
+            - worker.registered
+            - worker.deregistered
+            - system.health
+            - ping
+            - error
+        data:
+          type: object
+
+security:
+  - bearerAuth: []
+

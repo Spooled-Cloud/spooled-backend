@@ -1,0 +1,204 @@
+# ===========================================
+# SPOOLED BACKEND - PRODUCTION DEPLOYMENT
+# ===========================================
+# 
+# Deploy via Portainer, Docker Compose, or any container orchestrator.
+# Images are automatically built by GitHub Actions for amd64 and arm64.
+#
+# Quick start:
+#   1. Copy .env.example to .env and configure
+#   2. docker compose -f docker-compose.prod.yml up -d
+#
+# Environment variables (set in .env or Portainer):
+#   BACKEND_IMAGE     - Docker image (default: ghcr.io/spooled-cloud/spooled-backend:latest)
+#   POSTGRES_PASSWORD - Required: Database password
+#   JWT_SECRET        - Required: 32+ character secret for JWT signing
+#   REDIS_PASSWORD    - Optional: Redis password (recommended for production)
+
+services:
+  # ===========================================
+  # PostgreSQL Database
+  # ===========================================
+  db:
+    image: postgres:16-alpine
+    container_name: spooled_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-spooled}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-spooled}
+      # Performance tuning
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=en_US.UTF-8"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-spooled}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - spooled-network
+    # Uncomment to expose PostgreSQL externally (not recommended for production)
+    # ports:
+    #   - "5432:5432"
+
+  # ===========================================
+  # Redis Cache & Pub/Sub
+  # ===========================================
+  redis:
+    image: redis:7-alpine
+    container_name: spooled_redis
+    restart: unless-stopped
+    command: >
+      redis-server 
+      --appendonly yes 
+      --maxmemory 512mb 
+      --maxmemory-policy allkeys-lru
+      ${REDIS_PASSWORD:+--requirepass ${REDIS_PASSWORD}}
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - spooled-network
+    # Uncomment to expose Redis externally (not recommended for production)
+    # ports:
+    #   - "6379:6379"
+
+  # ===========================================
+  # Spooled Backend API
+  # ===========================================
+  backend:
+    image: ${BACKEND_IMAGE:-ghcr.io/spooled-cloud/spooled-backend:latest}
+    container_name: spooled_backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # Database
+      DATABASE_URL: postgres://${POSTGRES_USER:-spooled}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-spooled}
+      DATABASE_MAX_CONNECTIONS: ${DATABASE_MAX_CONNECTIONS:-25}
+      DATABASE_MIN_CONNECTIONS: ${DATABASE_MIN_CONNECTIONS:-5}
+      
+      # Redis
+      REDIS_URL: redis://${REDIS_PASSWORD:+:${REDIS_PASSWORD}@}redis:6379
+      REDIS_POOL_SIZE: ${REDIS_POOL_SIZE:-10}
+      
+      # Server
+      HOST: 0.0.0.0
+      PORT: 8080
+      METRICS_PORT: 9090
+      GRPC_PORT: 50051
+      
+      # Security
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required (min 32 chars)}
+      RUST_ENV: ${RUST_ENV:-production}
+      ENABLE_HSTS: ${ENABLE_HSTS:-true}
+      
+      # Logging
+      RUST_LOG: ${RUST_LOG:-info,tower_http=info}
+      JSON_LOGS: ${JSON_LOGS:-true}
+      
+      # Queue settings
+      QUEUE_DEFAULT_TIMEOUT: ${QUEUE_DEFAULT_TIMEOUT:-300}
+      QUEUE_MAX_RETRIES: ${QUEUE_MAX_RETRIES:-3}
+      
+      # Worker settings
+      WORKER_HEARTBEAT_INTERVAL: ${WORKER_HEARTBEAT_INTERVAL:-10}
+      WORKER_LEASE_DURATION: ${WORKER_LEASE_DURATION:-30}
+      WORKER_STALE_THRESHOLD: ${WORKER_STALE_THRESHOLD:-60}
+      
+      # Rate limiting
+      RATE_LIMIT_REQUESTS_PER_SECOND: ${RATE_LIMIT_REQUESTS_PER_SECOND:-100}
+      RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:-200}
+      
+      # OpenTelemetry (optional - for distributed tracing)
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-spooled-backend}
+    ports:
+      - "${API_PORT:-8080}:8080"
+      - "${METRICS_PORT:-9090}:9090"
+      - "${GRPC_PORT:-50051}:50051"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - spooled-network
+    # Optional: Mount for custom configs
+    # volumes:
+    #   - ./config:/app/config:ro
+
+  # ===========================================
+  # Prometheus (Optional - Metrics)
+  # ===========================================
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: spooled_prometheus
+    restart: unless-stopped
+    profiles: ["monitoring"]
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./docker/prometheus/spooled-rules.yml:/etc/prometheus/spooled-rules.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9091}:9090"
+    networks:
+      - spooled-network
+    depends_on:
+      - backend
+
+  # ===========================================
+  # Grafana (Optional - Dashboards)
+  # ===========================================
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: spooled_grafana
+    restart: unless-stopped
+    profiles: ["monitoring"]
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    networks:
+      - spooled-network
+    depends_on:
+      - prometheus
+
+# ===========================================
+# Volumes
+# ===========================================
+volumes:
+  db_data:
+    driver: local
+  redis_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+# ===========================================
+# Networks
+# ===========================================
+networks:
+  spooled-network:
+    driver: bridge

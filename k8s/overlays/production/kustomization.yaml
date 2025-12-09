@@ -1,0 +1,148 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: spooled
+
+resources:
+  - ../../base
+
+namePrefix: prod-
+
+commonLabels:
+  environment: production
+
+# =============================================================================
+# Production-specific patches
+# =============================================================================
+patches:
+  # Increase replicas for production
+  - patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 5
+    target:
+      kind: Deployment
+      name: spooled-backend
+  
+  # Higher resource limits for production
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: 250m
+            memory: 256Mi
+          limits:
+            cpu: 2000m
+            memory: 1Gi
+    target:
+      kind: Deployment
+      name: spooled-backend
+  
+  # Production HPA settings (scale up to 50 pods)
+  - patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 5
+      - op: replace
+        path: /spec/maxReplicas
+        value: 50
+    target:
+      kind: HorizontalPodAutoscaler
+      name: spooled-backend
+  
+  # Production PDB (always keep at least 3 available)
+  - patch: |-
+      - op: replace
+        path: /spec/minAvailable
+        value: 3
+    target:
+      kind: PodDisruptionBudget
+      name: spooled-backend
+  
+  # Production ingress with production hostname
+  - patch: |-
+      - op: replace
+        path: /spec/rules/0/host
+        value: api.spooled.io
+      - op: replace
+        path: /spec/tls/0/hosts/0
+        value: api.spooled.io
+    target:
+      kind: Ingress
+      name: spooled-backend
+  
+  # Scale up PgBouncer for production
+  - patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 3
+    target:
+      kind: Deployment
+      name: pgbouncer
+  
+  # Higher PgBouncer resources for production
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+    target:
+      kind: Deployment
+      name: pgbouncer
+  
+  # Higher Redis resources for production
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+    target:
+      kind: Deployment
+      name: redis
+
+# =============================================================================
+# Production-specific configuration
+# =============================================================================
+configMapGenerator:
+  - name: spooled-config
+    behavior: merge
+    literals:
+      # Logging
+      - RUST_LOG=info,spooled_backend=info
+      - RUST_ENV=production
+      - JSON_LOGS=true
+      
+      # Database pool (larger for production)
+      - DATABASE_MAX_CONNECTIONS=50
+      - DATABASE_MIN_CONNECTIONS=10
+      
+      # Redis pool
+      - REDIS_POOL_SIZE=20
+      
+      # Workers
+      - WORKER_MAX_CONCURRENCY=20
+      
+      # Rate limiting (higher for production)
+      - RATE_LIMIT_REQUESTS_PER_SECOND=200
+      - RATE_LIMIT_BURST_SIZE=500
+      
+      # Security
+      - ENABLE_HSTS=true
+      
+      # Tracing (set to your Jaeger/OTLP collector)
+      # - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger-collector.observability:4317
+
+images:
+  - name: spooled/backend
+    newTag: v1.0.0

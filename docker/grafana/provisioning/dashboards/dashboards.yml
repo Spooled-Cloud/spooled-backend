@@ -1,0 +1,17 @@
+# Grafana Dashboard Provisioning
+#
+# Auto-load dashboards from /var/lib/grafana/dashboards
+
+apiVersion: 1
+
+providers:
+  - name: 'Spooled Dashboards'
+    orgId: 1
+    folder: 'Spooled'
+    folderUid: 'spooled'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards

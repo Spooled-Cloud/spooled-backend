@@ -1,0 +1,264 @@
+syntax = "proto3";
+
+package spooled.v1;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/struct.proto";
+
+// Spooled Queue Service
+// High-performance gRPC API for job queue operations
+service QueueService {
+    // Enqueue a new job
+    rpc Enqueue(EnqueueRequest) returns (EnqueueResponse);
+    
+    // Dequeue a job (for workers)
+    rpc Dequeue(DequeueRequest) returns (DequeueResponse);
+    
+    // Complete a job
+    rpc Complete(CompleteRequest) returns (CompleteResponse);
+    
+    // Fail a job
+    rpc Fail(FailRequest) returns (FailResponse);
+    
+    // Renew job lease
+    rpc RenewLease(RenewLeaseRequest) returns (RenewLeaseResponse);
+    
+    // Get job status
+    rpc GetJob(GetJobRequest) returns (GetJobResponse);
+    
+    // Get queue statistics
+    rpc GetQueueStats(GetQueueStatsRequest) returns (GetQueueStatsResponse);
+    
+    // Stream jobs to workers (server-side streaming)
+    // Note: Streaming is implemented via REST API WebSocket/SSE endpoints:
+    //   - GET /api/v1/ws (WebSocket for bidirectional real-time updates)
+    //   - GET /api/v1/events (SSE for job event streaming)
+    //   - GET /api/v1/events/jobs/{id} (SSE for single job updates)
+    //   - GET /api/v1/events/queues/{name} (SSE for queue updates)
+    rpc StreamJobs(StreamJobsRequest) returns (stream Job);
+    
+    // Bidirectional streaming for real-time job processing
+    // Note: Use WebSocket endpoint /api/v1/ws for bidirectional communication
+    rpc ProcessJobs(stream ProcessRequest) returns (stream ProcessResponse);
+}
+
+// Worker Service for worker management
+service WorkerService {
+    // Register a new worker
+    rpc Register(RegisterWorkerRequest) returns (RegisterWorkerResponse);
+    
+    // Send heartbeat
+    rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+    
+    // Deregister worker
+    rpc Deregister(DeregisterRequest) returns (DeregisterResponse);
+}
+
+// Job status enumeration
+enum JobStatus {
+    JOB_STATUS_UNSPECIFIED = 0;
+    JOB_STATUS_PENDING = 1;
+    JOB_STATUS_SCHEDULED = 2;
+    JOB_STATUS_PROCESSING = 3;
+    JOB_STATUS_COMPLETED = 4;
+    JOB_STATUS_FAILED = 5;
+    JOB_STATUS_DEADLETTER = 6;
+    JOB_STATUS_CANCELLED = 7;
+}
+
+// Job message
+message Job {
+    string id = 1;
+    string organization_id = 2;
+    string queue_name = 3;
+    JobStatus status = 4;
+    google.protobuf.Struct payload = 5;
+    google.protobuf.Struct result = 6;
+    int32 retry_count = 7;
+    int32 max_retries = 8;
+    string last_error = 9;
+    int32 priority = 10;
+    int32 timeout_seconds = 11;
+    google.protobuf.Timestamp created_at = 12;
+    google.protobuf.Timestamp scheduled_at = 13;
+    google.protobuf.Timestamp started_at = 14;
+    google.protobuf.Timestamp completed_at = 15;
+    google.protobuf.Timestamp lease_expires_at = 16;
+    string assigned_worker_id = 17;
+    string idempotency_key = 18;
+}
+
+// Enqueue Request
+message EnqueueRequest {
+    string queue_name = 1;
+    google.protobuf.Struct payload = 2;
+    int32 priority = 3;
+    int32 max_retries = 4;
+    int32 timeout_seconds = 5;
+    google.protobuf.Timestamp scheduled_at = 6;
+    string idempotency_key = 7;
+    map<string, string> tags = 8;
+}
+
+// Enqueue Response
+message EnqueueResponse {
+    string job_id = 1;
+    bool created = 2; // false if idempotent (existing job)
+}
+
+// Dequeue Request
+message DequeueRequest {
+    string queue_name = 1;
+    string worker_id = 2;
+    int32 lease_duration_secs = 3;
+    int32 batch_size = 4; // How many jobs to dequeue at once
+}
+
+// Dequeue Response
+message DequeueResponse {
+    repeated Job jobs = 1;
+}
+
+// Complete Request
+message CompleteRequest {
+    string job_id = 1;
+    string worker_id = 2;
+    google.protobuf.Struct result = 3;
+}
+
+// Complete Response
+message CompleteResponse {
+    bool success = 1;
+}
+
+// Fail Request
+message FailRequest {
+    string job_id = 1;
+    string worker_id = 2;
+    string error = 3;
+    bool retry = 4; // Whether to retry or move to DLQ
+}
+
+// Fail Response
+message FailResponse {
+    bool success = 1;
+    bool will_retry = 2;
+    int32 next_retry_delay_secs = 3;
+}
+
+// Renew Lease Request
+message RenewLeaseRequest {
+    string job_id = 1;
+    string worker_id = 2;
+    int32 extension_secs = 3;
+}
+
+// Renew Lease Response
+message RenewLeaseResponse {
+    bool success = 1;
+    google.protobuf.Timestamp new_expires_at = 2;
+}
+
+// Get Job Request
+message GetJobRequest {
+    string job_id = 1;
+}
+
+// Get Job Response
+message GetJobResponse {
+    Job job = 1;
+}
+
+// Get Queue Stats Request
+message GetQueueStatsRequest {
+    string queue_name = 1;
+}
+
+// Get Queue Stats Response
+message GetQueueStatsResponse {
+    string queue_name = 1;
+    int64 pending = 2;
+    int64 scheduled = 3;
+    int64 processing = 4;
+    int64 completed = 5;
+    int64 failed = 6;
+    int64 deadletter = 7;
+    int64 total = 8;
+    int64 max_age_ms = 9; // Age of oldest pending job
+}
+
+// Stream Jobs Request (server-side streaming)
+message StreamJobsRequest {
+    string queue_name = 1;
+    string worker_id = 2;
+    int32 lease_duration_secs = 3;
+}
+
+// Process Request (for bidirectional streaming)
+message ProcessRequest {
+    oneof request {
+        DequeueRequest dequeue = 1;
+        CompleteRequest complete = 2;
+        FailRequest fail = 3;
+        RenewLeaseRequest renew_lease = 4;
+    }
+}
+
+// Process Response (for bidirectional streaming)
+message ProcessResponse {
+    oneof response {
+        Job job = 1;
+        CompleteResponse complete = 2;
+        FailResponse fail = 3;
+        RenewLeaseResponse renew_lease = 4;
+        ErrorResponse error = 5;
+    }
+}
+
+// Error Response
+message ErrorResponse {
+    string code = 1;
+    string message = 2;
+}
+
+// Worker Registration
+message RegisterWorkerRequest {
+    string queue_name = 1;
+    string hostname = 2;
+    string worker_type = 3;
+    int32 max_concurrency = 4;
+    string version = 5;
+    map<string, string> metadata = 6;
+}
+
+// Worker Registration Response
+message RegisterWorkerResponse {
+    string worker_id = 1;
+    int32 lease_duration_secs = 2;
+    int32 heartbeat_interval_secs = 3;
+}
+
+// Heartbeat Request
+message HeartbeatRequest {
+    string worker_id = 1;
+    int32 current_jobs = 2;
+    string status = 3;
+    map<string, string> metadata = 4;
+}
+
+// Heartbeat Response
+message HeartbeatResponse {
+    bool acknowledged = 1;
+    bool should_drain = 2; // Signal to worker to stop accepting new jobs
+}
+
+// Deregister Request
+message DeregisterRequest {
+    string worker_id = 1;
+}
+
+// Deregister Response
+message DeregisterResponse {
+    bool success = 1;
+}
+

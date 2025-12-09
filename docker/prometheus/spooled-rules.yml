@@ -1,0 +1,347 @@
+# Spooled Backend - Prometheus Alert Rules
+#
+# Critical alerting rules for production monitoring
+
+groups:
+  # =============================================================================
+  # Job Queue Health Alerts
+  # =============================================================================
+  - name: spooled-jobs
+    interval: 30s
+    rules:
+      # Alert when oldest pending job is older than 5 minutes
+      - alert: JobQueueBacklog
+        expr: spooled_job_max_age_seconds > 300
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Job queue has old pending jobs"
+          description: "Oldest pending job is {{ $value | humanizeDuration }} old. Jobs may not be processing fast enough."
+
+      # Critical: Queue backlog exceeds 15 minutes
+      - alert: JobQueueBacklogCritical
+        expr: spooled_job_max_age_seconds > 900
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Critical job queue backlog"
+          description: "Oldest pending job is {{ $value | humanizeDuration }} old. Immediate investigation required."
+
+      # Alert on high job failure rate
+      - alert: HighJobFailureRate
+        expr: |
+          rate(spooled_jobs_failed_total[5m]) / 
+          (rate(spooled_jobs_completed_total[5m]) + rate(spooled_jobs_failed_total[5m]) + 0.001) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High job failure rate"
+          description: "Job failure rate is {{ $value | humanizePercentage }}. Check job handlers and payloads."
+
+      # Critical failure rate
+      - alert: CriticalJobFailureRate
+        expr: |
+          rate(spooled_jobs_failed_total[5m]) / 
+          (rate(spooled_jobs_completed_total[5m]) + rate(spooled_jobs_failed_total[5m]) + 0.001) > 0.25
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Critical job failure rate"
+          description: "Job failure rate is {{ $value | humanizePercentage }}. Immediate investigation required."
+
+      # Alert when jobs are being deadlettered
+      - alert: JobsDeadlettered
+        expr: increase(spooled_jobs_deadlettered_total[15m]) > 5
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Jobs being moved to dead letter queue"
+          description: "{{ $value }} jobs moved to DLQ in the last 15 minutes. Check for persistent failures."
+
+      # No jobs processing when there are pending jobs
+      - alert: JobsNotProcessing
+        expr: spooled_jobs_pending > 10 and spooled_jobs_processing == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pending jobs but no processing"
+          description: "{{ $value }} pending jobs but no jobs currently processing. Workers may be down."
+
+  # =============================================================================
+  # Worker Health Alerts
+  # =============================================================================
+  - name: spooled-workers
+    interval: 30s
+    rules:
+      # No healthy workers
+      - alert: NoHealthyWorkers
+        expr: spooled_workers_healthy == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No healthy workers available"
+          description: "No workers are reporting healthy status. Job processing is halted."
+
+      # Worker count dropped significantly
+      - alert: WorkerCountDrop
+        expr: |
+          (spooled_workers_active - spooled_workers_active offset 5m) / 
+          (spooled_workers_active offset 5m + 0.001) < -0.5
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Significant worker count decrease"
+          description: "Worker count has dropped by more than 50% in 5 minutes."
+
+      # Unhealthy workers ratio
+      - alert: UnhealthyWorkerRatio
+        expr: |
+          (spooled_workers_active - spooled_workers_healthy) / 
+          (spooled_workers_active + 0.001) > 0.3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High ratio of unhealthy workers"
+          description: "{{ $value | humanizePercentage }} of workers are unhealthy."
+
+  # =============================================================================
+  # API Health Alerts
+  # =============================================================================
+  - name: spooled-api
+    interval: 30s
+    rules:
+      # High API latency (p99 > 1 second)
+      - alert: HighAPILatency
+        expr: histogram_quantile(0.99, rate(spooled_api_request_duration_seconds_bucket[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High API latency"
+          description: "99th percentile API latency is {{ $value | humanizeDuration }}."
+
+      # Critical API latency (p99 > 5 seconds)
+      - alert: CriticalAPILatency
+        expr: histogram_quantile(0.99, rate(spooled_api_request_duration_seconds_bucket[5m])) > 5
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Critical API latency"
+          description: "99th percentile API latency is {{ $value | humanizeDuration }}. Service may be degraded."
+
+      # Low request rate (service may be down)
+      - alert: LowRequestRate
+        expr: rate(spooled_api_requests_total[5m]) < 0.01 and rate(spooled_api_requests_total[1h] offset 1h) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Unusually low API request rate"
+          description: "API request rate has dropped significantly compared to historical baseline."
+
+  # =============================================================================
+  # Job Processing Performance
+  # =============================================================================
+  - name: spooled-performance
+    interval: 30s
+    rules:
+      # High job duration (p95 > 30 seconds)
+      - alert: SlowJobProcessing
+        expr: histogram_quantile(0.95, rate(spooled_job_duration_seconds_bucket[5m])) > 30
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Slow job processing"
+          description: "95th percentile job duration is {{ $value | humanizeDuration }}."
+
+      # Very slow jobs (p95 > 60 seconds)
+      - alert: VerySlowJobProcessing
+        expr: histogram_quantile(0.95, rate(spooled_job_duration_seconds_bucket[5m])) > 60
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Very slow job processing"
+          description: "95th percentile job duration is {{ $value | humanizeDuration }}. Check for resource constraints."
+
+      # High retry rate
+      - alert: HighRetryRate
+        expr: |
+          rate(spooled_jobs_retried_total[10m]) / 
+          (rate(spooled_jobs_enqueued_total[10m]) + 0.001) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High job retry rate"
+          description: "{{ $value | humanizePercentage }} of jobs are being retried."
+
+  # =============================================================================
+  # Infrastructure Alerts
+  # =============================================================================
+  - name: spooled-infrastructure
+    interval: 30s
+    rules:
+      # Database connection pool exhaustion warning
+      - alert: DatabaseConnectionsHigh
+        expr: spooled_database_connections_active > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High database connection usage"
+          description: "{{ $value }} database connections in use. Consider increasing pool size."
+
+      # Critical: Database connection pool nearly exhausted
+      - alert: DatabaseConnectionsCritical
+        expr: spooled_database_connections_active > 95
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Database connection pool nearly exhausted"
+          description: "{{ $value }} database connections in use. New requests may fail. Immediate action required."
+
+      # Redis operation rate drop (may indicate connectivity issues)
+      - alert: RedisOperationsLow
+        expr: |
+          rate(spooled_redis_operations_total[5m]) < 0.1 
+          and rate(spooled_redis_operations_total[1h] offset 1h) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low Redis operation rate"
+          description: "Redis operations have dropped significantly. Check Redis connectivity."
+
+      # Redis completely unavailable (zero operations when expected)
+      - alert: RedisUnavailable
+        expr: |
+          rate(spooled_redis_operations_total[2m]) == 0
+          and rate(spooled_redis_operations_total[1h] offset 1h) > 0.5
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis appears unavailable"
+          description: "No Redis operations in the last 2 minutes. Workers are likely using fallback polling."
+
+  # =============================================================================
+  # Worker Heartbeat Alerts
+  # =============================================================================
+  - name: spooled-worker-health
+    interval: 30s
+    rules:
+      # Worker heartbeat miss detection
+      - alert: WorkerHeartbeatMissing
+        expr: |
+          (spooled_workers_active - spooled_workers_healthy) > 0
+          and spooled_workers_active > 0
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Workers missing heartbeats"
+          description: "{{ $value }} workers are active but not reporting healthy. Check worker processes."
+
+      # All workers degraded or offline
+      - alert: AllWorkersDegraded
+        expr: |
+          spooled_workers_healthy == 0 
+          and spooled_workers_active > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "All workers are degraded"
+          description: "{{ $value }} workers are active but none are healthy. Job processing may be stalled."
+
+      # Worker capacity exhausted (all workers at max concurrency)
+      - alert: WorkerCapacityExhausted
+        expr: |
+          spooled_jobs_processing >= (spooled_workers_healthy * 5)
+          and spooled_workers_healthy > 0
+          and spooled_jobs_pending > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Worker capacity exhausted"
+          description: "All workers are at capacity with {{ $value }} pending jobs. Consider scaling workers."
+
+  # =============================================================================
+  # Database Health Alerts (for postgres-exporter if deployed)
+  # =============================================================================
+  - name: spooled-database-health
+    interval: 30s
+    rules:
+      # PostgreSQL replication lag (if using replicas)
+      # Uncomment when using postgres-exporter
+      # - alert: PostgresReplicationLag
+      #   expr: pg_replication_lag > 30
+      #   for: 5m
+      #   labels:
+      #     severity: warning
+      #   annotations:
+      #     summary: "PostgreSQL replication lag"
+      #     description: "Replication lag is {{ $value }} seconds. Read replicas may serve stale data."
+
+      # PostgreSQL too many connections (from postgres-exporter)
+      # - alert: PostgresTooManyConnections
+      #   expr: pg_stat_activity_count > (pg_settings_max_connections * 0.8)
+      #   for: 5m
+      #   labels:
+      #     severity: warning
+      #   annotations:
+      #     summary: "PostgreSQL connection count high"
+      #     description: "Using {{ $value | humanizePercentage }} of max connections."
+
+      # Dead tuples accumulating (vacuum not keeping up)
+      # - alert: PostgresDeadTuplesHigh
+      #   expr: pg_stat_user_tables_n_dead_tup > 100000
+      #   for: 30m
+      #   labels:
+      #     severity: warning
+      #   annotations:
+      #     summary: "High dead tuple count"
+      #     description: "Table has {{ $value }} dead tuples. Autovacuum may not be keeping up."
+
+      # Placeholder rule to ensure group is valid
+      - record: spooled:database_health_placeholder
+        expr: vector(1)
+
+  # =============================================================================
+  # Throughput Alerts
+  # =============================================================================
+  - name: spooled-throughput
+    interval: 1m
+    rules:
+      # Track job throughput for capacity planning
+      - record: spooled:jobs_throughput_per_minute
+        expr: rate(spooled_jobs_completed_total[1m]) * 60
+
+      - record: spooled:jobs_enqueue_rate_per_minute
+        expr: rate(spooled_jobs_enqueued_total[1m]) * 60
+
+      # Jobs accumulating faster than processing
+      - alert: JobAccumulationRate
+        expr: |
+          rate(spooled_jobs_enqueued_total[10m]) > 
+          rate(spooled_jobs_completed_total[10m]) * 1.2
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Jobs accumulating faster than processing"
+          description: "Enqueue rate exceeds completion rate by 20%. Queue will grow over time."

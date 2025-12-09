@@ -1,0 +1,42 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: spooled-backend
+  labels:
+    app: spooled-backend
+    app.kubernetes.io/name: spooled-backend
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+      protocol: TCP
+    - name: grpc
+      port: 50051
+      targetPort: grpc
+      protocol: TCP
+  selector:
+    app: spooled-backend
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spooled-backend-headless
+  labels:
+    app: spooled-backend
+    app.kubernetes.io/name: spooled-backend
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+  selector:
+    app: spooled-backend
+

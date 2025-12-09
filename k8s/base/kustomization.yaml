@@ -1,0 +1,27 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: spooled
+
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - configmap.yaml
+  - deployment.yaml
+  - service.yaml
+  - ingress.yaml
+  - hpa.yaml
+  - pdb.yaml
+  # Infrastructure components (can be excluded if using managed services)
+  - pgbouncer.yaml
+  - redis.yaml
+
+commonLabels:
+  app.kubernetes.io/name: spooled-backend
+  app.kubernetes.io/part-of: spooled-cloud
+  app.kubernetes.io/managed-by: kustomize
+  app.kubernetes.io/version: "1.0.0"
+
+images:
+  - name: spooled/backend
+    newTag: latest

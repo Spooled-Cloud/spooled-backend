@@ -1,0 +1,173 @@
+# =============================================================================
+# PgBouncer Deployment for Connection Pooling
+# =============================================================================
+#
+# PgBouncer provides connection pooling for PostgreSQL, allowing many
+# application connections to share a smaller pool of database connections.
+#
+# Benefits:
+#   - Reduces PostgreSQL connection overhead
+#   - Enables horizontal scaling of the application
+#   - Provides connection limiting and queuing
+#
+# Note: For managed PostgreSQL services (RDS, Cloud SQL), you may want to use
+# their built-in connection pooling instead (e.g., RDS Proxy, Cloud SQL Proxy).
+#
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgbouncer
+  labels:
+    app: pgbouncer
+    app.kubernetes.io/name: pgbouncer
+    app.kubernetes.io/component: database-proxy
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: pgbouncer
+  template:
+    metadata:
+      labels:
+        app: pgbouncer
+        app.kubernetes.io/name: pgbouncer
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        fsGroup: 1001
+      
+      containers:
+        - name: pgbouncer
+          image: bitnami/pgbouncer:1.22.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: pgbouncer
+              containerPort: 5432
+              protocol: TCP
+          
+          env:
+            # PostgreSQL connection settings
+            - name: POSTGRESQL_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: pgbouncer-secrets
+                  key: POSTGRESQL_HOST
+            - name: POSTGRESQL_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: pgbouncer-secrets
+                  key: POSTGRESQL_PORT
+            - name: POSTGRESQL_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: pgbouncer-secrets
+                  key: POSTGRESQL_DATABASE
+            - name: POSTGRESQL_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: pgbouncer-secrets
+                  key: POSTGRESQL_USERNAME
+            - name: POSTGRESQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: pgbouncer-secrets
+                  key: POSTGRESQL_PASSWORD
+            
+            # PgBouncer pool settings
+            - name: PGBOUNCER_POOL_MODE
+              value: "transaction"
+            - name: PGBOUNCER_MAX_CLIENT_CONN
+              value: "1000"
+            - name: PGBOUNCER_DEFAULT_POOL_SIZE
+              value: "50"
+            - name: PGBOUNCER_MIN_POOL_SIZE
+              value: "10"
+            - name: PGBOUNCER_RESERVE_POOL_SIZE
+              value: "10"
+            - name: PGBOUNCER_RESERVE_POOL_TIMEOUT
+              value: "5"
+            - name: PGBOUNCER_MAX_DB_CONNECTIONS
+              value: "100"
+            - name: PGBOUNCER_QUERY_WAIT_TIMEOUT
+              value: "120"
+            - name: PGBOUNCER_SERVER_IDLE_TIMEOUT
+              value: "600"
+            
+            # Stats and logging
+            - name: PGBOUNCER_STATS_USERS
+              value: "spooled"
+            - name: PGBOUNCER_IGNORE_STARTUP_PARAMETERS
+              value: "extra_float_digits"
+          
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          
+          livenessProbe:
+            tcpSocket:
+              port: pgbouncer
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          
+          readinessProbe:
+            tcpSocket:
+              port: pgbouncer
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: false
+      
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: pgbouncer
+                topologyKey: kubernetes.io/hostname
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pgbouncer
+  labels:
+    app: pgbouncer
+    app.kubernetes.io/name: pgbouncer
+spec:
+  type: ClusterIP
+  ports:
+    - name: pgbouncer
+      port: 5432
+      targetPort: pgbouncer
+      protocol: TCP
+  selector:
+    app: pgbouncer
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pgbouncer
+  labels:
+    app: pgbouncer
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: pgbouncer

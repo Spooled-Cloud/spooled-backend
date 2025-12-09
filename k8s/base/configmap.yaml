@@ -1,0 +1,75 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spooled-config
+  labels:
+    app: spooled-backend
+    app.kubernetes.io/name: spooled-backend
+data:
+  # =============================================================================
+  # Server Configuration
+  # =============================================================================
+  RUST_LOG: "info,spooled_backend=debug"
+  RUST_ENV: "production"
+  JSON_LOGS: "true"
+  
+  # =============================================================================
+  # Database Configuration
+  # =============================================================================
+  # Connection pool settings (for PgBouncer connections)
+  DATABASE_MAX_CONNECTIONS: "25"
+  DATABASE_MIN_CONNECTIONS: "5"
+  DATABASE_ACQUIRE_TIMEOUT_SECS: "30"
+  
+  # PgBouncer service location (for init container health check)
+  PGBOUNCER_HOST: "pgbouncer"
+  PGBOUNCER_PORT: "5432"
+  
+  # =============================================================================
+  # Redis Configuration
+  # =============================================================================
+  REDIS_POOL_SIZE: "10"
+  
+  # =============================================================================
+  # Queue Configuration
+  # =============================================================================
+  QUEUE_DEFAULT_MAX_RETRIES: "3"
+  QUEUE_DEFAULT_TIMEOUT_SECS: "300"
+  QUEUE_MAX_PAYLOAD_SIZE_BYTES: "1048576"
+  
+  # =============================================================================
+  # Worker Configuration
+  # =============================================================================
+  WORKER_HEARTBEAT_INTERVAL_SECS: "10"
+  WORKER_LEASE_DURATION_SECS: "30"
+  WORKER_MAX_CONCURRENCY: "10"
+  WORKER_FALLBACK_POLL_INTERVAL_SECS: "5"
+  
+  # =============================================================================
+  # Rate Limiting
+  # =============================================================================
+  RATE_LIMIT_REQUESTS_PER_SECOND: "100"
+  RATE_LIMIT_BURST_SIZE: "200"
+  
+  # =============================================================================
+  # Authentication
+  # =============================================================================
+  JWT_EXPIRATION_HOURS: "24"
+  
+  # =============================================================================
+  # Security
+  # =============================================================================
+  # Enable HSTS header (set to "true" in production with TLS)
+  ENABLE_HSTS: "true"
+  
+  # =============================================================================
+  # Observability - OpenTelemetry / Distributed Tracing
+  # =============================================================================
+  # Set to Jaeger/OTLP collector endpoint (e.g., "http://jaeger-collector:4317")
+  # Leave empty to disable tracing
+  OTEL_EXPORTER_OTLP_ENDPOINT: ""
+  
+  # =============================================================================
+  # gRPC Configuration
+  # =============================================================================
+  GRPC_PORT: "50051"

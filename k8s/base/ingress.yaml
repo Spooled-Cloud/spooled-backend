@@ -1,0 +1,39 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: spooled-backend
+  labels:
+    app: spooled-backend
+    app.kubernetes.io/name: spooled-backend
+  annotations:
+    # Nginx ingress controller
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
+    # Rate limiting
+    nginx.ingress.kubernetes.io/limit-connections: "100"
+    nginx.ingress.kubernetes.io/limit-rps: "100"
+    # SSL redirect
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    # WebSocket support
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+    nginx.ingress.kubernetes.io/upstream-hash-by: "$request_uri"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - api.spooled.cloud
+      secretName: spooled-tls
+  rules:
+    - host: api.spooled.cloud
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: spooled-backend
+                port:
+                  number: 80
+

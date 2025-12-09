@@ -1,0 +1,123 @@
+[package]
+name = "spooled-backend"
+version = "0.1.0"
+edition = "2021"
+authors = ["Spooled Cloud Team"]
+description = "Production-ready webhook queue service built with Rust + PostgreSQL"
+license = "Apache-2.0"
+repository = "https://github.com/spooled-cloud/spooled-backend"
+readme = "README.md"
+keywords = ["webhook", "queue", "job-queue", "postgresql", "async"]
+categories = ["web-programming", "asynchronous"]
+
+[lib]
+name = "spooled_backend"
+path = "src/lib.rs"
+
+[[bin]]
+name = "spooled-backend"
+path = "src/main.rs"
+
+[dependencies]
+# Web framework
+axum = { version = "0.8", features = ["macros", "ws"] }
+axum-extra = { version = "0.10", features = ["typed-header"] }
+tower = { version = "0.5", features = ["timeout", "limit"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "request-id", "compression-gzip", "timeout"] }
+
+# Async runtime
+tokio = { version = "1.42", features = ["full", "tracing"] }
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Configuration
+config = "0.14"
+dotenvy = "0.15"
+
+# Logging and tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = { version = "0.28", optional = true }
+opentelemetry = { version = "0.27", optional = true }
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.27", features = ["tonic"], optional = true }
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Security
+bcrypt = "0.16"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+jsonwebtoken = "9.3"
+subtle = "2.5"  # Constant-time comparison for crypto
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Utilities
+uuid = { version = "1.11", features = ["v4", "serde"] }
+rand = "0.8"
+base64 = "0.22"
+
+# Redis
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+
+# Metrics
+prometheus = "0.13"
+
+# HTTP client (for webhook delivery)
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# Validation
+validator = { version = "0.19", features = ["derive"] }
+
+# Utilities
+lazy_static = "1.5"
+regex = "1.11"
+hostname = "0.4"
+futures = "0.3"
+url = "2.5"  # URL parsing for SSRF protection
+
+# gRPC (optional, requires protoc)
+# tonic = "0.12"
+# prost = "0.13"
+# prost-types = "0.13"
+
+# [build-dependencies]
+# tonic-build = "0.12"
+
+[features]
+default = []
+# Enable OpenTelemetry/Jaeger distributed tracing
+otel = ["tracing-opentelemetry", "opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp"]
+
+[dev-dependencies]
+# Testing
+tokio-test = "0.4"
+testcontainers = "0.23"
+testcontainers-modules = { version = "0.11", features = ["postgres", "redis"] }
+pretty_assertions = "1.4"
+fake = { version = "3.0", features = ["derive", "chrono", "uuid"] }
+wiremock = "0.6"
+serial_test = "3.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = true
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+

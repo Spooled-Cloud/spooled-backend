@@ -1,0 +1,171 @@
+# =============================================================================
+# Redis Deployment for Caching and Pub/Sub
+# =============================================================================
+#
+# Redis provides:
+#   - Real-time job notifications via pub/sub
+#   - Rate limiting state
+#   - Optional caching layer
+#
+# Note: For production, consider using managed Redis:
+#   - AWS ElastiCache
+#   - Google Cloud Memorystore
+#   - Azure Cache for Redis
+#   - Redis Cloud
+#
+# The application gracefully degrades if Redis is unavailable (falls back to
+# polling for job notifications).
+#
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  labels:
+    app: redis
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/component: cache
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+        app.kubernetes.io/name: redis
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        fsGroup: 1001
+      
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          imagePullPolicy: IfNotPresent
+          command:
+            - redis-server
+            - --appendonly
+            - "yes"
+            - --appendfsync
+            - everysec
+            - --maxmemory
+            - 256mb
+            - --maxmemory-policy
+            - allkeys-lru
+            - --tcp-keepalive
+            - "300"
+            - --timeout
+            - "0"
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          
+          livenessProbe:
+            exec:
+              command:
+                - redis-cli
+                - ping
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          
+          readinessProbe:
+            exec:
+              command:
+                - redis-cli
+                - ping
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: false
+          
+          volumeMounts:
+            - name: redis-data
+              mountPath: /data
+      
+      volumes:
+        - name: redis-data
+          emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  labels:
+    app: redis
+    app.kubernetes.io/name: redis
+spec:
+  type: ClusterIP
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+      protocol: TCP
+  selector:
+    app: redis
+
+---
+# =============================================================================
+# Redis with Persistence (Optional)
+# =============================================================================
+# Uncomment this section if you need Redis persistence across restarts.
+# For most use cases, the in-memory Redis above is sufficient since the
+# application can rebuild state from PostgreSQL.
+#
+# apiVersion: apps/v1
+# kind: StatefulSet
+# metadata:
+#   name: redis-persistent
+#   labels:
+#     app: redis-persistent
+# spec:
+#   serviceName: redis-persistent
+#   replicas: 1
+#   selector:
+#     matchLabels:
+#       app: redis-persistent
+#   template:
+#     metadata:
+#       labels:
+#         app: redis-persistent
+#     spec:
+#       containers:
+#         - name: redis
+#           image: redis:7-alpine
+#           command:
+#             - redis-server
+#             - --appendonly
+#             - "yes"
+#           ports:
+#             - containerPort: 6379
+#           volumeMounts:
+#             - name: redis-data
+#               mountPath: /data
+#   volumeClaimTemplates:
+#     - metadata:
+#         name: redis-data
+#       spec:
+#         accessModes: ["ReadWriteOnce"]
+#         resources:
+#           requests:
+#             storage: 1Gi

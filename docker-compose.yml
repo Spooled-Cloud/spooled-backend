@@ -1,0 +1,172 @@
+# Spooled Backend - Local Development Environment
+# 
+# This docker-compose setup provides:
+# - PostgreSQL 16 with tuned settings for queue workloads
+# - PgBouncer for connection pooling (MANDATORY for production)
+# - Redis 7 for caching and pub/sub
+# - Prometheus for metrics collection
+# - Grafana for visualization (optional)
+#
+# Usage:
+#   docker-compose up -d              # Start all services
+#   docker-compose up -d postgres redis pgbouncer  # Start minimal services
+#   docker-compose logs -f            # View logs
+#   docker-compose down -v            # Stop and remove volumes
+
+version: '3.8'
+
+services:
+  # ==========================================================================
+  # PostgreSQL 16 - Primary Database
+  # ==========================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: spooled-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: spooled
+      POSTGRES_USER: spooled
+      POSTGRES_PASSWORD: spooled_password
+      # PostgreSQL tuning for queue workloads
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=en_US.UTF-8"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+    command: >
+      postgres 
+      -c shared_buffers=256MB
+      -c effective_cache_size=768MB
+      -c maintenance_work_mem=128MB
+      -c checkpoint_completion_target=0.9
+      -c wal_buffers=16MB
+      -c default_statistics_target=100
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+      -c work_mem=8MB
+      -c min_wal_size=1GB
+      -c max_wal_size=4GB
+      -c max_worker_processes=4
+      -c max_parallel_workers_per_gather=2
+      -c max_parallel_workers=4
+      -c max_parallel_maintenance_workers=2
+      -c log_statement=none
+      -c log_duration=off
+      -c log_min_duration_statement=1000
+      -c autovacuum_max_workers=4
+      -c autovacuum_naptime=10s
+      -c autovacuum_vacuum_cost_delay=5ms
+      -c autovacuum_vacuum_cost_limit=5000
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U spooled -d spooled"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ==========================================================================
+  # PgBouncer - Connection Pooler (MANDATORY for production)
+  # ==========================================================================
+  pgbouncer:
+    image: edoburu/pgbouncer:1.21.0
+    container_name: spooled-pgbouncer
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://spooled:spooled_password@postgres:5432/spooled
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: 1000
+      DEFAULT_POOL_SIZE: 25
+      RESERVE_POOL_SIZE: 5
+      SERVER_LIFETIME: 3600
+      SERVER_IDLE_TIMEOUT: 600
+      AUTH_TYPE: scram-sha-256
+    ports:
+      - "6432:6432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "localhost", "-p", "6432", "-U", "spooled"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ==========================================================================
+  # Redis 7 - Cache and Pub/Sub
+  # ==========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: spooled-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ==========================================================================
+  # Prometheus - Metrics Collection
+  # ==========================================================================
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: spooled-prometheus
+    restart: unless-stopped
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+      - '--web.enable-lifecycle'
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ==========================================================================
+  # Grafana - Visualization (Optional for development)
+  # ==========================================================================
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: spooled-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+networks:
+  default:
+    name: spooled-network
+

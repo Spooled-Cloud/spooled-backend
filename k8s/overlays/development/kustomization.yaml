@@ -1,0 +1,130 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: spooled-dev
+
+resources:
+  - ../../base
+
+namePrefix: dev-
+
+commonLabels:
+  environment: development
+
+# =============================================================================
+# Development-specific patches
+# =============================================================================
+patches:
+  # Single replica for development
+  - patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 1
+    target:
+      kind: Deployment
+      name: spooled-backend
+  
+  # Lower resource limits for development
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+    target:
+      kind: Deployment
+      name: spooled-backend
+  
+  # Minimal HPA in development
+  - patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 1
+      - op: replace
+        path: /spec/maxReplicas
+        value: 2
+    target:
+      kind: HorizontalPodAutoscaler
+      name: spooled-backend
+  
+  # No PDB requirement in development
+  - patch: |-
+      - op: replace
+        path: /spec/minAvailable
+        value: 0
+    target:
+      kind: PodDisruptionBudget
+      name: spooled-backend
+  
+  # Single PgBouncer replica for development
+  - patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 1
+    target:
+      kind: Deployment
+      name: pgbouncer
+  
+  # Lower PgBouncer resources
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: 25m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi
+    target:
+      kind: Deployment
+      name: pgbouncer
+  
+  # Lower Redis resources
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: 25m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi
+    target:
+      kind: Deployment
+      name: redis
+
+# =============================================================================
+# Development-specific configuration
+# =============================================================================
+configMapGenerator:
+  - name: spooled-config
+    behavior: merge
+    literals:
+      # Verbose logging for development
+      - RUST_LOG=debug,spooled_backend=trace
+      - RUST_ENV=development
+      - JSON_LOGS=false
+      
+      # Smaller pools for development
+      - DATABASE_MAX_CONNECTIONS=5
+      - DATABASE_MIN_CONNECTIONS=2
+      - REDIS_POOL_SIZE=5
+      
+      # Lower rate limits for testing
+      - RATE_LIMIT_REQUESTS_PER_SECOND=50
+      
+      # Disable HSTS in development (no TLS)
+      - ENABLE_HSTS=false
+      
+      # Local Jaeger for development tracing
+      # - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+
+images:
+  - name: spooled/backend
+    newTag: dev

@@ -1,0 +1,257 @@
+# Spooled Backend - Docker Compose
+#
+# Development and production-ready stack with:
+# - PostgreSQL with optimized settings
+# - PgBouncer for connection pooling
+# - Redis for caching and pub/sub
+# - Prometheus for metrics
+# - Grafana for dashboards
+# - Jaeger for distributed tracing
+
+services:
+  # =============================================================================
+  # PostgreSQL Database
+  # =============================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: spooled-postgres
+    environment:
+      POSTGRES_USER: spooled
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-spooled_dev_password}
+      POSTGRES_DB: spooled
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    command:
+      - "postgres"
+      # Connection settings
+      - "-c"
+      - "max_connections=200"
+      # Memory settings (adjust based on available RAM)
+      - "-c"
+      - "shared_buffers=256MB"
+      - "-c"
+      - "effective_cache_size=768MB"
+      - "-c"
+      - "work_mem=16MB"
+      - "-c"
+      - "maintenance_work_mem=128MB"
+      # WAL settings
+      - "-c"
+      - "wal_buffers=16MB"
+      - "-c"
+      - "checkpoint_completion_target=0.9"
+      # Logging
+      - "-c"
+      - "log_statement=none"
+      - "-c"
+      - "log_min_duration_statement=1000"
+      # Autovacuum tuning for high-churn tables
+      - "-c"
+      - "autovacuum_vacuum_scale_factor=0.05"
+      - "-c"
+      - "autovacuum_analyze_scale_factor=0.025"
+      - "-c"
+      - "autovacuum_vacuum_cost_limit=1000"
+      - "-c"
+      - "autovacuum_naptime=30s"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U spooled -d spooled"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - spooled-network
+
+  # =============================================================================
+  # PgBouncer - Connection Pooler
+  # =============================================================================
+  pgbouncer:
+    image: bitnami/pgbouncer:latest
+    container_name: spooled-pgbouncer
+    environment:
+      PGBOUNCER_DATABASE: spooled
+      PGBOUNCER_PORT: 6432
+      PGBOUNCER_POOL_MODE: transaction
+      PGBOUNCER_MAX_CLIENT_CONN: 1000
+      PGBOUNCER_DEFAULT_POOL_SIZE: 50
+      PGBOUNCER_MIN_POOL_SIZE: 10
+      PGBOUNCER_RESERVE_POOL_SIZE: 10
+      PGBOUNCER_RESERVE_POOL_TIMEOUT: 3
+      PGBOUNCER_MAX_DB_CONNECTIONS: 100
+      PGBOUNCER_QUERY_WAIT_TIMEOUT: 60
+      PGBOUNCER_SERVER_IDLE_TIMEOUT: 300
+      POSTGRESQL_HOST: postgres
+      POSTGRESQL_PORT: 5432
+      POSTGRESQL_USERNAME: spooled
+      POSTGRESQL_PASSWORD: ${POSTGRES_PASSWORD:-spooled_dev_password}
+      POSTGRESQL_DATABASE: spooled
+    ports:
+      - "6432:6432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "localhost", "-p", "6432", "-U", "spooled"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - spooled-network
+
+  # =============================================================================
+  # Redis - Cache and Pub/Sub
+  # =============================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: spooled-redis
+    command:
+      - "redis-server"
+      - "--maxmemory"
+      - "256mb"
+      - "--maxmemory-policy"
+      - "allkeys-lru"
+      - "--appendonly"
+      - "yes"
+      - "--appendfsync"
+      - "everysec"
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - spooled-network
+
+  # =============================================================================
+  # Prometheus - Metrics Collection
+  # =============================================================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: spooled-prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
+      - "--web.enable-admin-api"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/spooled-rules.yml:/etc/prometheus/spooled-rules.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9091:9090"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - spooled-network
+
+  # =============================================================================
+  # Grafana - Dashboards and Visualization
+  # =============================================================================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: spooled-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost:3000}
+      GF_INSTALL_PLUGINS: grafana-piechart-panel
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - spooled-network
+
+  # =============================================================================
+  # Jaeger - Distributed Tracing
+  # =============================================================================
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: spooled-jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      SPAN_STORAGE_TYPE: badger
+      BADGER_EPHEMERAL: "false"
+      BADGER_DIRECTORY_VALUE: /badger/data
+      BADGER_DIRECTORY_KEY: /badger/key
+    volumes:
+      - jaeger_data:/badger
+    ports:
+      # Jaeger UI
+      - "16686:16686"
+      # OTLP gRPC
+      - "4317:4317"
+      # OTLP HTTP
+      - "4318:4318"
+      # Jaeger thrift compact (UDP)
+      - "6831:6831/udp"
+      # Jaeger thrift binary (UDP)
+      - "6832:6832/udp"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:16686/"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - spooled-network
+
+  # =============================================================================
+  # Spooled Backend (optional - for full stack testing)
+  # =============================================================================
+  # Uncomment to run the backend as part of the stack
+  # spooled-backend:
+  #   build:
+  #     context: ..
+  #     dockerfile: docker/Dockerfile
+  #   container_name: spooled-backend
+  #   environment:
+  #     DATABASE_URL: postgres://spooled:${POSTGRES_PASSWORD:-spooled_dev_password}@pgbouncer:6432/spooled
+  #     DATABASE_DIRECT_URL: postgres://spooled:${POSTGRES_PASSWORD:-spooled_dev_password}@postgres:5432/spooled
+  #     REDIS_URL: redis://redis:6379
+  #     OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+  #     OTEL_SERVICE_NAME: spooled-backend
+  #     RUST_LOG: info
+  #   ports:
+  #     - "8080:8080"
+  #     - "9090:9090"
+  #   depends_on:
+  #     pgbouncer:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
+  #     jaeger:
+  #       condition: service_healthy
+  #   networks:
+  #     - spooled-network
+
+volumes:
+  postgres_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+  jaeger_data:
+
+networks:
+  spooled-network:
+    driver: bridge

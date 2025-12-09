@@ -1,0 +1,13 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: spooled-backend
+  labels:
+    app: spooled-backend
+    app.kubernetes.io/name: spooled-backend
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: spooled-backend
+

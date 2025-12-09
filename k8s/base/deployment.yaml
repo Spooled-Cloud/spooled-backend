@@ -1,0 +1,298 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spooled-backend
+  labels:
+    app: spooled-backend
+    app.kubernetes.io/name: spooled-backend
+    app.kubernetes.io/component: api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: spooled-backend
+  template:
+    metadata:
+      labels:
+        app: spooled-backend
+        app.kubernetes.io/name: spooled-backend
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: spooled-backend
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      
+      # Init container to wait for dependencies
+      initContainers:
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z ${PGBOUNCER_HOST:-pgbouncer} ${PGBOUNCER_PORT:-5432}; do echo waiting for postgres; sleep 2; done']
+          env:
+            - name: PGBOUNCER_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: spooled-config
+                  key: PGBOUNCER_HOST
+                  optional: true
+            - name: PGBOUNCER_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: spooled-config
+                  key: PGBOUNCER_PORT
+                  optional: true
+      
+      containers:
+        # Main application container
+        - name: spooled-backend
+          image: spooled/backend:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+            - name: grpc
+              containerPort: 50051
+              protocol: TCP
+          
+          env:
+            # Server configuration
+            - name: RUST_LOG
+              valueFrom:
+                configMapKeyRef:
+                  name: spooled-config
+                  key: RUST_LOG
+                  optional: true
+            - name: RUST_ENV
+              valueFrom:
+                configMapKeyRef:
+                  name: spooled-config
+                  key: RUST_ENV
+                  optional: true
+            - name: HOST
+              value: "0.0.0.0"
+            - name: PORT
+              value: "8080"
+            - name: METRICS_PORT
+              value: "9090"
+            - name: GRPC_PORT
+              value: "50051"
+            
+            # Pod information
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            
+            # Database configuration (via PgBouncer)
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: spooled-secrets
+                  key: database-url
+            # Direct connection for migrations (bypasses PgBouncer)
+            - name: DATABASE_DIRECT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: spooled-secrets
+                  key: database-direct-url
+                  optional: true
+            - name: DATABASE_MAX_CONNECTIONS
+              valueFrom:
+                configMapKeyRef:
+                  name: spooled-config
+                  key: DATABASE_MAX_CONNECTIONS
+                  optional: true
+            - name: DATABASE_MIN_CONNECTIONS
+              valueFrom:
+                configMapKeyRef:
+                  name: spooled-config
+                  key: DATABASE_MIN_CONNECTIONS
+                  optional: true
+            
+            # Redis configuration
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: spooled-secrets
+                  key: redis-url
+            - name: REDIS_POOL_SIZE
+              valueFrom:
+                configMapKeyRef:
+                  name: spooled-config
+                  key: REDIS_POOL_SIZE
+                  optional: true
+            
+            # Authentication
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: spooled-secrets
+                  key: jwt-secret
+            
+            # Webhook secrets (optional)
+            - name: GITHUB_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: spooled-secrets
+                  key: github-webhook-secret
+                  optional: true
+            - name: STRIPE_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: spooled-secrets
+                  key: stripe-webhook-secret
+                  optional: true
+            
+            # OpenTelemetry / Distributed Tracing
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: spooled-config
+                  key: OTEL_EXPORTER_OTLP_ENDPOINT
+                  optional: true
+            - name: OTEL_SERVICE_NAME
+              value: "spooled-backend"
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "service.namespace=$(POD_NAMESPACE),service.instance.id=$(POD_NAME)"
+            
+            # Logging
+            - name: JSON_LOGS
+              valueFrom:
+                configMapKeyRef:
+                  name: spooled-config
+                  key: JSON_LOGS
+                  optional: true
+            
+            # Security
+            - name: ENABLE_HSTS
+              valueFrom:
+                configMapKeyRef:
+                  name: spooled-config
+                  key: ENABLE_HSTS
+                  optional: true
+            
+            # Worker configuration
+            - name: WORKER_HEARTBEAT_INTERVAL_SECS
+              valueFrom:
+                configMapKeyRef:
+                  name: spooled-config
+                  key: WORKER_HEARTBEAT_INTERVAL_SECS
+                  optional: true
+            - name: WORKER_LEASE_DURATION_SECS
+              valueFrom:
+                configMapKeyRef:
+                  name: spooled-config
+                  key: WORKER_LEASE_DURATION_SECS
+                  optional: true
+            - name: WORKER_MAX_CONCURRENCY
+              valueFrom:
+                configMapKeyRef:
+                  name: spooled-config
+                  key: WORKER_MAX_CONCURRENCY
+                  optional: true
+            - name: WORKER_FALLBACK_POLL_INTERVAL_SECS
+              valueFrom:
+                configMapKeyRef:
+                  name: spooled-config
+                  key: WORKER_FALLBACK_POLL_INTERVAL_SECS
+                  optional: true
+            
+            # Rate limiting
+            - name: RATE_LIMIT_REQUESTS_PER_SECOND
+              valueFrom:
+                configMapKeyRef:
+                  name: spooled-config
+                  key: RATE_LIMIT_REQUESTS_PER_SECOND
+                  optional: true
+          
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+          
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          
+          # Startup probe for slow starts
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 30
+          
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      
+      # Pod scheduling
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - spooled-backend
+                topologyKey: kubernetes.io/hostname
+      
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: spooled-backend
+      
+      # Graceful shutdown
+      terminationGracePeriodSeconds: 30
