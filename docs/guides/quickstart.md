@@ -5,7 +5,7 @@ Get up and running with Spooled Cloud in 5 minutes.
 ## Prerequisites
 
 - Docker & Docker Compose
-- Rust 1.75+ (for local development)
+- Rust 1.85+ (for local development)
 - curl or httpie
 
 ## Step 1: Start the Services

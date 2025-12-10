@@ -24,7 +24,7 @@ By participating in this project, you agree to abide by our [Code of Conduct](CO
 
 #### Prerequisites
 
-- Rust 1.75 or later
+- Rust 1.85 or later
 - Docker and Docker Compose
 - PostgreSQL 16+ (via Docker)
 - Redis 7+ (via Docker)

@@ -1,7 +1,7 @@
 # Spooled Backend
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
 [![Docker](https://img.shields.io/badge/docker-ghcr.io-blue.svg)](https://ghcr.io)
 
 **Production-ready job queue and webhook processing service built with Rust**
@@ -62,7 +62,7 @@ curl http://localhost:8080/health
 
 ### Prerequisites
 
-- Rust 1.75+
+- Rust 1.85+
 - Docker & Docker Compose
 - PostgreSQL 16+ (or use Docker)
 - Redis 7+ (optional, for pub/sub)
