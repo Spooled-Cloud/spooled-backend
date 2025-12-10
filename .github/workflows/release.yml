@@ -10,7 +10,8 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/spooled-backend
+  # Note: Docker registry requires lowercase names
+  IMAGE_NAME: spooled-cloud/spooled-backend
 
 jobs:
   build:
