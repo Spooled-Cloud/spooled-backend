@@ -81,9 +81,7 @@ pub async fn create(
         }
         RegistrationMode::Closed => {
             // Require admin API key
-            let admin_key = headers
-                .get("X-Admin-Key")
-                .and_then(|v| v.to_str().ok());
+            let admin_key = headers.get("X-Admin-Key").and_then(|v| v.to_str().ok());
 
             match (&state.settings.registration.admin_api_key, admin_key) {
                 (Some(expected), Some(provided)) if expected == provided => {
@@ -96,7 +94,8 @@ pub async fn create(
                 }
                 (None, _) => {
                     return Err(AppError::Authorization(
-                        "Organization creation is disabled and no admin key is configured.".to_string(),
+                        "Organization creation is disabled and no admin key is configured."
+                            .to_string(),
                     ));
                 }
             }
