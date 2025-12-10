@@ -19,6 +19,11 @@
 #   JWT_SECRET           - 32+ character secret for JWT signing
 #   CLOUDFLARE_TUNNEL_TOKEN - Cloudflare tunnel token (for cloudflared)
 #
+# Registration Mode (for SaaS vs Self-hosted):
+#   REGISTRATION_MODE    - "open" (default, anyone can create orgs)
+#                        - "closed" (only admin can create orgs - for SaaS)
+#   ADMIN_API_KEY        - Secret key for creating orgs when mode is "closed"
+#
 # Optional Environment Variables:
 #   BACKEND_IMAGE        - Docker image (default: ghcr.io/spooled-cloud/spooled-backend:latest)
 #   REDIS_PASSWORD       - Redis password (recommended for production)
@@ -122,6 +127,12 @@ services:
       # OpenTelemetry (optional)
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
       OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-spooled-backend}
+      
+      # Registration mode (SaaS vs Self-hosted)
+      # - "open": Anyone can create organizations (default, for self-hosted)
+      # - "closed": Only admin can create organizations (for SaaS)
+      REGISTRATION_MODE: ${REGISTRATION_MODE:-open}
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
       interval: 30s

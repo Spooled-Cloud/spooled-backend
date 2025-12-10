@@ -20,6 +20,33 @@ pub struct Settings {
     pub queue: QueueSettings,
     pub webhooks: WebhookSettings,
     pub tracing: TracingSettings,
+    pub registration: RegistrationSettings,
+}
+
+/// Registration/onboarding settings
+#[derive(Debug, Clone, Deserialize)]
+pub struct RegistrationSettings {
+    /// Registration mode:
+    /// - "open": Anyone can create organizations (default, for self-hosted)
+    /// - "closed": Organization creation is disabled (for SaaS - admin creates orgs)
+    /// - "invite": Require invite code to create organization (future)
+    pub mode: RegistrationMode,
+    /// Admin API key for creating organizations when mode is "closed"
+    /// This key bypasses registration restrictions
+    pub admin_api_key: Option<String>,
+}
+
+/// Registration mode
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RegistrationMode {
+    /// Anyone can create organizations (self-hosted default)
+    #[default]
+    Open,
+    /// Organization creation disabled (SaaS mode - admin only)
+    Closed,
+    /// Require invite code (future feature)
+    Invite,
 }
 
 /// Server configuration
@@ -252,6 +279,18 @@ impl Settings {
                     .map(|v| v == "true" || v == "1")
                     .unwrap_or(false),
             },
+            registration: RegistrationSettings {
+                mode: match env::var("REGISTRATION_MODE")
+                    .unwrap_or_else(|_| "open".to_string())
+                    .to_lowercase()
+                    .as_str()
+                {
+                    "closed" => RegistrationMode::Closed,
+                    "invite" => RegistrationMode::Invite,
+                    _ => RegistrationMode::Open,
+                },
+                admin_api_key: env::var("ADMIN_API_KEY").ok(),
+            },
         };
 
         // Validate settings
@@ -438,6 +477,10 @@ impl Settings {
                 otlp_endpoint: None,
                 service_name: "spooled-backend".to_string(),
                 json_logs: false,
+            },
+            registration: RegistrationSettings {
+                mode: RegistrationMode::Open,
+                admin_api_key: None,
             },
         }
     }

@@ -63,11 +63,52 @@ const MAX_SETTINGS_SIZE: usize = 64 * 1024; // 64KB
 
 /// Create a new organization
 ///
-/// Now validates slug format
+/// Registration mode controls access:
+/// - "open": Anyone can create organizations (self-hosted default)
+/// - "closed": Requires X-Admin-Key header matching ADMIN_API_KEY env var
+/// - "invite": Requires valid invite code (future)
 pub async fn create(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     ValidatedJson(request): ValidatedJson<CreateOrganizationRequest>,
 ) -> AppResult<(StatusCode, Json<Organization>)> {
+    use crate::config::RegistrationMode;
+
+    // Check registration mode
+    match state.settings.registration.mode {
+        RegistrationMode::Open => {
+            // Anyone can create organizations
+        }
+        RegistrationMode::Closed => {
+            // Require admin API key
+            let admin_key = headers
+                .get("X-Admin-Key")
+                .and_then(|v| v.to_str().ok());
+
+            match (&state.settings.registration.admin_api_key, admin_key) {
+                (Some(expected), Some(provided)) if expected == provided => {
+                    // Valid admin key
+                }
+                (Some(_), _) => {
+                    return Err(AppError::Authorization(
+                        "Organization creation is disabled. Contact admin for access.".to_string(),
+                    ));
+                }
+                (None, _) => {
+                    return Err(AppError::Authorization(
+                        "Organization creation is disabled and no admin key is configured.".to_string(),
+                    ));
+                }
+            }
+        }
+        RegistrationMode::Invite => {
+            // Future: Check invite code in request
+            return Err(AppError::Authorization(
+                "Invite-based registration is not yet implemented.".to_string(),
+            ));
+        }
+    }
+
     // Validate slug format
     validate_slug(&request.slug)?;
 
