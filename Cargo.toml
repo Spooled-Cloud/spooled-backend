@@ -21,7 +21,7 @@ path = "src/main.rs"
 [dependencies]
 # Web framework
 axum = { version = "0.8", features = ["macros", "ws"] }
-axum-extra = { version = "0.10", features = ["typed-header"] }
+axum-extra = { version = "0.12", features = ["typed-header"] }
 tower = { version = "0.5", features = ["timeout", "limit"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "request-id", "compression-gzip", "timeout"] }
 
