@@ -9,11 +9,19 @@
 #   1. Copy .env.example to .env and configure
 #   2. docker compose -f docker-compose.prod.yml up -d
 #
-# Environment variables (set in .env or Portainer):
-#   BACKEND_IMAGE     - Docker image (default: ghcr.io/spooled-cloud/spooled-backend:latest)
-#   POSTGRES_PASSWORD - Required: Database password
-#   JWT_SECRET        - Required: 32+ character secret for JWT signing
-#   REDIS_PASSWORD    - Optional: Redis password (recommended for production)
+# For Portainer:
+#   1. Create a new Stack
+#   2. Upload this file or paste contents
+#   3. Add environment variables in the Portainer UI
+#
+# Required Environment Variables:
+#   POSTGRES_PASSWORD    - Database password
+#   JWT_SECRET           - 32+ character secret for JWT signing
+#   CLOUDFLARE_TUNNEL_TOKEN - Cloudflare tunnel token (for cloudflared)
+#
+# Optional Environment Variables:
+#   BACKEND_IMAGE        - Docker image (default: ghcr.io/spooled-cloud/spooled-backend:latest)
+#   REDIS_PASSWORD       - Redis password (recommended for production)
 
 services:
   # ===========================================
@@ -25,9 +33,8 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-spooled}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB:-spooled}
-      # Performance tuning
       POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=en_US.UTF-8"
     volumes:
       - db_data:/var/lib/postgresql/data
@@ -38,9 +45,6 @@ services:
       retries: 5
     networks:
       - spooled-network
-    # Uncomment to expose PostgreSQL externally (not recommended for production)
-    # ports:
-    #   - "5432:5432"
 
   # ===========================================
   # Redis Cache & Pub/Sub
@@ -49,12 +53,7 @@ services:
     image: redis:7-alpine
     container_name: spooled_redis
     restart: unless-stopped
-    command: >
-      redis-server 
-      --appendonly yes 
-      --maxmemory 512mb 
-      --maxmemory-policy allkeys-lru
-      ${REDIS_PASSWORD:+--requirepass ${REDIS_PASSWORD}}
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
     volumes:
       - redis_data:/data
     healthcheck:
@@ -64,15 +63,13 @@ services:
       retries: 5
     networks:
       - spooled-network
-    # Uncomment to expose Redis externally (not recommended for production)
-    # ports:
-    #   - "6379:6379"
 
   # ===========================================
   # Spooled Backend API
   # ===========================================
   backend:
     image: ${BACKEND_IMAGE:-ghcr.io/spooled-cloud/spooled-backend:latest}
+    platform: linux/arm64
     container_name: spooled_backend
     restart: unless-stopped
     depends_on:
@@ -87,7 +84,7 @@ services:
       DATABASE_MIN_CONNECTIONS: ${DATABASE_MIN_CONNECTIONS:-5}
       
       # Redis
-      REDIS_URL: redis://${REDIS_PASSWORD:+:${REDIS_PASSWORD}@}redis:6379
+      REDIS_URL: redis://redis:6379
       REDIS_POOL_SIZE: ${REDIS_POOL_SIZE:-10}
       
       # Server
@@ -96,10 +93,14 @@ services:
       METRICS_PORT: 9090
       GRPC_PORT: 50051
       
+      # URLs (update for your domain)
+      BASE_URL: ${BASE_URL:-https://api.spooled.cloud}
+      
       # Security
-      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required (min 32 chars)}
+      JWT_SECRET: ${JWT_SECRET}
       RUST_ENV: ${RUST_ENV:-production}
       ENABLE_HSTS: ${ENABLE_HSTS:-true}
+      FORCE_HTTPS: ${FORCE_HTTPS:-true}
       
       # Logging
       RUST_LOG: ${RUST_LOG:-info,tower_http=info}
@@ -118,28 +119,39 @@ services:
       RATE_LIMIT_REQUESTS_PER_SECOND: ${RATE_LIMIT_REQUESTS_PER_SECOND:-100}
       RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:-200}
       
-      # OpenTelemetry (optional - for distributed tracing)
+      # OpenTelemetry (optional)
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
       OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-spooled-backend}
-    ports:
-      - "${API_PORT:-8080}:8080"
-      - "${METRICS_PORT:-9090}:9090"
-      - "${GRPC_PORT:-50051}:50051"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 30s
+      start_period: 60s
     networks:
       - spooled-network
-    # Optional: Mount for custom configs
-    # volumes:
-    #   - ./config:/app/config:ro
+
+  # ===========================================
+  # Cloudflare Tunnel (Zero Trust Access)
+  # ===========================================
+  # Routes traffic to backend without exposing ports
+  # Configure routes in Cloudflare Zero Trust dashboard:
+  #   - api.yourdomain.com -> http://backend:8080
+  #   - grpc.yourdomain.com -> http://backend:50051
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: spooled_cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - backend
+    networks:
+      - spooled-network
 
   # ===========================================
   # Prometheus (Optional - Metrics)
   # ===========================================
+  # Enable with: docker compose --profile monitoring up -d
   prometheus:
     image: prom/prometheus:v2.48.0
     container_name: spooled_prometheus
@@ -151,11 +163,7 @@ services:
       - '--storage.tsdb.retention.time=15d'
       - '--web.enable-lifecycle'
     volumes:
-      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - ./docker/prometheus/spooled-rules.yml:/etc/prometheus/spooled-rules.yml:ro
       - prometheus_data:/prometheus
-    ports:
-      - "${PROMETHEUS_PORT:-9091}:9090"
     networks:
       - spooled-network
     depends_on:
@@ -164,6 +172,7 @@ services:
   # ===========================================
   # Grafana (Optional - Dashboards)
   # ===========================================
+  # Enable with: docker compose --profile monitoring up -d
   grafana:
     image: grafana/grafana:10.2.2
     container_name: spooled_grafana
@@ -174,14 +183,32 @@ services:
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
       GF_USERS_ALLOW_SIGN_UP: "false"
     volumes:
-      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
       - grafana_data:/var/lib/grafana
-    ports:
-      - "${GRAFANA_PORT:-3000}:3000"
     networks:
       - spooled-network
     depends_on:
       - prometheus
+
+  # ===========================================
+  # pgAdmin (Optional - Database Admin)
+  # ===========================================
+  # Expose via Cloudflare tunnel when needed (e.g., db.yourdomain.com)
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: spooled_pgadmin
+    restart: unless-stopped
+    profiles: ["admin"]
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@spooled.cloud}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      - db
+    networks:
+      - spooled-network
 
 # ===========================================
 # Volumes
@@ -194,6 +221,8 @@ volumes:
   prometheus_data:
     driver: local
   grafana_data:
+    driver: local
+  pgadmin_data:
     driver: local
 
 # ===========================================
