@@ -105,7 +105,7 @@ tokio-test = "0.4"
 testcontainers = "0.24"
 testcontainers-modules = { version = "0.12", features = ["postgres", "redis"] }
 pretty_assertions = "1.4"
-fake = { version = "3.0", features = ["derive", "chrono", "uuid"] }
+fake = { version = "4.0", features = ["derive", "chrono", "uuid"] }
 wiremock = "0.6"
 serial_test = "3.2"
 

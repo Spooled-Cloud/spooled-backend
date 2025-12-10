@@ -217,7 +217,7 @@ fn init_with_otel(
 }
 
 /// Shutdown OpenTelemetry tracer provider gracefully
-/// 
+///
 /// Note: In OpenTelemetry 0.31+, shutdown is handled by storing the provider
 /// reference and calling `provider.shutdown()`. For global tracer, this is
 /// a no-op as the provider will be shut down when dropped.
