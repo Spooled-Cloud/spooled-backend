@@ -20,8 +20,11 @@ WORKDIR /app
 # Copy manifests first (for caching)
 COPY Cargo.toml Cargo.lock ./
 
-# Create dummy main.rs for dependency caching
-RUN mkdir src && echo "fn main() {}" > src/main.rs
+# Create dummy source files for dependency caching
+# Project has both lib.rs and main.rs
+RUN mkdir src && \
+    echo "fn main() {}" > src/main.rs && \
+    echo "" > src/lib.rs
 
 # Build dependencies only (cached layer)
 RUN cargo build --release && rm -rf src
@@ -30,8 +33,8 @@ RUN cargo build --release && rm -rf src
 COPY src ./src
 COPY migrations ./migrations
 
-# Touch main.rs to invalidate cache for source changes
-RUN touch src/main.rs
+# Touch source to invalidate cache for source changes
+RUN touch src/main.rs src/lib.rs
 
 # Build the application
 RUN cargo build --release
