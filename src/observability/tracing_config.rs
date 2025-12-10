@@ -202,10 +202,7 @@ fn init_with_otel(
     let otel_layer = OpenTelemetryLayer::new(tracer);
 
     // Initialize with both layers
-    Registry::default()
-        .with(fmt_layer)
-        .with(otel_layer)
-        .init();
+    Registry::default().with(fmt_layer).with(otel_layer).init();
 
     tracing::info!(
         service = %config.service_name,

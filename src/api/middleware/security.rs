@@ -50,7 +50,10 @@ pub async fn security_headers_middleware(request: Request<Body>, next: Next) -> 
 
     // Add HSTS header in production (when behind HTTPS)
     // Check environment variable to enable HSTS
-    if std::env::var("ENABLE_HSTS").map(|v| v == "true" || v == "1").unwrap_or(false) {
+    if std::env::var("ENABLE_HSTS")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+    {
         headers.insert(
             header::STRICT_TRANSPORT_SECURITY,
             HeaderValue::from_static("max-age=31536000; includeSubDomains; preload"),

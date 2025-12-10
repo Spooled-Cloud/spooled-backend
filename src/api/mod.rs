@@ -121,7 +121,8 @@ pub fn router(state: AppState) -> Router {
         // API v1 with versioning middleware
         .nest(
             "/api/v1",
-            api_v1_router(state.clone()).layer(axum::middleware::from_fn(api_versioning_middleware)),
+            api_v1_router(state.clone())
+                .layer(axum::middleware::from_fn(api_versioning_middleware)),
         )
         .layer(middleware)
         .with_state(state)

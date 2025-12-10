@@ -4888,7 +4888,7 @@ async fn test_refresh_token_respects_revocation() {
         r#"
         INSERT INTO api_keys (id, organization_id, name, key_hash, is_active, created_at)
         VALUES ($1, 'refresh-test-org', 'Test Key', '$2b$12$abcdefghijklmnopqrstuv', TRUE, NOW())
-        "#
+        "#,
     )
     .bind(&api_key_id)
     .execute(db.pool())
