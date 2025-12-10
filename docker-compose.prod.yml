@@ -251,12 +251,18 @@ services:
       timeout: 10s
       retries: 3
 
-  # Grafana provisioning init - configures Prometheus datasource
+  # Grafana provisioning init - configures datasource and dashboards
   grafana-init:
     image: busybox:latest
     container_name: spooled_grafana_init
     command: |
-      sh -c 'mkdir -p /etc/grafana/provisioning/datasources && cat > /etc/grafana/provisioning/datasources/prometheus.yml << EOF
+      sh -c '
+      mkdir -p /etc/grafana/provisioning/datasources
+      mkdir -p /etc/grafana/provisioning/dashboards
+      mkdir -p /var/lib/grafana/dashboards
+
+      # Datasource config
+      cat > /etc/grafana/provisioning/datasources/prometheus.yml << EOF
       apiVersion: 1
       datasources:
         - name: Prometheus
@@ -266,9 +272,206 @@ services:
           isDefault: true
           editable: false
       EOF
-      echo "Grafana datasource provisioned"'
+
+      # Dashboard provider config
+      cat > /etc/grafana/provisioning/dashboards/default.yml << EOF
+      apiVersion: 1
+      providers:
+        - name: Spooled
+          orgId: 1
+          folder: ""
+          type: file
+          disableDeletion: false
+          updateIntervalSeconds: 30
+          options:
+            path: /var/lib/grafana/dashboards
+      EOF
+
+      # Main dashboard
+      cat > /var/lib/grafana/dashboards/spooled-overview.json << DASHBOARD
+      {
+        "annotations": {"list": []},
+        "editable": true,
+        "fiscalYearStartMonth": 0,
+        "graphTooltip": 1,
+        "id": null,
+        "links": [],
+        "liveNow": false,
+        "panels": [
+          {
+            "datasource": {"type": "prometheus", "uid": "prometheus"},
+            "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "short"}, "overrides": []},
+            "gridPos": {"h": 4, "w": 4, "x": 0, "y": 0},
+            "id": 1,
+            "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+            "title": "Jobs Pending",
+            "type": "stat",
+            "targets": [{"expr": "spooled_jobs_pending", "refId": "A"}]
+          },
+          {
+            "datasource": {"type": "prometheus", "uid": "prometheus"},
+            "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "short"}, "overrides": []},
+            "gridPos": {"h": 4, "w": 4, "x": 4, "y": 0},
+            "id": 2,
+            "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+            "title": "Jobs Processing",
+            "type": "stat",
+            "targets": [{"expr": "spooled_jobs_processing", "refId": "A"}]
+          },
+          {
+            "datasource": {"type": "prometheus", "uid": "prometheus"},
+            "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "short"}, "overrides": []},
+            "gridPos": {"h": 4, "w": 4, "x": 8, "y": 0},
+            "id": 3,
+            "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+            "title": "Active Workers",
+            "type": "stat",
+            "targets": [{"expr": "spooled_workers_active", "refId": "A"}]
+          },
+          {
+            "datasource": {"type": "prometheus", "uid": "prometheus"},
+            "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "short"}, "overrides": []},
+            "gridPos": {"h": 4, "w": 4, "x": 12, "y": 0},
+            "id": 4,
+            "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+            "title": "Healthy Workers",
+            "type": "stat",
+            "targets": [{"expr": "spooled_workers_healthy", "refId": "A"}]
+          },
+          {
+            "datasource": {"type": "prometheus", "uid": "prometheus"},
+            "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "short"}, "overrides": []},
+            "gridPos": {"h": 4, "w": 4, "x": 16, "y": 0},
+            "id": 5,
+            "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+            "title": "DB Connections",
+            "type": "stat",
+            "targets": [{"expr": "spooled_database_connections", "refId": "A"}]
+          },
+          {
+            "datasource": {"type": "prometheus", "uid": "prometheus"},
+            "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}, "unit": "short"}, "overrides": []},
+            "gridPos": {"h": 4, "w": 4, "x": 20, "y": 0},
+            "id": 6,
+            "options": {"colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+            "title": "Backend Up",
+            "type": "stat",
+            "targets": [{"expr": "up{job=\"spooled-backend\"}", "refId": "A"}]
+          },
+          {
+            "datasource": {"type": "prometheus", "uid": "prometheus"},
+            "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": {"legend": false, "tooltip": false, "viz": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": false, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "ops"}, "overrides": []},
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+            "id": 7,
+            "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+            "title": "Job Throughput",
+            "type": "timeseries",
+            "targets": [
+              {"expr": "rate(spooled_jobs_enqueued_total[1m])", "legendFormat": "Enqueued", "refId": "A"},
+              {"expr": "rate(spooled_jobs_completed_total[1m])", "legendFormat": "Completed", "refId": "B"},
+              {"expr": "rate(spooled_jobs_failed_total[1m])", "legendFormat": "Failed", "refId": "C"}
+            ]
+          },
+          {
+            "datasource": {"type": "prometheus", "uid": "prometheus"},
+            "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": {"legend": false, "tooltip": false, "viz": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": false, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "s"}, "overrides": []},
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+            "id": 8,
+            "options": {"legend": {"calcs": ["mean", "max", "p95"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+            "title": "Job Duration",
+            "type": "timeseries",
+            "targets": [
+              {"expr": "histogram_quantile(0.5, rate(spooled_job_duration_seconds_bucket[5m]))", "legendFormat": "p50", "refId": "A"},
+              {"expr": "histogram_quantile(0.95, rate(spooled_job_duration_seconds_bucket[5m]))", "legendFormat": "p95", "refId": "B"},
+              {"expr": "histogram_quantile(0.99, rate(spooled_job_duration_seconds_bucket[5m]))", "legendFormat": "p99", "refId": "C"}
+            ]
+          },
+          {
+            "datasource": {"type": "prometheus", "uid": "prometheus"},
+            "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": {"legend": false, "tooltip": false, "viz": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": false, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "ops"}, "overrides": []},
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+            "id": 9,
+            "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+            "title": "API Requests",
+            "type": "timeseries",
+            "targets": [
+              {"expr": "rate(spooled_api_requests_total[1m])", "legendFormat": "Requests/sec", "refId": "A"}
+            ]
+          },
+          {
+            "datasource": {"type": "prometheus", "uid": "prometheus"},
+            "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": {"legend": false, "tooltip": false, "viz": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": false, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "s"}, "overrides": []},
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+            "id": 10,
+            "options": {"legend": {"calcs": ["mean", "max", "p95"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+            "title": "API Latency",
+            "type": "timeseries",
+            "targets": [
+              {"expr": "histogram_quantile(0.5, rate(spooled_api_request_duration_bucket[5m]))", "legendFormat": "p50", "refId": "A"},
+              {"expr": "histogram_quantile(0.95, rate(spooled_api_request_duration_bucket[5m]))", "legendFormat": "p95", "refId": "B"},
+              {"expr": "histogram_quantile(0.99, rate(spooled_api_request_duration_bucket[5m]))", "legendFormat": "p99", "refId": "C"}
+            ]
+          },
+          {
+            "datasource": {"type": "prometheus", "uid": "prometheus"},
+            "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 60}, {"color": "red", "value": 300}]}, "unit": "s"}, "overrides": []},
+            "gridPos": {"h": 4, "w": 6, "x": 0, "y": 20},
+            "id": 11,
+            "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+            "title": "Oldest Pending Job Age",
+            "type": "stat",
+            "targets": [{"expr": "spooled_job_max_age_seconds", "refId": "A"}]
+          },
+          {
+            "datasource": {"type": "prometheus", "uid": "prometheus"},
+            "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "short"}, "overrides": []},
+            "gridPos": {"h": 4, "w": 6, "x": 6, "y": 20},
+            "id": 12,
+            "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+            "title": "Total Jobs Enqueued",
+            "type": "stat",
+            "targets": [{"expr": "spooled_jobs_enqueued_total", "refId": "A"}]
+          },
+          {
+            "datasource": {"type": "prometheus", "uid": "prometheus"},
+            "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "short"}, "overrides": []},
+            "gridPos": {"h": 4, "w": 6, "x": 12, "y": 20},
+            "id": 13,
+            "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+            "title": "Total Jobs Completed",
+            "type": "stat",
+            "targets": [{"expr": "spooled_jobs_completed_total", "refId": "A"}]
+          },
+          {
+            "datasource": {"type": "prometheus", "uid": "prometheus"},
+            "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}, {"color": "red", "value": 10}]}, "unit": "short"}, "overrides": []},
+            "gridPos": {"h": 4, "w": 6, "x": 18, "y": 20},
+            "id": 14,
+            "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+            "title": "Total Jobs Failed",
+            "type": "stat",
+            "targets": [{"expr": "spooled_jobs_failed_total", "refId": "A"}]
+          }
+        ],
+        "refresh": "10s",
+        "schemaVersion": 38,
+        "style": "dark",
+        "tags": ["spooled", "backend", "jobs"],
+        "templating": {"list": []},
+        "time": {"from": "now-1h", "to": "now"},
+        "timepicker": {},
+        "timezone": "browser",
+        "title": "Spooled Backend Overview",
+        "uid": "spooled-overview",
+        "version": 1
+      }
+      DASHBOARD
+
+      echo "Grafana provisioning complete"
+      '
     volumes:
       - grafana_provisioning:/etc/grafana/provisioning
+      - grafana_data:/var/lib/grafana
     networks:
       - spooled-network
 
