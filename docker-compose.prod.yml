@@ -5,6 +5,8 @@
 # Deploy via Portainer, Docker Compose, or any container orchestrator.
 # Images are automatically built by GitHub Actions for amd64 and arm64.
 #
+# Includes: Backend API, PostgreSQL, Redis, Prometheus, Grafana, Cloudflare Tunnel
+#
 # Quick start:
 #   1. Copy .env.example to .env and configure
 #   2. docker compose -f docker-compose.prod.yml up -d
@@ -15,8 +17,8 @@
 #   3. Add environment variables in the Portainer UI
 #
 # Required Environment Variables:
-#   POSTGRES_PASSWORD    - Database password
-#   JWT_SECRET           - 32+ character secret for JWT signing
+#   POSTGRES_PASSWORD       - Database password
+#   JWT_SECRET              - 32+ character secret for JWT signing
 #   CLOUDFLARE_TUNNEL_TOKEN - Cloudflare tunnel token (for cloudflared)
 #
 # Registration Mode (for SaaS vs Self-hosted):
@@ -27,6 +29,13 @@
 # Optional Environment Variables:
 #   BACKEND_IMAGE        - Docker image (default: ghcr.io/spooled-cloud/spooled-backend:latest)
 #   REDIS_PASSWORD       - Redis password (recommended for production)
+#   GRAFANA_USER         - Grafana admin username (default: admin)
+#   GRAFANA_PASSWORD     - Grafana admin password (default: admin) - CHANGE THIS!
+#   GRAFANA_URL          - Grafana public URL (e.g., https://grafana.spooled.cloud)
+#
+# Cloudflare Tunnel Routes (configure in Zero Trust dashboard):
+#   - api.spooled.cloud     -> http://backend:8080
+#   - grafana.spooled.cloud -> http://grafana:3000
 
 services:
   # ===========================================
@@ -74,7 +83,7 @@ services:
   # ===========================================
   backend:
     image: ${BACKEND_IMAGE:-ghcr.io/spooled-cloud/spooled-backend:latest}
-    platform: linux/arm64
+    # platform: linux/arm64  # Uncomment if you need to force ARM64
     container_name: spooled_backend
     restart: unless-stopped
     depends_on:
@@ -160,14 +169,12 @@ services:
       - spooled-network
 
   # ===========================================
-  # Prometheus (Optional - Metrics)
+  # Prometheus (Metrics Collection)
   # ===========================================
-  # Enable with: docker compose --profile monitoring up -d
   prometheus:
     image: prom/prometheus:v2.48.0
     container_name: spooled_prometheus
     restart: unless-stopped
-    profiles: ["monitoring"]
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
@@ -175,30 +182,95 @@ services:
       - '--web.enable-lifecycle'
     volumes:
       - prometheus_data:/prometheus
+      - prometheus_config:/etc/prometheus
     networks:
       - spooled-network
     depends_on:
       - backend
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Prometheus config init - creates config file
+  prometheus-init:
+    image: busybox:latest
+    container_name: spooled_prometheus_init
+    command: |
+      sh -c 'cat > /etc/prometheus/prometheus.yml << EOF
+      global:
+        scrape_interval: 15s
+        evaluation_interval: 15s
+        external_labels:
+          cluster: spooled
+          environment: production
+
+      scrape_configs:
+        - job_name: spooled-backend
+          static_configs:
+            - targets: ["backend:9090"]
+          metrics_path: /metrics
+          scrape_interval: 10s
+
+        - job_name: prometheus
+          static_configs:
+            - targets: ["localhost:9090"]
+      EOF
+      echo "Prometheus config created"'
+    volumes:
+      - prometheus_config:/etc/prometheus
+    networks:
+      - spooled-network
 
   # ===========================================
-  # Grafana (Optional - Dashboards)
+  # Grafana (Dashboards & Visualization)
   # ===========================================
-  # Enable with: docker compose --profile monitoring up -d
   grafana:
     image: grafana/grafana:10.2.2
     container_name: spooled_grafana
     restart: unless-stopped
-    profiles: ["monitoring"]
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
       GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_ROOT_URL: ${GRAFANA_URL:-http://localhost:3000}
+      # Auto-provision Prometheus datasource
+      GF_DATASOURCES_DEFAULT_NAME: Prometheus
     volumes:
       - grafana_data:/var/lib/grafana
+      - grafana_provisioning:/etc/grafana/provisioning
     networks:
       - spooled-network
     depends_on:
       - prometheus
+      - grafana-init
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Grafana provisioning init - configures Prometheus datasource
+  grafana-init:
+    image: busybox:latest
+    container_name: spooled_grafana_init
+    command: |
+      sh -c 'mkdir -p /etc/grafana/provisioning/datasources && cat > /etc/grafana/provisioning/datasources/prometheus.yml << EOF
+      apiVersion: 1
+      datasources:
+        - name: Prometheus
+          type: prometheus
+          access: proxy
+          url: http://prometheus:9090
+          isDefault: true
+          editable: false
+      EOF
+      echo "Grafana datasource provisioned"'
+    volumes:
+      - grafana_provisioning:/etc/grafana/provisioning
+    networks:
+      - spooled-network
 
   # ===========================================
   # pgAdmin (Optional - Database Admin)
@@ -231,7 +303,11 @@ volumes:
     driver: local
   prometheus_data:
     driver: local
+  prometheus_config:
+    driver: local
   grafana_data:
+    driver: local
+  grafana_provisioning:
     driver: local
   pgadmin_data:
     driver: local
