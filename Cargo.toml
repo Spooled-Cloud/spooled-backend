@@ -36,7 +36,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Configuration
-config = "0.14"
+config = "0.15"
 dotenvy = "0.15"
 
 # Logging and tracing
@@ -52,7 +52,7 @@ thiserror = "2.0"
 anyhow = "1.0"
 
 # Security
-bcrypt = "0.16"
+bcrypt = "0.17"
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
@@ -71,13 +71,13 @@ base64 = "0.22"
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 
 # Metrics
-prometheus = "0.13"
+prometheus = "0.14"
 
 # HTTP client (for webhook delivery)
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
 # Validation
-validator = { version = "0.19", features = ["derive"] }
+validator = { version = "0.20", features = ["derive"] }
 
 # Utilities
 lazy_static = "1.5"
@@ -102,8 +102,8 @@ otel = ["tracing-opentelemetry", "opentelemetry", "opentelemetry_sdk", "opentele
 [dev-dependencies]
 # Testing
 tokio-test = "0.4"
-testcontainers = "0.23"
-testcontainers-modules = { version = "0.11", features = ["postgres", "redis"] }
+testcontainers = "0.24"
+testcontainers-modules = { version = "0.12", features = ["postgres", "redis"] }
 pretty_assertions = "1.4"
 fake = { version = "3.0", features = ["derive", "chrono", "uuid"] }
 wiremock = "0.6"
