@@ -261,12 +261,12 @@ async fn invalidate_api_key_cache(cache: &crate::cache::RedisCache, key_hash: &s
 /// Now uses cryptographically secure random number generator.
 /// Previously used thread_rng() which may not be cryptographically secure.
 fn generate_api_key() -> String {
-    use rand::RngCore;
+    use rand::Rng;
 
-    // Use OsRng which is cryptographically secure
-    let mut rng = rand::rngs::OsRng;
-    let mut bytes = [0u8; 32]; // Increased from 24 to 32 bytes for more entropy
-    rng.fill_bytes(&mut bytes);
+    // Use thread_rng which uses OsRng internally and is cryptographically secure
+    let mut rng = rand::rng();
+    let mut bytes = [0u8; 32]; // 32 bytes for sufficient entropy
+    rng.fill(&mut bytes);
     base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes)
 }
 
