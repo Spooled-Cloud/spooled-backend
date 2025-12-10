@@ -21,7 +21,7 @@ path = "src/main.rs"
 [dependencies]
 # Web framework
 axum = { version = "0.8", features = ["macros", "ws"] }
-axum-extra = { version = "0.10", features = ["typed-header"] }
+axum-extra = { version = "0.12", features = ["typed-header"] }
 tower = { version = "0.5", features = ["timeout", "limit"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "request-id", "compression-gzip", "timeout"] }
 
@@ -36,27 +36,27 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Configuration
-config = "0.14"
+config = "0.15"
 dotenvy = "0.15"
 
 # Logging and tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-tracing-opentelemetry = { version = "0.28", optional = true }
-opentelemetry = { version = "0.27", optional = true }
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true }
-opentelemetry-otlp = { version = "0.27", features = ["tonic"], optional = true }
+tracing-opentelemetry = { version = "0.32", optional = true }
+opentelemetry = { version = "0.31", optional = true }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.31", features = ["tonic"], optional = true }
 
 # Error handling
 thiserror = "2.0"
 anyhow = "1.0"
 
 # Security
-bcrypt = "0.16"
+bcrypt = "0.17"
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
-jsonwebtoken = "9.3"
+jsonwebtoken = "10.2"
 subtle = "2.5"  # Constant-time comparison for crypto
 
 # Time
@@ -64,20 +64,20 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Utilities
 uuid = { version = "1.11", features = ["v4", "serde"] }
-rand = "0.8"
+rand = "0.9"
 base64 = "0.22"
 
 # Redis
-redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+redis = { version = "1.0", features = ["tokio-comp", "connection-manager"] }
 
 # Metrics
-prometheus = "0.13"
+prometheus = "0.14"
 
 # HTTP client (for webhook delivery)
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
 # Validation
-validator = { version = "0.19", features = ["derive"] }
+validator = { version = "0.20", features = ["derive"] }
 
 # Utilities
 lazy_static = "1.5"
@@ -102,10 +102,10 @@ otel = ["tracing-opentelemetry", "opentelemetry", "opentelemetry_sdk", "opentele
 [dev-dependencies]
 # Testing
 tokio-test = "0.4"
-testcontainers = "0.23"
-testcontainers-modules = { version = "0.11", features = ["postgres", "redis"] }
+testcontainers = "0.24"
+testcontainers-modules = { version = "0.12", features = ["postgres", "redis"] }
 pretty_assertions = "1.4"
-fake = { version = "3.0", features = ["derive", "chrono", "uuid"] }
+fake = { version = "4.4", features = ["derive", "chrono", "uuid"] }
 wiremock = "0.6"
 serial_test = "3.2"
 
