@@ -18,3 +18,4 @@ CREATE INDEX IF NOT EXISTS idx_workers_org_queues ON workers(organization_id) WH
 
 COMMENT ON COLUMN workers.queue_names IS 'Array of queue names this worker processes (supports multi-queue workers)';
 COMMENT ON COLUMN workers.queue_name IS 'DEPRECATED: Legacy single queue name, use queue_names array instead';
+

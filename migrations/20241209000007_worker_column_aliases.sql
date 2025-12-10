@@ -41,3 +41,4 @@ COMMENT ON COLUMN workers.updated_at IS 'Worker last update timestamp';
 COMMENT ON COLUMN workers.max_concurrency IS 'DEPRECATED: Use max_concurrent_jobs instead';
 COMMENT ON COLUMN workers.current_jobs IS 'DEPRECATED: Use current_job_count instead';
 COMMENT ON COLUMN workers.registered_at IS 'DEPRECATED: Use created_at instead';
+

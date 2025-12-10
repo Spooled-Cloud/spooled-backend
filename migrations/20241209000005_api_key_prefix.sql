@@ -14,3 +14,4 @@ CREATE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys(key_prefix) WHERE key
 -- New keys will have prefix populated at creation time
 
 COMMENT ON COLUMN api_keys.key_prefix IS 'First 8 characters of raw API key for fast indexed lookup';
+

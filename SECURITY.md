@@ -112,3 +112,4 @@ No known vulnerabilities at this time.
 ---
 
 Thank you for helping keep Spooled Backend and its users safe!
+

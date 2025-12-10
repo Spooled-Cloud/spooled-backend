@@ -55,3 +55,4 @@ psql "$DB_URL" -c "VACUUM ANALYZE jobs;" 2>/dev/null || true
 psql "$DB_URL" -c "VACUUM ANALYZE jobs_partitioned;" 2>/dev/null || true
 
 log "All maintenance tasks completed"
+
