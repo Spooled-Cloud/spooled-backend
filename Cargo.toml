@@ -42,10 +42,10 @@ dotenvy = "0.15"
 # Logging and tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-tracing-opentelemetry = { version = "0.28", optional = true }
-opentelemetry = { version = "0.27", optional = true }
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true }
-opentelemetry-otlp = { version = "0.27", features = ["tonic"], optional = true }
+tracing-opentelemetry = { version = "0.32", optional = true }
+opentelemetry = { version = "0.31", optional = true }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"], optional = true }
 
 # Error handling
 thiserror = "2.0"
