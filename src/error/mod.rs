@@ -73,8 +73,9 @@ pub enum AppError {
     Configuration(String),
 
     /// Plan limit exceeded (wraps a pre-built Response)
+    /// Boxed to reduce enum size (Clippy: result_large_err)
     #[error("Plan limit exceeded")]
-    LimitExceeded(Response),
+    LimitExceeded(Box<Response>),
 }
 
 /// Error response body
@@ -93,7 +94,7 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         // Handle pre-built limit exceeded response
         if let AppError::LimitExceeded(response) = self {
-            return response;
+            return *response;
         }
 
         // Check for rate limit with retry-after

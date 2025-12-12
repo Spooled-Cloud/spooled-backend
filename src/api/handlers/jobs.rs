@@ -144,12 +144,12 @@ pub async fn create(
     // Check payload size against plan limits
     let payload_json = serde_json::to_string(&request.payload).unwrap_or_default();
     if let Err(response) = check_payload_size(state.db.pool(), &org_id, payload_json.len()).await {
-        return Err(AppError::LimitExceeded(response));
+        return Err(AppError::LimitExceeded(Box::new(response)));
     }
 
     // Check job limits (daily + active) before creating
     if let Err(response) = check_job_limits(state.db.pool(), &org_id, 1).await {
-        return Err(AppError::LimitExceeded(response));
+        return Err(AppError::LimitExceeded(Box::new(response)));
     }
 
     let job_id = Uuid::new_v4().to_string();
@@ -423,7 +423,7 @@ pub async fn bulk_enqueue(
 
     // Check job limits (daily + active) before creating
     if let Err(response) = check_job_limits(state.db.pool(), &org_id, job_count).await {
-        return Err(AppError::LimitExceeded(response));
+        return Err(AppError::LimitExceeded(Box::new(response)));
     }
 
     let now = Utc::now();
