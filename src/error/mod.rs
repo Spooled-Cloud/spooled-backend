@@ -71,6 +71,10 @@ pub enum AppError {
     /// Configuration error
     #[error("Configuration error: {0}")]
     Configuration(String),
+
+    /// Plan limit exceeded (wraps a pre-built Response)
+    #[error("Plan limit exceeded")]
+    LimitExceeded(Response),
 }
 
 /// Error response body
@@ -87,6 +91,11 @@ pub struct ErrorResponse {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        // Handle pre-built limit exceeded response
+        if let AppError::LimitExceeded(response) = self {
+            return response;
+        }
+
         // Check for rate limit with retry-after
         if let AppError::RateLimitExceededWithRetry(retry_after) = &self {
             let body = Json(ErrorResponse {
@@ -150,7 +159,7 @@ impl IntoResponse for AppError {
                 "RATE_LIMIT_EXCEEDED",
                 "Too many requests, please try again later".to_string(),
             ),
-            AppError::RateLimitExceededWithRetry(_) => {
+            AppError::RateLimitExceededWithRetry(_) | AppError::LimitExceeded(_) => {
                 // Already handled above
                 unreachable!()
             }

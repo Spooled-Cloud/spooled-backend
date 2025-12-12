@@ -89,59 +89,248 @@ pub struct ListOrgsResponse {
 /// List all organizations with usage stats
 ///
 /// GET /api/v1/admin/organizations
+///
+/// SECURITY: Uses parameterized queries to prevent SQL injection.
+/// Sort fields are validated against an allowlist.
 pub async fn list_organizations(
     State(state): State<AppState>,
     Query(query): Query<ListOrgsQuery>,
 ) -> AppResult<Json<ListOrgsResponse>> {
     let limit = query.limit.unwrap_or(50).clamp(1, 100);
     let offset = query.offset.unwrap_or(0).max(0);
-    let sort_by = query.sort_by.as_deref().unwrap_or("created_at");
-    let sort_order = query.sort_order.as_deref().unwrap_or("desc");
 
-    // Validate sort fields to prevent SQL injection
-    let sort_by = match sort_by {
-        "name" | "slug" | "plan_tier" | "created_at" | "updated_at" => sort_by,
+    // Validate sort fields against allowlist to prevent SQL injection
+    let sort_by = match query.sort_by.as_deref().unwrap_or("created_at") {
+        "name" => "name",
+        "slug" => "slug",
+        "plan_tier" => "plan_tier",
+        "updated_at" => "updated_at",
         _ => "created_at",
     };
-    let sort_order = if sort_order.to_lowercase() == "asc" {
-        "ASC"
-    } else {
-        "DESC"
+    let sort_order = match query
+        .sort_order
+        .as_deref()
+        .unwrap_or("desc")
+        .to_lowercase()
+        .as_str()
+    {
+        "asc" => "ASC",
+        _ => "DESC",
     };
 
-    // Build query with optional filters
-    let mut sql = String::from("SELECT * FROM organizations WHERE 1=1");
-    let mut count_sql = String::from("SELECT COUNT(*) FROM organizations WHERE 1=1");
+    // Validate plan_tier against allowlist if provided
+    let valid_plans = ["free", "starter", "pro", "enterprise", "deleted"];
+    let plan_tier_filter = query.plan_tier.as_ref().and_then(|p| {
+        if valid_plans.contains(&p.to_lowercase().as_str()) {
+            Some(p.to_lowercase())
+        } else {
+            tracing::warn!(plan_tier = %p, "Invalid plan_tier filter ignored");
+            None
+        }
+    });
 
-    if let Some(ref plan) = query.plan_tier {
-        sql.push_str(&format!(" AND plan_tier = '{}'", plan.replace('\'', "''")));
-        count_sql.push_str(&format!(" AND plan_tier = '{}'", plan.replace('\'', "''")));
-    }
+    // Sanitize search query - remove SQL wildcards and limit length
+    let search_filter = query
+        .search
+        .as_ref()
+        .map(|s| {
+            s.chars()
+                .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-' || *c == '_')
+                .take(100)
+                .collect::<String>()
+        })
+        .filter(|s| !s.is_empty());
 
-    if let Some(ref search) = query.search {
-        let escaped = search.replace('\'', "''");
-        sql.push_str(&format!(
-            " AND (name ILIKE '%{}%' OR slug ILIKE '%{}%')",
-            escaped, escaped
-        ));
-        count_sql.push_str(&format!(
-            " AND (name ILIKE '%{}%' OR slug ILIKE '%{}%')",
-            escaped, escaped
-        ));
-    }
+    // Use parameterized queries based on filter combination
+    // This is more verbose but completely safe from SQL injection
+    let (orgs, total): (Vec<Organization>, i64) = match (&plan_tier_filter, &search_filter) {
+        (Some(plan), Some(search)) => {
+            let search_pattern = format!("%{}%", search);
+            let count: (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM organizations WHERE plan_tier = $1 AND (name ILIKE $2 OR slug ILIKE $2)"
+            )
+            .bind(plan)
+            .bind(&search_pattern)
+            .fetch_one(state.db.pool())
+            .await?;
 
-    sql.push_str(&format!(" ORDER BY {} {}", sort_by, sort_order));
-    sql.push_str(&format!(" LIMIT {} OFFSET {}", limit, offset));
+            // Dynamic ORDER BY requires separate queries per sort field
+            let orgs = match sort_by {
+                "name" if sort_order == "ASC" => {
+                    sqlx::query_as::<_, Organization>(
+                        "SELECT * FROM organizations WHERE plan_tier = $1 AND (name ILIKE $2 OR slug ILIKE $2) ORDER BY name ASC LIMIT $3 OFFSET $4"
+                    )
+                    .bind(plan).bind(&search_pattern).bind(limit).bind(offset)
+                    .fetch_all(state.db.pool()).await?
+                }
+                "name" => {
+                    sqlx::query_as::<_, Organization>(
+                        "SELECT * FROM organizations WHERE plan_tier = $1 AND (name ILIKE $2 OR slug ILIKE $2) ORDER BY name DESC LIMIT $3 OFFSET $4"
+                    )
+                    .bind(plan).bind(&search_pattern).bind(limit).bind(offset)
+                    .fetch_all(state.db.pool()).await?
+                }
+                "slug" if sort_order == "ASC" => {
+                    sqlx::query_as::<_, Organization>(
+                        "SELECT * FROM organizations WHERE plan_tier = $1 AND (name ILIKE $2 OR slug ILIKE $2) ORDER BY slug ASC LIMIT $3 OFFSET $4"
+                    )
+                    .bind(plan).bind(&search_pattern).bind(limit).bind(offset)
+                    .fetch_all(state.db.pool()).await?
+                }
+                "slug" => {
+                    sqlx::query_as::<_, Organization>(
+                        "SELECT * FROM organizations WHERE plan_tier = $1 AND (name ILIKE $2 OR slug ILIKE $2) ORDER BY slug DESC LIMIT $3 OFFSET $4"
+                    )
+                    .bind(plan).bind(&search_pattern).bind(limit).bind(offset)
+                    .fetch_all(state.db.pool()).await?
+                }
+                "plan_tier" if sort_order == "ASC" => {
+                    sqlx::query_as::<_, Organization>(
+                        "SELECT * FROM organizations WHERE plan_tier = $1 AND (name ILIKE $2 OR slug ILIKE $2) ORDER BY plan_tier ASC LIMIT $3 OFFSET $4"
+                    )
+                    .bind(plan).bind(&search_pattern).bind(limit).bind(offset)
+                    .fetch_all(state.db.pool()).await?
+                }
+                "plan_tier" => {
+                    sqlx::query_as::<_, Organization>(
+                        "SELECT * FROM organizations WHERE plan_tier = $1 AND (name ILIKE $2 OR slug ILIKE $2) ORDER BY plan_tier DESC LIMIT $3 OFFSET $4"
+                    )
+                    .bind(plan).bind(&search_pattern).bind(limit).bind(offset)
+                    .fetch_all(state.db.pool()).await?
+                }
+                "updated_at" if sort_order == "ASC" => {
+                    sqlx::query_as::<_, Organization>(
+                        "SELECT * FROM organizations WHERE plan_tier = $1 AND (name ILIKE $2 OR slug ILIKE $2) ORDER BY updated_at ASC LIMIT $3 OFFSET $4"
+                    )
+                    .bind(plan).bind(&search_pattern).bind(limit).bind(offset)
+                    .fetch_all(state.db.pool()).await?
+                }
+                "updated_at" => {
+                    sqlx::query_as::<_, Organization>(
+                        "SELECT * FROM organizations WHERE plan_tier = $1 AND (name ILIKE $2 OR slug ILIKE $2) ORDER BY updated_at DESC LIMIT $3 OFFSET $4"
+                    )
+                    .bind(plan).bind(&search_pattern).bind(limit).bind(offset)
+                    .fetch_all(state.db.pool()).await?
+                }
+                // created_at (default)
+                _ if sort_order == "ASC" => {
+                    sqlx::query_as::<_, Organization>(
+                        "SELECT * FROM organizations WHERE plan_tier = $1 AND (name ILIKE $2 OR slug ILIKE $2) ORDER BY created_at ASC LIMIT $3 OFFSET $4"
+                    )
+                    .bind(plan).bind(&search_pattern).bind(limit).bind(offset)
+                    .fetch_all(state.db.pool()).await?
+                }
+                _ => {
+                    sqlx::query_as::<_, Organization>(
+                        "SELECT * FROM organizations WHERE plan_tier = $1 AND (name ILIKE $2 OR slug ILIKE $2) ORDER BY created_at DESC LIMIT $3 OFFSET $4"
+                    )
+                    .bind(plan).bind(&search_pattern).bind(limit).bind(offset)
+                    .fetch_all(state.db.pool()).await?
+                }
+            };
+            (orgs, count.0)
+        }
+        (Some(plan), None) => {
+            let count: (i64,) =
+                sqlx::query_as("SELECT COUNT(*) FROM organizations WHERE plan_tier = $1")
+                    .bind(plan)
+                    .fetch_one(state.db.pool())
+                    .await?;
 
-    // Get total count
-    let total: (i64,) = sqlx::query_as(&count_sql)
-        .fetch_one(state.db.pool())
-        .await?;
+            let orgs = match sort_by {
+                "name" if sort_order == "ASC" => {
+                    sqlx::query_as::<_, Organization>("SELECT * FROM organizations WHERE plan_tier = $1 ORDER BY name ASC LIMIT $2 OFFSET $3")
+                        .bind(plan).bind(limit).bind(offset).fetch_all(state.db.pool()).await?
+                }
+                "name" => {
+                    sqlx::query_as::<_, Organization>("SELECT * FROM organizations WHERE plan_tier = $1 ORDER BY name DESC LIMIT $2 OFFSET $3")
+                        .bind(plan).bind(limit).bind(offset).fetch_all(state.db.pool()).await?
+                }
+                "created_at" if sort_order == "ASC" => {
+                    sqlx::query_as::<_, Organization>("SELECT * FROM organizations WHERE plan_tier = $1 ORDER BY created_at ASC LIMIT $2 OFFSET $3")
+                        .bind(plan).bind(limit).bind(offset).fetch_all(state.db.pool()).await?
+                }
+                _ => {
+                    sqlx::query_as::<_, Organization>("SELECT * FROM organizations WHERE plan_tier = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3")
+                        .bind(plan).bind(limit).bind(offset).fetch_all(state.db.pool()).await?
+                }
+            };
+            (orgs, count.0)
+        }
+        (None, Some(search)) => {
+            let search_pattern = format!("%{}%", search);
+            let count: (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM organizations WHERE name ILIKE $1 OR slug ILIKE $1",
+            )
+            .bind(&search_pattern)
+            .fetch_one(state.db.pool())
+            .await?;
 
-    // Get organizations
-    let orgs: Vec<Organization> = sqlx::query_as(&sql).fetch_all(state.db.pool()).await?;
+            let orgs = match sort_by {
+                "name" if sort_order == "ASC" => {
+                    sqlx::query_as::<_, Organization>("SELECT * FROM organizations WHERE name ILIKE $1 OR slug ILIKE $1 ORDER BY name ASC LIMIT $2 OFFSET $3")
+                        .bind(&search_pattern).bind(limit).bind(offset).fetch_all(state.db.pool()).await?
+                }
+                "name" => {
+                    sqlx::query_as::<_, Organization>("SELECT * FROM organizations WHERE name ILIKE $1 OR slug ILIKE $1 ORDER BY name DESC LIMIT $2 OFFSET $3")
+                        .bind(&search_pattern).bind(limit).bind(offset).fetch_all(state.db.pool()).await?
+                }
+                "created_at" if sort_order == "ASC" => {
+                    sqlx::query_as::<_, Organization>("SELECT * FROM organizations WHERE name ILIKE $1 OR slug ILIKE $1 ORDER BY created_at ASC LIMIT $2 OFFSET $3")
+                        .bind(&search_pattern).bind(limit).bind(offset).fetch_all(state.db.pool()).await?
+                }
+                _ => {
+                    sqlx::query_as::<_, Organization>("SELECT * FROM organizations WHERE name ILIKE $1 OR slug ILIKE $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3")
+                        .bind(&search_pattern).bind(limit).bind(offset).fetch_all(state.db.pool()).await?
+                }
+            };
+            (orgs, count.0)
+        }
+        (None, None) => {
+            let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM organizations")
+                .fetch_one(state.db.pool())
+                .await?;
 
-    // Fetch usage for each org (in parallel would be better, but keeping simple for now)
+            let orgs =
+                match sort_by {
+                    "name" if sort_order == "ASC" => {
+                        sqlx::query_as::<_, Organization>(
+                            "SELECT * FROM organizations ORDER BY name ASC LIMIT $1 OFFSET $2",
+                        )
+                        .bind(limit)
+                        .bind(offset)
+                        .fetch_all(state.db.pool())
+                        .await?
+                    }
+                    "name" => {
+                        sqlx::query_as::<_, Organization>(
+                            "SELECT * FROM organizations ORDER BY name DESC LIMIT $1 OFFSET $2",
+                        )
+                        .bind(limit)
+                        .bind(offset)
+                        .fetch_all(state.db.pool())
+                        .await?
+                    }
+                    "created_at" if sort_order == "ASC" => sqlx::query_as::<_, Organization>(
+                        "SELECT * FROM organizations ORDER BY created_at ASC LIMIT $1 OFFSET $2",
+                    )
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all(state.db.pool())
+                    .await?,
+                    _ => sqlx::query_as::<_, Organization>(
+                        "SELECT * FROM organizations ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+                    )
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all(state.db.pool())
+                    .await?,
+                };
+            (orgs, count.0)
+        }
+    };
+
+    // Fetch usage for each org
     let mut admin_orgs = Vec::with_capacity(orgs.len());
     for org in orgs {
         let usage = get_resource_counts(state.db.pool(), &org.id)
@@ -162,7 +351,7 @@ pub async fn list_organizations(
 
     Ok(Json(ListOrgsResponse {
         organizations: admin_orgs,
-        total: total.0,
+        total,
         limit,
         offset,
     }))

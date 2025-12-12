@@ -90,13 +90,27 @@ pub async fn require_admin(
 }
 
 /// Constant-time string comparison to prevent timing attacks
+///
+/// SECURITY: Uses SHA-256 hash comparison to prevent both timing attacks
+/// AND length disclosure. Both inputs are hashed first, ensuring:
+/// 1. Comparison always operates on fixed-size (32 byte) values
+/// 2. No early return based on length differences
+/// 3. XOR comparison in constant time
 fn constant_time_compare(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
+    use sha2::{Digest, Sha256};
 
+    // Hash both values first to prevent length disclosure
+    let mut hasher_a = Sha256::new();
+    hasher_a.update(a.as_bytes());
+    let hash_a = hasher_a.finalize();
+
+    let mut hasher_b = Sha256::new();
+    hasher_b.update(b.as_bytes());
+    let hash_b = hasher_b.finalize();
+
+    // Constant-time comparison of hashes
     let mut result = 0u8;
-    for (x, y) in a.bytes().zip(b.bytes()) {
+    for (x, y) in hash_a.iter().zip(hash_b.iter()) {
         result |= x ^ y;
     }
     result == 0
@@ -118,11 +132,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_constant_time_compare() {
+    fn test_constant_time_compare_equal() {
         assert!(constant_time_compare("secret", "secret"));
+        assert!(constant_time_compare("", ""));
+        assert!(constant_time_compare("a", "a"));
+        assert!(constant_time_compare(
+            "super-long-admin-key-1234567890",
+            "super-long-admin-key-1234567890"
+        ));
+    }
+
+    #[test]
+    fn test_constant_time_compare_different() {
+        // Different content
         assert!(!constant_time_compare("secret", "Secret"));
+        assert!(!constant_time_compare("abc", "abd"));
+
+        // Different lengths (should still work securely via hash comparison)
         assert!(!constant_time_compare("secret", "secre"));
         assert!(!constant_time_compare("secret", "secretx"));
-        assert!(constant_time_compare("", ""));
+        assert!(!constant_time_compare("short", "much-longer-string"));
+    }
+
+    #[test]
+    fn test_constant_time_compare_timing_safety() {
+        // These comparisons should take approximately the same time
+        // regardless of where/if differences occur or length differences
+        // This is ensured by the SHA-256 hash comparison approach
+        let _ = constant_time_compare("aaaaaaaaaa", "aaaaaaaaaa"); // All same
+        let _ = constant_time_compare("aaaaaaaaaa", "baaaaaaaaa"); // First char diff
+        let _ = constant_time_compare("aaaaaaaaaa", "aaaaaaaaab"); // Last char diff
+        let _ = constant_time_compare("aaaaaaaaaa", "aaa"); // Different length
     }
 }

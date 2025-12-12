@@ -9,6 +9,7 @@ use chrono::Utc;
 use tracing::info;
 use uuid::Uuid;
 
+use crate::api::middleware::limits::{check_job_limits, check_payload_size, increment_daily_jobs};
 use crate::api::middleware::ValidatedJson;
 use crate::api::AppState;
 use crate::error::{AppError, AppResult};
@@ -132,12 +133,24 @@ pub async fn list(
 /// Create a new job
 ///
 /// Now requires authenticated context - previously fell back to "default-org"
+/// SECURITY: Enforces plan limits before creating jobs
 pub async fn create(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
     ValidatedJson(request): ValidatedJson<CreateJobRequest>,
 ) -> AppResult<(StatusCode, Json<CreateJobResponse>)> {
     let org_id = ctx.organization_id;
+
+    // Check payload size against plan limits
+    let payload_json = serde_json::to_string(&request.payload).unwrap_or_default();
+    if let Err(response) = check_payload_size(state.db.pool(), &org_id, payload_json.len()).await {
+        return Err(AppError::LimitExceeded(response));
+    }
+
+    // Check job limits (daily + active) before creating
+    if let Err(response) = check_job_limits(state.db.pool(), &org_id, 1).await {
+        return Err(AppError::LimitExceeded(response));
+    }
 
     let job_id = Uuid::new_v4().to_string();
     let now = Utc::now();
@@ -205,10 +218,15 @@ pub async fn create(
     // Check if this was a new job or existing (idempotent)
     let created = returned_id == job_id;
 
-    // Update metrics
+    // Update metrics and usage counters
     if created {
         state.metrics.jobs_enqueued.inc();
         state.metrics.jobs_pending.inc();
+
+        // Increment daily job counter for plan limit tracking
+        if let Err(e) = increment_daily_jobs(state.db.pool(), &org_id, 1).await {
+            tracing::warn!(error = %e, org_id = %org_id, "Failed to increment daily job counter");
+        }
     }
 
     // Publish to Redis with org context for real-time subscribers
@@ -394,12 +412,19 @@ pub async fn stats(
 /// Bulk enqueue multiple jobs
 ///
 /// Now requires authenticated context - previously fell back to "default-org"
+/// SECURITY: Enforces plan limits before creating jobs
 pub async fn bulk_enqueue(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
     ValidatedJson(request): ValidatedJson<crate::models::BulkEnqueueRequest>,
 ) -> AppResult<Json<crate::models::BulkEnqueueResponse>> {
     let org_id = ctx.organization_id;
+    let job_count = request.jobs.len() as u64;
+
+    // Check job limits (daily + active) before creating
+    if let Err(response) = check_job_limits(state.db.pool(), &org_id, job_count).await {
+        return Err(AppError::LimitExceeded(response));
+    }
 
     let now = Utc::now();
     let default_priority = request.default_priority.unwrap_or(0);
@@ -483,10 +508,22 @@ pub async fn bulk_enqueue(
     let failure_count = failed.len();
     let total = success_count + failure_count;
 
-    // Update metrics only after all jobs processed to ensure consistency
+    // Update metrics and usage counters only after all jobs processed
     // Previously metrics were updated per-job, which could leave inconsistent state on partial failure
     if successful_count > 0 {
         state.metrics.jobs_enqueued.inc_by(successful_count);
+
+        // Increment daily job counter for plan limit tracking
+        if let Err(e) =
+            increment_daily_jobs(state.db.pool(), &org_id, successful_count as i32).await
+        {
+            tracing::warn!(
+                error = %e,
+                org_id = %org_id,
+                count = successful_count,
+                "Failed to increment daily job counter"
+            );
+        }
     }
 
     // Publish notification for new jobs with org context
