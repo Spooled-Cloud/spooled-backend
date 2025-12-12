@@ -1,5 +1,6 @@
 //! HTTP handlers for the API
 
+pub mod admin;
 pub mod api_keys;
 pub mod auth;
 pub mod health;

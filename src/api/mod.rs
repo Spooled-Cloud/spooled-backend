@@ -279,10 +279,24 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
         // Apply authentication middleware to all protected routes
         // route_layer runs the middleware for matched routes only
         .route_layer(axum::middleware::from_fn_with_state(
-            state,
+            state.clone(),
             middleware::auth::authenticate_api_key,
         ));
 
-    // Merge public and protected routes
-    public_routes.merge(protected_routes)
+    // Admin routes (require X-Admin-Key authentication)
+    let admin_routes = Router::new()
+        .route("/admin/organizations", get(handlers::admin::list_organizations))
+        .route("/admin/organizations/{id}", get(handlers::admin::get_organization))
+        .route("/admin/organizations/{id}", axum::routing::patch(handlers::admin::update_organization))
+        .route("/admin/organizations/{id}", delete(handlers::admin::delete_organization))
+        .route("/admin/stats", get(handlers::admin::get_platform_stats))
+        .route("/admin/plans", get(handlers::admin::list_plans))
+        // Apply admin authentication middleware
+        .route_layer(axum::middleware::from_fn_with_state(
+            state,
+            middleware::admin_auth::require_admin,
+        ));
+
+    // Merge public, protected, and admin routes
+    public_routes.merge(protected_routes).merge(admin_routes)
 }

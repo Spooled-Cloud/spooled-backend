@@ -1,6 +1,8 @@
 //! API middleware
 
+pub mod admin_auth;
 pub mod auth;
+pub mod limits;
 pub mod rate_limit;
 pub mod security;
 pub mod validation;
@@ -8,6 +10,11 @@ pub mod versioning;
 
 // Re-export commonly used items
 // Some exports are for external use by SDK consumers
+#[allow(unused_imports)]
+pub use limits::{
+    check_job_limits, check_payload_size, check_resource_limit, get_usage_info,
+    increment_daily_jobs, LimitExceededResponse, UsageInfo,
+};
 #[allow(unused_imports)]
 pub use rate_limit::{rate_limit_middleware, RateLimitConfig, RateLimitState};
 #[allow(unused_imports)]

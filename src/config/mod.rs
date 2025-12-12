@@ -3,6 +3,10 @@
 //! This module handles loading and validating configuration from environment
 //! variables and configuration files.
 
+pub mod plans;
+
+pub use plans::{LimitError, PlanLimits};
+
 use std::env;
 
 use anyhow::{Context, Result};
