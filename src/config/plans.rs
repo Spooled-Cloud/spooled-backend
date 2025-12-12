@@ -179,7 +179,12 @@ impl PlanLimits {
 
     /// Get all available plan tiers
     pub fn all_tiers() -> Vec<Self> {
-        vec![Self::free(), Self::starter(), Self::pro(), Self::enterprise()]
+        vec![
+            Self::free(),
+            Self::starter(),
+            Self::pro(),
+            Self::enterprise(),
+        ]
     }
 
     /// Check if a limit is exceeded

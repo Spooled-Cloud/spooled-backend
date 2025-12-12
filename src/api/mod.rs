@@ -286,10 +286,22 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
 
     // Admin routes (require X-Admin-Key authentication)
     let admin_routes = Router::new()
-        .route("/admin/organizations", get(handlers::admin::list_organizations))
-        .route("/admin/organizations/{id}", get(handlers::admin::get_organization))
-        .route("/admin/organizations/{id}", axum::routing::patch(handlers::admin::update_organization))
-        .route("/admin/organizations/{id}", delete(handlers::admin::delete_organization))
+        .route(
+            "/admin/organizations",
+            get(handlers::admin::list_organizations),
+        )
+        .route(
+            "/admin/organizations/{id}",
+            get(handlers::admin::get_organization),
+        )
+        .route(
+            "/admin/organizations/{id}",
+            axum::routing::patch(handlers::admin::update_organization),
+        )
+        .route(
+            "/admin/organizations/{id}",
+            delete(handlers::admin::delete_organization),
+        )
         .route("/admin/stats", get(handlers::admin::get_platform_stats))
         .route("/admin/plans", get(handlers::admin::list_plans))
         // Apply admin authentication middleware

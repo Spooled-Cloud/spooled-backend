@@ -76,13 +76,15 @@ pub struct ResourceCounts {
 }
 
 /// Get current resource counts for an organization
-pub async fn get_resource_counts(pool: &PgPool, org_id: &str) -> Result<ResourceCounts, sqlx::Error> {
-    let row: (i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
-        "SELECT * FROM get_org_resource_counts($1)"
-    )
-    .bind(org_id)
-    .fetch_one(pool)
-    .await?;
+pub async fn get_resource_counts(
+    pool: &PgPool,
+    org_id: &str,
+) -> Result<ResourceCounts, sqlx::Error> {
+    let row: (i64, i64, i64, i64, i64, i64, i64, i64) =
+        sqlx::query_as("SELECT * FROM get_org_resource_counts($1)")
+            .bind(org_id)
+            .fetch_one(pool)
+            .await?;
 
     Ok(ResourceCounts {
         active_jobs: row.0 as u64,
@@ -98,12 +100,10 @@ pub async fn get_resource_counts(pool: &PgPool, org_id: &str) -> Result<Resource
 
 /// Get the plan tier for an organization
 pub async fn get_org_plan_tier(pool: &PgPool, org_id: &str) -> Result<String, sqlx::Error> {
-    let row: (String,) = sqlx::query_as(
-        "SELECT plan_tier FROM organizations WHERE id = $1"
-    )
-    .bind(org_id)
-    .fetch_one(pool)
-    .await?;
+    let row: (String,) = sqlx::query_as("SELECT plan_tier FROM organizations WHERE id = $1")
+        .bind(org_id)
+        .fetch_one(pool)
+        .await?;
 
     Ok(row.0)
 }
@@ -117,12 +117,10 @@ pub async fn check_resource_limit(
     resource: &str,
     adding: u64,
 ) -> Result<(), Response> {
-    let plan_tier = get_org_plan_tier(pool, org_id)
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "Failed to get org plan tier");
-            (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
-        })?;
+    let plan_tier = get_org_plan_tier(pool, org_id).await.map_err(|e| {
+        tracing::error!(error = %e, "Failed to get org plan tier");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
+    })?;
 
     let limits = PlanLimits::for_tier(&plan_tier);
 
@@ -141,12 +139,10 @@ pub async fn check_resource_limit(
         .into_response());
     }
 
-    let counts = get_resource_counts(pool, org_id)
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "Failed to get resource counts");
-            (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
-        })?;
+    let counts = get_resource_counts(pool, org_id).await.map_err(|e| {
+        tracing::error!(error = %e, "Failed to get resource counts");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
+    })?;
 
     let current = match resource {
         "jobs_per_day" => counts.jobs_today,
@@ -166,25 +162,17 @@ pub async fn check_resource_limit(
 }
 
 /// Check job creation limits (both daily and active)
-pub async fn check_job_limits(
-    pool: &PgPool,
-    org_id: &str,
-    job_count: u64,
-) -> Result<(), Response> {
-    let plan_tier = get_org_plan_tier(pool, org_id)
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "Failed to get org plan tier");
-            (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
-        })?;
+pub async fn check_job_limits(pool: &PgPool, org_id: &str, job_count: u64) -> Result<(), Response> {
+    let plan_tier = get_org_plan_tier(pool, org_id).await.map_err(|e| {
+        tracing::error!(error = %e, "Failed to get org plan tier");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
+    })?;
 
     let limits = PlanLimits::for_tier(&plan_tier);
-    let counts = get_resource_counts(pool, org_id)
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "Failed to get resource counts");
-            (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
-        })?;
+    let counts = get_resource_counts(pool, org_id).await.map_err(|e| {
+        tracing::error!(error = %e, "Failed to get resource counts");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
+    })?;
 
     // Check daily limit
     limits
@@ -205,12 +193,10 @@ pub async fn check_payload_size(
     org_id: &str,
     payload_size: usize,
 ) -> Result<(), Response> {
-    let plan_tier = get_org_plan_tier(pool, org_id)
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "Failed to get org plan tier");
-            (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
-        })?;
+    let plan_tier = get_org_plan_tier(pool, org_id).await.map_err(|e| {
+        tracing::error!(error = %e, "Failed to get org plan tier");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
+    })?;
 
     let limits = PlanLimits::for_tier(&plan_tier);
 
@@ -235,14 +221,16 @@ pub async fn check_payload_size(
 /// Increment daily job counter
 ///
 /// Returns the new count
-pub async fn increment_daily_jobs(pool: &PgPool, org_id: &str, count: i32) -> Result<i64, sqlx::Error> {
-    let row: (i64,) = sqlx::query_as(
-        "SELECT increment_daily_jobs($1, $2)"
-    )
-    .bind(org_id)
-    .bind(count)
-    .fetch_one(pool)
-    .await?;
+pub async fn increment_daily_jobs(
+    pool: &PgPool,
+    org_id: &str,
+    count: i32,
+) -> Result<i64, sqlx::Error> {
+    let row: (i64,) = sqlx::query_as("SELECT increment_daily_jobs($1, $2)")
+        .bind(org_id)
+        .bind(count)
+        .fetch_one(pool)
+        .await?;
 
     Ok(row.0)
 }
@@ -289,7 +277,7 @@ pub async fn get_usage_info(pool: &PgPool, org_id: &str) -> Result<UsageInfo, sq
     let plan_tier = get_org_plan_tier(pool, org_id).await?;
     let limits = PlanLimits::for_tier(&plan_tier);
     let counts = get_resource_counts(pool, org_id).await?;
-    
+
     let warning_threshold = limits.warning_threshold();
     let mut warnings = Vec::new();
 
@@ -297,7 +285,7 @@ pub async fn get_usage_info(pool: &PgPool, org_id: &str) -> Result<UsageInfo, sq
     let mut make_item = |resource: &str, current: u64, limit: Option<u64>| -> UsageItem {
         let percentage = limit.map(|l| (current as f64 / l as f64) * 100.0);
         let is_disabled = limits.is_disabled(resource);
-        
+
         if let Some(pct) = percentage {
             if pct >= 100.0 {
                 warnings.push(UsageWarning {
@@ -313,7 +301,7 @@ pub async fn get_usage_info(pool: &PgPool, org_id: &str) -> Result<UsageInfo, sq
                 });
             }
         }
-        
+
         UsageItem {
             current,
             limit,
@@ -326,11 +314,31 @@ pub async fn get_usage_info(pool: &PgPool, org_id: &str) -> Result<UsageInfo, sq
         jobs_today: make_item("jobs_per_day", counts.jobs_today, limits.max_jobs_per_day),
         active_jobs: make_item("active_jobs", counts.active_jobs, limits.max_active_jobs),
         queues: make_item("queues", counts.queues, limits.max_queues.map(|v| v as u64)),
-        workers: make_item("workers", counts.workers, limits.max_workers.map(|v| v as u64)),
-        api_keys: make_item("api_keys", counts.api_keys, limits.max_api_keys.map(|v| v as u64)),
-        schedules: make_item("schedules", counts.schedules, limits.max_schedules.map(|v| v as u64)),
-        workflows: make_item("workflows", counts.workflows, limits.max_workflows.map(|v| v as u64)),
-        webhooks: make_item("webhooks", counts.webhooks, limits.max_webhooks.map(|v| v as u64)),
+        workers: make_item(
+            "workers",
+            counts.workers,
+            limits.max_workers.map(|v| v as u64),
+        ),
+        api_keys: make_item(
+            "api_keys",
+            counts.api_keys,
+            limits.max_api_keys.map(|v| v as u64),
+        ),
+        schedules: make_item(
+            "schedules",
+            counts.schedules,
+            limits.max_schedules.map(|v| v as u64),
+        ),
+        workflows: make_item(
+            "workflows",
+            counts.workflows,
+            limits.max_workflows.map(|v| v as u64),
+        ),
+        webhooks: make_item(
+            "webhooks",
+            counts.webhooks,
+            limits.max_webhooks.map(|v| v as u64),
+        ),
     };
 
     Ok(UsageInfo {

@@ -13,7 +13,9 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::api::middleware::limits::{get_resource_counts, get_usage_info, ResourceCounts, UsageInfo};
+use crate::api::middleware::limits::{
+    get_resource_counts, get_usage_info, ResourceCounts, UsageInfo,
+};
 use crate::api::AppState;
 use crate::config::PlanLimits;
 use crate::error::{AppError, AppResult};
@@ -101,7 +103,11 @@ pub async fn list_organizations(
         "name" | "slug" | "plan_tier" | "created_at" | "updated_at" => sort_by,
         _ => "created_at",
     };
-    let sort_order = if sort_order.to_lowercase() == "asc" { "ASC" } else { "DESC" };
+    let sort_order = if sort_order.to_lowercase() == "asc" {
+        "ASC"
+    } else {
+        "DESC"
+    };
 
     // Build query with optional filters
     let mut sql = String::from("SELECT * FROM organizations WHERE 1=1");
@@ -133,9 +139,7 @@ pub async fn list_organizations(
         .await?;
 
     // Get organizations
-    let orgs: Vec<Organization> = sqlx::query_as(&sql)
-        .fetch_all(state.db.pool())
-        .await?;
+    let orgs: Vec<Organization> = sqlx::query_as(&sql).fetch_all(state.db.pool()).await?;
 
     // Fetch usage for each org (in parallel would be better, but keeping simple for now)
     let mut admin_orgs = Vec::with_capacity(orgs.len());
@@ -199,15 +203,14 @@ pub async fn get_organization(
 
     let usage_info = get_usage_info(state.db.pool(), &id).await?;
 
-    let api_keys_count: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM api_keys WHERE organization_id = $1"
-    )
-    .bind(&id)
-    .fetch_one(state.db.pool())
-    .await?;
+    let api_keys_count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM api_keys WHERE organization_id = $1")
+            .bind(&id)
+            .fetch_one(state.db.pool())
+            .await?;
 
     let total_jobs: (i64,) = sqlx::query_as(
-        "SELECT COALESCE(total_jobs_created, 0) FROM organization_usage WHERE organization_id = $1"
+        "SELECT COALESCE(total_jobs_created, 0) FROM organization_usage WHERE organization_id = $1",
     )
     .bind(&id)
     .fetch_optional(state.db.pool())
@@ -314,10 +317,11 @@ pub async fn delete_organization(
     Query(query): Query<DeleteOrgQuery>,
 ) -> AppResult<StatusCode> {
     // Check org exists
-    let existing: Option<Organization> = sqlx::query_as("SELECT * FROM organizations WHERE id = $1")
-        .bind(&id)
-        .fetch_optional(state.db.pool())
-        .await?;
+    let existing: Option<Organization> =
+        sqlx::query_as("SELECT * FROM organizations WHERE id = $1")
+            .bind(&id)
+            .fetch_optional(state.db.pool())
+            .await?;
 
     if existing.is_none() {
         return Err(AppError::NotFound(format!("Organization {} not found", id)));
@@ -333,10 +337,12 @@ pub async fn delete_organization(
         tracing::warn!(org_id = %id, "Organization hard deleted by admin");
     } else {
         // Soft delete - just mark plan as "deleted" (could add a status column)
-        sqlx::query("UPDATE organizations SET plan_tier = 'deleted', updated_at = NOW() WHERE id = $1")
-            .bind(&id)
-            .execute(state.db.pool())
-            .await?;
+        sqlx::query(
+            "UPDATE organizations SET plan_tier = 'deleted', updated_at = NOW() WHERE id = $1",
+        )
+        .bind(&id)
+        .execute(state.db.pool())
+        .await?;
 
         tracing::info!(org_id = %id, "Organization soft deleted by admin");
     }
@@ -402,28 +408,25 @@ pub struct SystemStats {
 /// Get platform-wide statistics
 ///
 /// GET /api/v1/admin/stats
-pub async fn get_platform_stats(
-    State(state): State<AppState>,
-) -> AppResult<Json<PlatformStats>> {
+pub async fn get_platform_stats(State(state): State<AppState>) -> AppResult<Json<PlatformStats>> {
     // Organization stats
     let total_orgs: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM organizations")
         .fetch_one(state.db.pool())
         .await?;
 
     let orgs_by_plan: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT plan_tier, COUNT(*) FROM organizations GROUP BY plan_tier ORDER BY COUNT(*) DESC"
+        "SELECT plan_tier, COUNT(*) FROM organizations GROUP BY plan_tier ORDER BY COUNT(*) DESC",
     )
     .fetch_all(state.db.pool())
     .await?;
 
-    let orgs_today: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM organizations WHERE created_at > CURRENT_DATE"
-    )
-    .fetch_one(state.db.pool())
-    .await?;
+    let orgs_today: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM organizations WHERE created_at > CURRENT_DATE")
+            .fetch_one(state.db.pool())
+            .await?;
 
     let orgs_week: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM organizations WHERE created_at > CURRENT_DATE - INTERVAL '7 days'"
+        "SELECT COUNT(*) FROM organizations WHERE created_at > CURRENT_DATE - INTERVAL '7 days'",
     )
     .fetch_one(state.db.pool())
     .await?;
@@ -452,7 +455,7 @@ pub async fn get_platform_stats(
             COUNT(*) FILTER (WHERE status = 'degraded')
         FROM workers
         WHERE last_heartbeat > NOW() - INTERVAL '1 minute'
-        "#
+        "#,
     )
     .fetch_one(state.db.pool())
     .await?;
