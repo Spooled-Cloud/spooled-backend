@@ -75,8 +75,8 @@ pub async fn create(
     validate_events(&request.events)?;
 
     // Validate URL scheme (only HTTPS in production)
-    let parsed_url =
-        url::Url::parse(&request.url).map_err(|e| AppError::Validation(format!("Invalid URL: {}", e)))?;
+    let parsed_url = url::Url::parse(&request.url)
+        .map_err(|e| AppError::Validation(format!("Invalid URL: {}", e)))?;
 
     if parsed_url.scheme() != "https" && parsed_url.scheme() != "http" {
         return Err(AppError::Validation(
@@ -180,7 +180,8 @@ pub async fn update(
     .fetch_optional(state.db.pool())
     .await?;
 
-    let existing = existing.ok_or_else(|| AppError::NotFound(format!("Webhook {} not found", id)))?;
+    let existing =
+        existing.ok_or_else(|| AppError::NotFound(format!("Webhook {} not found", id)))?;
 
     // Build update query dynamically
     let name = request.name.unwrap_or(existing.name);

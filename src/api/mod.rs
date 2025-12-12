@@ -249,10 +249,7 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
         )
         .route("/schedules/{id}/history", get(handlers::schedules::history))
         // Outgoing Webhooks (notification configuration)
-        .route(
-            "/outgoing-webhooks",
-            get(handlers::outgoing_webhooks::list),
-        )
+        .route("/outgoing-webhooks", get(handlers::outgoing_webhooks::list))
         .route(
             "/outgoing-webhooks",
             post(handlers::outgoing_webhooks::create),
