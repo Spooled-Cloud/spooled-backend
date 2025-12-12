@@ -113,12 +113,11 @@ pub async fn get_org_plan_and_limits(
     pool: &PgPool,
     org_id: &str,
 ) -> Result<(String, Option<serde_json::Value>), sqlx::Error> {
-    let row: (String, Option<serde_json::Value>) = sqlx::query_as(
-        "SELECT plan_tier, custom_limits FROM organizations WHERE id = $1",
-    )
-    .bind(org_id)
-    .fetch_one(pool)
-    .await?;
+    let row: (String, Option<serde_json::Value>) =
+        sqlx::query_as("SELECT plan_tier, custom_limits FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .fetch_one(pool)
+            .await?;
 
     Ok(row)
 }

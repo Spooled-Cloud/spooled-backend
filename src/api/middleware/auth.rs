@@ -106,10 +106,7 @@ async fn authenticate_jwt_token(
 
     // Verify it's an access token (not a refresh token)
     if token_data.claims.token_type != "access" {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            "Invalid token type".to_string(),
-        ));
+        return Err((StatusCode::UNAUTHORIZED, "Invalid token type".to_string()));
     }
 
     // Check if token is blacklisted (logged out)
@@ -125,19 +122,18 @@ async fn authenticate_jwt_token(
     }
 
     // Verify the API key is still active
-    let api_key_active: Option<(bool, Option<i32>)> = sqlx::query_as(
-        "SELECT is_active, rate_limit FROM api_keys WHERE id = $1",
-    )
-    .bind(&token_data.claims.api_key_id)
-    .fetch_optional(state.db.pool())
-    .await
-    .map_err(|e| {
-        tracing::error!(error = %e, "Failed to check API key status");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Database error".to_string(),
-        )
-    })?;
+    let api_key_active: Option<(bool, Option<i32>)> =
+        sqlx::query_as("SELECT is_active, rate_limit FROM api_keys WHERE id = $1")
+            .bind(&token_data.claims.api_key_id)
+            .fetch_optional(state.db.pool())
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "Failed to check API key status");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Database error".to_string(),
+                )
+            })?;
 
     match api_key_active {
         Some((true, rate_limit)) => {
@@ -164,10 +160,7 @@ async fn authenticate_jwt_token(
                 api_key_id = %token_data.claims.api_key_id,
                 "JWT token references deleted API key"
             );
-            Err((
-                StatusCode::UNAUTHORIZED,
-                "API key not found".to_string(),
-            ))
+            Err((StatusCode::UNAUTHORIZED, "API key not found".to_string()))
         }
     }
 }

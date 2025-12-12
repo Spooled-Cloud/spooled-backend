@@ -25,24 +25,52 @@ impl TestDatabase {
             .await
             .expect("Failed to start PostgreSQL container");
 
+        let host = container
+            .get_host()
+            .await
+            .expect("Failed to get PostgreSQL host");
+
         let host_port = container
             .get_host_port_ipv4(5432)
             .await
             .expect("Failed to get PostgreSQL port");
 
         let connection_string = format!(
-            "postgres://postgres:postgres@127.0.0.1:{}/postgres",
-            host_port
+            "postgres://postgres:postgres@{}:{}/postgres",
+            host, host_port
         );
 
-        // Wait for database to be ready
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        // Wait for database to be ready (robust retry instead of fixed sleep)
+        let pool = {
+            let mut last_err: Option<sqlx::Error> = None;
+            let started = tokio::time::Instant::now();
+            // First-run container init can be slow (image pull, DB init).
+            let timeout = tokio::time::Duration::from_secs(90);
+            let mut delay = tokio::time::Duration::from_millis(200);
 
-        let pool = PgPoolOptions::new()
-            .max_connections(5)
-            .connect(&connection_string)
-            .await
-            .expect("Failed to connect to PostgreSQL");
+            loop {
+                match PgPoolOptions::new()
+                    .max_connections(5)
+                    .acquire_timeout(tokio::time::Duration::from_secs(10))
+                    .connect(&connection_string)
+                    .await
+                {
+                    Ok(pool) => break pool,
+                    Err(e) => {
+                        last_err = Some(e);
+                        if started.elapsed() >= timeout {
+                            panic!(
+                                "Failed to connect to PostgreSQL after {:?}: {:?}",
+                                timeout, last_err
+                            );
+                        }
+                        tokio::time::sleep(delay).await;
+                        // Cap backoff at 2s
+                        delay = std::cmp::min(delay * 2, tokio::time::Duration::from_secs(2));
+                    }
+                }
+            }
+        };
 
         // Run migrations
         sqlx::migrate!("./migrations")
