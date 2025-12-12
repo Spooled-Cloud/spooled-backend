@@ -12,9 +12,8 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use serde::Serialize;
-// sha2 used in tests
 use hex;
+use serde::Serialize;
 #[cfg(test)]
 use sha2::{Digest, Sha256}; // For hex encoding hash
 

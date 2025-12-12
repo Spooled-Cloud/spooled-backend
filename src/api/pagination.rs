@@ -198,7 +198,7 @@ mod tests {
     #[test]
     fn test_cursor_encode_decode() {
         let now = Utc::now();
-        let cursor = Cursor::new(now, "job-123".to_string());
+        let cursor = Cursor::new_with_org(now, "job-123".to_string(), "org-123".to_string());
 
         let encoded = cursor.encode();
         let decoded = Cursor::decode(&encoded).unwrap();
