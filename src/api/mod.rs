@@ -151,14 +151,15 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
             post(handlers::webhooks::custom),
         )
         // Organization creation is public (for onboarding)
-        .route("/organizations", post(handlers::organizations::create));
+        .route("/organizations", post(handlers::organizations::create))
+        // Auth/me uses JWT validation internally (not API key middleware)
+        .route("/auth/me", get(handlers::auth::me));
 
     // Protected routes (require API key authentication)
     // Auth middleware is applied via route_layer which runs AFTER state extraction
     let protected_routes = Router::new()
         // Auth endpoints that need context
         .route("/auth/logout", post(handlers::auth::logout))
-        .route("/auth/me", get(handlers::auth::me))
         // Dashboard
         .route("/dashboard", get(handlers::health::dashboard_data))
         // Organizations (except create which is public)
