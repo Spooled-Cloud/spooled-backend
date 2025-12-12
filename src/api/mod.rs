@@ -85,6 +85,8 @@ pub fn router(state: AppState) -> Router {
                 axum::http::header::CONTENT_TYPE,
                 axum::http::header::HeaderName::from_static("x-api-key"),
                 axum::http::header::HeaderName::from_static("x-request-id"),
+                axum::http::header::HeaderName::from_static("x-admin-key"),
+                axum::http::header::HeaderName::from_static("x-organization-id"),
             ])
             // In production, origins should come from config
             // For now, we use permissive but not "Any" - actual origins should be configured
