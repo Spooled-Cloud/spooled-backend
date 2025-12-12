@@ -248,6 +248,35 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
             post(handlers::schedules::trigger),
         )
         .route("/schedules/{id}/history", get(handlers::schedules::history))
+        // Outgoing Webhooks (notification configuration)
+        .route(
+            "/outgoing-webhooks",
+            get(handlers::outgoing_webhooks::list),
+        )
+        .route(
+            "/outgoing-webhooks",
+            post(handlers::outgoing_webhooks::create),
+        )
+        .route(
+            "/outgoing-webhooks/{id}",
+            get(handlers::outgoing_webhooks::get),
+        )
+        .route(
+            "/outgoing-webhooks/{id}",
+            put(handlers::outgoing_webhooks::update),
+        )
+        .route(
+            "/outgoing-webhooks/{id}",
+            delete(handlers::outgoing_webhooks::delete),
+        )
+        .route(
+            "/outgoing-webhooks/{id}/test",
+            post(handlers::outgoing_webhooks::test),
+        )
+        .route(
+            "/outgoing-webhooks/{id}/deliveries",
+            get(handlers::outgoing_webhooks::deliveries),
+        )
         // Apply authentication middleware to all protected routes
         // route_layer runs the middleware for matched routes only
         .route_layer(axum::middleware::from_fn_with_state(

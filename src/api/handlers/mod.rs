@@ -6,6 +6,7 @@ pub mod health;
 pub mod jobs;
 pub mod metrics;
 pub mod organizations;
+pub mod outgoing_webhooks;
 pub mod queues;
 pub mod realtime;
 pub mod schedules;

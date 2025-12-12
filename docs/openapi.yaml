@@ -80,6 +80,8 @@ tags:
     description: Workflow and job dependency management
   - name: Schedules
     description: Cron-based recurring job schedules
+  - name: Outgoing Webhooks
+    description: Configure webhooks for receiving notifications when events occur
   - name: Real-time
     description: WebSocket and Server-Sent Events for real-time updates
 
@@ -1610,6 +1612,141 @@ paths:
         '404':
           description: Schedule not found
 
+  # Outgoing Webhook Endpoints
+  /api/v1/outgoing-webhooks:
+    get:
+      tags: [Outgoing Webhooks]
+      summary: List outgoing webhooks
+      description: List all configured outgoing webhooks for the organization
+      operationId: listOutgoingWebhooks
+      responses:
+        '200':
+          description: List of outgoing webhooks
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/OutgoingWebhook'
+    post:
+      tags: [Outgoing Webhooks]
+      summary: Create outgoing webhook
+      description: |
+        Create a new outgoing webhook configuration.
+        The webhook will be called when any of the subscribed events occur.
+      operationId: createOutgoingWebhook
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOutgoingWebhookRequest'
+      responses:
+        '201':
+          description: Webhook created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OutgoingWebhook'
+        '400':
+          description: Invalid request
+
+  /api/v1/outgoing-webhooks/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Webhook ID
+    get:
+      tags: [Outgoing Webhooks]
+      summary: Get outgoing webhook
+      operationId: getOutgoingWebhook
+      responses:
+        '200':
+          description: Webhook details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OutgoingWebhook'
+        '404':
+          description: Webhook not found
+    put:
+      tags: [Outgoing Webhooks]
+      summary: Update outgoing webhook
+      operationId: updateOutgoingWebhook
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateOutgoingWebhookRequest'
+      responses:
+        '200':
+          description: Webhook updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OutgoingWebhook'
+        '404':
+          description: Webhook not found
+    delete:
+      tags: [Outgoing Webhooks]
+      summary: Delete outgoing webhook
+      operationId: deleteOutgoingWebhook
+      responses:
+        '204':
+          description: Webhook deleted
+        '404':
+          description: Webhook not found
+
+  /api/v1/outgoing-webhooks/{id}/test:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      tags: [Outgoing Webhooks]
+      summary: Test outgoing webhook
+      description: Send a test payload to the webhook URL to verify connectivity
+      operationId: testOutgoingWebhook
+      responses:
+        '200':
+          description: Test result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TestWebhookResponse'
+        '404':
+          description: Webhook not found
+
+  /api/v1/outgoing-webhooks/{id}/deliveries:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      tags: [Outgoing Webhooks]
+      summary: Get webhook delivery history
+      description: Get the delivery history for an outgoing webhook
+      operationId: getOutgoingWebhookDeliveries
+      responses:
+        '200':
+          description: Delivery history
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/OutgoingWebhookDelivery'
+        '404':
+          description: Webhook not found
+
 components:
   securitySchemes:
     bearerAuth:
@@ -2909,6 +3046,152 @@ components:
             - error
         data:
           type: object
+
+    # Outgoing Webhook Schemas
+    OutgoingWebhook:
+      type: object
+      required: [id, organization_id, name, url, events, enabled, failure_count, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        organization_id:
+          type: string
+        name:
+          type: string
+        url:
+          type: string
+          format: uri
+        events:
+          type: array
+          items:
+            type: string
+            enum:
+              - job.created
+              - job.started
+              - job.completed
+              - job.failed
+              - job.cancelled
+              - queue.paused
+              - queue.resumed
+              - worker.registered
+              - worker.deregistered
+              - schedule.triggered
+        enabled:
+          type: boolean
+        failure_count:
+          type: integer
+        last_triggered_at:
+          type: string
+          format: date-time
+        last_status:
+          type: string
+          enum: [success, failed]
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    CreateOutgoingWebhookRequest:
+      type: object
+      required: [name, url, events]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+        url:
+          type: string
+          format: uri
+          maxLength: 2048
+        events:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            enum:
+              - job.created
+              - job.started
+              - job.completed
+              - job.failed
+              - job.cancelled
+              - queue.paused
+              - queue.resumed
+              - worker.registered
+              - worker.deregistered
+              - schedule.triggered
+        secret:
+          type: string
+          maxLength: 255
+          description: Optional HMAC secret for signing webhook payloads
+        enabled:
+          type: boolean
+          default: true
+
+    UpdateOutgoingWebhookRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+        url:
+          type: string
+          format: uri
+          maxLength: 2048
+        events:
+          type: array
+          items:
+            type: string
+        secret:
+          type: string
+          maxLength: 255
+        enabled:
+          type: boolean
+
+    TestWebhookResponse:
+      type: object
+      required: [success, response_time_ms]
+      properties:
+        success:
+          type: boolean
+        status_code:
+          type: integer
+        response_time_ms:
+          type: integer
+        error:
+          type: string
+
+    OutgoingWebhookDelivery:
+      type: object
+      required: [id, webhook_id, event, payload, status, attempts, created_at]
+      properties:
+        id:
+          type: string
+        webhook_id:
+          type: string
+        event:
+          type: string
+        payload:
+          type: object
+        status:
+          type: string
+          enum: [pending, success, failed]
+        status_code:
+          type: integer
+        response_body:
+          type: string
+        error:
+          type: string
+        attempts:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        delivered_at:
+          type: string
+          format: date-time
 
 security:
   - bearerAuth: []
