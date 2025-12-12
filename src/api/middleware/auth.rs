@@ -132,12 +132,9 @@ pub async fn authenticate_api_key(
 
 /// Fetch API key from database
 ///
-/// Previously returned ANY active key instead of the specific token's key.
-/// Now properly looks up by key_prefix (first 8 chars) and verifies with bcrypt.
-///
-/// PERFORMANCE FIX: Now uses key_prefix for indexed lookup instead of scanning
-/// all active keys. This prevents DoS attacks where an attacker could slow down
-/// authentication by creating many API keys (each requiring bcrypt verification).
+/// Uses key_prefix (first 8 chars) for indexed lookup before bcrypt verification.
+/// This prevents DoS attacks where an attacker could slow down authentication
+/// by creating many API keys (each requiring bcrypt verification).
 /// With key_prefix filtering, we only verify a small subset of keys (typically 1-2).
 async fn fetch_api_key(
     state: &AppState,

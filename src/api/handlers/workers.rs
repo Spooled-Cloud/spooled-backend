@@ -73,7 +73,6 @@ pub async fn register(
     }
 
     // Check if queue config exists for this org (optional - queue can be auto-created)
-    // FIX: Table name was wrong (queue_configs -> queue_config)
     let queue_exists: Option<(i64,)> = sqlx::query_as(
         "SELECT COUNT(*) FROM queue_config WHERE organization_id = $1 AND queue_name = $2",
     )

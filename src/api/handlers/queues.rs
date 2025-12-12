@@ -157,8 +157,7 @@ pub async fn stats(
     // Validate queue name
     validate_queue_name_param(&name)?;
 
-    // FIX: Now checks both legacy queue_name AND queue_names array for worker count
-    // Previously only checked queue_name, missing workers using the newer queue_names array
+    // Check both legacy queue_name AND queue_names array for accurate worker count
     let stats = sqlx::query_as::<_, (i64, i64, i64, i64, Option<f64>, Option<i64>, i64)>(
         r#"
         SELECT 

@@ -107,11 +107,14 @@ cargo test
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/api/v1/admin/organizations` | List all organizations |
+| `POST` | `/api/v1/admin/organizations` | Create organization with plan tier |
 | `GET` | `/api/v1/admin/organizations/{id}` | Get organization details |
-| `PUT` | `/api/v1/admin/organizations/{id}` | Update organization (plan, status) |
-| `DELETE` | `/api/v1/admin/organizations/{id}` | Delete organization |
+| `PATCH` | `/api/v1/admin/organizations/{id}` | Update organization (plan, status) |
+| `DELETE` | `/api/v1/admin/organizations/{id}` | Delete organization (soft or hard) |
+| `POST` | `/api/v1/admin/organizations/{id}/api-keys` | Create API key for organization |
+| `POST` | `/api/v1/admin/organizations/{id}/reset-usage` | Reset daily usage counters |
 | `GET` | `/api/v1/admin/stats` | Platform-wide statistics |
-| `GET` | `/api/v1/admin/plans` | List available plans |
+| `GET` | `/api/v1/admin/plans` | List available plans with limits |
 
 ### Create Your First Job
 
