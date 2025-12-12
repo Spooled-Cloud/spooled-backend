@@ -52,8 +52,10 @@ curl http://localhost:8080/health
 |----------|----------|---------|-------------|
 | `DATABASE_URL` | ✅ | - | PostgreSQL connection string |
 | `JWT_SECRET` | ✅ | - | 32+ char secret for JWT signing |
+| `ADMIN_API_KEY` | ❌ | - | Key for admin portal access |
 | `REDIS_URL` | ❌ | `redis://localhost:6379` | Redis for pub/sub & caching |
 | `RUST_ENV` | ❌ | `development` | `development`/`staging`/`production` |
+| `REGISTRATION_MODE` | ❌ | `open` | `open`/`closed` - controls public registration |
 | `PORT` | ❌ | `8080` | API server port |
 | `METRICS_PORT` | ❌ | `9090` | Prometheus metrics port |
 | `GRPC_PORT` | ❌ | `50051` | gRPC port for workers |
@@ -89,7 +91,8 @@ cargo test
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/health` | Health check |
-| `POST` | `/api/v1/organizations` | Create organization |
+| `POST` | `/api/v1/organizations` | Create organization (returns initial API key) |
+| `GET` | `/api/v1/organizations/usage` | Get plan usage info |
 | `POST` | `/api/v1/jobs` | Create a job |
 | `GET` | `/api/v1/jobs` | List jobs |
 | `POST` | `/api/v1/jobs/bulk` | Bulk enqueue jobs |
@@ -99,21 +102,29 @@ cargo test
 | `POST` | `/api/v1/webhooks/{org}/stripe` | Stripe webhook |
 | `GET` | `/api/v1/ws` | WebSocket for real-time |
 
+#### Admin API (requires `X-Admin-Key` header)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/v1/admin/organizations` | List all organizations |
+| `GET` | `/api/v1/admin/organizations/{id}` | Get organization details |
+| `PUT` | `/api/v1/admin/organizations/{id}` | Update organization (plan, status) |
+| `DELETE` | `/api/v1/admin/organizations/{id}` | Delete organization |
+| `GET` | `/api/v1/admin/stats` | Platform-wide statistics |
+| `GET` | `/api/v1/admin/plans` | List available plans |
+
 ### Create Your First Job
 
 ```bash
-# 1. Create an organization
-ORG=$(curl -s -X POST http://localhost:8080/api/v1/organizations \
+# 1. Create an organization (returns initial API key - save it!)
+RESPONSE=$(curl -s -X POST http://localhost:8080/api/v1/organizations \
   -H "Content-Type: application/json" \
-  -d '{"name": "My Company", "slug": "my-company"}' | jq -r '.id')
+  -d '{"name": "My Company", "slug": "my-company"}')
+echo "$RESPONSE"
+# Save the api_key from the response - it's only shown once!
+API_KEY=$(echo "$RESPONSE" | jq -r '.api_key')
 
-# 2. Create an API key (store this - shown only once!)
-API_KEY=$(curl -s -X POST http://localhost:8080/api/v1/api-keys \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer bootstrap" \
-  -d "{\"name\": \"Production\", \"organization_id\": \"$ORG\"}" | jq -r '.key')
-
-# 3. Create a job
+# 2. Create a job using the API key
 curl -X POST http://localhost:8080/api/v1/jobs \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $API_KEY" \

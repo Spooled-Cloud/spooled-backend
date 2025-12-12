@@ -32,15 +32,25 @@ info:
     
     ## Rate Limiting
     
-    Rate limits are applied per API key. Default limits:
-    - Free tier: 100 requests/second
-    - Pro tier: 1000 requests/second
-    - Enterprise: Custom limits
+    Rate limits are applied per API key based on plan tier:
+    - Free tier: 5 requests/second (burst: 10)
+    - Starter tier: 25 requests/second (burst: 50)
+    - Pro tier: 100 requests/second (burst: 200)
+    - Enterprise: 500 requests/second (burst: 1000)
     
     Rate limit headers included in all responses:
     - `X-RateLimit-Limit`: Maximum requests per window
     - `X-RateLimit-Remaining`: Remaining requests in current window
     - `X-RateLimit-Reset`: Unix timestamp when the window resets
+    
+    ## Plan Limits
+    
+    Each plan tier has resource limits:
+    - Jobs per day: Free (1,000), Starter (10,000), Pro (100,000), Enterprise (unlimited)
+    - Active jobs: Free (10), Starter (500), Pro (5,000), Enterprise (unlimited)
+    - Queues: Free (2), Starter (10), Pro (50), Enterprise (unlimited)
+    - Workers: Free (1), Starter (5), Pro (25), Enterprise (unlimited)
+    - Workflows: Free (disabled), Starter (5), Pro (50), Enterprise (unlimited)
     
   version: 1.0.0
   license:
@@ -84,6 +94,8 @@ tags:
     description: Configure webhooks for receiving notifications when events occur
   - name: Real-time
     description: WebSocket and Server-Sent Events for real-time updates
+  - name: Admin
+    description: Platform administration (requires X-Admin-Key header)
 
 paths:
   /health:
@@ -377,6 +389,163 @@ paths:
           description: Organization deleted
         '404':
           description: Organization not found
+
+  /api/v1/organizations/usage:
+    get:
+      tags: [Organizations]
+      summary: Get organization usage
+      description: |
+        Returns current resource usage and plan limits for the authenticated organization.
+        Includes daily job counts, resource counts, and warnings for approaching limits.
+      operationId: getOrganizationUsage
+      responses:
+        '200':
+          description: Usage information
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageInfo'
+
+  # Admin Endpoints
+  /api/v1/admin/organizations:
+    get:
+      tags: [Admin]
+      summary: List all organizations
+      description: |
+        List all organizations on the platform. Requires admin authentication via X-Admin-Key header.
+      operationId: adminListOrganizations
+      security:
+        - AdminKeyAuth: []
+      parameters:
+        - name: plan_tier
+          in: query
+          schema:
+            type: string
+            enum: [free, starter, pro, enterprise]
+          description: Filter by plan tier
+        - name: search
+          in: query
+          schema:
+            type: string
+          description: Search by name or slug
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: List of organizations
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminOrganizationList'
+        '401':
+          description: Invalid or missing admin key
+
+  /api/v1/admin/organizations/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Organization ID
+    get:
+      tags: [Admin]
+      summary: Get organization details
+      description: Get detailed information about an organization including usage statistics
+      operationId: adminGetOrganization
+      security:
+        - AdminKeyAuth: []
+      responses:
+        '200':
+          description: Organization details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminOrganizationDetail'
+        '404':
+          description: Organization not found
+    put:
+      tags: [Admin]
+      summary: Update organization
+      description: Update organization settings including plan tier
+      operationId: adminUpdateOrganization
+      security:
+        - AdminKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminUpdateOrganizationRequest'
+      responses:
+        '200':
+          description: Organization updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Organization'
+    delete:
+      tags: [Admin]
+      summary: Delete organization
+      description: |
+        Delete an organization and all its data. Use `hard=true` for permanent deletion.
+      operationId: adminDeleteOrganization
+      security:
+        - AdminKeyAuth: []
+      parameters:
+        - name: hard
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: Permanent deletion (cannot be undone)
+      responses:
+        '204':
+          description: Organization deleted
+        '404':
+          description: Organization not found
+
+  /api/v1/admin/stats:
+    get:
+      tags: [Admin]
+      summary: Get platform statistics
+      description: Get platform-wide statistics
+      operationId: adminGetStats
+      security:
+        - AdminKeyAuth: []
+      responses:
+        '200':
+          description: Platform statistics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlatformStats'
+
+  /api/v1/admin/plans:
+    get:
+      tags: [Admin]
+      summary: List available plans
+      description: Get all available plan tiers with their limits
+      operationId: adminListPlans
+      security:
+        - AdminKeyAuth: []
+      responses:
+        '200':
+          description: List of plans
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/PlanLimits'
 
   /api/v1/jobs:
     get:
@@ -1753,6 +1922,11 @@ components:
       type: http
       scheme: bearer
       description: API key in Bearer token format
+    AdminKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Admin-Key
+      description: Admin API key for platform administration
 
   schemas:
     HealthResponse:
@@ -3192,6 +3366,225 @@ components:
         delivered_at:
           type: string
           format: date-time
+
+    # Usage and Admin Schemas
+    UsageInfo:
+      type: object
+      required: [plan, limits, usage, warnings]
+      properties:
+        plan:
+          type: string
+          enum: [free, starter, pro, enterprise]
+        limits:
+          $ref: '#/components/schemas/PlanLimits'
+        usage:
+          $ref: '#/components/schemas/ResourceUsage'
+        warnings:
+          type: array
+          items:
+            $ref: '#/components/schemas/UsageWarning'
+
+    PlanLimits:
+      type: object
+      properties:
+        tier:
+          type: string
+        display_name:
+          type: string
+        max_jobs_per_day:
+          type: integer
+          nullable: true
+        max_active_jobs:
+          type: integer
+          nullable: true
+        max_queues:
+          type: integer
+          nullable: true
+        max_workers:
+          type: integer
+          nullable: true
+        max_api_keys:
+          type: integer
+          nullable: true
+        max_schedules:
+          type: integer
+          nullable: true
+        max_workflows:
+          type: integer
+          nullable: true
+        max_webhooks:
+          type: integer
+          nullable: true
+        max_payload_size_bytes:
+          type: integer
+        rate_limit_requests_per_second:
+          type: integer
+        rate_limit_burst:
+          type: integer
+        job_retention_days:
+          type: integer
+        history_retention_days:
+          type: integer
+
+    ResourceUsage:
+      type: object
+      properties:
+        jobs_today:
+          $ref: '#/components/schemas/UsageItem'
+        active_jobs:
+          $ref: '#/components/schemas/UsageItem'
+        queues:
+          $ref: '#/components/schemas/UsageItem'
+        workers:
+          $ref: '#/components/schemas/UsageItem'
+        api_keys:
+          $ref: '#/components/schemas/UsageItem'
+        schedules:
+          $ref: '#/components/schemas/UsageItem'
+        workflows:
+          $ref: '#/components/schemas/UsageItem'
+        webhooks:
+          $ref: '#/components/schemas/UsageItem'
+
+    UsageItem:
+      type: object
+      properties:
+        current:
+          type: integer
+        limit:
+          type: integer
+          nullable: true
+        percentage:
+          type: number
+          nullable: true
+
+    UsageWarning:
+      type: object
+      properties:
+        resource:
+          type: string
+        message:
+          type: string
+        severity:
+          type: string
+          enum: [warning, critical]
+        current:
+          type: integer
+        limit:
+          type: integer
+
+    AdminOrganizationList:
+      type: object
+      required: [organizations, total, limit, offset]
+      properties:
+        organizations:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminOrganizationSummary'
+        total:
+          type: integer
+        limit:
+          type: integer
+        offset:
+          type: integer
+
+    AdminOrganizationSummary:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        slug:
+          type: string
+        plan_tier:
+          type: string
+        is_active:
+          type: boolean
+        jobs_today:
+          type: integer
+        active_jobs:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+
+    AdminOrganizationDetail:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        slug:
+          type: string
+        plan_tier:
+          type: string
+        billing_email:
+          type: string
+        is_active:
+          type: boolean
+        settings:
+          type: object
+        usage:
+          $ref: '#/components/schemas/ResourceUsage'
+        resource_counts:
+          type: object
+          properties:
+            queues:
+              type: integer
+            workers:
+              type: integer
+            api_keys:
+              type: integer
+            schedules:
+              type: integer
+            workflows:
+              type: integer
+            webhooks:
+              type: integer
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    AdminUpdateOrganizationRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        plan_tier:
+          type: string
+          enum: [free, starter, pro, enterprise]
+        is_active:
+          type: boolean
+        billing_email:
+          type: string
+          format: email
+        settings:
+          type: object
+
+    PlatformStats:
+      type: object
+      properties:
+        total_organizations:
+          type: integer
+        active_organizations:
+          type: integer
+        total_jobs_24h:
+          type: integer
+        completed_jobs_24h:
+          type: integer
+        failed_jobs_24h:
+          type: integer
+        active_workers:
+          type: integer
+        organizations_by_plan:
+          type: object
+          additionalProperties:
+            type: integer
 
 security:
   - bearerAuth: []

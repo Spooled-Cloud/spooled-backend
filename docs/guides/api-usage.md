@@ -737,11 +737,63 @@ Retry-After: 60
 5. **Handle Webhooks** - Use completion webhooks for async flows
 6. **Implement Circuit Breakers** - Handle downstream failures gracefully
 
+## Usage & Plan Limits
+
+### Get Current Usage
+
+```bash
+GET /api/v1/organizations/usage
+Authorization: Bearer <token>
+```
+
+Response:
+```json
+{
+  "plan": "free",
+  "limits": {
+    "tier": "free",
+    "display_name": "Free",
+    "max_jobs_per_day": 1000,
+    "max_active_jobs": 10,
+    "max_queues": 2,
+    "max_workers": 1,
+    "max_api_keys": 2,
+    "max_schedules": 1,
+    "max_workflows": 0,
+    "max_webhooks": 1
+  },
+  "usage": {
+    "jobs_today": {"current": 150, "limit": 1000, "percentage": 15.0},
+    "active_jobs": {"current": 5, "limit": 10, "percentage": 50.0},
+    "queues": {"current": 1, "limit": 2, "percentage": 50.0}
+  },
+  "warnings": []
+}
+```
+
+### Plan Limits
+
+| Resource | Free | Starter | Pro | Enterprise |
+|----------|------|---------|-----|------------|
+| Jobs/day | 1,000 | 10,000 | 100,000 | Unlimited |
+| Active jobs | 10 | 500 | 5,000 | Unlimited |
+| Queues | 2 | 10 | 50 | Unlimited |
+| Workers | 1 | 5 | 25 | Unlimited |
+| API keys | 2 | 10 | 50 | Unlimited |
+| Schedules | 1 | 25 | 100 | Unlimited |
+| Workflows | ❌ | 5 | 50 | Unlimited |
+| Webhooks | 1 | 10 | 50 | Unlimited |
+| Payload size | 64KB | 256KB | 1MB | 5MB |
+| Job retention | 3 days | 14 days | 30 days | 90 days |
+
+---
+
 ## Rate Limits
 
 | Tier | Requests/second | Burst |
 |------|-----------------|-------|
-| Free | 100 | 200 |
-| Pro | 1,000 | 2,000 |
-| Enterprise | Custom | Custom |
+| Free | 5 | 10 |
+| Starter | 25 | 50 |
+| Pro | 100 | 200 |
+| Enterprise | 500 | 1,000 |
 

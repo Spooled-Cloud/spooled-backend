@@ -70,7 +70,7 @@ Expected response:
 
 ## Step 5: Create Your Organization
 
-Every tenant in Spooled has an organization. Create one first:
+Every tenant in Spooled has an organization. When you create one, you get an initial API key:
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/organizations \
@@ -87,39 +87,18 @@ Response:
   "id": "org_a1b2c3d4e5f6",
   "name": "My Company",
   "slug": "my-company",
+  "plan_tier": "free",
+  "api_key": "sk_a1b2c3d4e5f6g7h8i9j0...",
+  "api_key_id": "key_x1y2z3",
   "created_at": "2024-12-09T10:00:00Z"
 }
 ```
 
-**Save the `id` value** - you'll need it for the next step.
+⚠️ **IMPORTANT**: Save the `api_key` value immediately! It's only shown once and cannot be retrieved later.
 
-## Step 6: Create Your API Key
+You can create additional API keys later via the dashboard or API.
 
-API keys authenticate all requests to the API:
-
-```bash
-curl -X POST http://localhost:8080/api/v1/organizations/org_a1b2c3d4e5f6/api-keys \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "Development Key",
-    "permissions": ["jobs:read", "jobs:write", "queues:read"]
-  }'
-```
-
-Response:
-```json
-{
-  "id": "key_x1y2z3",
-  "key": "sk_live_abc123xyz789...",
-  "name": "Development Key",
-  "permissions": ["jobs:read", "jobs:write", "queues:read"],
-  "created_at": "2024-12-09T10:01:00Z"
-}
-```
-
-⚠️ **IMPORTANT**: Save the `key` value immediately! It's only shown once and cannot be retrieved later.
-
-## Step 7: Create Your First Job
+## Step 6: Create Your First Job
 
 Now use your API key to create a job:
 
@@ -153,7 +132,7 @@ Response:
 }
 ```
 
-## Step 8: List Your Jobs
+## Step 7: List Your Jobs
 
 ```bash
 curl http://localhost:8080/api/v1/jobs \
@@ -177,7 +156,7 @@ Response:
 }
 ```
 
-## Step 9: Get Queue Statistics
+## Step 8: Get Queue Statistics
 
 ```bash
 curl http://localhost:8080/api/v1/queues/emails/stats \
