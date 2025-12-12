@@ -186,3 +186,4 @@ CREATE TRIGGER trigger_create_org_usage
 
 COMMENT ON TRIGGER trigger_create_org_usage ON organizations IS 'Auto-create usage tracking record';
 
+

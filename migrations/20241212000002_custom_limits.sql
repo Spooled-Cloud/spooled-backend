@@ -22,3 +22,4 @@ ALTER TABLE organizations ADD COLUMN IF NOT EXISTS custom_limits JSONB;
 -- null values or missing keys fall back to plan defaults.
 
 COMMENT ON COLUMN organizations.custom_limits IS 'Optional per-org limit overrides as JSONB. Keys match PlanLimits fields. Null values use plan defaults.';
+

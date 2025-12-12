@@ -9,8 +9,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: "sccache"
 
 # Cancel in-progress runs for the same branch
 concurrency:
@@ -33,29 +31,7 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
-    
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: spooled_test
-        ports:
-          - 5432:5432
-        options: --health-cmd pg_isready --health-interval 5s --health-timeout 3s --health-retries 5
-      
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 5
-
-    env:
-      DATABASE_URL: postgres://postgres:postgres@localhost:5432/spooled_test
-      REDIS_URL: redis://localhost:6379
-      JWT_SECRET: test-secret-key-for-ci-minimum-32-chars
-      RUST_ENV: development
+    # Tests use testcontainers for Postgres/Redis, so we don't need service containers here.
 
     steps:
       - uses: actions/checkout@v4
@@ -64,18 +40,13 @@ jobs:
         with:
           components: clippy
 
-      - uses: mozilla-actions/sccache-action@v0.0.6
-
       - uses: Swatinem/rust-cache@v2
         with:
           cache-all-crates: true
 
       - uses: taiki-e/install-action@v2
         with:
-          tool: sqlx-cli,cargo-nextest
-
-      - name: Setup database
-        run: sqlx database create && sqlx migrate run
+          tool: cargo-nextest
 
       - name: Build
         run: cargo build --all-targets
