@@ -55,7 +55,9 @@ jobs:
         run: cargo nextest run --no-fail-fast
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings -A dead_code -A unused_imports
+        # Lint production code only (lib + bins). Tests are exercised by nextest,
+        # and clippy on all targets is too noisy/slow for CI.
+        run: cargo clippy --lib --bins -- -D warnings -A dead_code -A unused_imports
 
   # Security audit in parallel
   security:

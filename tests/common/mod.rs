@@ -42,7 +42,6 @@ impl TestDatabase {
 
         // Wait for database to be ready (robust retry instead of fixed sleep)
         let pool = {
-            let mut last_err: Option<sqlx::Error> = None;
             let started = tokio::time::Instant::now();
             // First-run container init can be slow (image pull, DB init).
             let timeout = tokio::time::Duration::from_secs(90);
@@ -57,11 +56,10 @@ impl TestDatabase {
                 {
                     Ok(pool) => break pool,
                     Err(e) => {
-                        last_err = Some(e);
                         if started.elapsed() >= timeout {
                             panic!(
                                 "Failed to connect to PostgreSQL after {:?}: {:?}",
-                                timeout, last_err
+                                timeout, e
                             );
                         }
                         tokio::time::sleep(delay).await;

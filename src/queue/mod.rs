@@ -702,10 +702,18 @@ mod tests {
     #[test]
     fn test_max_retries_edge_cases() {
         // Test edge cases for retry counting
-        assert!(0 < 3, "Fresh job can retry");
-        assert!(2 < 3, "Job with 2 retries can retry once more");
-        assert!(!(3 < 3), "Job with max retries cannot retry");
-        assert!(!(4 < 3), "Job exceeding max retries cannot retry");
+        let max_retries = 3;
+        let cases = vec![(0, true), (2, true), (3, false), (4, false)];
+
+        for (retry_count, expected) in cases {
+            assert_eq!(
+                retry_count < max_retries,
+                expected,
+                "retry_count={} max_retries={}",
+                retry_count,
+                max_retries
+            );
+        }
     }
 
     #[test]

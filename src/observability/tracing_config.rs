@@ -305,9 +305,9 @@ mod tests {
     #[test]
     fn test_span_fields() {
         // Ensure span field constants are valid
-        assert!(!span_fields::HTTP_METHOD.is_empty());
-        assert!(!span_fields::REQUEST_ID.is_empty());
-        assert!(!span_fields::JOB_ID.is_empty());
+        assert_eq!(span_fields::HTTP_METHOD, "http.method");
+        assert_eq!(span_fields::REQUEST_ID, "request_id");
+        assert_eq!(span_fields::JOB_ID, "job_id");
     }
 
     #[test]

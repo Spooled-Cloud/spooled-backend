@@ -317,7 +317,7 @@ mod tests {
             assert!(
                 error.to_string().contains(expected_prefix),
                 "Error '{}' should contain '{}'",
-                error.to_string(),
+                error,
                 expected_prefix
             );
         }

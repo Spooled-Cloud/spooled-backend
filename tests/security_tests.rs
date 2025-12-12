@@ -2,6 +2,8 @@
 //!
 //! These tests verify security controls and input validation.
 
+#![allow(clippy::useless_vec)]
+
 mod common;
 
 use common::TestDatabase;
