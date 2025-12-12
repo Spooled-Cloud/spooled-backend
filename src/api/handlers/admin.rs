@@ -688,3 +688,327 @@ pub async fn get_platform_stats(State(state): State<AppState>) -> AppResult<Json
 pub async fn list_plans() -> Json<Vec<PlanLimits>> {
     Json(PlanLimits::all_tiers())
 }
+
+// ============================================================================
+// Admin Organization Creation
+// ============================================================================
+
+/// Request to create an organization as admin
+#[derive(Debug, Deserialize)]
+pub struct AdminCreateOrgRequest {
+    /// Organization name
+    pub name: String,
+    /// URL-friendly slug
+    pub slug: String,
+    /// Optional billing email
+    pub billing_email: Option<String>,
+    /// Optional plan tier (defaults to "free")
+    pub plan_tier: Option<String>,
+}
+
+/// Response for admin organization creation
+#[derive(Debug, Serialize)]
+pub struct AdminCreateOrgResponse {
+    /// The created organization
+    pub organization: Organization,
+    /// Initial API key (only shown once!)
+    pub api_key: AdminApiKeyResponse,
+}
+
+/// API key info in admin response
+#[derive(Debug, Serialize)]
+pub struct AdminApiKeyResponse {
+    pub id: String,
+    /// The raw API key - SAVE THIS, it's only shown once!
+    pub key: String,
+    pub name: String,
+    pub created_at: chrono::DateTime<Utc>,
+}
+
+/// Create a new organization (admin-only)
+///
+/// POST /api/v1/admin/organizations
+///
+/// Unlike the public registration endpoint, admin can:
+/// - Create organizations regardless of registration mode
+/// - Set the initial plan tier
+pub async fn create_organization(
+    State(state): State<AppState>,
+    Json(request): Json<AdminCreateOrgRequest>,
+) -> AppResult<(StatusCode, Json<AdminCreateOrgResponse>)> {
+    use uuid::Uuid;
+
+    // Validate name
+    if request.name.len() < 3 || request.name.len() > 100 {
+        return Err(AppError::Validation(
+            "Name must be 3-100 characters".to_string(),
+        ));
+    }
+
+    // Validate slug
+    if request.slug.len() < 3 || request.slug.len() > 50 {
+        return Err(AppError::Validation(
+            "Slug must be 3-50 characters".to_string(),
+        ));
+    }
+    if !request
+        .slug
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(AppError::Validation(
+            "Slug can only contain lowercase letters, digits, and hyphens".to_string(),
+        ));
+    }
+    if request.slug.starts_with('-') || request.slug.ends_with('-') {
+        return Err(AppError::Validation(
+            "Slug cannot start or end with a hyphen".to_string(),
+        ));
+    }
+
+    // Validate plan tier if provided
+    let plan_tier = match &request.plan_tier {
+        Some(tier) => {
+            let valid_plans = ["free", "starter", "pro", "enterprise"];
+            if !valid_plans.contains(&tier.to_lowercase().as_str()) {
+                return Err(AppError::Validation(format!(
+                    "Invalid plan tier: {}. Valid options: {:?}",
+                    tier, valid_plans
+                )));
+            }
+            tier.to_lowercase()
+        }
+        None => "free".to_string(),
+    };
+
+    let org_id = Uuid::new_v4().to_string();
+    let now = Utc::now();
+
+    // Create organization with specified plan tier
+    let org = sqlx::query_as::<_, Organization>(
+        r#"
+        INSERT INTO organizations (id, name, slug, plan_tier, billing_email, settings, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, '{}', $6, $6)
+        RETURNING *
+        "#,
+    )
+    .bind(&org_id)
+    .bind(&request.name)
+    .bind(&request.slug)
+    .bind(&plan_tier)
+    .bind(&request.billing_email)
+    .bind(now)
+    .fetch_one(state.db.pool())
+    .await
+    .map_err(|e| {
+        if e.to_string().contains("duplicate key") {
+            AppError::Conflict("Organization with this slug already exists".to_string())
+        } else {
+            AppError::Database(e)
+        }
+    })?;
+
+    // Create initial API key
+    let api_key_id = Uuid::new_v4().to_string();
+    let raw_key = format!(
+        "sk_{}_{}",
+        if state.settings.server.environment == crate::config::Environment::Production {
+            "live"
+        } else {
+            "test"
+        },
+        generate_secure_key()
+    );
+    let key_prefix: String = raw_key.chars().take(8).collect();
+    let key_hash = bcrypt::hash(&raw_key, bcrypt::DEFAULT_COST)
+        .map_err(|e| AppError::Internal(format!("Failed to hash API key: {}", e)))?;
+
+    let key_name = "Initial Admin Key".to_string();
+    let queues: Vec<String> = vec!["*".to_string()];
+
+    sqlx::query(
+        r#"
+        INSERT INTO api_keys (
+            id, organization_id, key_hash, key_prefix, name, queues, rate_limit,
+            is_active, created_at, expires_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, NULL, TRUE, $7, NULL)
+        "#,
+    )
+    .bind(&api_key_id)
+    .bind(&org_id)
+    .bind(&key_hash)
+    .bind(&key_prefix)
+    .bind(&key_name)
+    .bind(&queues)
+    .bind(now)
+    .execute(state.db.pool())
+    .await?;
+
+    tracing::info!(
+        org_id = %org_id,
+        org_name = %request.name,
+        plan_tier = %plan_tier,
+        "Admin created organization"
+    );
+
+    Ok((
+        StatusCode::CREATED,
+        Json(AdminCreateOrgResponse {
+            organization: org,
+            api_key: AdminApiKeyResponse {
+                id: api_key_id,
+                key: raw_key,
+                name: key_name,
+                created_at: now,
+            },
+        }),
+    ))
+}
+
+// ============================================================================
+// Admin API Key Management
+// ============================================================================
+
+/// Request to create an API key for an organization
+#[derive(Debug, Deserialize)]
+pub struct AdminCreateApiKeyRequest {
+    /// Key name
+    pub name: String,
+    /// Queue access patterns (["*"] for all)
+    pub queues: Option<Vec<String>>,
+}
+
+/// Create an API key for an organization (admin-only)
+///
+/// POST /api/v1/admin/organizations/{id}/api-keys
+pub async fn create_api_key(
+    State(state): State<AppState>,
+    Path(org_id): Path<String>,
+    Json(request): Json<AdminCreateApiKeyRequest>,
+) -> AppResult<(StatusCode, Json<AdminApiKeyResponse>)> {
+    use uuid::Uuid;
+
+    // Verify organization exists
+    let org: Option<Organization> = sqlx::query_as("SELECT * FROM organizations WHERE id = $1")
+        .bind(&org_id)
+        .fetch_optional(state.db.pool())
+        .await?;
+
+    let org = org.ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+
+    // Validate name
+    if request.name.is_empty() || request.name.len() > 100 {
+        return Err(AppError::Validation(
+            "Key name must be 1-100 characters".to_string(),
+        ));
+    }
+
+    let now = Utc::now();
+    let api_key_id = Uuid::new_v4().to_string();
+    let raw_key = format!(
+        "sk_{}_{}",
+        if state.settings.server.environment == crate::config::Environment::Production {
+            "live"
+        } else {
+            "test"
+        },
+        generate_secure_key()
+    );
+    let key_prefix: String = raw_key.chars().take(8).collect();
+    let key_hash = bcrypt::hash(&raw_key, bcrypt::DEFAULT_COST)
+        .map_err(|e| AppError::Internal(format!("Failed to hash API key: {}", e)))?;
+
+    let queues = request.queues.unwrap_or_else(|| vec!["*".to_string()]);
+
+    sqlx::query(
+        r#"
+        INSERT INTO api_keys (
+            id, organization_id, key_hash, key_prefix, name, queues, rate_limit,
+            is_active, created_at, expires_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, NULL, TRUE, $7, NULL)
+        "#,
+    )
+    .bind(&api_key_id)
+    .bind(&org_id)
+    .bind(&key_hash)
+    .bind(&key_prefix)
+    .bind(&request.name)
+    .bind(&queues)
+    .bind(now)
+    .execute(state.db.pool())
+    .await?;
+
+    tracing::info!(
+        org_id = %org_id,
+        org_name = %org.name,
+        key_id = %api_key_id,
+        key_name = %request.name,
+        "Admin created API key for organization"
+    );
+
+    Ok((
+        StatusCode::CREATED,
+        Json(AdminApiKeyResponse {
+            id: api_key_id,
+            key: raw_key,
+            name: request.name,
+            created_at: now,
+        }),
+    ))
+}
+
+// ============================================================================
+// Admin Usage Management
+// ============================================================================
+
+/// Reset organization usage counters
+///
+/// POST /api/v1/admin/organizations/{id}/reset-usage
+///
+/// Resets daily job counter to 0. Useful for support scenarios.
+pub async fn reset_usage(
+    State(state): State<AppState>,
+    Path(org_id): Path<String>,
+) -> AppResult<StatusCode> {
+    // Verify organization exists
+    let org: Option<Organization> = sqlx::query_as("SELECT * FROM organizations WHERE id = $1")
+        .bind(&org_id)
+        .fetch_optional(state.db.pool())
+        .await?;
+
+    let org = org.ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+
+    // Reset usage counters - reset daily counter and last_daily_reset to today
+    // so the counter effectively becomes 0 for today
+    sqlx::query(
+        r#"
+        UPDATE organization_usage
+        SET jobs_created_today = 0,
+            last_daily_reset = CURRENT_DATE,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE organization_id = $1
+        "#,
+    )
+    .bind(&org_id)
+    .execute(state.db.pool())
+    .await?;
+
+    tracing::info!(
+        org_id = %org_id,
+        org_name = %org.name,
+        "Admin reset usage counters for organization"
+    );
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Generate a secure random API key
+fn generate_secure_key() -> String {
+    use rand::Rng;
+    let mut rng = rand::rng();
+    let mut bytes = [0u8; 32];
+    rng.fill(&mut bytes);
+    base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes)
+}

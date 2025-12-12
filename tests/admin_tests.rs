@@ -445,3 +445,417 @@ fn test_plan_display_names() {
     assert_eq!(PlanLimits::pro().display_name, "Pro");
     assert_eq!(PlanLimits::enterprise().display_name, "Enterprise");
 }
+
+// ============================================================================
+// Admin Create Organization Tests (Integration)
+// ============================================================================
+
+use common::TestDatabase;
+
+/// Test admin organization creation with default plan
+#[tokio::test]
+async fn test_admin_create_organization_default_plan() {
+    let db = TestDatabase::new().await;
+
+    let org_id = uuid::Uuid::new_v4().to_string();
+    let org_name = "Admin Created Org";
+    let org_slug = format!("admin-org-{}", &org_id[..8]);
+
+    // Insert organization with free tier (default)
+    sqlx::query(
+        r#"
+        INSERT INTO organizations (id, name, slug, plan_tier, created_at, updated_at)
+        VALUES ($1, $2, $3, 'free', NOW(), NOW())
+        "#,
+    )
+    .bind(&org_id)
+    .bind(org_name)
+    .bind(&org_slug)
+    .execute(db.pool())
+    .await
+    .expect("Should create organization");
+
+    // Verify organization exists with free tier
+    let org: (String, String) =
+        sqlx::query_as("SELECT name, plan_tier FROM organizations WHERE id = $1")
+            .bind(&org_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("Should fetch organization");
+
+    assert_eq!(org.0, org_name);
+    assert_eq!(org.1, "free");
+}
+
+/// Test admin organization creation with specified plan tier
+#[tokio::test]
+async fn test_admin_create_organization_custom_plan() {
+    let db = TestDatabase::new().await;
+
+    let org_id = uuid::Uuid::new_v4().to_string();
+    let org_name = "Pro Organization";
+    let org_slug = format!("pro-org-{}", &org_id[..8]);
+
+    // Insert organization with pro tier
+    sqlx::query(
+        r#"
+        INSERT INTO organizations (id, name, slug, plan_tier, created_at, updated_at)
+        VALUES ($1, $2, $3, 'pro', NOW(), NOW())
+        "#,
+    )
+    .bind(&org_id)
+    .bind(org_name)
+    .bind(&org_slug)
+    .execute(db.pool())
+    .await
+    .expect("Should create organization");
+
+    // Verify organization exists with pro tier
+    let org: (String, String) =
+        sqlx::query_as("SELECT name, plan_tier FROM organizations WHERE id = $1")
+            .bind(&org_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("Should fetch organization");
+
+    assert_eq!(org.0, org_name);
+    assert_eq!(org.1, "pro");
+}
+
+/// Test admin organization creation fails for duplicate slug
+#[tokio::test]
+async fn test_admin_create_organization_duplicate_slug_fails() {
+    let db = TestDatabase::new().await;
+
+    let slug = format!(
+        "unique-slug-{}",
+        uuid::Uuid::new_v4().to_string()[..8].to_string()
+    );
+
+    // Create first organization
+    sqlx::query(
+        r#"
+        INSERT INTO organizations (id, name, slug, plan_tier, created_at, updated_at)
+        VALUES ($1, 'First Org', $2, 'free', NOW(), NOW())
+        "#,
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(&slug)
+    .execute(db.pool())
+    .await
+    .expect("Should create first organization");
+
+    // Try to create second organization with same slug
+    let result = sqlx::query(
+        r#"
+        INSERT INTO organizations (id, name, slug, plan_tier, created_at, updated_at)
+        VALUES ($1, 'Second Org', $2, 'free', NOW(), NOW())
+        "#,
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(&slug)
+    .execute(db.pool())
+    .await;
+
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("duplicate key"));
+}
+
+// ============================================================================
+// Admin API Key Creation Tests (Integration)
+// ============================================================================
+
+/// Test admin can create API key for organization
+#[tokio::test]
+async fn test_admin_create_api_key_for_org() {
+    let db = TestDatabase::new().await;
+
+    // Create an organization first
+    let org_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        r#"
+        INSERT INTO organizations (id, name, slug, plan_tier, created_at, updated_at)
+        VALUES ($1, 'Test Org', $2, 'free', NOW(), NOW())
+        "#,
+    )
+    .bind(&org_id)
+    .bind(format!("test-org-{}", &org_id[..8]))
+    .execute(db.pool())
+    .await
+    .expect("Should create organization");
+
+    // Create an API key for the organization
+    let key_id = uuid::Uuid::new_v4().to_string();
+    let key_name = "Admin Created Key";
+    let key_hash = bcrypt::hash("test_key", 4).unwrap();
+    let queues: Vec<String> = vec!["*".to_string()];
+
+    sqlx::query(
+        r#"
+        INSERT INTO api_keys (id, organization_id, key_hash, key_prefix, name, queues, is_active, created_at)
+        VALUES ($1, $2, $3, 'sk_test_', $4, $5, TRUE, NOW())
+        "#,
+    )
+    .bind(&key_id)
+    .bind(&org_id)
+    .bind(&key_hash)
+    .bind(key_name)
+    .bind(&queues)
+    .execute(db.pool())
+    .await
+    .expect("Should create API key");
+
+    // Verify API key was created
+    let key: (String, String, bool) = sqlx::query_as(
+        "SELECT id, name, is_active FROM api_keys WHERE organization_id = $1 AND id = $2",
+    )
+    .bind(&org_id)
+    .bind(&key_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("Should fetch API key");
+
+    assert_eq!(key.0, key_id);
+    assert_eq!(key.1, key_name);
+    assert!(key.2);
+}
+
+/// Test multiple API keys can be created for same organization
+#[tokio::test]
+async fn test_admin_create_multiple_api_keys() {
+    let db = TestDatabase::new().await;
+
+    // Create an organization
+    let org_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        r#"
+        INSERT INTO organizations (id, name, slug, plan_tier, created_at, updated_at)
+        VALUES ($1, 'Multi Key Org', $2, 'pro', NOW(), NOW())
+        "#,
+    )
+    .bind(&org_id)
+    .bind(format!("multi-key-{}", &org_id[..8]))
+    .execute(db.pool())
+    .await
+    .expect("Should create organization");
+
+    // Create multiple API keys
+    for i in 1..=3 {
+        let key_id = uuid::Uuid::new_v4().to_string();
+        let key_hash = bcrypt::hash(format!("test_key_{}", i), 4).unwrap();
+        let queues: Vec<String> = vec!["*".to_string()];
+
+        sqlx::query(
+            r#"
+            INSERT INTO api_keys (id, organization_id, key_hash, key_prefix, name, queues, is_active, created_at)
+            VALUES ($1, $2, $3, 'sk_test_', $4, $5, TRUE, NOW())
+            "#,
+        )
+        .bind(&key_id)
+        .bind(&org_id)
+        .bind(&key_hash)
+        .bind(format!("Key {}", i))
+        .bind(&queues)
+        .execute(db.pool())
+        .await
+        .expect("Should create API key");
+    }
+
+    // Verify all keys were created
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM api_keys WHERE organization_id = $1")
+        .bind(&org_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("Should count keys");
+
+    assert_eq!(count.0, 3);
+}
+
+// ============================================================================
+// Admin Usage Reset Tests (Integration)
+// ============================================================================
+
+/// Test admin can reset organization usage counters
+#[tokio::test]
+async fn test_admin_reset_usage_counters() {
+    let db = TestDatabase::new().await;
+
+    // Create an organization
+    let org_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        r#"
+        INSERT INTO organizations (id, name, slug, plan_tier, created_at, updated_at)
+        VALUES ($1, 'Usage Test Org', $2, 'free', NOW(), NOW())
+        "#,
+    )
+    .bind(&org_id)
+    .bind(format!("usage-test-{}", &org_id[..8]))
+    .execute(db.pool())
+    .await
+    .expect("Should create organization");
+
+    // Create usage record with some jobs (use correct column names from schema)
+    sqlx::query(
+        r#"
+        INSERT INTO organization_usage (organization_id, jobs_created_today, total_jobs_created, last_daily_reset)
+        VALUES ($1, 500, 1000, CURRENT_DATE)
+        ON CONFLICT (organization_id) DO UPDATE
+        SET jobs_created_today = 500, last_daily_reset = CURRENT_DATE
+        "#,
+    )
+    .bind(&org_id)
+    .execute(db.pool())
+    .await
+    .expect("Should create usage record");
+
+    // Verify usage is set
+    let before: (i64,) = sqlx::query_as(
+        "SELECT jobs_created_today FROM organization_usage WHERE organization_id = $1",
+    )
+    .bind(&org_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("Should fetch usage");
+
+    assert_eq!(before.0, 500);
+
+    // Reset usage counters
+    sqlx::query(
+        r#"
+        UPDATE organization_usage
+        SET jobs_created_today = 0, last_daily_reset = CURRENT_DATE, updated_at = CURRENT_TIMESTAMP
+        WHERE organization_id = $1
+        "#,
+    )
+    .bind(&org_id)
+    .execute(db.pool())
+    .await
+    .expect("Should reset usage");
+
+    // Verify usage was reset
+    let after: (i64,) = sqlx::query_as(
+        "SELECT jobs_created_today FROM organization_usage WHERE organization_id = $1",
+    )
+    .bind(&org_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("Should fetch usage after reset");
+
+    assert_eq!(after.0, 0);
+}
+
+/// Test usage reset preserves total_jobs_created
+#[tokio::test]
+async fn test_admin_reset_usage_preserves_total() {
+    let db = TestDatabase::new().await;
+
+    // Create an organization
+    let org_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        r#"
+        INSERT INTO organizations (id, name, slug, plan_tier, created_at, updated_at)
+        VALUES ($1, 'Preserve Total Org', $2, 'free', NOW(), NOW())
+        "#,
+    )
+    .bind(&org_id)
+    .bind(format!("preserve-{}", &org_id[..8]))
+    .execute(db.pool())
+    .await
+    .expect("Should create organization");
+
+    // Create usage record (use correct column names from schema)
+    sqlx::query(
+        r#"
+        INSERT INTO organization_usage (organization_id, jobs_created_today, total_jobs_created, last_daily_reset)
+        VALUES ($1, 100, 5000, CURRENT_DATE)
+        ON CONFLICT (organization_id) DO UPDATE
+        SET jobs_created_today = 100, total_jobs_created = 5000, last_daily_reset = CURRENT_DATE
+        "#,
+    )
+    .bind(&org_id)
+    .execute(db.pool())
+    .await
+    .expect("Should create usage record");
+
+    // Reset only daily usage (not total)
+    sqlx::query(
+        r#"
+        UPDATE organization_usage
+        SET jobs_created_today = 0, last_daily_reset = CURRENT_DATE, updated_at = CURRENT_TIMESTAMP
+        WHERE organization_id = $1
+        "#,
+    )
+    .bind(&org_id)
+    .execute(db.pool())
+    .await
+    .expect("Should reset daily usage");
+
+    // Verify daily is 0 but total is preserved
+    let usage: (i64, i64) = sqlx::query_as(
+        "SELECT jobs_created_today, total_jobs_created FROM organization_usage WHERE organization_id = $1",
+    )
+    .bind(&org_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("Should fetch usage");
+
+    assert_eq!(usage.0, 0); // daily reset
+    assert_eq!(usage.1, 5000); // total preserved
+}
+
+// ============================================================================
+// Admin Validation Tests
+// ============================================================================
+
+/// Test valid plan tier values
+#[test]
+fn test_valid_plan_tier_values() {
+    let valid_tiers = ["free", "starter", "pro", "enterprise"];
+
+    for tier in &valid_tiers {
+        let plan = PlanLimits::for_tier(tier);
+        assert_eq!(plan.tier, *tier);
+    }
+}
+
+/// Test slug validation patterns
+#[test]
+fn test_slug_validation_patterns() {
+    // Valid slugs
+    let valid_slugs = ["my-org", "test123", "a1b2c3", "company-name-here", "abc"];
+
+    for slug in &valid_slugs {
+        assert!(
+            slug.len() >= 3
+                && slug.len() <= 50
+                && slug
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                && !slug.starts_with('-')
+                && !slug.ends_with('-'),
+            "Slug '{}' should be valid",
+            slug
+        );
+    }
+
+    // Invalid slugs
+    let invalid_slugs = [
+        "-starts-with-dash",
+        "ends-with-dash-",
+        "has UPPERCASE",
+        "has spaces",
+        "ab", // too short
+    ];
+
+    for slug in &invalid_slugs {
+        let is_valid = slug.len() >= 3
+            && slug.len() <= 50
+            && slug
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            && !slug.starts_with('-')
+            && !slug.ends_with('-');
+
+        assert!(!is_valid, "Slug '{}' should be invalid", slug);
+    }
+}

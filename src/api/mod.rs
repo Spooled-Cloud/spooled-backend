@@ -288,7 +288,7 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
     let admin_routes = Router::new()
         .route(
             "/admin/organizations",
-            get(handlers::admin::list_organizations),
+            get(handlers::admin::list_organizations).post(handlers::admin::create_organization),
         )
         .route(
             "/admin/organizations/{id}",
@@ -301,6 +301,14 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
         .route(
             "/admin/organizations/{id}",
             delete(handlers::admin::delete_organization),
+        )
+        .route(
+            "/admin/organizations/{id}/api-keys",
+            axum::routing::post(handlers::admin::create_api_key),
+        )
+        .route(
+            "/admin/organizations/{id}/reset-usage",
+            axum::routing::post(handlers::admin::reset_usage),
         )
         .route("/admin/stats", get(handlers::admin::get_platform_stats))
         .route("/admin/plans", get(handlers::admin::list_plans))
