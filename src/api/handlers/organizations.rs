@@ -5,7 +5,8 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+use serde::Serialize;
 use uuid::Uuid;
 
 use crate::api::middleware::ValidatedJson;
@@ -15,6 +16,28 @@ use crate::models::{
     ApiKeyContext, CreateOrganizationRequest, Organization, OrganizationSummary,
     UpdateOrganizationRequest,
 };
+
+/// Response for organization creation - includes initial API key
+#[derive(Debug, Serialize)]
+pub struct CreateOrganizationResponse {
+    /// The created organization
+    pub organization: Organization,
+    /// Initial API key (only shown once!)
+    pub api_key: InitialApiKey,
+}
+
+/// Initial API key returned during org creation
+#[derive(Debug, Serialize)]
+pub struct InitialApiKey {
+    /// API key ID
+    pub id: String,
+    /// The raw API key - SAVE THIS, it's only shown once!
+    pub key: String,
+    /// Key name
+    pub name: String,
+    /// When the key was created
+    pub created_at: DateTime<Utc>,
+}
 
 /// List organizations (returns only the authenticated user's organization)
 ///
@@ -67,11 +90,13 @@ const MAX_SETTINGS_SIZE: usize = 64 * 1024; // 64KB
 /// - "open": Anyone can create organizations (self-hosted default)
 /// - "closed": Requires X-Admin-Key header matching ADMIN_API_KEY env var
 /// - "invite": Requires valid invite code (future)
+///
+/// Returns both the organization and an initial API key for immediate access.
 pub async fn create(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     ValidatedJson(request): ValidatedJson<CreateOrganizationRequest>,
-) -> AppResult<(StatusCode, Json<Organization>)> {
+) -> AppResult<(StatusCode, Json<CreateOrganizationResponse>)> {
     use crate::config::RegistrationMode;
 
     // Check registration mode
@@ -111,9 +136,10 @@ pub async fn create(
     // Validate slug format
     validate_slug(&request.slug)?;
 
-    let id = Uuid::new_v4().to_string();
+    let org_id = Uuid::new_v4().to_string();
     let now = Utc::now();
 
+    // Create organization
     let org = sqlx::query_as::<_, Organization>(
         r#"
         INSERT INTO organizations (id, name, slug, plan_tier, billing_email, settings, created_at, updated_at)
@@ -121,7 +147,7 @@ pub async fn create(
         RETURNING *
         "#,
     )
-    .bind(&id)
+    .bind(&org_id)
     .bind(&request.name)
     .bind(&request.slug)
     .bind(&request.billing_email)
@@ -136,7 +162,64 @@ pub async fn create(
         }
     })?;
 
-    Ok((StatusCode::CREATED, Json(org)))
+    // Create initial API key for the organization
+    let api_key_id = Uuid::new_v4().to_string();
+    let raw_key = format!(
+        "sk_{}_{}",
+        if state.settings.server.environment == crate::config::Environment::Production {
+            "live"
+        } else {
+            "test"
+        },
+        generate_api_key()
+    );
+    let key_prefix: String = raw_key.chars().take(8).collect();
+    let key_hash = bcrypt::hash(&raw_key, bcrypt::DEFAULT_COST)
+        .map_err(|e| AppError::Internal(format!("Failed to hash API key: {}", e)))?;
+
+    let key_name = "Initial Admin Key".to_string();
+    let queues: Vec<String> = vec!["*".to_string()]; // Full access to all queues
+
+    sqlx::query(
+        r#"
+        INSERT INTO api_keys (
+            id, organization_id, key_hash, key_prefix, name, queues, rate_limit,
+            is_active, created_at, expires_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, NULL, TRUE, $7, NULL)
+        "#,
+    )
+    .bind(&api_key_id)
+    .bind(&org_id)
+    .bind(&key_hash)
+    .bind(&key_prefix)
+    .bind(&key_name)
+    .bind(&queues)
+    .bind(now)
+    .execute(state.db.pool())
+    .await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateOrganizationResponse {
+            organization: org,
+            api_key: InitialApiKey {
+                id: api_key_id,
+                key: raw_key, // This is the ONLY time the raw key is returned!
+                name: key_name,
+                created_at: now,
+            },
+        }),
+    ))
+}
+
+/// Generate a secure random API key
+fn generate_api_key() -> String {
+    use rand::Rng;
+    let mut rng = rand::rng();
+    let mut bytes = [0u8; 32];
+    rng.fill(&mut bytes);
+    base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes)
 }
 
 /// Get an organization by ID
