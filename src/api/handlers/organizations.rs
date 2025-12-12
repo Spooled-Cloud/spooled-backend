@@ -374,6 +374,21 @@ pub async fn delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Get organization usage and plan limits
+///
+/// Returns the current organization's resource usage against plan limits.
+/// This is used to display usage warnings and upgrade prompts in the dashboard.
+pub async fn usage(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+) -> AppResult<Json<crate::api::middleware::limits::UsageInfo>> {
+    let usage_info =
+        crate::api::middleware::limits::get_usage_info(state.db.pool(), &ctx.organization_id)
+            .await?;
+
+    Ok(Json(usage_info))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

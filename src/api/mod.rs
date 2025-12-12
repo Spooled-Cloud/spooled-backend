@@ -163,6 +163,7 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
         .route("/dashboard", get(handlers::health::dashboard_data))
         // Organizations (except create which is public)
         .route("/organizations", get(handlers::organizations::list))
+        .route("/organizations/usage", get(handlers::organizations::usage))
         .route("/organizations/{id}", get(handlers::organizations::get))
         .route("/organizations/{id}", put(handlers::organizations::update))
         .route(
