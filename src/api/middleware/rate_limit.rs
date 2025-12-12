@@ -14,8 +14,6 @@ use axum::{
 };
 use hex;
 use serde::Serialize;
-#[cfg(test)]
-use sha2::{Digest, Sha256}; // For hex encoding hash
 
 use crate::cache::RedisCache;
 
