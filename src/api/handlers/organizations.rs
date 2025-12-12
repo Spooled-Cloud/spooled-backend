@@ -402,6 +402,7 @@ mod tests {
             plan_tier: "free".to_string(),
             billing_email: None,
             settings: serde_json::json!({}),
+            custom_limits: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

@@ -177,6 +177,71 @@ impl PlanLimits {
         }
     }
 
+    /// Get plan limits with custom overrides merged in
+    ///
+    /// Custom overrides take precedence over plan defaults.
+    /// Only specified fields are overridden; null/missing values use defaults.
+    pub fn for_tier_with_overrides(tier: &str, custom_limits: Option<&serde_json::Value>) -> Self {
+        let mut limits = Self::for_tier(tier);
+
+        if let Some(overrides) = custom_limits {
+            if let Some(obj) = overrides.as_object() {
+                // Override each limit if specified
+                if let Some(v) = obj.get("max_jobs_per_day") {
+                    limits.max_jobs_per_day = v.as_u64();
+                }
+                if let Some(v) = obj.get("max_active_jobs") {
+                    limits.max_active_jobs = v.as_u64();
+                }
+                if let Some(v) = obj.get("max_queues") {
+                    limits.max_queues = v.as_u64().map(|n| n as u32);
+                }
+                if let Some(v) = obj.get("max_workers") {
+                    limits.max_workers = v.as_u64().map(|n| n as u32);
+                }
+                if let Some(v) = obj.get("max_api_keys") {
+                    limits.max_api_keys = v.as_u64().map(|n| n as u32);
+                }
+                if let Some(v) = obj.get("max_schedules") {
+                    limits.max_schedules = v.as_u64().map(|n| n as u32);
+                }
+                if let Some(v) = obj.get("max_workflows") {
+                    limits.max_workflows = v.as_u64().map(|n| n as u32);
+                }
+                if let Some(v) = obj.get("max_webhooks") {
+                    limits.max_webhooks = v.as_u64().map(|n| n as u32);
+                }
+                if let Some(v) = obj.get("max_payload_size_bytes") {
+                    if let Some(n) = v.as_u64() {
+                        limits.max_payload_size_bytes = n as usize;
+                    }
+                }
+                if let Some(v) = obj.get("rate_limit_requests_per_second") {
+                    if let Some(n) = v.as_u64() {
+                        limits.rate_limit_requests_per_second = n as u32;
+                    }
+                }
+                if let Some(v) = obj.get("rate_limit_burst") {
+                    if let Some(n) = v.as_u64() {
+                        limits.rate_limit_burst = n as u32;
+                    }
+                }
+                if let Some(v) = obj.get("job_retention_days") {
+                    if let Some(n) = v.as_u64() {
+                        limits.job_retention_days = n as u32;
+                    }
+                }
+                if let Some(v) = obj.get("history_retention_days") {
+                    if let Some(n) = v.as_u64() {
+                        limits.history_retention_days = n as u32;
+                    }
+                }
+            }
+        }
+
+        limits
+    }
+
     /// Get all available plan tiers
     pub fn all_tiers() -> Vec<Self> {
         vec![

@@ -108,6 +108,21 @@ pub async fn get_org_plan_tier(pool: &PgPool, org_id: &str) -> Result<String, sq
     Ok(row.0)
 }
 
+/// Get the plan tier and custom limits for an organization
+pub async fn get_org_plan_and_limits(
+    pool: &PgPool,
+    org_id: &str,
+) -> Result<(String, Option<serde_json::Value>), sqlx::Error> {
+    let row: (String, Option<serde_json::Value>) = sqlx::query_as(
+        "SELECT plan_tier, custom_limits FROM organizations WHERE id = $1",
+    )
+    .bind(org_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(row)
+}
+
 /// Check if creating a resource would exceed limits
 ///
 /// Returns Ok(()) if allowed, Err with response if limit exceeded
@@ -117,12 +132,12 @@ pub async fn check_resource_limit(
     resource: &str,
     adding: u64,
 ) -> Result<(), Response> {
-    let plan_tier = get_org_plan_tier(pool, org_id).await.map_err(|e| {
+    let (plan_tier, custom_limits) = get_org_plan_and_limits(pool, org_id).await.map_err(|e| {
         tracing::error!(error = %e, "Failed to get org plan tier");
         (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
     })?;
 
-    let limits = PlanLimits::for_tier(&plan_tier);
+    let limits = PlanLimits::for_tier_with_overrides(&plan_tier, custom_limits.as_ref());
 
     // Check if feature is disabled
     if limits.is_disabled(resource) {
@@ -163,12 +178,12 @@ pub async fn check_resource_limit(
 
 /// Check job creation limits (both daily and active)
 pub async fn check_job_limits(pool: &PgPool, org_id: &str, job_count: u64) -> Result<(), Response> {
-    let plan_tier = get_org_plan_tier(pool, org_id).await.map_err(|e| {
+    let (plan_tier, custom_limits) = get_org_plan_and_limits(pool, org_id).await.map_err(|e| {
         tracing::error!(error = %e, "Failed to get org plan tier");
         (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
     })?;
 
-    let limits = PlanLimits::for_tier(&plan_tier);
+    let limits = PlanLimits::for_tier_with_overrides(&plan_tier, custom_limits.as_ref());
     let counts = get_resource_counts(pool, org_id).await.map_err(|e| {
         tracing::error!(error = %e, "Failed to get resource counts");
         (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
@@ -193,12 +208,12 @@ pub async fn check_payload_size(
     org_id: &str,
     payload_size: usize,
 ) -> Result<(), Response> {
-    let plan_tier = get_org_plan_tier(pool, org_id).await.map_err(|e| {
+    let (plan_tier, custom_limits) = get_org_plan_and_limits(pool, org_id).await.map_err(|e| {
         tracing::error!(error = %e, "Failed to get org plan tier");
         (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
     })?;
 
-    let limits = PlanLimits::for_tier(&plan_tier);
+    let limits = PlanLimits::for_tier_with_overrides(&plan_tier, custom_limits.as_ref());
 
     if payload_size > limits.max_payload_size_bytes {
         return Err(Json(serde_json::json!({
@@ -274,8 +289,8 @@ pub struct UsageWarning {
 
 /// Get full usage info for an organization
 pub async fn get_usage_info(pool: &PgPool, org_id: &str) -> Result<UsageInfo, sqlx::Error> {
-    let plan_tier = get_org_plan_tier(pool, org_id).await?;
-    let limits = PlanLimits::for_tier(&plan_tier);
+    let (plan_tier, custom_limits) = get_org_plan_and_limits(pool, org_id).await?;
+    let limits = PlanLimits::for_tier_with_overrides(&plan_tier, custom_limits.as_ref());
     let counts = get_resource_counts(pool, org_id).await?;
 
     let warning_threshold = limits.warning_threshold();

@@ -370,6 +370,7 @@ pub struct AdminOrganizationDetail {
     pub plan_tier: String,
     pub billing_email: Option<String>,
     pub settings: serde_json::Value,
+    pub custom_limits: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub usage_info: UsageInfo,
@@ -413,6 +414,7 @@ pub async fn get_organization(
         plan_tier: org.plan_tier,
         billing_email: org.billing_email,
         settings: org.settings,
+        custom_limits: org.custom_limits,
         created_at: org.created_at,
         updated_at: org.updated_at,
         usage_info,
@@ -434,6 +436,8 @@ pub struct UpdateOrgRequest {
     pub billing_email: Option<String>,
     /// New settings (merged with existing)
     pub settings: Option<serde_json::Value>,
+    /// Custom limit overrides (null = use plan defaults, empty object = reset to defaults)
+    pub custom_limits: Option<serde_json::Value>,
 }
 
 /// Update organization plan or settings
@@ -467,18 +471,25 @@ pub async fn update_organization(
     let plan_tier = request.plan_tier.unwrap_or(existing.plan_tier);
     let billing_email = request.billing_email.or(existing.billing_email);
     let settings = request.settings.unwrap_or(existing.settings);
+    // For custom_limits: None means keep existing, Some(null) or empty object means reset to defaults
+    let custom_limits = match &request.custom_limits {
+        Some(limits) if limits.is_null() || limits == &serde_json::json!({}) => None,
+        Some(limits) => Some(limits.clone()),
+        None => existing.custom_limits,
+    };
 
     let updated: Organization = sqlx::query_as(
         r#"
         UPDATE organizations
-        SET plan_tier = $1, billing_email = $2, settings = $3, updated_at = NOW()
-        WHERE id = $4
+        SET plan_tier = $1, billing_email = $2, settings = $3, custom_limits = $4, updated_at = NOW()
+        WHERE id = $5
         RETURNING *
         "#,
     )
     .bind(&plan_tier)
     .bind(&billing_email)
     .bind(&settings)
+    .bind(&custom_limits)
     .bind(&id)
     .fetch_one(state.db.pool())
     .await?;

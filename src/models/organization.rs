@@ -20,6 +20,8 @@ pub struct Organization {
     pub billing_email: Option<String>,
     /// Additional settings as JSON
     pub settings: serde_json::Value,
+    /// Custom limit overrides (null = use plan defaults)
+    pub custom_limits: Option<serde_json::Value>,
     /// Creation timestamp
     pub created_at: DateTime<Utc>,
     /// Last update timestamp
