@@ -1,6 +1,6 @@
 [package]
 name = "spooled-backend"
-version = "0.1.0"
+version = "1.0.19"
 edition = "2021"
 authors = ["Spooled Cloud Team"]
 description = "Production-ready webhook queue service built with Rust + PostgreSQL"
