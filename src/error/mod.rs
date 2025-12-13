@@ -52,6 +52,10 @@ pub enum AppError {
     #[error("Rate limit exceeded, retry after {0} seconds")]
     RateLimitExceededWithRetry(u64),
 
+    /// Rate limit exceeded with custom message
+    #[error("Rate limit exceeded: {0}")]
+    RateLimit(String),
+
     /// Payload too large
     #[error("Payload too large")]
     PayloadTooLarge,
@@ -159,6 +163,11 @@ impl IntoResponse for AppError {
                 StatusCode::TOO_MANY_REQUESTS,
                 "RATE_LIMIT_EXCEEDED",
                 "Too many requests, please try again later".to_string(),
+            ),
+            AppError::RateLimit(msg) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "RATE_LIMIT_EXCEEDED",
+                msg.clone(),
             ),
             AppError::RateLimitExceededWithRetry(_) | AppError::LimitExceeded(_) => {
                 // Already handled above

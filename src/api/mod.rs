@@ -40,6 +40,8 @@ pub struct AppState {
     pub cache: Option<RedisCache>,
     pub metrics: Arc<Metrics>,
     pub settings: Settings,
+    /// Stripe configuration (extracted for easy access)
+    pub stripe: crate::config::StripeSettings,
 }
 
 impl AppState {
@@ -49,11 +51,13 @@ impl AppState {
         metrics: Metrics,
         settings: Settings,
     ) -> Self {
+        let stripe = settings.stripe.clone();
         Self {
             db,
             cache,
             metrics: Arc::new(metrics),
             settings,
+            stripe,
         }
     }
 }
@@ -137,6 +141,9 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
         .route("/auth/login", post(handlers::auth::login))
         .route("/auth/refresh", post(handlers::auth::refresh_token))
         .route("/auth/validate", post(handlers::auth::validate_token))
+        // Email login flow (passwordless)
+        .route("/auth/email/start", post(handlers::email_login::start))
+        .route("/auth/email/verify", post(handlers::email_login::verify))
         // Webhooks are authenticated via signatures, not API keys
         .route(
             "/webhooks/{org_id}/github",
@@ -150,6 +157,8 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
             "/webhooks/{org_id}/custom",
             post(handlers::webhooks::custom),
         )
+        // Stripe billing webhook (separate from job webhooks)
+        .route("/billing/webhook", post(handlers::billing::webhook))
         // Organization creation is public (for onboarding)
         .route("/organizations", post(handlers::organizations::create))
         // Auth/me uses JWT validation internally (not API key middleware)
@@ -282,6 +291,9 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
             "/outgoing-webhooks/{id}/deliveries",
             get(handlers::outgoing_webhooks::deliveries),
         )
+        // Billing endpoints
+        .route("/billing/status", get(handlers::billing::status))
+        .route("/billing/portal", post(handlers::billing::create_portal))
         // Apply authentication middleware to all protected routes
         // route_layer runs the middleware for matched routes only
         .route_layer(axum::middleware::from_fn_with_state(

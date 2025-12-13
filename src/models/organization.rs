@@ -22,6 +22,16 @@ pub struct Organization {
     pub settings: serde_json::Value,
     /// Custom limit overrides (null = use plan defaults)
     pub custom_limits: Option<serde_json::Value>,
+    /// Stripe customer ID
+    pub stripe_customer_id: Option<String>,
+    /// Stripe subscription ID
+    pub stripe_subscription_id: Option<String>,
+    /// Stripe subscription status (active, past_due, canceled, etc.)
+    pub stripe_subscription_status: Option<String>,
+    /// Current billing period end
+    pub stripe_current_period_end: Option<DateTime<Utc>>,
+    /// Whether subscription will cancel at period end
+    pub stripe_cancel_at_period_end: Option<bool>,
     /// Creation timestamp
     pub created_at: DateTime<Utc>,
     /// Last update timestamp

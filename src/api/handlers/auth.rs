@@ -100,6 +100,23 @@ pub struct CurrentUserResponse {
     pub issued_at: chrono::DateTime<Utc>,
     /// Token expires at
     pub expires_at: chrono::DateTime<Utc>,
+    /// Organization details
+    pub organization: Option<OrganizationInfo>,
+}
+
+/// Organization info for /auth/me response
+#[derive(Debug, Serialize)]
+pub struct OrganizationInfo {
+    /// Organization ID
+    pub id: String,
+    /// Organization name
+    pub name: String,
+    /// Organization slug
+    pub slug: String,
+    /// Current plan tier
+    pub plan_tier: String,
+    /// Billing email
+    pub billing_email: Option<String>,
 }
 
 /// API key record for login
@@ -495,6 +512,7 @@ pub async fn logout(
 ///
 /// Now checks token blacklist before returning user info.
 /// Previously, a logged-out token could still access this endpoint.
+/// Now includes full organization details in the response.
 pub async fn me(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -536,6 +554,29 @@ pub async fn me(
         }
     }
 
+    // Fetch organization details
+    let org_info: Option<(String, String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, name, slug, plan_tier, billing_email FROM organizations WHERE id = $1",
+    )
+    .bind(&token_data.claims.org_id)
+    .fetch_optional(state.db.pool())
+    .await
+    .map_err(|e| {
+        error!(error = %e, "Failed to fetch organization for /auth/me");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse::internal()),
+        )
+    })?;
+
+    let organization = org_info.map(|(id, name, slug, plan_tier, billing_email)| OrganizationInfo {
+        id,
+        name,
+        slug,
+        plan_tier,
+        billing_email,
+    });
+
     Ok(Json(CurrentUserResponse {
         organization_id: token_data.claims.org_id,
         api_key_id: token_data.claims.api_key_id,
@@ -544,6 +585,7 @@ pub async fn me(
             .unwrap_or_else(Utc::now),
         expires_at: chrono::DateTime::from_timestamp(token_data.claims.exp, 0)
             .unwrap_or_else(Utc::now),
+        organization,
     }))
 }
 

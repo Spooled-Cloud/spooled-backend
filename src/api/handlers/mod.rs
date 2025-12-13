@@ -3,6 +3,8 @@
 pub mod admin;
 pub mod api_keys;
 pub mod auth;
+pub mod billing;
+pub mod email_login;
 pub mod health;
 pub mod jobs;
 pub mod metrics;

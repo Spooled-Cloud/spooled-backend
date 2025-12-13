@@ -25,6 +25,8 @@ pub struct Settings {
     pub webhooks: WebhookSettings,
     pub tracing: TracingSettings,
     pub registration: RegistrationSettings,
+    pub stripe: StripeSettings,
+    pub email: EmailSettings,
 }
 
 /// Registration/onboarding settings
@@ -172,6 +174,59 @@ pub struct TracingSettings {
     pub json_logs: bool,
 }
 
+/// Stripe billing configuration
+#[derive(Debug, Clone, Deserialize)]
+pub struct StripeSettings {
+    /// Stripe secret key (sk_live_xxx or sk_test_xxx)
+    pub secret_key: Option<String>,
+    /// Stripe webhook signing secret (whsec_xxx)
+    pub webhook_secret: Option<String>,
+    /// Price ID for Starter plan
+    pub starter_price_id: Option<String>,
+    /// Price ID for Pro plan
+    pub pro_price_id: Option<String>,
+    /// Stripe billing portal configuration ID (optional)
+    pub billing_portal_config_id: Option<String>,
+}
+
+/// Email sending configuration
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmailSettings {
+    /// Email provider: "resend", "sendgrid", "postmark", or "smtp"
+    pub provider: EmailProvider,
+    /// API key for the email provider (Resend, SendGrid, Postmark)
+    pub api_key: Option<String>,
+    /// From email address
+    pub from_address: String,
+    /// From name
+    pub from_name: String,
+    /// SMTP host (only for SMTP provider)
+    pub smtp_host: Option<String>,
+    /// SMTP port (only for SMTP provider)
+    pub smtp_port: Option<u16>,
+    /// SMTP username (only for SMTP provider)
+    pub smtp_username: Option<String>,
+    /// SMTP password (only for SMTP provider)
+    pub smtp_password: Option<String>,
+}
+
+/// Email provider type
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EmailProvider {
+    /// Console logging (development only)
+    #[default]
+    Console,
+    /// Resend (recommended)
+    Resend,
+    /// SendGrid
+    Sendgrid,
+    /// Postmark
+    Postmark,
+    /// SMTP
+    Smtp,
+}
+
 impl Settings {
     /// Load settings from environment variables
     pub fn load() -> Result<Self> {
@@ -294,6 +349,37 @@ impl Settings {
                     _ => RegistrationMode::Open,
                 },
                 admin_api_key: env::var("ADMIN_API_KEY").ok(),
+            },
+            stripe: StripeSettings {
+                secret_key: env::var("STRIPE_SECRET_KEY").ok(),
+                webhook_secret: env::var("STRIPE_BILLING_WEBHOOK_SECRET").ok(),
+                starter_price_id: env::var("STRIPE_STARTER_PRICE_ID").ok(),
+                pro_price_id: env::var("STRIPE_PRO_PRICE_ID").ok(),
+                billing_portal_config_id: env::var("STRIPE_BILLING_PORTAL_CONFIG_ID").ok(),
+            },
+            email: EmailSettings {
+                provider: match env::var("EMAIL_PROVIDER")
+                    .unwrap_or_else(|_| "console".to_string())
+                    .to_lowercase()
+                    .as_str()
+                {
+                    "resend" => EmailProvider::Resend,
+                    "sendgrid" => EmailProvider::Sendgrid,
+                    "postmark" => EmailProvider::Postmark,
+                    "smtp" => EmailProvider::Smtp,
+                    _ => EmailProvider::Console,
+                },
+                api_key: env::var("EMAIL_API_KEY").ok(),
+                from_address: env::var("EMAIL_FROM_ADDRESS")
+                    .unwrap_or_else(|_| "noreply@spooled.cloud".to_string()),
+                from_name: env::var("EMAIL_FROM_NAME")
+                    .unwrap_or_else(|_| "Spooled Cloud".to_string()),
+                smtp_host: env::var("SMTP_HOST").ok(),
+                smtp_port: env::var("SMTP_PORT")
+                    .ok()
+                    .and_then(|s| s.parse().ok()),
+                smtp_username: env::var("SMTP_USERNAME").ok(),
+                smtp_password: env::var("SMTP_PASSWORD").ok(),
             },
         };
 
@@ -485,6 +571,23 @@ impl Settings {
             registration: RegistrationSettings {
                 mode: RegistrationMode::Open,
                 admin_api_key: None,
+            },
+            stripe: StripeSettings {
+                secret_key: None,
+                webhook_secret: None,
+                starter_price_id: None,
+                pro_price_id: None,
+                billing_portal_config_id: None,
+            },
+            email: EmailSettings {
+                provider: EmailProvider::Console,
+                api_key: None,
+                from_address: "noreply@test.local".to_string(),
+                from_name: "Test".to_string(),
+                smtp_host: None,
+                smtp_port: None,
+                smtp_username: None,
+                smtp_password: None,
             },
         }
     }
