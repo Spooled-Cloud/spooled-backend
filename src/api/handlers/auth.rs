@@ -569,13 +569,16 @@ pub async fn me(
         )
     })?;
 
-    let organization = org_info.map(|(id, name, slug, plan_tier, billing_email)| OrganizationInfo {
-        id,
-        name,
-        slug,
-        plan_tier,
-        billing_email,
-    });
+    let organization =
+        org_info.map(
+            |(id, name, slug, plan_tier, billing_email)| OrganizationInfo {
+                id,
+                name,
+                slug,
+                plan_tier,
+                billing_email,
+            },
+        );
 
     Ok(Json(CurrentUserResponse {
         organization_id: token_data.claims.org_id,

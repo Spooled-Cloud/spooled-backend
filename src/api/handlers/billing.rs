@@ -119,17 +119,18 @@ pub async fn create_portal(
     Extension(context): Extension<ApiKeyContext>,
     Json(request): Json<CreatePortalRequest>,
 ) -> AppResult<Json<CreatePortalResponse>> {
-    let stripe_secret = state.stripe.secret_key.as_ref().ok_or_else(|| {
-        AppError::Internal("Stripe is not configured".to_string())
-    })?;
+    let stripe_secret = state
+        .stripe
+        .secret_key
+        .as_ref()
+        .ok_or_else(|| AppError::Internal("Stripe is not configured".to_string()))?;
 
     // Get customer ID
-    let customer_id: Option<(Option<String>,)> = sqlx::query_as(
-        "SELECT stripe_customer_id FROM organizations WHERE id = $1",
-    )
-    .bind(&context.organization_id)
-    .fetch_optional(state.db.pool())
-    .await?;
+    let customer_id: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT stripe_customer_id FROM organizations WHERE id = $1")
+            .bind(&context.organization_id)
+            .fetch_optional(state.db.pool())
+            .await?;
 
     let Some((Some(customer_id),)) = customer_id else {
         return Err(AppError::BadRequest(
@@ -139,12 +140,12 @@ pub async fn create_portal(
 
     // Create billing portal session via Stripe API
     let client = reqwest::Client::new();
-    
+
     let mut form_params = vec![
         ("customer", customer_id.as_str()),
         ("return_url", request.return_url.as_str()),
     ];
-    
+
     // Add configuration if specified
     if let Some(ref config_id) = state.stripe.billing_portal_config_id {
         form_params.push(("configuration", config_id.as_str()));
@@ -166,9 +167,10 @@ pub async fn create_portal(
         ));
     }
 
-    let portal: StripePortalSession = response.json().await.map_err(|e| {
-        AppError::Internal(format!("Failed to parse Stripe response: {}", e))
-    })?;
+    let portal: StripePortalSession = response
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to parse Stripe response: {}", e)))?;
 
     info!(
         org_id = %context.organization_id,
@@ -201,7 +203,9 @@ pub async fn webhook(
 
     // Verify signature
     let webhook_secret = state.stripe.webhook_secret.as_ref().ok_or_else(|| {
-        error!("Stripe billing webhook received but STRIPE_BILLING_WEBHOOK_SECRET is not configured");
+        error!(
+            "Stripe billing webhook received but STRIPE_BILLING_WEBHOOK_SECRET is not configured"
+        );
         AppError::Internal("Webhook signature verification not configured".to_string())
     })?;
 
@@ -254,11 +258,11 @@ struct StripeEventData {
 /// Handle checkout.session.completed event
 async fn handle_checkout_completed(state: &AppState, event: &StripeEvent) -> AppResult<()> {
     let session = &event.data.object;
-    
+
     let customer_id = session["customer"].as_str();
     let subscription_id = session["subscription"].as_str();
     let client_reference_id = session["client_reference_id"].as_str(); // org_id
-    
+
     if let (Some(customer_id), Some(org_id)) = (customer_id, client_reference_id) {
         // Update organization with Stripe customer ID
         sqlx::query(
@@ -285,19 +289,18 @@ async fn handle_checkout_completed(state: &AppState, event: &StripeEvent) -> App
 /// Handle subscription created/updated events
 async fn handle_subscription_updated(state: &AppState, event: &StripeEvent) -> AppResult<()> {
     let subscription = &event.data.object;
-    
+
     let subscription_id = subscription["id"].as_str();
     let customer_id = subscription["customer"].as_str();
     let status = subscription["status"].as_str();
     let current_period_end = subscription["current_period_end"].as_i64();
     let cancel_at_period_end = subscription["cancel_at_period_end"].as_bool();
-    
+
     // Determine plan tier from price
     let plan_tier = determine_plan_tier(subscription, state);
-    
+
     if let (Some(customer_id), Some(status)) = (customer_id, status) {
-        let period_end = current_period_end
-            .and_then(|ts| DateTime::from_timestamp(ts, 0));
+        let period_end = current_period_end.and_then(|ts| DateTime::from_timestamp(ts, 0));
 
         // Update organization
         sqlx::query(
@@ -336,9 +339,9 @@ async fn handle_subscription_updated(state: &AppState, event: &StripeEvent) -> A
 /// Handle subscription deleted event
 async fn handle_subscription_deleted(state: &AppState, event: &StripeEvent) -> AppResult<()> {
     let subscription = &event.data.object;
-    
+
     let customer_id = subscription["customer"].as_str();
-    
+
     if let Some(customer_id) = customer_id {
         // Downgrade to free tier
         sqlx::query(
@@ -366,10 +369,10 @@ async fn handle_subscription_deleted(state: &AppState, event: &StripeEvent) -> A
 /// Handle invoice.paid event
 async fn handle_invoice_paid(state: &AppState, event: &StripeEvent) -> AppResult<()> {
     let invoice = &event.data.object;
-    
+
     let customer_id = invoice["customer"].as_str();
     let subscription_id = invoice["subscription"].as_str();
-    
+
     if let (Some(customer_id), Some(_sub_id)) = (customer_id, subscription_id) {
         // Ensure subscription is active
         sqlx::query(
@@ -394,9 +397,9 @@ async fn handle_invoice_paid(state: &AppState, event: &StripeEvent) -> AppResult
 /// Handle invoice.payment_failed event
 async fn handle_payment_failed(state: &AppState, event: &StripeEvent) -> AppResult<()> {
     let invoice = &event.data.object;
-    
+
     let customer_id = invoice["customer"].as_str();
-    
+
     if let Some(customer_id) = customer_id {
         // Mark as past_due
         sqlx::query(
@@ -423,7 +426,7 @@ fn determine_plan_tier(subscription: &serde_json::Value, state: &AppState) -> Op
     let items = subscription["items"]["data"].as_array()?;
     let first_item = items.first()?;
     let price_id = first_item["price"]["id"].as_str()?;
-    
+
     // Match against configured price IDs
     if let Some(ref starter_price) = state.stripe.starter_price_id {
         if price_id == starter_price {
@@ -435,7 +438,7 @@ fn determine_plan_tier(subscription: &serde_json::Value, state: &AppState) -> Op
             return Some("pro".to_string());
         }
     }
-    
+
     // Default: keep current plan
     None
 }
@@ -505,9 +508,17 @@ fn constant_time_compare(a: &str, b: &str) -> bool {
 
     let len_eq = a.len() == b.len();
     let max_len = a.len().max(b.len());
-    
-    let a_bytes: Vec<u8> = a.bytes().chain(std::iter::repeat(0u8)).take(max_len).collect();
-    let b_bytes: Vec<u8> = b.bytes().chain(std::iter::repeat(0u8)).take(max_len).collect();
+
+    let a_bytes: Vec<u8> = a
+        .bytes()
+        .chain(std::iter::repeat(0u8))
+        .take(max_len)
+        .collect();
+    let b_bytes: Vec<u8> = b
+        .bytes()
+        .chain(std::iter::repeat(0u8))
+        .take(max_len)
+        .collect();
 
     let bytes_eq = a_bytes.ct_eq(&b_bytes).into();
     len_eq && bytes_eq

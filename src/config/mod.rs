@@ -375,9 +375,7 @@ impl Settings {
                 from_name: env::var("EMAIL_FROM_NAME")
                     .unwrap_or_else(|_| "Spooled Cloud".to_string()),
                 smtp_host: env::var("SMTP_HOST").ok(),
-                smtp_port: env::var("SMTP_PORT")
-                    .ok()
-                    .and_then(|s| s.parse().ok()),
+                smtp_port: env::var("SMTP_PORT").ok().and_then(|s| s.parse().ok()),
                 smtp_username: env::var("SMTP_USERNAME").ok(),
                 smtp_password: env::var("SMTP_PASSWORD").ok(),
             },

@@ -48,7 +48,7 @@ pub async fn start(
     ValidatedJson(request): ValidatedJson<StartEmailLoginRequest>,
 ) -> AppResult<Json<StartEmailLoginResponse>> {
     let email = request.email.to_lowercase().trim().to_string();
-    
+
     // Rate limit: check how many codes sent in the last hour
     let recent_codes: (i64,) = sqlx::query_as(
         r#"
@@ -60,32 +60,31 @@ pub async fn start(
     .bind(&email)
     .fetch_one(state.db.pool())
     .await?;
-    
+
     if recent_codes.0 >= MAX_CODES_PER_HOUR {
         warn!(email = %email, "Email login rate limit exceeded");
         return Err(AppError::RateLimit(
             "Too many login attempts. Please try again later.".to_string(),
         ));
     }
-    
+
     // Check if email is associated with an organization
-    let org: Option<(String,)> = sqlx::query_as(
-        "SELECT id FROM organizations WHERE billing_email = $1",
-    )
-    .bind(&email)
-    .fetch_optional(state.db.pool())
-    .await?;
-    
+    let org: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM organizations WHERE billing_email = $1")
+            .bind(&email)
+            .fetch_optional(state.db.pool())
+            .await?;
+
     let org_id = org.map(|(id,)| id);
-    
+
     // Generate a 6-digit code
     let code: String = {
         let mut rng = rand::rng();
         format!("{:06}", rng.random_range(0..1000000))
     };
-    
+
     let expires_at = Utc::now() + Duration::minutes(CODE_VALIDITY_MINUTES);
-    
+
     // Store the code
     sqlx::query(
         r#"
@@ -99,15 +98,15 @@ pub async fn start(
     .bind(expires_at)
     .execute(state.db.pool())
     .await?;
-    
+
     // Send the email
     send_login_code_email(&state, &email, &code).await?;
-    
+
     // Mask email for response
     let masked_email = mask_email(&email);
-    
+
     info!(email = %masked_email, "Login code sent");
-    
+
     Ok(Json(StartEmailLoginResponse {
         message: "Login code sent to your email".to_string(),
         email_sent_to: masked_email,
@@ -158,7 +157,7 @@ pub async fn verify(
 ) -> AppResult<Json<VerifyEmailLoginResponse>> {
     let email = request.email.to_lowercase().trim().to_string();
     let code = request.code.trim().to_string();
-    
+
     // Find valid, unused code
     let login_code: Option<(Uuid, String, Option<String>, i32)> = sqlx::query_as(
         r#"
@@ -174,14 +173,14 @@ pub async fn verify(
     .bind(&email)
     .fetch_optional(state.db.pool())
     .await?;
-    
+
     let Some((code_id, stored_code, org_id, attempts)) = login_code else {
         warn!(email = %mask_email(&email), "No valid login code found");
         return Err(AppError::Authentication(
             "Invalid or expired code. Please request a new one.".to_string(),
         ));
     };
-    
+
     // Check attempts
     if attempts >= MAX_CODE_ATTEMPTS {
         // Invalidate the code
@@ -189,30 +188,30 @@ pub async fn verify(
             .bind(code_id)
             .execute(state.db.pool())
             .await?;
-        
+
         return Err(AppError::Authentication(
             "Too many attempts. Please request a new code.".to_string(),
         ));
     }
-    
+
     // Increment attempts
     sqlx::query("UPDATE email_login_codes SET attempts = attempts + 1 WHERE id = $1")
         .bind(code_id)
         .execute(state.db.pool())
         .await?;
-    
+
     // Verify code
     if code != stored_code {
         warn!(email = %mask_email(&email), attempts = attempts + 1, "Invalid login code");
         return Err(AppError::Authentication("Invalid code".to_string()));
     }
-    
+
     // Mark code as used
     sqlx::query("UPDATE email_login_codes SET used_at = NOW() WHERE id = $1")
         .bind(code_id)
         .execute(state.db.pool())
         .await?;
-    
+
     // Get or create organization
     let org_id = match org_id {
         Some(id) => id,
@@ -221,15 +220,15 @@ pub async fn verify(
             create_organization_for_email(&state, &email).await?
         }
     };
-    
+
     // Get or create an API key for this org (for the token)
     let api_key_id = get_or_create_email_api_key(&state, &org_id, &email).await?;
-    
+
     // Generate JWT tokens
     let now = Utc::now();
     let access_expiration = state.settings.jwt.expiration_hours as i64;
     let refresh_expiration = access_expiration * 24;
-    
+
     let access_claims = Claims {
         sub: org_id.clone(),
         api_key_id: api_key_id.clone(),
@@ -242,7 +241,7 @@ pub async fn verify(
         token_type: "access".to_string(),
         email: Some(email.clone()),
     };
-    
+
     let refresh_claims = Claims {
         sub: org_id.clone(),
         api_key_id: api_key_id.clone(),
@@ -255,7 +254,7 @@ pub async fn verify(
         token_type: "refresh".to_string(),
         email: Some(email.clone()),
     };
-    
+
     let access_token = encode(
         &Header::default(),
         &access_claims,
@@ -265,7 +264,7 @@ pub async fn verify(
         error!(error = %e, "Failed to encode access token");
         AppError::Internal("Failed to generate token".to_string())
     })?;
-    
+
     let refresh_token = encode(
         &Header::default(),
         &refresh_claims,
@@ -275,9 +274,9 @@ pub async fn verify(
         error!(error = %e, "Failed to encode refresh token");
         AppError::Internal("Failed to generate token".to_string())
     })?;
-    
+
     info!(email = %mask_email(&email), org_id = %org_id, "Email login successful");
-    
+
     Ok(Json(VerifyEmailLoginResponse {
         access_token,
         refresh_token,
@@ -303,7 +302,7 @@ Best,
 The Spooled Cloud Team"#,
         code, CODE_VALIDITY_MINUTES
     );
-    
+
     let html_body = format!(
         r#"<!DOCTYPE html>
 <html>
@@ -327,7 +326,7 @@ The Spooled Cloud Team"#,
 </html>"#,
         code, CODE_VALIDITY_MINUTES
     );
-    
+
     match state.settings.email.provider {
         EmailProvider::Console => {
             // Development: log to console
@@ -360,7 +359,7 @@ The Spooled Cloud Team"#,
             println!("=======================================================\n");
         }
     }
-    
+
     Ok(())
 }
 
@@ -372,10 +371,11 @@ async fn send_via_resend(
     text: &str,
     html: &str,
 ) -> AppResult<()> {
-    let api_key = state.settings.email.api_key.as_ref().ok_or_else(|| {
-        AppError::Internal("EMAIL_API_KEY not configured for Resend".to_string())
-    })?;
-    
+    let api_key =
+        state.settings.email.api_key.as_ref().ok_or_else(|| {
+            AppError::Internal("EMAIL_API_KEY not configured for Resend".to_string())
+        })?;
+
     let client = reqwest::Client::new();
     let response = client
         .post("https://api.resend.com/emails")
@@ -390,13 +390,13 @@ async fn send_via_resend(
         .send()
         .await
         .map_err(|e| AppError::Internal(format!("Failed to send email: {}", e)))?;
-    
+
     if !response.status().is_success() {
         let error = response.text().await.unwrap_or_default();
         error!(error = %error, "Resend email failed");
         return Err(AppError::Internal("Failed to send email".to_string()));
     }
-    
+
     Ok(())
 }
 
@@ -411,7 +411,7 @@ async fn send_via_sendgrid(
     let api_key = state.settings.email.api_key.as_ref().ok_or_else(|| {
         AppError::Internal("EMAIL_API_KEY not configured for SendGrid".to_string())
     })?;
-    
+
     let client = reqwest::Client::new();
     let response = client
         .post("https://api.sendgrid.com/v3/mail/send")
@@ -433,13 +433,13 @@ async fn send_via_sendgrid(
         .send()
         .await
         .map_err(|e| AppError::Internal(format!("Failed to send email: {}", e)))?;
-    
+
     if !response.status().is_success() {
         let error = response.text().await.unwrap_or_default();
         error!(error = %error, "SendGrid email failed");
         return Err(AppError::Internal("Failed to send email".to_string()));
     }
-    
+
     Ok(())
 }
 
@@ -454,7 +454,7 @@ async fn send_via_postmark(
     let api_key = state.settings.email.api_key.as_ref().ok_or_else(|| {
         AppError::Internal("EMAIL_API_KEY not configured for Postmark".to_string())
     })?;
-    
+
     let client = reqwest::Client::new();
     let response = client
         .post("https://api.postmarkapp.com/email")
@@ -470,13 +470,13 @@ async fn send_via_postmark(
         .send()
         .await
         .map_err(|e| AppError::Internal(format!("Failed to send email: {}", e)))?;
-    
+
     if !response.status().is_success() {
         let error = response.text().await.unwrap_or_default();
         error!(error = %error, "Postmark email failed");
         return Err(AppError::Internal("Failed to send email".to_string()));
     }
-    
+
     Ok(())
 }
 
@@ -484,7 +484,7 @@ async fn send_via_postmark(
 async fn create_organization_for_email(state: &AppState, email: &str) -> AppResult<String> {
     let org_id = Uuid::new_v4().to_string();
     let now = Utc::now();
-    
+
     // Generate slug from email
     let slug = email
         .split('@')
@@ -495,20 +495,16 @@ async fn create_organization_for_email(state: &AppState, email: &str) -> AppResu
         .take(20)
         .collect::<String>()
         .to_lowercase();
-    
+
     let slug = if slug.len() < 3 {
         format!("{}-{}", slug, &org_id[..6])
     } else {
         // Add random suffix to ensure uniqueness
         format!("{}-{}", slug, &org_id[..6])
     };
-    
-    let name = email
-        .split('@')
-        .next()
-        .unwrap_or("User")
-        .to_string();
-    
+
+    let name = email.split('@').next().unwrap_or("User").to_string();
+
     sqlx::query(
         r#"
         INSERT INTO organizations (id, name, slug, plan_tier, billing_email, settings, created_at, updated_at)
@@ -522,9 +518,9 @@ async fn create_organization_for_email(state: &AppState, email: &str) -> AppResu
     .bind(now)
     .execute(state.db.pool())
     .await?;
-    
+
     info!(org_id = %org_id, email = %mask_email(email), "Created organization for email login");
-    
+
     Ok(org_id)
 }
 
@@ -547,21 +543,21 @@ async fn get_or_create_email_api_key(
     .bind(org_id)
     .fetch_optional(state.db.pool())
     .await?;
-    
+
     if let Some((id,)) = existing {
         return Ok(id);
     }
-    
+
     // Create new API key
     let key_id = Uuid::new_v4().to_string();
     let now = Utc::now();
-    
+
     // Generate a random key (we won't expose it, just for internal use)
     let raw_key = format!("sk_email_{}", Uuid::new_v4().to_string().replace('-', ""));
     let key_hash = bcrypt::hash(&raw_key, 10)
         .map_err(|e| AppError::Internal(format!("Failed to hash key: {}", e)))?;
     let key_prefix = raw_key.chars().take(8).collect::<String>();
-    
+
     sqlx::query(
         r#"
         INSERT INTO api_keys (id, organization_id, name, key_hash, key_prefix, queues, is_active, created_at)
@@ -575,13 +571,13 @@ async fn get_or_create_email_api_key(
     .bind(now)
     .execute(state.db.pool())
     .await?;
-    
+
     info!(
         org_id = %org_id,
         email = %mask_email(email),
         "Created API key for email login"
     );
-    
+
     Ok(key_id)
 }
 
@@ -591,16 +587,16 @@ fn mask_email(email: &str) -> String {
     if parts.len() != 2 {
         return "***@***".to_string();
     }
-    
+
     let local = parts[0];
     let domain = parts[1];
-    
+
     let masked_local = if local.len() <= 2 {
         "*".repeat(local.len())
     } else {
-        format!("{}***{}", &local[..1], &local[local.len()-1..])
+        format!("{}***{}", &local[..1], &local[local.len() - 1..])
     };
-    
+
     format!("{}@{}", masked_local, domain)
 }
 
