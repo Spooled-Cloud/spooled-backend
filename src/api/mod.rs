@@ -168,6 +168,10 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
         .route("/organizations/{id}", get(handlers::organizations::get))
         .route("/organizations/{id}", put(handlers::organizations::update))
         .route(
+            "/organizations/{id}/members",
+            get(handlers::organizations::members),
+        )
+        .route(
             "/organizations/{id}",
             delete(handlers::organizations::delete),
         )

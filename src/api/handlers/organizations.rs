@@ -17,6 +17,23 @@ use crate::models::{
     UpdateOrganizationRequest,
 };
 
+/// Organization member representation (dashboard UI)
+///
+/// Note: Spooled does not currently have "user accounts" stored in the DB.
+/// The dashboard "members" view is backed by active API keys that have access
+/// to the organization.
+#[derive(Debug, Serialize)]
+pub struct OrganizationMember {
+    pub id: String,
+    pub user_id: String,
+    pub email: String,
+    pub name: String,
+    pub role: String,
+    pub joined_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invited_by: Option<String>,
+}
+
 /// Response for organization creation - includes initial API key
 #[derive(Debug, Serialize)]
 pub struct CreateOrganizationResponse {
@@ -242,6 +259,71 @@ pub async fn get(
         .ok_or_else(|| AppError::NotFound(format!("Organization {} not found", id)))?;
 
     Ok(Json(org))
+}
+
+/// Get organization members (API keys with access)
+///
+/// GET /api/v1/organizations/{id}/members
+pub async fn members(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path(id): Path<String>,
+) -> AppResult<Json<Vec<OrganizationMember>>> {
+    // Verify caller belongs to this organization
+    if id != ctx.organization_id {
+        return Err(AppError::NotFound(format!("Organization {} not found", id)));
+    }
+
+    let org = sqlx::query_as::<_, Organization>("SELECT * FROM organizations WHERE id = $1")
+        .bind(&id)
+        .fetch_optional(state.db.pool())
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Organization {} not found", id)))?;
+
+    #[derive(sqlx::FromRow)]
+    struct ApiKeyRow {
+        id: String,
+        name: String,
+        queues: Vec<String>,
+        created_at: DateTime<Utc>,
+    }
+
+    let keys: Vec<ApiKeyRow> = sqlx::query_as(
+        r#"
+        SELECT id, name, queues, created_at
+        FROM api_keys
+        WHERE organization_id = $1 AND is_active = TRUE
+        ORDER BY created_at ASC
+        "#,
+    )
+    .bind(&id)
+    .fetch_all(state.db.pool())
+    .await?;
+
+    let email = org.billing_email.unwrap_or_default();
+
+    let members = keys
+        .into_iter()
+        .map(|k| {
+            let role = if k.queues.iter().any(|q| q == "*") {
+                "owner"
+            } else {
+                "member"
+            };
+
+            OrganizationMember {
+                id: k.id.clone(),
+                user_id: k.id,
+                email: email.clone(),
+                name: k.name,
+                role: role.to_string(),
+                joined_at: k.created_at,
+                invited_by: None,
+            }
+        })
+        .collect();
+
+    Ok(Json(members))
 }
 
 /// Update an organization
