@@ -12,8 +12,6 @@ mod common;
 use common::TestDatabase;
 use futures::future::join_all;
 use serde_json::{json, Value};
-use std::sync::Arc;
-use std::time::Duration;
 
 /// Test helper to setup test organization
 async fn setup_org(db: &TestDatabase, name: &str) -> String {
@@ -292,7 +290,7 @@ async fn test_job_status_transition_validity() {
     }
 
     // Invalid transition: completed -> pending (should not update)
-    let result = sqlx::query(
+    let _result = sqlx::query(
         "UPDATE jobs SET status = 'pending', updated_at = NOW() WHERE id = $1 AND status = 'completed'"
     )
     .bind(&job_id)
@@ -996,8 +994,6 @@ async fn test_job_dependencies() {
 async fn test_cron_schedule_storage() {
     let db = TestDatabase::new().await;
     let org_id = setup_org(&db, "cron-test").await;
-
-    let schedule_id = uuid::Uuid::new_v4().to_string();
 
     // Various cron expressions
     let cron_expressions = [

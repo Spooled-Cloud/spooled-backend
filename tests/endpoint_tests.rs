@@ -5,8 +5,7 @@
 
 mod common;
 
-use chrono::Utc;
-use common::{fixtures, TestDatabase};
+use common::TestDatabase;
 
 // =============================================================================
 // Health Endpoints Tests

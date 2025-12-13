@@ -1,7 +1,8 @@
 //! Common test utilities and fixtures
 
+#![allow(dead_code)]
+
 // Test utilities may not all be used in every test
-#[allow(dead_code)]
 use std::sync::Arc;
 
 use sqlx::postgres::PgPoolOptions;

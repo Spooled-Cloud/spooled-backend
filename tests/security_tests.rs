@@ -3,6 +3,7 @@
 //! These tests verify security controls and input validation.
 
 #![allow(clippy::useless_vec)]
+#![allow(dead_code, unused_imports, unused_variables)]
 
 mod common;
 
