@@ -25,12 +25,12 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Organization billing data tuple from database query
 type OrgBillingData = (
-    String,                    // plan_tier
-    Option<String>,            // stripe_customer_id
-    Option<String>,            // stripe_subscription_id
-    Option<String>,            // stripe_subscription_status
-    Option<DateTime<Utc>>,     // stripe_current_period_end
-    Option<bool>,              // stripe_cancel_at_period_end
+    String,                // plan_tier
+    Option<String>,        // stripe_customer_id
+    Option<String>,        // stripe_subscription_id
+    Option<String>,        // stripe_subscription_status
+    Option<DateTime<Utc>>, // stripe_current_period_end
+    Option<bool>,          // stripe_cancel_at_period_end
 );
 
 /// Maximum age for Stripe webhook timestamps (5 minutes)

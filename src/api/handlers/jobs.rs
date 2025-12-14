@@ -6,9 +6,9 @@ use axum::{
     Json,
 };
 use chrono::Utc;
+use std::sync::Arc;
 use tracing::info;
 use uuid::Uuid;
-use std::sync::Arc;
 
 use crate::api::middleware::limits::{check_job_limits, check_payload_size, increment_daily_jobs};
 use crate::api::middleware::ValidatedJson;
@@ -17,10 +17,11 @@ use crate::error::{AppError, AppResult};
 use crate::models::ApiKeyContext;
 use crate::models::{
     ClaimJobsRequest, ClaimJobsResponse, ClaimedJob, CompleteJobRequest, CreateJobRequest,
-    CreateJobResponse, FailJobRequest, HeartbeatJobRequest, Job, JobStats, JobSummary, ListJobsQuery,
+    CreateJobResponse, FailJobRequest, HeartbeatJobRequest, Job, JobStats, JobSummary,
+    ListJobsQuery,
 };
-use axum::extract::Extension;
 use crate::queue::QueueManager;
+use axum::extract::Extension;
 
 /// Maximum jobs per list request
 /// Reduced from 1000 to prevent memory exhaustion
@@ -267,7 +268,10 @@ pub async fn claim(
     ValidatedJson(request): ValidatedJson<ClaimJobsRequest>,
 ) -> AppResult<Json<ClaimJobsResponse>> {
     // Defaults and safety bounds
-    let limit = request.limit.unwrap_or(1).clamp(1, MAX_JOBS_PER_PAGE as i32) as usize;
+    let limit = request
+        .limit
+        .unwrap_or(1)
+        .clamp(1, MAX_JOBS_PER_PAGE as i32) as usize;
     let lease_duration_secs = request.lease_duration_secs.unwrap_or(30);
 
     let queue = QueueManager::new(
