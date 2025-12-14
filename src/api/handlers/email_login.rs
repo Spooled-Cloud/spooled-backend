@@ -1274,4 +1274,232 @@ mod tests {
         let decoded: Claims = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.email, None);
     }
+
+    #[test]
+    fn test_check_email_request_validation() {
+        // Valid email
+        let valid = CheckEmailRequest {
+            email: "test@example.com".to_string(),
+        };
+        assert!(valid.validate().is_ok());
+
+        // Invalid email
+        let invalid = CheckEmailRequest {
+            email: "not-an-email".to_string(),
+        };
+        assert!(invalid.validate().is_err());
+
+        // Empty email
+        let empty = CheckEmailRequest {
+            email: "".to_string(),
+        };
+        assert!(empty.validate().is_err());
+    }
+
+    #[test]
+    fn test_check_email_response_serialization() {
+        // Email exists
+        let exists_response = CheckEmailResponse {
+            available: false,
+            exists: true,
+        };
+        let json = serde_json::to_string(&exists_response).unwrap();
+        assert!(json.contains("\"available\":false"));
+        assert!(json.contains("\"exists\":true"));
+
+        // Email available
+        let available_response = CheckEmailResponse {
+            available: true,
+            exists: false,
+        };
+        let json = serde_json::to_string(&available_response).unwrap();
+        assert!(json.contains("\"available\":true"));
+        assert!(json.contains("\"exists\":false"));
+    }
+
+    #[test]
+    fn test_verify_email_signup_response_serialization() {
+        let response = VerifyEmailSignupResponse {
+            signup_token: "abc123-token".to_string(),
+            email: "test@example.com".to_string(),
+            expires_in: 900,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("abc123-token"));
+        assert!(json.contains("test@example.com"));
+        assert!(json.contains("900"));
+    }
+
+    #[test]
+    fn test_verify_email_response_login_variant() {
+        let login_response = VerifyEmailResponse::Login(VerifyEmailLoginResponse {
+            access_token: "access-token".to_string(),
+            refresh_token: "refresh-token".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+            refresh_expires_in: 2592000,
+        });
+
+        let json = serde_json::to_string(&login_response).unwrap();
+        assert!(json.contains("\"type\":\"login\""));
+        assert!(json.contains("access-token"));
+        assert!(json.contains("Bearer"));
+    }
+
+    #[test]
+    fn test_verify_email_response_signup_variant() {
+        let signup_response = VerifyEmailResponse::Signup(VerifyEmailSignupResponse {
+            signup_token: "signup-token-123".to_string(),
+            email: "new@user.com".to_string(),
+            expires_in: 900,
+        });
+
+        let json = serde_json::to_string(&signup_response).unwrap();
+        assert!(json.contains("\"type\":\"signup\""));
+        assert!(json.contains("signup-token-123"));
+        assert!(json.contains("new@user.com"));
+    }
+
+    #[test]
+    fn test_complete_signup_request_validation() {
+        // Valid request
+        let valid = CompleteSignupRequest {
+            signup_token: "abc123".to_string(),
+            name: "My Company".to_string(),
+            slug: "my-company".to_string(),
+        };
+        assert!(valid.validate().is_ok());
+
+        // Name too short
+        let short_name = CompleteSignupRequest {
+            signup_token: "abc123".to_string(),
+            name: "ab".to_string(),
+            slug: "my-company".to_string(),
+        };
+        assert!(short_name.validate().is_err());
+
+        // Slug too short
+        let short_slug = CompleteSignupRequest {
+            signup_token: "abc123".to_string(),
+            name: "My Company".to_string(),
+            slug: "ab".to_string(),
+        };
+        assert!(short_slug.validate().is_err());
+
+        // Name too long (over 100 chars)
+        let long_name = CompleteSignupRequest {
+            signup_token: "abc123".to_string(),
+            name: "a".repeat(101),
+            slug: "my-company".to_string(),
+        };
+        assert!(long_name.validate().is_err());
+
+        // Slug too long (over 50 chars)
+        let long_slug = CompleteSignupRequest {
+            signup_token: "abc123".to_string(),
+            name: "My Company".to_string(),
+            slug: "a".repeat(51),
+        };
+        assert!(long_slug.validate().is_err());
+    }
+
+    #[test]
+    fn test_complete_signup_response_serialization() {
+        let response = CompleteSignupResponse {
+            organization: SignupOrganization {
+                id: "org-123".to_string(),
+                name: "Test Org".to_string(),
+                slug: "test-org".to_string(),
+                billing_email: "test@example.com".to_string(),
+            },
+            api_key: "sk_test_abc123".to_string(),
+            access_token: "jwt-access-token".to_string(),
+            refresh_token: "jwt-refresh-token".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("org-123"));
+        assert!(json.contains("test-org"));
+        assert!(json.contains("sk_test_abc123"));
+        assert!(json.contains("jwt-access-token"));
+        assert!(json.contains("Bearer"));
+    }
+
+    #[test]
+    fn test_signup_organization_serialization() {
+        let org = SignupOrganization {
+            id: "org-456".to_string(),
+            name: "New Organization".to_string(),
+            slug: "new-org".to_string(),
+            billing_email: "billing@neworg.com".to_string(),
+        };
+
+        let json = serde_json::to_string(&org).unwrap();
+        assert!(json.contains("org-456"));
+        assert!(json.contains("New Organization"));
+        assert!(json.contains("new-org"));
+        assert!(json.contains("billing@neworg.com"));
+    }
+
+    #[test]
+    fn test_extract_client_ip_cloudflare() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("CF-Connecting-IP", "203.0.113.50".parse().unwrap());
+        headers.insert("X-Forwarded-For", "10.0.0.1, 172.16.0.1".parse().unwrap());
+
+        let ip = extract_client_ip(&headers);
+        assert_eq!(ip, "203.0.113.50");
+    }
+
+    #[test]
+    fn test_extract_client_ip_real_ip() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("X-Real-IP", "192.168.1.100".parse().unwrap());
+        headers.insert("X-Forwarded-For", "10.0.0.1".parse().unwrap());
+
+        let ip = extract_client_ip(&headers);
+        assert_eq!(ip, "192.168.1.100");
+    }
+
+    #[test]
+    fn test_extract_client_ip_forwarded_for() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "X-Forwarded-For",
+            "203.0.113.195, 70.41.3.18, 150.172.238.178"
+                .parse()
+                .unwrap(),
+        );
+
+        let ip = extract_client_ip(&headers);
+        assert_eq!(ip, "203.0.113.195");
+    }
+
+    #[test]
+    fn test_extract_client_ip_unknown() {
+        let headers = axum::http::HeaderMap::new();
+        let ip = extract_client_ip(&headers);
+        assert_eq!(ip, "unknown");
+    }
+
+    #[test]
+    fn test_extract_client_ip_empty_forwarded() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("X-Forwarded-For", "".parse().unwrap());
+
+        let ip = extract_client_ip(&headers);
+        assert_eq!(ip, "unknown");
+    }
+
+    #[test]
+    fn test_extract_client_ip_whitespace_handling() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("CF-Connecting-IP", "  192.168.1.1  ".parse().unwrap());
+
+        let ip = extract_client_ip(&headers);
+        assert_eq!(ip, "192.168.1.1");
+    }
 }

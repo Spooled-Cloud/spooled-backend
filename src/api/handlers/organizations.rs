@@ -683,4 +683,198 @@ mod tests {
         let summary: OrganizationSummary = org.into();
         assert_eq!(summary.slug, "test-org");
     }
+
+    #[test]
+    fn test_check_slug_response_available() {
+        let response = CheckSlugResponse {
+            available: true,
+            valid: true,
+            error: None,
+            suggestion: None,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"available\":true"));
+        assert!(json.contains("\"valid\":true"));
+        // error and suggestion should not be present (skip_serializing_if)
+        assert!(!json.contains("\"error\""));
+        assert!(!json.contains("\"suggestion\""));
+    }
+
+    #[test]
+    fn test_check_slug_response_taken() {
+        let response = CheckSlugResponse {
+            available: false,
+            valid: true,
+            error: None,
+            suggestion: Some("my-org-abc123".to_string()),
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"available\":false"));
+        assert!(json.contains("\"suggestion\":\"my-org-abc123\""));
+    }
+
+    #[test]
+    fn test_check_slug_response_invalid() {
+        let response = CheckSlugResponse {
+            available: false,
+            valid: false,
+            error: Some("Slug must start with a letter".to_string()),
+            suggestion: None,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"valid\":false"));
+        assert!(json.contains("Slug must start with a letter"));
+    }
+
+    #[test]
+    fn test_validate_slug_valid() {
+        assert!(validate_slug("my-org").is_ok());
+        assert!(validate_slug("test123").is_ok());
+        assert!(validate_slug("a1b2c3").is_ok());
+        assert!(validate_slug("company-name").is_ok());
+        assert!(validate_slug("abc").is_ok());
+    }
+
+    #[test]
+    fn test_validate_slug_too_short() {
+        // Empty slug
+        assert!(validate_slug("").is_err());
+        // Would fail if we had a min-length check - but current impl allows any length > 0
+    }
+
+    #[test]
+    fn test_validate_slug_too_long() {
+        let long_slug = "a".repeat(101);
+        assert!(validate_slug(&long_slug).is_err());
+    }
+
+    #[test]
+    fn test_validate_slug_invalid_chars() {
+        assert!(validate_slug("my_org").is_err()); // underscore
+        assert!(validate_slug("My-Org").is_err()); // uppercase
+        assert!(validate_slug("my org").is_err()); // space
+        assert!(validate_slug("my@org").is_err()); // special char
+    }
+
+    #[test]
+    fn test_validate_slug_hyphen_position() {
+        assert!(validate_slug("-starts-with").is_err());
+        assert!(validate_slug("ends-with-").is_err());
+        assert!(validate_slug("-both-").is_err());
+    }
+
+    #[test]
+    fn test_organization_member_serialization() {
+        let member = OrganizationMember {
+            id: "key-123".to_string(),
+            user_id: "key-123".to_string(),
+            email: "user@example.com".to_string(),
+            name: "Initial Admin Key".to_string(),
+            role: "owner".to_string(),
+            joined_at: Utc::now(),
+            invited_by: None,
+        };
+
+        let json = serde_json::to_string(&member).unwrap();
+        assert!(json.contains("key-123"));
+        assert!(json.contains("user@example.com"));
+        assert!(json.contains("owner"));
+        // invited_by is None so should not appear (skip_serializing_if)
+        assert!(!json.contains("invited_by"));
+    }
+
+    #[test]
+    fn test_organization_member_with_inviter() {
+        let member = OrganizationMember {
+            id: "key-456".to_string(),
+            user_id: "key-456".to_string(),
+            email: "member@example.com".to_string(),
+            name: "Team Member Key".to_string(),
+            role: "member".to_string(),
+            joined_at: Utc::now(),
+            invited_by: Some("admin@example.com".to_string()),
+        };
+
+        let json = serde_json::to_string(&member).unwrap();
+        assert!(json.contains("member"));
+        assert!(json.contains("invited_by"));
+        assert!(json.contains("admin@example.com"));
+    }
+
+    #[test]
+    fn test_initial_api_key_serialization() {
+        let api_key = InitialApiKey {
+            id: "key-789".to_string(),
+            key: "sk_test_abcdef123456".to_string(),
+            name: "Initial Admin Key".to_string(),
+            created_at: Utc::now(),
+        };
+
+        let json = serde_json::to_string(&api_key).unwrap();
+        assert!(json.contains("key-789"));
+        assert!(json.contains("sk_test_abcdef123456"));
+        assert!(json.contains("Initial Admin Key"));
+    }
+
+    #[test]
+    fn test_extract_client_ip_cloudflare() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("CF-Connecting-IP", "203.0.113.50".parse().unwrap());
+        headers.insert("X-Forwarded-For", "10.0.0.1, 172.16.0.1".parse().unwrap());
+
+        let ip = extract_client_ip(&headers);
+        assert_eq!(ip, "203.0.113.50");
+    }
+
+    #[test]
+    fn test_extract_client_ip_real_ip() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("X-Real-IP", "192.168.1.100".parse().unwrap());
+        headers.insert("X-Forwarded-For", "10.0.0.1".parse().unwrap());
+
+        let ip = extract_client_ip(&headers);
+        assert_eq!(ip, "192.168.1.100");
+    }
+
+    #[test]
+    fn test_extract_client_ip_forwarded_for() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "X-Forwarded-For",
+            "203.0.113.195, 70.41.3.18, 150.172.238.178"
+                .parse()
+                .unwrap(),
+        );
+
+        let ip = extract_client_ip(&headers);
+        assert_eq!(ip, "203.0.113.195");
+    }
+
+    #[test]
+    fn test_extract_client_ip_unknown() {
+        let headers = axum::http::HeaderMap::new();
+        let ip = extract_client_ip(&headers);
+        assert_eq!(ip, "unknown");
+    }
+
+    #[test]
+    fn test_extract_client_ip_empty_forwarded() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("X-Forwarded-For", "".parse().unwrap());
+
+        let ip = extract_client_ip(&headers);
+        assert_eq!(ip, "unknown");
+    }
+
+    #[test]
+    fn test_extract_client_ip_whitespace_handling() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("CF-Connecting-IP", "  192.168.1.1  ".parse().unwrap());
+
+        let ip = extract_client_ip(&headers);
+        assert_eq!(ip, "192.168.1.1");
+    }
 }

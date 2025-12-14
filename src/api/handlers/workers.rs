@@ -280,6 +280,7 @@ pub async fn deregister(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use validator::Validate;
 
     #[test]
     fn test_register_response_serialization() {
@@ -293,5 +294,107 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("worker-1"));
         assert!(json.contains("default"));
+        assert!(json.contains("\"lease_duration_secs\":30"));
+        assert!(json.contains("\"heartbeat_interval_secs\":10"));
+    }
+
+    #[test]
+    fn test_register_worker_request_validation() {
+        // Valid request
+        let valid = RegisterWorkerRequest {
+            queue_name: "emails".to_string(),
+            hostname: "worker-host-1".to_string(),
+            worker_type: Some("http".to_string()),
+            max_concurrency: Some(10),
+            metadata: None,
+            version: Some("1.0.0".to_string()),
+        };
+        assert!(valid.validate().is_ok());
+
+        // Queue name too short
+        let short_queue = RegisterWorkerRequest {
+            queue_name: "".to_string(),
+            hostname: "host".to_string(),
+            worker_type: Some("http".to_string()),
+            max_concurrency: Some(10),
+            metadata: None,
+            version: None,
+        };
+        assert!(short_queue.validate().is_err());
+
+        // Hostname too short
+        let short_host = RegisterWorkerRequest {
+            queue_name: "default".to_string(),
+            hostname: "".to_string(),
+            worker_type: Some("http".to_string()),
+            max_concurrency: Some(10),
+            metadata: None,
+            version: None,
+        };
+        assert!(short_host.validate().is_err());
+    }
+
+    #[test]
+    fn test_worker_heartbeat_request_deserialization() {
+        let json = r#"{"status":"healthy","current_jobs":5}"#;
+        let request: WorkerHeartbeatRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.status.as_deref(), Some("healthy"));
+        assert_eq!(request.current_jobs, 5);
+    }
+
+    #[test]
+    fn test_worker_heartbeat_request_defaults() {
+        let json = r#"{"current_jobs":0}"#;
+        let request: WorkerHeartbeatRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.status, None);
+        assert_eq!(request.current_jobs, 0);
+    }
+
+    #[test]
+    fn test_worker_summary_serialization() {
+        let summary = WorkerSummary {
+            id: "worker-abc123".to_string(),
+            queue_name: "default".to_string(),
+            hostname: "worker-host".to_string(),
+            status: "healthy".to_string(),
+            current_jobs: 3,
+            max_concurrency: 10,
+            last_heartbeat: Utc::now(),
+        };
+
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("worker-abc123"));
+        assert!(json.contains("\"status\":\"healthy\""));
+        assert!(json.contains("\"current_jobs\":3"));
+    }
+
+    #[test]
+    fn test_max_workers_per_page_constant() {
+        assert_eq!(MAX_WORKERS_PER_PAGE, 100);
+    }
+
+    #[test]
+    fn test_queue_name_validation_in_register() {
+        // Valid queue names
+        assert!("default"
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.'));
+        assert!("my-queue"
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.'));
+        assert!("my_queue"
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.'));
+        assert!("queue.v2"
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.'));
+
+        // Invalid queue names
+        assert!(!"my queue"
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.'));
+        assert!(!"my@queue"
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.'));
     }
 }

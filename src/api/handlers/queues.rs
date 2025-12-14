@@ -381,4 +381,123 @@ mod tests {
         assert!(json.contains("default"));
         assert!(json.contains("pending_jobs"));
     }
+
+    #[test]
+    fn test_queue_stats_without_optional_fields() {
+        let stats = QueueStats {
+            queue_name: "emails".to_string(),
+            pending_jobs: 0,
+            processing_jobs: 0,
+            completed_jobs_24h: 0,
+            failed_jobs_24h: 0,
+            avg_processing_time_ms: None,
+            max_job_age_seconds: None,
+            active_workers: 0,
+        };
+
+        let json = serde_json::to_string(&stats).unwrap();
+        assert!(json.contains("emails"));
+        assert!(json.contains("\"pending_jobs\":0"));
+    }
+
+    #[test]
+    fn test_validate_queue_name_valid() {
+        assert!(validate_queue_name_param("default").is_ok());
+        assert!(validate_queue_name_param("my-queue").is_ok());
+        assert!(validate_queue_name_param("my_queue").is_ok());
+        assert!(validate_queue_name_param("my.queue").is_ok());
+        assert!(validate_queue_name_param("queue123").is_ok());
+        assert!(validate_queue_name_param("a").is_ok());
+    }
+
+    #[test]
+    fn test_validate_queue_name_empty() {
+        let result = validate_queue_name_param("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_queue_name_too_long() {
+        let long_name = "a".repeat(101);
+        let result = validate_queue_name_param(&long_name);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_queue_name_invalid_chars() {
+        assert!(validate_queue_name_param("my queue").is_err()); // space
+        assert!(validate_queue_name_param("my@queue").is_err()); // @
+        assert!(validate_queue_name_param("my/queue").is_err()); // /
+        assert!(validate_queue_name_param("my\\queue").is_err()); // backslash
+        assert!(validate_queue_name_param("my#queue").is_err()); // #
+        assert!(validate_queue_name_param("my$queue").is_err()); // $
+                                                                 // Note: Unicode alphanumeric chars like CJK are allowed by is_alphanumeric()
+    }
+
+    #[test]
+    fn test_pause_queue_response_serialization() {
+        let response = PauseQueueResponse {
+            queue_name: "emails".to_string(),
+            paused: true,
+            paused_at: Utc::now(),
+            reason: Some("Maintenance".to_string()),
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("emails"));
+        assert!(json.contains("\"paused\":true"));
+        assert!(json.contains("Maintenance"));
+    }
+
+    #[test]
+    fn test_resume_queue_response_serialization() {
+        let response = ResumeQueueResponse {
+            queue_name: "emails".to_string(),
+            resumed: true,
+            paused_duration_secs: 3600,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("emails"));
+        assert!(json.contains("\"resumed\":true"));
+        assert!(json.contains("\"paused_duration_secs\":3600"));
+    }
+
+    #[test]
+    fn test_queue_config_summary_serialization() {
+        let summary = QueueConfigSummary {
+            queue_name: "high-priority".to_string(),
+            max_retries: 5,
+            default_timeout: 120,
+            rate_limit: Some(1000),
+            enabled: true,
+        };
+
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("high-priority"));
+        assert!(json.contains("\"max_retries\":5"));
+        assert!(json.contains("\"rate_limit\":1000"));
+    }
+
+    #[test]
+    fn test_queue_config_summary_without_rate_limit() {
+        let summary = QueueConfigSummary {
+            queue_name: "default".to_string(),
+            max_retries: 3,
+            default_timeout: 60,
+            rate_limit: None,
+            enabled: true,
+        };
+
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("default"));
+        // rate_limit should be null
+        assert!(json.contains("\"rate_limit\":null"));
+    }
+
+    #[test]
+    fn test_constants() {
+        assert_eq!(MAX_QUEUES_PER_PAGE, 100);
+        assert_eq!(MAX_RATE_LIMIT, 100000);
+    }
 }
