@@ -147,7 +147,10 @@ Response:
       "id": "job_m1n2o3p4",
       "queue_name": "emails",
       "status": "pending",
-      ...
+      "payload": {"to": "user@example.com", "subject": "Welcome!", "body": "This is my first job!"},
+      "priority": 0,
+      "max_retries": 3,
+      "created_at": "2024-12-09T10:02:00Z"
     }
   ],
   "total": 1,

@@ -130,7 +130,7 @@ Response:
   "organization_id": "org_xxxxx",
   "queue_name": "emails",
   "status": "pending",
-  "payload": {...},
+  "payload": {"type": "send_welcome_email", "user_id": 123},
   "priority": 0,
   "max_retries": 3,
   "retry_count": 0,
