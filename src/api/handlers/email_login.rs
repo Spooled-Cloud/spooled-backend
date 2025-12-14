@@ -351,12 +351,7 @@ The Spooled Cloud Team"#,
             send_via_postmark(state, email, subject, &body, &html_body).await?;
         }
         EmailProvider::Smtp => {
-            // SMTP would require lettre or similar - for now, fall back to console
-            warn!("SMTP email not implemented, falling back to console");
-            println!("\n========== LOGIN CODE EMAIL (SMTP fallback) ==========");
-            println!("To: {}", email);
-            println!("Code: {}", code);
-            println!("=======================================================\n");
+            send_via_smtp(state, email, subject, &body, &html_body).await?;
         }
     }
 
@@ -476,6 +471,88 @@ async fn send_via_postmark(
         error!(error = %error, "Postmark email failed");
         return Err(AppError::Internal("Failed to send email".to_string()));
     }
+
+    Ok(())
+}
+
+/// Send email via SMTP (using lettre)
+async fn send_via_smtp(
+    state: &AppState,
+    to: &str,
+    subject: &str,
+    text: &str,
+    html: &str,
+) -> AppResult<()> {
+    use lettre::{
+        message::{header::ContentType, Mailbox, MultiPart, SinglePart},
+        transport::smtp::authentication::Credentials,
+        AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
+    };
+
+    let smtp_host = state
+        .settings
+        .email
+        .smtp_host
+        .as_ref()
+        .ok_or_else(|| AppError::Internal("SMTP_HOST not configured".to_string()))?;
+
+    let smtp_port = state.settings.email.smtp_port.unwrap_or(587);
+
+    let from_mailbox: Mailbox = format!(
+        "{} <{}>",
+        state.settings.email.from_name, state.settings.email.from_address
+    )
+    .parse()
+    .map_err(|e| AppError::Internal(format!("Invalid from address: {}", e)))?;
+
+    let to_mailbox: Mailbox = to
+        .parse()
+        .map_err(|e| AppError::Internal(format!("Invalid to address: {}", e)))?;
+
+    let email = Message::builder()
+        .from(from_mailbox)
+        .to(to_mailbox)
+        .subject(subject)
+        .multipart(
+            MultiPart::alternative()
+                .singlepart(
+                    SinglePart::builder()
+                        .header(ContentType::TEXT_PLAIN)
+                        .body(text.to_string()),
+                )
+                .singlepart(
+                    SinglePart::builder()
+                        .header(ContentType::TEXT_HTML)
+                        .body(html.to_string()),
+                ),
+        )
+        .map_err(|e| AppError::Internal(format!("Failed to build email: {}", e)))?;
+
+    // Build SMTP transport
+    let transport = if let (Some(username), Some(password)) = (
+        state.settings.email.smtp_username.as_ref(),
+        state.settings.email.smtp_password.as_ref(),
+    ) {
+        let creds = Credentials::new(username.clone(), password.clone());
+        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(smtp_host)
+            .map_err(|e| AppError::Internal(format!("Failed to create SMTP transport: {}", e)))?
+            .port(smtp_port)
+            .credentials(creds)
+            .build()
+    } else {
+        // No auth
+        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(smtp_host)
+            .map_err(|e| AppError::Internal(format!("Failed to create SMTP transport: {}", e)))?
+            .port(smtp_port)
+            .build()
+    };
+
+    transport
+        .send(email)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to send email via SMTP: {}", e)))?;
+
+    info!(to = %to, "Email sent via SMTP");
 
     Ok(())
 }

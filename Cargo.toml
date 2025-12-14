@@ -85,6 +85,7 @@ regex = "1.11"
 hostname = "0.4"
 futures = "0.3"
 url = "2.5"  # URL parsing for SSRF protection
+lettre = { version = "0.11.19", features = ["smtp-transport", "tokio1-native-tls", "builder"] }
 
 # gRPC (optional, requires protoc)
 # tonic = "0.12"
