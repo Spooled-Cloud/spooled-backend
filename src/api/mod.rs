@@ -187,6 +187,11 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
         // Jobs - CRUD
         .route("/jobs", get(handlers::jobs::list))
         .route("/jobs", post(handlers::jobs::create))
+        // Worker processing (polling/acking)
+        .route("/jobs/claim", post(handlers::jobs::claim))
+        .route("/jobs/{id}/complete", post(handlers::jobs::complete))
+        .route("/jobs/{id}/fail", post(handlers::jobs::fail))
+        .route("/jobs/{id}/heartbeat", post(handlers::jobs::heartbeat))
         .route("/jobs/stats", get(handlers::jobs::stats))
         .route("/jobs/status", get(handlers::jobs::batch_status))
         .route("/jobs/bulk", post(handlers::jobs::bulk_enqueue))

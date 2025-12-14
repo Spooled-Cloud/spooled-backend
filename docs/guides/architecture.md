@@ -102,7 +102,7 @@ Request → Rate Limit → Auth → Validation → Handler → Response
 Core job queue logic with guaranteed delivery.
 
 **Key Features:**
-- `FOR UPDATE SKIP LOCKED` for safe concurrent dequeue
+- `FOR UPDATE SKIP LOCKED for safe concurrent job claiming
 - Exponential backoff retry logic
 - Dead-letter queue for failed jobs
 - Lease-based job ownership

@@ -49,16 +49,17 @@ curl -X POST https://api.spooled.cloud/api/v1/organizations \
 
 ---
 
-### Step 2: Create an API Key
+### Step 2: Get Your API Key
 
-API keys authenticate your requests (like Laravel's `APP_KEY` but for the queue).
+When you create an organization (Step 1), you automatically receive an initial API key in the response. If you need additional API keys:
 
 ```bash
-curl -X POST https://api.spooled.cloud/api/v1/organizations/org_abc123/api-keys \
+curl -X POST https://api.spooled.cloud/api/v1/api-keys \
+  -H "Authorization: Bearer sk_live_xxxxxxxxxxxxxxxxxxxx" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "Production App",
-    "permissions": ["jobs:write", "jobs:read", "queues:read"]
+    "queues": ["emails", "notifications"]
   }'
 ```
 
@@ -68,7 +69,8 @@ curl -X POST https://api.spooled.cloud/api/v1/organizations/org_abc123/api-keys 
   "id": "key_xyz789",
   "name": "Production App",
   "key": "sk_live_xxxxxxxxxxxxxxxxxxxx",
-  "permissions": ["jobs:write", "jobs:read", "queues:read"]
+  "queues": ["emails", "notifications"],
+  "created_at": "2024-01-15T10:00:00Z"
 }
 ```
 
@@ -76,29 +78,28 @@ curl -X POST https://api.spooled.cloud/api/v1/organizations/org_abc123/api-keys 
 
 ---
 
-### Step 3: Create a Queue
+### Step 3: Configure a Queue (Optional)
 
-Queues organize your jobs (like `emails`, `notifications`, `exports`).
+Queues are created implicitly when you enqueue your first job. You can optionally configure queue settings:
 
 ```bash
-curl -X POST https://api.spooled.cloud/api/v1/queues \
+curl -X PUT https://api.spooled.cloud/api/v1/queues/emails/config \
   -H "Authorization: Bearer sk_live_xxxxxxxxxxxxxxxxxxxx" \
   -H "Content-Type: application/json" \
   -d '{
-    "name": "emails",
     "max_retries": 3,
-    "retry_delay_seconds": 60,
-    "timeout_seconds": 300
+    "default_timeout": 300,
+    "rate_limit": {"requests": 100, "period": 60}
   }'
 ```
 
 **Response:**
 ```json
 {
-  "id": "queue_def456",
   "name": "emails",
   "max_retries": 3,
-  "timeout_seconds": 300
+  "default_timeout": 300,
+  "rate_limit": {"requests": 100, "period": 60}
 }
 ```
 
@@ -113,7 +114,7 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs \
   -H "Authorization: Bearer sk_live_xxxxxxxxxxxxxxxxxxxx" \
   -H "Content-Type: application/json" \
   -d '{
-    "queue": "emails",
+    "queue_name": "emails",
     "payload": {
       "type": "send_welcome_email",
       "user_id": 123,
@@ -127,7 +128,7 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs \
 ```json
 {
   "id": "job_ghi789",
-  "queue": "emails",
+  "queue_name": "emails",
   "status": "pending",
   "payload": {
     "type": "send_welcome_email",
@@ -146,31 +147,34 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs \
 Your worker fetches jobs and processes them:
 
 ```bash
-# 1. Dequeue a job (get the next job to process)
-curl -X POST https://api.spooled.cloud/api/v1/jobs/dequeue \
+# 1. Claim jobs (get the next job(s) to process)
+curl -X POST https://api.spooled.cloud/api/v1/jobs/claim \
   -H "Authorization: Bearer sk_live_xxxxxxxxxxxxxxxxxxxx" \
   -H "Content-Type: application/json" \
   -d '{
-    "queue": "emails",
-    "worker_id": "worker-1"
+    "queue_name": "emails",
+    "worker_id": "worker-1",
+    "limit": 10
   }'
 ```
 
 **Response:**
 ```json
-{
-  "id": "job_ghi789",
-  "queue": "emails",
-  "status": "processing",
-  "payload": {
-    "type": "send_welcome_email",
-    "user_id": 123,
-    "email": "user@example.com",
-    "template": "welcome"
-  },
-  "attempts": 1,
-  "leased_until": "2024-01-15T10:10:00Z"
-}
+[
+  {
+    "id": "job_ghi789",
+    "queue_name": "emails",
+    "status": "processing",
+    "payload": {
+      "type": "send_welcome_email",
+      "user_id": 123,
+      "email": "user@example.com",
+      "template": "welcome"
+    },
+    "attempts": 1,
+    "leased_until": "2024-01-15T10:10:00Z"
+  }
+]
 ```
 
 ```bash
@@ -182,6 +186,7 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs/job_ghi789/complete \
   -H "Authorization: Bearer sk_live_xxxxxxxxxxxxxxxxxxxx" \
   -H "Content-Type: application/json" \
   -d '{
+    "worker_id": "worker-1",
     "result": {"email_sent": true, "message_id": "msg_123"}
   }'
 ```
@@ -268,8 +273,8 @@ $queue = 'emails';
 echo "Worker {$workerId} starting...\n";
 
 while (true) {
-    // Fetch next job
-    $response = file_get_contents("{$baseUrl}/api/v1/jobs/dequeue", false, stream_context_create([
+    // Claim jobs
+    $response = file_get_contents("{$baseUrl}/api/v1/jobs/claim", false, stream_context_create([
         'http' => [
             'method' => 'POST',
             'header' => [
@@ -277,62 +282,66 @@ while (true) {
                 "Content-Type: application/json",
             ],
             'content' => json_encode([
-                'queue' => $queue,
+                'queue_name' => $queue,
                 'worker_id' => $workerId,
+                'limit' => 10,
             ]),
         ],
     ]));
 
-    $job = json_decode($response, true);
+    $jobs = json_decode($response, true);
 
-    if (!$job || isset($job['error'])) {
+    if (empty($jobs)) {
         // No jobs available, wait and retry
         sleep(1);
         continue;
     }
 
-    echo "Processing job {$job['id']}: {$job['payload']['type']}\n";
+    foreach ($jobs as $job) {
 
-    try {
-        // Process the job based on type
-        switch ($job['payload']['type']) {
-            case 'send_welcome_email':
-                sendWelcomeEmail($job['payload']);
-                break;
-            case 'send_reminder':
-                sendReminderEmail($job['payload']);
-                break;
-            default:
-                throw new Exception("Unknown job type: {$job['payload']['type']}");
+        echo "Processing job {$job['id']}: {$job['payload']['type']}\n";
+
+        try {
+            // Process the job based on type
+            switch ($job['payload']['type']) {
+                case 'send_welcome_email':
+                    sendWelcomeEmail($job['payload']);
+                    break;
+                case 'send_reminder':
+                    sendReminderEmail($job['payload']);
+                    break;
+                default:
+                    throw new Exception("Unknown job type: {$job['payload']['type']}");
+            }
+
+            // Mark as completed
+            completeJob($baseUrl, $apiKey, $workerId, $job['id']);
+            echo "✓ Job {$job['id']} completed\n";
+
+        } catch (Exception $e) {
+            // Mark as failed
+            failJob($baseUrl, $apiKey, $workerId, $job['id'], $e->getMessage());
+            echo "✗ Job {$job['id']} failed: {$e->getMessage()}\n";
         }
-
-        // Mark as completed
-        completeJob($baseUrl, $apiKey, $job['id']);
-        echo "✓ Job {$job['id']} completed\n";
-
-    } catch (Exception $e) {
-        // Mark as failed
-        failJob($baseUrl, $apiKey, $job['id'], $e->getMessage());
-        echo "✗ Job {$job['id']} failed: {$e->getMessage()}\n";
     }
 }
 
-function completeJob($baseUrl, $apiKey, $jobId) {
+function completeJob($baseUrl, $apiKey, $workerId, $jobId) {
     file_get_contents("{$baseUrl}/api/v1/jobs/{$jobId}/complete", false, stream_context_create([
         'http' => [
             'method' => 'POST',
             'header' => ["Authorization: Bearer {$apiKey}", "Content-Type: application/json"],
-            'content' => '{}',
+            'content' => json_encode(['worker_id' => $workerId]),
         ],
     ]));
 }
 
-function failJob($baseUrl, $apiKey, $jobId, $error) {
+function failJob($baseUrl, $apiKey, $workerId, $jobId, $error) {
     file_get_contents("{$baseUrl}/api/v1/jobs/{$jobId}/fail", false, stream_context_create([
         'http' => [
             'method' => 'POST',
             'header' => ["Authorization: Bearer {$apiKey}", "Content-Type: application/json"],
-            'content' => json_encode(['error' => $error]),
+            'content' => json_encode(['worker_id' => $workerId, 'error' => $error]),
         ],
     ]));
 }
@@ -353,33 +362,40 @@ class Spooled {
   }
 
   // Push a job (like Laravel's dispatch)
-  async dispatch(queue, payload, options = {}) {
+  async dispatch(queue_name, payload, options = {}) {
     const { data } = await this.client.post('/api/v1/jobs', {
-      queue,
+      queue_name,
       payload,
-      delay_seconds: options.delay,
+      scheduled_at: options.delay ? new Date(Date.now() + options.delay * 1000).toISOString() : undefined,
       priority: options.priority
     });
     return data;
   }
 
-  // Fetch next job for processing
-  async dequeue(queue, workerId) {
-    const { data } = await this.client.post('/api/v1/jobs/dequeue', {
-      queue,
-      worker_id: workerId
+  // Claim jobs for processing
+  async claim(queue_name, workerId, limit = 10) {
+    const { data } = await this.client.post('/api/v1/jobs/claim', {
+      queue_name,
+      worker_id: workerId,
+      limit
     });
     return data;
   }
 
   // Mark job as completed
-  async complete(jobId, result = {}) {
-    await this.client.post(`/api/v1/jobs/${jobId}/complete`, { result });
+  async complete(jobId, workerId, result = {}) {
+    await this.client.post(`/api/v1/jobs/${jobId}/complete`, { 
+      worker_id: workerId,
+      result 
+    });
   }
 
   // Mark job as failed
-  async fail(jobId, error) {
-    await this.client.post(`/api/v1/jobs/${jobId}/fail`, { error });
+  async fail(jobId, workerId, error) {
+    await this.client.post(`/api/v1/jobs/${jobId}/fail`, { 
+      worker_id: workerId,
+      error 
+    });
   }
 }
 
@@ -415,34 +431,36 @@ console.log(`Worker ${workerId} starting...`);
 async function processJobs() {
   while (true) {
     try {
-      const job = await spooled.dequeue(queue, workerId);
+      const jobs = await spooled.claim(queue, workerId, 10);
       
-      if (!job || job.error) {
+      if (!jobs || jobs.length === 0) {
         await sleep(1000);
         continue;
       }
 
-      console.log(`Processing job ${job.id}: ${job.payload.type}`);
+      for (const job of jobs) {
+        console.log(`Processing job ${job.id}: ${job.payload.type}`);
 
-      try {
-        // Process based on job type
-        switch (job.payload.type) {
-          case 'send_welcome_email':
-            await sendWelcomeEmail(job.payload);
-            break;
-          case 'send_reminder':
-            await sendReminderEmail(job.payload);
-            break;
-          default:
-            throw new Error(`Unknown job type: ${job.payload.type}`);
+        try {
+          // Process based on job type
+          switch (job.payload.type) {
+            case 'send_welcome_email':
+              await sendWelcomeEmail(job.payload);
+              break;
+            case 'send_reminder':
+              await sendReminderEmail(job.payload);
+              break;
+            default:
+              throw new Error(`Unknown job type: ${job.payload.type}`);
+          }
+
+          await spooled.complete(job.id, workerId);
+          console.log(`✓ Job ${job.id} completed`);
+
+        } catch (err) {
+          await spooled.fail(job.id, workerId, err.message);
+          console.log(`✗ Job ${job.id} failed: ${err.message}`);
         }
-
-        await spooled.complete(job.id);
-        console.log(`✓ Job ${job.id} completed`);
-
-      } catch (err) {
-        await spooled.fail(job.id, err.message);
-        console.log(`✗ Job ${job.id} failed: ${err.message}`);
       }
 
     } catch (err) {
@@ -474,43 +492,47 @@ class Spooled:
             'Content-Type': 'application/json'
         }
 
-    def dispatch(self, queue, payload, delay=None, priority=0):
+    def dispatch(self, queue_name, payload, delay=None, priority=0):
         """Push a job to the queue (like Laravel's dispatch)"""
+        job_data = {
+            'queue_name': queue_name,
+            'payload': payload,
+            'priority': priority
+        }
+        if delay:
+            from datetime import datetime, timedelta
+            job_data['scheduled_at'] = (datetime.utcnow() + timedelta(seconds=delay)).isoformat() + 'Z'
+        
         response = requests.post(
             f'{self.base_url}/api/v1/jobs',
             headers=self.headers,
-            json={
-                'queue': queue,
-                'payload': payload,
-                'delay_seconds': delay,
-                'priority': priority
-            }
+            json=job_data
         )
         return response.json()
 
-    def dequeue(self, queue, worker_id):
-        """Fetch the next job to process"""
+    def claim(self, queue_name, worker_id, limit=10):
+        """Claim jobs for processing"""
         response = requests.post(
-            f'{self.base_url}/api/v1/jobs/dequeue',
+            f'{self.base_url}/api/v1/jobs/claim',
             headers=self.headers,
-            json={'queue': queue, 'worker_id': worker_id}
+            json={'queue_name': queue_name, 'worker_id': worker_id, 'limit': limit}
         )
         return response.json()
 
-    def complete(self, job_id, result=None):
+    def complete(self, job_id, worker_id, result=None):
         """Mark a job as completed"""
         requests.post(
             f'{self.base_url}/api/v1/jobs/{job_id}/complete',
             headers=self.headers,
-            json={'result': result or {}}
+            json={'worker_id': worker_id, 'result': result or {}}
         )
 
-    def fail(self, job_id, error):
+    def fail(self, job_id, worker_id, error):
         """Mark a job as failed"""
         requests.post(
             f'{self.base_url}/api/v1/jobs/{job_id}/fail',
             headers=self.headers,
-            json={'error': error}
+            json={'worker_id': worker_id, 'error': error}
         )
 
 
@@ -544,11 +566,13 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs \
   -H "Authorization: Bearer sk_live_xxx" \
   -H "Content-Type: application/json" \
   -d '{
-    "queue": "emails",
+    "queue_name": "emails",
     "payload": {"type": "send_reminder", "user_id": 123},
-    "delay_seconds": 3600
+    "scheduled_at": "2024-01-15T11:05:00Z"
   }'
 ```
+
+> **Note:** `scheduled_at` is an ISO 8601 timestamp. For relative delays, calculate the future timestamp in your code.
 
 This is like Laravel's:
 ```php
@@ -565,17 +589,17 @@ Higher priority jobs are processed first:
 # High priority (processed first)
 curl -X POST https://api.spooled.cloud/api/v1/jobs \
   -H "Authorization: Bearer sk_live_xxx" \
-  -d '{"queue": "emails", "payload": {...}, "priority": 10}'
+  -d '{"queue_name": "emails", "payload": {...}, "priority": 10}'
 
 # Normal priority
 curl -X POST https://api.spooled.cloud/api/v1/jobs \
   -H "Authorization: Bearer sk_live_xxx" \
-  -d '{"queue": "emails", "payload": {...}, "priority": 0}'
+  -d '{"queue_name": "emails", "payload": {...}, "priority": 0}'
 
 # Low priority (processed last)
 curl -X POST https://api.spooled.cloud/api/v1/jobs \
   -H "Authorization: Bearer sk_live_xxx" \
-  -d '{"queue": "emails", "payload": {...}, "priority": -10}'
+  -d '{"queue_name": "emails", "payload": {...}, "priority": -10}'
 ```
 
 ---
@@ -590,7 +614,7 @@ curl -X POST https://api.spooled.cloud/api/v1/schedules \
   -H "Content-Type: application/json" \
   -d '{
     "name": "daily-report",
-    "queue": "reports",
+    "queue_name": "reports",
     "cron_expression": "0 9 * * *",
     "payload": {"type": "generate_daily_report"},
     "timezone": "America/New_York"
@@ -616,9 +640,9 @@ curl -X POST https://api.spooled.cloud/api/v1/workflows \
   -d '{
     "name": "user-onboarding",
     "jobs": [
-      {"name": "create-account", "queue": "users", "payload": {"step": 1}},
-      {"name": "send-welcome", "queue": "emails", "payload": {"step": 2}, "depends_on": ["create-account"]},
-      {"name": "setup-defaults", "queue": "users", "payload": {"step": 3}, "depends_on": ["create-account"]}
+      {"name": "create-account", "queue_name": "users", "payload": {"step": 1}},
+      {"name": "send-welcome", "queue_name": "emails", "payload": {"step": 2}, "depends_on": ["create-account"]},
+      {"name": "setup-defaults", "queue_name": "users", "payload": {"step": 3}, "depends_on": ["create-account"]}
     ]
   }'
 ```
@@ -646,14 +670,14 @@ curl https://api.spooled.cloud/api/v1/jobs/job_xxx \
 ### List Pending Jobs
 
 ```bash
-curl "https://api.spooled.cloud/api/v1/jobs?queue=emails&status=pending" \
+curl "https://api.spooled.cloud/api/v1/jobs?queue_name=emails&status=pending" \
   -H "Authorization: Bearer sk_live_xxx"
 ```
 
 ### View Failed Jobs (Dead Letter Queue)
 
 ```bash
-curl "https://api.spooled.cloud/api/v1/jobs?queue=emails&status=dead_letter" \
+curl "https://api.spooled.cloud/api/v1/jobs/dlq?queue_name=emails" \
   -H "Authorization: Bearer sk_live_xxx"
 ```
 
@@ -670,14 +694,14 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs/job_xxx/retry \
 
 | Laravel | Spooled |
 |---------|---------|
-| `dispatch(new Job($data))` | `POST /api/v1/jobs` with payload |
-| `dispatch()->delay(60)` | `delay_seconds: 60` in request |
-| `dispatch()->onQueue('emails')` | `queue: "emails"` in request |
-| `php artisan queue:work` | Worker loop calling `/dequeue` |
-| `php artisan queue:retry` | `POST /jobs/{id}/retry` |
-| `failed_jobs` table | `GET /jobs?status=dead_letter` |
-| `$schedule->job()->daily()` | `POST /schedules` with cron |
-| `Bus::chain([...])` | `POST /workflows` with dependencies |
+| `dispatch(new Job($data))` | `POST /api/v1/jobs` with `queue_name` + `payload` |
+| `dispatch()->delay(60)` | `scheduled_at` with future timestamp |
+| `dispatch()->onQueue('emails')` | `queue_name: "emails"` in request |
+| `php artisan queue:work` | Worker loop calling `POST /api/v1/jobs/claim` |
+| `php artisan queue:retry` | `POST /api/v1/jobs/{id}/retry` |
+| `failed_jobs` table | `GET /api/v1/jobs/dlq` |
+| `$schedule->job()->daily()` | `POST /api/v1/schedules` with cron |
+| `Bus::chain([...])` | `POST /api/v1/workflows` with dependencies |
 
 ---
 

@@ -10,8 +10,6 @@ pub mod cache;
 pub mod config;
 pub mod db;
 pub mod error;
-/// gRPC module - provides worker-backend communication
-/// Now properly exposed (was inconsistently commented out)
 pub mod grpc;
 pub mod models;
 pub mod observability;

@@ -294,6 +294,106 @@ pub struct CreateJobResponse {
     pub created: bool,
 }
 
+/// Request to claim jobs for processing (worker polling)
+///
+/// Used by workers to atomically lease jobs from a queue.
+#[derive(Debug, Deserialize, Validate)]
+pub struct ClaimJobsRequest {
+    /// Queue name to claim from
+    #[validate(length(min = 1, max = 100, message = "Queue name must be 1-100 characters"))]
+    #[validate(custom(function = "validate_queue_name_chars"))]
+    pub queue_name: String,
+
+    /// Worker identifier (should come from /api/v1/workers/register)
+    #[validate(length(min = 1, max = 255, message = "Worker ID must be 1-255 characters"))]
+    pub worker_id: String,
+
+    /// Maximum number of jobs to claim (default: 1, max: 100)
+    #[validate(range(min = 1, max = 100, message = "Limit must be between 1 and 100"))]
+    pub limit: Option<i32>,
+
+    /// Lease duration for claimed jobs (in seconds).
+    /// Internally bounded to a safe range by the queue implementation.
+    #[validate(range(
+        min = 5,
+        max = 3600,
+        message = "Lease duration must be between 5 and 3600 seconds"
+    ))]
+    pub lease_duration_secs: Option<i64>,
+}
+
+/// Minimal job payload for worker processing.
+/// Avoids returning internal fields that workers don't need.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClaimedJob {
+    pub id: String,
+    pub queue_name: String,
+    pub payload: serde_json::Value,
+    pub retry_count: i32,
+    pub max_retries: i32,
+    pub timeout_seconds: i32,
+    pub lease_expires_at: Option<DateTime<Utc>>,
+}
+
+impl From<Job> for ClaimedJob {
+    fn from(j: Job) -> Self {
+        Self {
+            id: j.id,
+            queue_name: j.queue_name,
+            payload: j.payload,
+            retry_count: j.retry_count,
+            max_retries: j.max_retries,
+            timeout_seconds: j.timeout_seconds,
+            lease_expires_at: j.lease_expires_at,
+        }
+    }
+}
+
+/// Response for job claiming
+#[derive(Debug, Serialize)]
+pub struct ClaimJobsResponse {
+    pub jobs: Vec<ClaimedJob>,
+}
+
+/// Request to complete (ack) a job
+#[derive(Debug, Deserialize, Validate)]
+pub struct CompleteJobRequest {
+    /// Worker identifier (must match the worker that leased the job)
+    #[validate(length(min = 1, max = 255, message = "Worker ID must be 1-255 characters"))]
+    pub worker_id: String,
+
+    /// Optional result payload
+    pub result: Option<serde_json::Value>,
+}
+
+/// Request to fail a job (triggers retry or DLQ based on retry_count/max_retries)
+#[derive(Debug, Deserialize, Validate)]
+pub struct FailJobRequest {
+    /// Worker identifier (must match the worker that leased the job)
+    #[validate(length(min = 1, max = 255, message = "Worker ID must be 1-255 characters"))]
+    pub worker_id: String,
+
+    /// Error message (required)
+    #[validate(length(min = 1, max = 2048, message = "Error must be 1-2048 characters"))]
+    pub error: String,
+}
+
+/// Request to extend a job lease (heartbeat)
+#[derive(Debug, Deserialize, Validate)]
+pub struct HeartbeatJobRequest {
+    /// Worker identifier (must match the worker that leased the job)
+    #[validate(length(min = 1, max = 255, message = "Worker ID must be 1-255 characters"))]
+    pub worker_id: String,
+
+    /// New lease duration from now (in seconds)
+    #[validate(range(
+        min = 5,
+        max = 3600,
+        message = "Lease duration must be between 5 and 3600 seconds"
+    ))]
+    pub lease_duration_secs: i64,
+}
+
 /// Job summary for list responses
 #[derive(Debug, Serialize)]
 pub struct JobSummary {

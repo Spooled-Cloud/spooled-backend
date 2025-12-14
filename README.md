@@ -4,19 +4,19 @@
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
 [![Docker](https://img.shields.io/badge/docker-ghcr.io-blue.svg)](https://ghcr.io)
 
-**Production-ready job queue and webhook processing service built with Rust**
+**Job queue + worker coordination service built with Rust**
 
 Spooled is a high-performance, multi-tenant job queue system designed for reliability, observability, and horizontal scalability.
 
 ## ✨ Features
 
-- 🚀 **High Performance**: 10,000+ jobs/sec throughput with Rust + Tokio
+- 🚀 **High Performance**: Built on Rust + Tokio + PostgreSQL (throughput depends on workload and hardware)
 - 🔒 **Multi-Tenant**: PostgreSQL Row-Level Security (RLS) for data isolation
-- 📊 **Observable**: Prometheus metrics, Grafana dashboards, OpenTelemetry tracing
-- 🔄 **Reliable**: Exactly-once delivery with `FOR UPDATE SKIP LOCKED`
-- ⚡ **Real-Time**: WebSocket/SSE for live job updates
+- 📊 **Observable**: Prometheus metrics, Grafana dashboards, optional OpenTelemetry export (`--features otel`)
+- 🔄 **Reliable**: At-least-once processing with leases + retries (use idempotency keys for exactly-once effects)
+- ⚡ **Real-Time**: WebSocket + SSE for live job/queue updates
 - 🔐 **Secure**: Bcrypt API keys, JWT auth, HMAC webhook verification
-- 📈 **Scalable**: Kubernetes-ready with HPA, PDB, and health probes
+- 📈 **Scalable**: Stateless API nodes (Kubernetes-friendly) + DB-backed locking (`FOR UPDATE SKIP LOCKED`)
 - 🗓️ **Scheduling**: Cron-based recurring jobs with timezone support
 - 🔗 **Workflows**: Job dependencies with DAG execution
 
@@ -58,7 +58,7 @@ curl http://localhost:8080/health
 | `REGISTRATION_MODE` | ❌ | `open` | `open`/`closed` - controls public registration |
 | `PORT` | ❌ | `8080` | API server port |
 | `METRICS_PORT` | ❌ | `9090` | Prometheus metrics port |
-| `GRPC_PORT` | ❌ | `50051` | gRPC port for workers |
+| `METRICS_TOKEN` | ❌ | - | If set, requires `Authorization: Bearer <token>` for `/metrics` |
 
 ## 🔧 Local Development
 
@@ -96,11 +96,16 @@ cargo test
 | `POST` | `/api/v1/jobs` | Create a job |
 | `GET` | `/api/v1/jobs` | List jobs |
 | `POST` | `/api/v1/jobs/bulk` | Bulk enqueue jobs |
+| `POST` | `/api/v1/jobs/claim` | Claim (lease) jobs for worker processing |
+| `POST` | `/api/v1/jobs/{id}/complete` | Mark a job completed (worker ack) |
+| `POST` | `/api/v1/jobs/{id}/fail` | Mark a job failed (worker nack) |
+| `POST` | `/api/v1/jobs/{id}/heartbeat` | Extend a job lease (long-running jobs) |
 | `POST` | `/api/v1/schedules` | Create cron schedule |
 | `POST` | `/api/v1/workflows` | Create workflow (DAG) |
 | `POST` | `/api/v1/webhooks/{org}/github` | GitHub webhook |
 | `POST` | `/api/v1/webhooks/{org}/stripe` | Stripe webhook |
 | `GET` | `/api/v1/ws` | WebSocket for real-time |
+| `GET` | `/api/v1/events/queues/{name}` | SSE stream of queue updates |
 
 #### Admin API (requires `X-Admin-Key` header)
 
@@ -193,7 +198,7 @@ docker pull --platform linux/arm64 ghcr.io/spooled-cloud/spooled-backend:latest
 ### Prometheus Metrics
 
 ```bash
-curl http://localhost:9090/metrics
+curl -H "Authorization: Bearer $METRICS_TOKEN" http://localhost:9090/metrics
 
 # Key metrics:
 # spooled_jobs_pending       - Jobs waiting
@@ -224,7 +229,7 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317 ./target/release/spooled-backend
 
 - **Authentication**: API keys (bcrypt hashed) or JWT tokens
 - **Multi-tenancy**: PostgreSQL Row-Level Security (RLS)
-- **Rate Limiting**: Per-key limits with Redis (fails closed)
+- **Rate Limiting**: Per-key limits with Redis (fails closed when configured)
 - **Webhooks**: HMAC-SHA256 signature verification
 - **Input Validation**: All inputs sanitized and size-limited
 - **SSRF Protection**: Webhook URLs validated in production

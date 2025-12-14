@@ -146,9 +146,9 @@ The k6 test includes these pass/fail thresholds:
 | `http_req_failed` | < 1% | Less than 1% error rate |
 | `success_rate` | > 99% | Over 99% successful responses |
 
-### Throughput Target
+### Throughput Testing
 
-The target throughput for the Spooled backend is **10,000 jobs/second**. Use the `throughput` scenario to validate your deployment can handle this load.
+Use the `throughput` scenario to measure your deployment's maximum sustainable throughput. Actual throughput depends on hardware, payload size, DB configuration, and worker behavior.
 
 ## Custom Metrics
 

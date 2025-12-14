@@ -8,6 +8,7 @@ use axum::{
 use chrono::Utc;
 use tracing::info;
 use uuid::Uuid;
+use std::sync::Arc;
 
 use crate::api::middleware::limits::{check_job_limits, check_payload_size, increment_daily_jobs};
 use crate::api::middleware::ValidatedJson;
@@ -15,9 +16,11 @@ use crate::api::AppState;
 use crate::error::{AppError, AppResult};
 use crate::models::ApiKeyContext;
 use crate::models::{
-    CreateJobRequest, CreateJobResponse, Job, JobStats, JobSummary, ListJobsQuery,
+    ClaimJobsRequest, ClaimJobsResponse, ClaimedJob, CompleteJobRequest, CreateJobRequest,
+    CreateJobResponse, FailJobRequest, HeartbeatJobRequest, Job, JobStats, JobSummary, ListJobsQuery,
 };
 use axum::extract::Extension;
+use crate::queue::QueueManager;
 
 /// Maximum jobs per list request
 /// Reduced from 1000 to prevent memory exhaustion
@@ -250,6 +253,158 @@ pub async fn create(
             created,
         }),
     ))
+}
+
+/// Claim jobs for processing (worker polling)
+///
+/// POST /api/v1/jobs/claim
+///
+/// This endpoint is designed for worker processes. It atomically leases jobs
+/// using PostgreSQL FOR UPDATE SKIP LOCKED.
+pub async fn claim(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    ValidatedJson(request): ValidatedJson<ClaimJobsRequest>,
+) -> AppResult<Json<ClaimJobsResponse>> {
+    // Defaults and safety bounds
+    let limit = request.limit.unwrap_or(1).clamp(1, MAX_JOBS_PER_PAGE as i32) as usize;
+    let lease_duration_secs = request.lease_duration_secs.unwrap_or(30);
+
+    let queue = QueueManager::new(
+        state.db.pool_arc(),
+        state.cache.as_ref().map(|c| Arc::new(c.clone())),
+    );
+
+    let mut jobs: Vec<ClaimedJob> = Vec::with_capacity(limit);
+    for _ in 0..limit {
+        let job = queue
+            .dequeue(
+                &ctx.organization_id,
+                &request.queue_name,
+                &request.worker_id,
+                lease_duration_secs,
+            )
+            .await?;
+        match job {
+            Some(j) => {
+                // Metrics: claimed job transitions pending -> processing
+                state.metrics.jobs_processing.inc();
+                state.metrics.jobs_pending.dec();
+                jobs.push(j.into());
+            }
+            None => break,
+        }
+    }
+
+    Ok(Json(ClaimJobsResponse { jobs }))
+}
+
+/// Complete (ack) a job as the worker that leased it
+///
+/// POST /api/v1/jobs/{id}/complete
+pub async fn complete(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path(id): Path<String>,
+    ValidatedJson(request): ValidatedJson<CompleteJobRequest>,
+) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+    let queue = QueueManager::new(
+        state.db.pool_arc(),
+        state.cache.as_ref().map(|c| Arc::new(c.clone())),
+    );
+
+    queue
+        .complete_with_worker_and_org(
+            &id,
+            Some(&request.worker_id),
+            Some(&ctx.organization_id),
+            request.result,
+        )
+        .await
+        .map_err(|e| AppError::Validation(e.to_string()))?;
+
+    // Metrics: processing -> completed
+    state.metrics.jobs_processing.dec();
+    state.metrics.jobs_completed.inc();
+
+    Ok((StatusCode::OK, Json(serde_json::json!({ "success": true }))))
+}
+
+/// Fail a job as the worker that leased it (triggers retry or DLQ)
+///
+/// POST /api/v1/jobs/{id}/fail
+pub async fn fail(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path(id): Path<String>,
+    ValidatedJson(request): ValidatedJson<FailJobRequest>,
+) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+    // Enforce that this job is currently leased to this worker before failing it.
+    // This prevents workers from interfering with each other's in-flight jobs.
+    let leased: Option<(String,)> = sqlx::query_as(
+        "SELECT id FROM jobs WHERE id = $1 AND organization_id = $2 AND assigned_worker_id = $3 AND status = 'processing'",
+    )
+    .bind(&id)
+    .bind(&ctx.organization_id)
+    .bind(&request.worker_id)
+    .fetch_optional(state.db.pool())
+    .await?;
+
+    if leased.is_none() {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "success": false, "error": "job_not_found_or_not_owned" })),
+        ));
+    }
+
+    let queue = QueueManager::new(
+        state.db.pool_arc(),
+        state.cache.as_ref().map(|c| Arc::new(c.clone())),
+    );
+
+    queue
+        .fail(&id, &ctx.organization_id, &request.error)
+        .await
+        .map_err(|e| AppError::Validation(e.to_string()))?;
+
+    // Metrics: processing -> pending (retry) OR processing -> deadletter.
+    // We don't know which without re-fetching; keep counters conservative.
+    state.metrics.jobs_processing.dec();
+
+    Ok((StatusCode::OK, Json(serde_json::json!({ "success": true }))))
+}
+
+/// Extend a lease on an in-flight job (heartbeat)
+///
+/// POST /api/v1/jobs/{id}/heartbeat
+pub async fn heartbeat(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path(id): Path<String>,
+    ValidatedJson(request): ValidatedJson<HeartbeatJobRequest>,
+) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+    let queue = QueueManager::new(
+        state.db.pool_arc(),
+        state.cache.as_ref().map(|c| Arc::new(c.clone())),
+    );
+
+    let ok = queue
+        .renew_lease(
+            &id,
+            &request.worker_id,
+            &ctx.organization_id,
+            request.lease_duration_secs,
+        )
+        .await?;
+
+    if !ok {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "success": false, "error": "job_not_found_or_not_owned" })),
+        ));
+    }
+
+    Ok((StatusCode::OK, Json(serde_json::json!({ "success": true }))))
 }
 
 /// Get a job by ID
