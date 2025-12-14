@@ -25,6 +25,44 @@ const CODE_VALIDITY_MINUTES: i64 = 10;
 /// Rate limit: max codes per email per hour
 const MAX_CODES_PER_HOUR: i64 = 5;
 
+/// Check email availability request
+#[derive(Debug, Deserialize, Validate)]
+pub struct CheckEmailRequest {
+    #[validate(email(message = "Invalid email format"))]
+    pub email: String,
+}
+
+/// Check email availability response
+#[derive(Debug, Serialize)]
+pub struct CheckEmailResponse {
+    /// Whether the email is available (no account exists)
+    pub available: bool,
+    /// Whether an account exists with this email
+    pub exists: bool,
+}
+
+/// Check if an email is already registered
+///
+/// GET /api/v1/auth/check-email?email=...
+pub async fn check_email(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<CheckEmailRequest>,
+) -> AppResult<Json<CheckEmailResponse>> {
+    let email = query.email.to_lowercase().trim().to_string();
+
+    // Check if email is associated with any organization
+    let exists: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM organizations WHERE billing_email = $1")
+            .bind(&email)
+            .fetch_optional(state.db.pool())
+            .await?;
+
+    Ok(Json(CheckEmailResponse {
+        available: exists.is_none(),
+        exists: exists.is_some(),
+    }))
+}
+
 /// Start email login request
 #[derive(Debug, Deserialize, Validate)]
 pub struct StartEmailLoginRequest {
@@ -132,6 +170,29 @@ pub struct VerifyEmailLoginResponse {
     pub refresh_expires_in: i64,
 }
 
+/// Verify email response for signup flow (no existing account)
+#[derive(Debug, Serialize)]
+pub struct VerifyEmailSignupResponse {
+    /// Signup token to complete registration (short-lived)
+    pub signup_token: String,
+    /// The verified email
+    pub email: String,
+    /// Token expiration in seconds
+    pub expires_in: i64,
+}
+
+/// Combined response for email verification
+#[derive(Debug, Serialize)]
+#[serde(tag = "type")]
+pub enum VerifyEmailResponse {
+    /// Existing account - logged in
+    #[serde(rename = "login")]
+    Login(VerifyEmailLoginResponse),
+    /// New email - signup needed
+    #[serde(rename = "signup")]
+    Signup(VerifyEmailSignupResponse),
+}
+
 /// JWT Claims structure (same as auth.rs)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Claims {
@@ -148,13 +209,17 @@ struct Claims {
     email: Option<String>,
 }
 
-/// Verify email login - validates code and returns JWT
+/// Verify email login - validates code and returns JWT or signup token
 ///
 /// POST /api/v1/auth/email/verify
+///
+/// Returns:
+/// - If email has an existing organization: login tokens
+/// - If email is new: signup token to complete registration
 pub async fn verify(
     State(state): State<AppState>,
     ValidatedJson(request): ValidatedJson<VerifyEmailLoginRequest>,
-) -> AppResult<Json<VerifyEmailLoginResponse>> {
+) -> AppResult<Json<VerifyEmailResponse>> {
     let email = request.email.to_lowercase().trim().to_string();
     let code = request.code.trim().to_string();
 
@@ -212,22 +277,283 @@ pub async fn verify(
         .execute(state.db.pool())
         .await?;
 
-    // Get or create organization
-    let org_id = match org_id {
-        Some(id) => id,
-        None => {
-            // Create a new organization for this email
-            create_organization_for_email(&state, &email).await?
+    // Check if organization exists
+    match org_id {
+        Some(existing_org_id) => {
+            // Existing user - return login tokens
+            let api_key_id = get_or_create_email_api_key(&state, &existing_org_id, &email).await?;
+
+            let now = Utc::now();
+            let access_expiration = state.settings.jwt.expiration_hours as i64;
+            let refresh_expiration = access_expiration * 24;
+
+            let access_claims = Claims {
+                sub: existing_org_id.clone(),
+                api_key_id: api_key_id.clone(),
+                org_id: existing_org_id.clone(),
+                iat: now.timestamp(),
+                exp: (now + Duration::hours(access_expiration)).timestamp(),
+                nbf: now.timestamp(),
+                jti: Uuid::new_v4().to_string(),
+                queues: vec!["*".to_string()],
+                token_type: "access".to_string(),
+                email: Some(email.clone()),
+            };
+
+            let refresh_claims = Claims {
+                sub: existing_org_id.clone(),
+                api_key_id: api_key_id.clone(),
+                org_id: existing_org_id.clone(),
+                iat: now.timestamp(),
+                exp: (now + Duration::hours(refresh_expiration)).timestamp(),
+                nbf: now.timestamp(),
+                jti: Uuid::new_v4().to_string(),
+                queues: vec!["*".to_string()],
+                token_type: "refresh".to_string(),
+                email: Some(email.clone()),
+            };
+
+            let access_token = encode(
+                &Header::default(),
+                &access_claims,
+                &EncodingKey::from_secret(state.settings.jwt.secret.as_bytes()),
+            )
+            .map_err(|e| {
+                error!(error = %e, "Failed to encode access token");
+                AppError::Internal("Failed to generate token".to_string())
+            })?;
+
+            let refresh_token = encode(
+                &Header::default(),
+                &refresh_claims,
+                &EncodingKey::from_secret(state.settings.jwt.secret.as_bytes()),
+            )
+            .map_err(|e| {
+                error!(error = %e, "Failed to encode refresh token");
+                AppError::Internal("Failed to generate token".to_string())
+            })?;
+
+            info!(email = %mask_email(&email), org_id = %existing_org_id, "Email login successful");
+
+            Ok(Json(VerifyEmailResponse::Login(VerifyEmailLoginResponse {
+                access_token,
+                refresh_token,
+                token_type: "Bearer".to_string(),
+                expires_in: access_expiration * 3600,
+                refresh_expires_in: refresh_expiration * 3600,
+            })))
         }
+        None => {
+            // New user - return signup token
+            let signup_token = generate_signup_token(&state, &email).await?;
+
+            info!(email = %mask_email(&email), "Email verified, signup token issued");
+
+            Ok(Json(VerifyEmailResponse::Signup(
+                VerifyEmailSignupResponse {
+                    signup_token,
+                    email: email.clone(),
+                    expires_in: 900, // 15 minutes
+                },
+            )))
+        }
+    }
+}
+
+/// Signup token validity in minutes
+const SIGNUP_TOKEN_VALIDITY_MINUTES: i64 = 15;
+
+/// Generate a short-lived signup token for verified emails
+async fn generate_signup_token(state: &AppState, email: &str) -> AppResult<String> {
+    let token = Uuid::new_v4().to_string();
+    let expires_at = Utc::now() + Duration::minutes(SIGNUP_TOKEN_VALIDITY_MINUTES);
+
+    // Store in email_login_codes table with a special marker
+    sqlx::query(
+        r#"
+        INSERT INTO email_login_codes (email, code, expires_at, used_at)
+        VALUES ($1, $2, $3, NULL)
+        "#,
+    )
+    .bind(email)
+    .bind(format!("signup:{}", token))
+    .bind(expires_at)
+    .execute(state.db.pool())
+    .await?;
+
+    Ok(token)
+}
+
+/// Complete signup request
+#[derive(Debug, Deserialize, Validate)]
+pub struct CompleteSignupRequest {
+    /// Signup token from email verification
+    pub signup_token: String,
+    /// Organization name
+    #[validate(length(min = 3, max = 100, message = "Name must be 3-100 characters"))]
+    pub name: String,
+    /// Organization slug
+    #[validate(length(min = 3, max = 50, message = "Slug must be 3-50 characters"))]
+    pub slug: String,
+}
+
+/// Complete signup response
+#[derive(Debug, Serialize)]
+pub struct CompleteSignupResponse {
+    /// The created organization
+    pub organization: SignupOrganization,
+    /// API key (only shown once!)
+    pub api_key: String,
+    /// Access token for immediate login
+    pub access_token: String,
+    /// Refresh token
+    pub refresh_token: String,
+    pub token_type: String,
+    pub expires_in: i64,
+}
+
+/// Organization info in signup response
+#[derive(Debug, Serialize)]
+pub struct SignupOrganization {
+    pub id: String,
+    pub name: String,
+    pub slug: String,
+    pub billing_email: String,
+}
+
+/// Complete signup with verified email
+///
+/// POST /api/v1/auth/signup/complete
+pub async fn complete_signup(
+    State(state): State<AppState>,
+    ValidatedJson(request): ValidatedJson<CompleteSignupRequest>,
+) -> AppResult<(axum::http::StatusCode, Json<CompleteSignupResponse>)> {
+    // Validate signup token
+    let token_code = format!("signup:{}", request.signup_token);
+
+    let signup_record: Option<(Uuid, String)> = sqlx::query_as(
+        r#"
+        SELECT id, email
+        FROM email_login_codes
+        WHERE code = $1 
+          AND expires_at > NOW()
+          AND used_at IS NULL
+        "#,
+    )
+    .bind(&token_code)
+    .fetch_optional(state.db.pool())
+    .await?;
+
+    let Some((record_id, email)) = signup_record else {
+        return Err(AppError::Authentication(
+            "Invalid or expired signup token. Please verify your email again.".to_string(),
+        ));
     };
 
-    // Get or create an API key for this org (for the token)
-    let api_key_id = get_or_create_email_api_key(&state, &org_id, &email).await?;
+    // Mark token as used
+    sqlx::query("UPDATE email_login_codes SET used_at = NOW() WHERE id = $1")
+        .bind(record_id)
+        .execute(state.db.pool())
+        .await?;
+
+    // Validate slug format
+    let slug = request.slug.to_lowercase().trim().to_string();
+    if !slug
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(AppError::Validation(
+            "Slug can only contain lowercase letters, digits, and hyphens".to_string(),
+        ));
+    }
+    if slug.starts_with('-') || slug.ends_with('-') {
+        return Err(AppError::Validation(
+            "Slug cannot start or end with a hyphen".to_string(),
+        ));
+    }
+
+    // Check for duplicate email (race condition guard)
+    let existing_email: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM organizations WHERE billing_email = $1")
+            .bind(&email)
+            .fetch_optional(state.db.pool())
+            .await?;
+
+    if existing_email.is_some() {
+        return Err(AppError::Conflict(
+            "An account with this email already exists.".to_string(),
+        ));
+    }
+
+    // Check for duplicate slug
+    let existing_slug: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM organizations WHERE slug = $1")
+            .bind(&slug)
+            .fetch_optional(state.db.pool())
+            .await?;
+
+    if existing_slug.is_some() {
+        return Err(AppError::Conflict(
+            "This slug is already taken. Please choose another.".to_string(),
+        ));
+    }
+
+    // Create organization
+    let org_id = Uuid::new_v4().to_string();
+    let now = Utc::now();
+
+    sqlx::query(
+        r#"
+        INSERT INTO organizations (id, name, slug, plan_tier, billing_email, settings, created_at, updated_at)
+        VALUES ($1, $2, $3, 'free', $4, '{}', $5, $5)
+        "#,
+    )
+    .bind(&org_id)
+    .bind(&request.name)
+    .bind(&slug)
+    .bind(&email)
+    .bind(now)
+    .execute(state.db.pool())
+    .await
+    .map_err(|e| {
+        if e.to_string().contains("duplicate key") {
+            AppError::Conflict("Organization creation failed due to conflict".to_string())
+        } else {
+            AppError::Database(e)
+        }
+    })?;
+
+    // Create API key
+    let api_key_id = Uuid::new_v4().to_string();
+    let raw_key = format!(
+        "sk_{}_{}",
+        if state.settings.server.environment == crate::config::Environment::Production {
+            "live"
+        } else {
+            "test"
+        },
+        generate_api_key_string()
+    );
+    let key_prefix: String = raw_key.chars().take(8).collect();
+    let key_hash = bcrypt::hash(&raw_key, bcrypt::DEFAULT_COST)
+        .map_err(|e| AppError::Internal(format!("Failed to hash API key: {}", e)))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO api_keys (id, organization_id, key_hash, key_prefix, name, queues, is_active, created_at)
+        VALUES ($1, $2, $3, $4, 'Initial Admin Key', ARRAY['*'], TRUE, $5)
+        "#,
+    )
+    .bind(&api_key_id)
+    .bind(&org_id)
+    .bind(&key_hash)
+    .bind(&key_prefix)
+    .bind(now)
+    .execute(state.db.pool())
+    .await?;
 
     // Generate JWT tokens
-    let now = Utc::now();
     let access_expiration = state.settings.jwt.expiration_hours as i64;
-    let refresh_expiration = access_expiration * 24;
 
     let access_claims = Claims {
         sub: org_id.clone(),
@@ -237,7 +563,7 @@ pub async fn verify(
         exp: (now + Duration::hours(access_expiration)).timestamp(),
         nbf: now.timestamp(),
         jti: Uuid::new_v4().to_string(),
-        queues: vec!["*".to_string()], // Email login gets all queues
+        queues: vec!["*".to_string()],
         token_type: "access".to_string(),
         email: Some(email.clone()),
     };
@@ -247,7 +573,7 @@ pub async fn verify(
         api_key_id: api_key_id.clone(),
         org_id: org_id.clone(),
         iat: now.timestamp(),
-        exp: (now + Duration::hours(refresh_expiration)).timestamp(),
+        exp: (now + Duration::hours(access_expiration * 24)).timestamp(),
         nbf: now.timestamp(),
         jti: Uuid::new_v4().to_string(),
         queues: vec!["*".to_string()],
@@ -275,15 +601,33 @@ pub async fn verify(
         AppError::Internal("Failed to generate token".to_string())
     })?;
 
-    info!(email = %mask_email(&email), org_id = %org_id, "Email login successful");
+    info!(email = %mask_email(&email), org_id = %org_id, "Signup completed");
 
-    Ok(Json(VerifyEmailLoginResponse {
-        access_token,
-        refresh_token,
-        token_type: "Bearer".to_string(),
-        expires_in: access_expiration * 3600,
-        refresh_expires_in: refresh_expiration * 3600,
-    }))
+    Ok((
+        axum::http::StatusCode::CREATED,
+        Json(CompleteSignupResponse {
+            organization: SignupOrganization {
+                id: org_id,
+                name: request.name,
+                slug,
+                billing_email: email,
+            },
+            api_key: raw_key,
+            access_token,
+            refresh_token,
+            token_type: "Bearer".to_string(),
+            expires_in: access_expiration * 3600,
+        }),
+    ))
+}
+
+/// Generate a secure random API key string
+fn generate_api_key_string() -> String {
+    use rand::Rng;
+    let mut rng = rand::rng();
+    let mut bytes = [0u8; 32];
+    rng.fill(&mut bytes);
+    base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes)
 }
 
 /// Send login code email
@@ -557,7 +901,8 @@ async fn send_via_smtp(
     Ok(())
 }
 
-/// Create organization for email
+/// Create organization for email (legacy - used in self-hosted auto-create mode)
+#[allow(dead_code)]
 async fn create_organization_for_email(state: &AppState, email: &str) -> AppResult<String> {
     let org_id = Uuid::new_v4().to_string();
     let now = Utc::now();

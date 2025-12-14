@@ -56,6 +56,81 @@ pub struct InitialApiKey {
     pub created_at: DateTime<Utc>,
 }
 
+/// Check slug availability request
+#[derive(Debug, serde::Deserialize)]
+pub struct CheckSlugQuery {
+    pub slug: String,
+}
+
+/// Check slug availability response
+#[derive(Debug, Serialize)]
+pub struct CheckSlugResponse {
+    /// Whether the slug is available
+    pub available: bool,
+    /// Whether slug format is valid
+    pub valid: bool,
+    /// Validation error message if any
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Suggested alternative if taken
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggestion: Option<String>,
+}
+
+/// Check if a slug is available
+///
+/// GET /api/v1/organizations/check-slug?slug=...
+pub async fn check_slug(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<CheckSlugQuery>,
+) -> AppResult<Json<CheckSlugResponse>> {
+    let slug = query.slug.to_lowercase().trim().to_string();
+
+    // Validate slug format
+    if let Err(e) = validate_slug(&slug) {
+        return Ok(Json(CheckSlugResponse {
+            available: false,
+            valid: false,
+            error: Some(e.to_string()),
+            suggestion: None,
+        }));
+    }
+
+    // Check reserved slugs
+    if crate::models::RESERVED_SLUGS.contains(&slug.as_str()) {
+        return Ok(Json(CheckSlugResponse {
+            available: false,
+            valid: true,
+            error: Some("This slug is reserved".to_string()),
+            suggestion: Some(format!("{}-{}", slug, &Uuid::new_v4().to_string()[..6])),
+        }));
+    }
+
+    // Check if slug exists in database
+    let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM organizations WHERE slug = $1")
+        .bind(&slug)
+        .fetch_optional(state.db.pool())
+        .await?;
+
+    if exists.is_some() {
+        // Generate a suggestion
+        let suggestion = format!("{}-{}", slug, &Uuid::new_v4().to_string()[..6]);
+        return Ok(Json(CheckSlugResponse {
+            available: false,
+            valid: true,
+            error: None,
+            suggestion: Some(suggestion),
+        }));
+    }
+
+    Ok(Json(CheckSlugResponse {
+        available: true,
+        valid: true,
+        error: None,
+        suggestion: None,
+    }))
+}
+
 /// List organizations (returns only the authenticated user's organization)
 ///
 /// Previously listed ALL organizations (critical data leak)
@@ -152,6 +227,21 @@ pub async fn create(
 
     // Validate slug format
     validate_slug(&request.slug)?;
+
+    // Check for duplicate billing email
+    if let Some(ref email) = request.billing_email {
+        let existing: Option<(String,)> =
+            sqlx::query_as("SELECT id FROM organizations WHERE billing_email = $1")
+                .bind(email)
+                .fetch_optional(state.db.pool())
+                .await?;
+
+        if existing.is_some() {
+            return Err(AppError::Conflict(
+                "An account with this email already exists. Please log in instead.".to_string(),
+            ));
+        }
+    }
 
     let org_id = Uuid::new_v4().to_string();
     let now = Utc::now();
