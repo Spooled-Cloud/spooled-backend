@@ -242,4 +242,151 @@ mod tests {
         assert!(!json.contains("secret_hash"));
         assert!(json.contains("Test Key"));
     }
+
+    #[test]
+    fn test_validate_queues_valid() {
+        let queues = vec!["default".to_string(), "emails".to_string()];
+        assert!(validate_queues(&queues).is_ok());
+    }
+
+    #[test]
+    fn test_validate_queues_wildcard() {
+        let queues = vec!["*".to_string()];
+        assert!(validate_queues(&queues).is_ok());
+    }
+
+    #[test]
+    fn test_validate_queues_too_many() {
+        let queues: Vec<String> = (0..=MAX_QUEUES_PER_KEY)
+            .map(|i| format!("queue-{}", i))
+            .collect();
+        assert!(validate_queues(&queues).is_err());
+    }
+
+    #[test]
+    fn test_validate_queues_empty_name() {
+        let queues = vec!["".to_string()];
+        assert!(validate_queues(&queues).is_err());
+    }
+
+    #[test]
+    fn test_validate_queues_invalid_chars() {
+        let queues = vec!["invalid@queue".to_string()];
+        assert!(validate_queues(&queues).is_err());
+    }
+
+    #[test]
+    fn test_validate_expires_at_future() {
+        let future = Utc::now() + chrono::Duration::hours(1);
+        assert!(validate_expires_at(&future).is_ok());
+    }
+
+    #[test]
+    fn test_validate_expires_at_past() {
+        let past = Utc::now() - chrono::Duration::hours(1);
+        assert!(validate_expires_at(&past).is_err());
+    }
+
+    #[test]
+    fn test_create_api_key_request_validation() {
+        // Valid request
+        let valid = CreateApiKeyRequest {
+            name: "Production Key".to_string(),
+            queues: Some(vec!["default".to_string()]),
+            rate_limit: Some(1000),
+            expires_at: None,
+        };
+        assert!(valid.validate().is_ok());
+
+        // Name too short
+        let short_name = CreateApiKeyRequest {
+            name: "".to_string(),
+            queues: None,
+            rate_limit: None,
+            expires_at: None,
+        };
+        assert!(short_name.validate().is_err());
+    }
+
+    #[test]
+    fn test_create_api_key_request_rate_limit_bounds() {
+        // Rate limit too low
+        let low_rate = CreateApiKeyRequest {
+            name: "Test Key".to_string(),
+            queues: None,
+            rate_limit: Some(0),
+            expires_at: None,
+        };
+        assert!(low_rate.validate().is_err());
+
+        // Rate limit at max (10000)
+        let max_rate = CreateApiKeyRequest {
+            name: "Test Key".to_string(),
+            queues: None,
+            rate_limit: Some(10000),
+            expires_at: None,
+        };
+        assert!(max_rate.validate().is_ok());
+
+        // Rate limit over max
+        let over_max = CreateApiKeyRequest {
+            name: "Test Key".to_string(),
+            queues: None,
+            rate_limit: Some(10001),
+            expires_at: None,
+        };
+        assert!(over_max.validate().is_err());
+    }
+
+    #[test]
+    fn test_create_api_key_response_serialization() {
+        let response = CreateApiKeyResponse {
+            id: "key-123".to_string(),
+            key: "sk_live_abcdefgh12345678".to_string(),
+            name: "My Key".to_string(),
+            created_at: Utc::now(),
+            expires_at: None,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("key-123"));
+        assert!(json.contains("sk_live_abcdefgh12345678"));
+        assert!(json.contains("My Key"));
+    }
+
+    #[test]
+    fn test_update_api_key_request_validation() {
+        // Valid partial update
+        let valid = UpdateApiKeyRequest {
+            name: Some("Updated Name".to_string()),
+            queues: None,
+            rate_limit: None,
+            is_active: Some(false),
+        };
+        assert!(valid.validate().is_ok());
+    }
+
+    #[test]
+    fn test_api_key_summary_serialization() {
+        let summary = ApiKeySummary {
+            id: "key-456".to_string(),
+            name: "Summary Key".to_string(),
+            queues: vec!["default".to_string(), "emails".to_string()],
+            rate_limit: Some(500),
+            is_active: true,
+            created_at: Utc::now(),
+            last_used: None,
+            expires_at: None,
+        };
+
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("key-456"));
+        assert!(json.contains("Summary Key"));
+        assert!(json.contains("default"));
+    }
+
+    #[test]
+    fn test_max_queues_per_key_constant() {
+        assert_eq!(MAX_QUEUES_PER_KEY, 50);
+    }
 }
