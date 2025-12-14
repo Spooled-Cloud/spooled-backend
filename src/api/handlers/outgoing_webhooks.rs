@@ -394,3 +394,192 @@ pub async fn deliveries(
 
     Ok(Json(deliveries))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::VALID_WEBHOOK_EVENTS;
+
+    #[test]
+    fn test_validate_events_valid() {
+        let valid_events = vec!["job.created".to_string(), "job.completed".to_string()];
+        assert!(validate_events(&valid_events).is_ok());
+    }
+
+    #[test]
+    fn test_validate_events_invalid() {
+        let invalid_events = vec!["job.created".to_string(), "invalid.event".to_string()];
+        let result = validate_events(&invalid_events);
+        assert!(result.is_err());
+        if let Err(AppError::Validation(msg)) = result {
+            assert!(msg.contains("invalid.event"));
+        }
+    }
+
+    #[test]
+    fn test_validate_events_empty() {
+        let empty_events: Vec<String> = vec![];
+        assert!(validate_events(&empty_events).is_ok());
+    }
+
+    #[test]
+    fn test_validate_events_all_valid_event_types() {
+        let all_events: Vec<String> = VALID_WEBHOOK_EVENTS.iter().map(|s| s.to_string()).collect();
+        assert!(validate_events(&all_events).is_ok());
+    }
+
+    #[test]
+    fn test_outgoing_webhook_summary_serialization() {
+        let summary = OutgoingWebhookSummary {
+            id: "wh-123".to_string(),
+            organization_id: "org-1".to_string(),
+            name: "My Webhook".to_string(),
+            url: "https://example.com/webhook".to_string(),
+            events: vec!["job.completed".to_string()],
+            enabled: true,
+            failure_count: 0,
+            last_triggered_at: None,
+            last_status: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("wh-123"));
+        assert!(json.contains("My Webhook"));
+        assert!(json.contains("https://example.com/webhook"));
+        assert!(json.contains("job.completed"));
+    }
+
+    #[test]
+    fn test_outgoing_webhook_summary_with_failure() {
+        let summary = OutgoingWebhookSummary {
+            id: "wh-456".to_string(),
+            organization_id: "org-2".to_string(),
+            name: "Failed Webhook".to_string(),
+            url: "https://example.com/fail".to_string(),
+            events: vec!["job.failed".to_string()],
+            enabled: false,
+            failure_count: 5,
+            last_triggered_at: Some(Utc::now()),
+            last_status: Some("failed".to_string()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("\"enabled\":false"));
+        assert!(json.contains("\"failure_count\":5"));
+        assert!(json.contains("failed"));
+    }
+
+    #[test]
+    fn test_test_webhook_response_serialization() {
+        let response = TestWebhookResponse {
+            success: true,
+            status_code: Some(200),
+            response_time_ms: 150,
+            error: None,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"success\":true"));
+        assert!(json.contains("\"status_code\":200"));
+        assert!(json.contains("\"response_time_ms\":150"));
+    }
+
+    #[test]
+    fn test_test_webhook_response_with_error() {
+        let response = TestWebhookResponse {
+            success: false,
+            status_code: None,
+            response_time_ms: 5000,
+            error: Some("Connection timeout".to_string()),
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"success\":false"));
+        assert!(json.contains("Connection timeout"));
+    }
+
+    #[test]
+    fn test_create_outgoing_webhook_request_validation() {
+        use validator::Validate;
+
+        // Valid request
+        let valid = CreateOutgoingWebhookRequest {
+            name: "My Webhook".to_string(),
+            url: "https://example.com/webhook".to_string(),
+            secret: Some("my-secret-key-12345".to_string()),
+            events: vec!["job.completed".to_string()],
+            enabled: true,
+        };
+        assert!(valid.validate().is_ok());
+
+        // Name too short
+        let short_name = CreateOutgoingWebhookRequest {
+            name: "".to_string(),
+            url: "https://example.com/webhook".to_string(),
+            secret: None,
+            events: vec!["job.completed".to_string()],
+            enabled: true,
+        };
+        assert!(short_name.validate().is_err());
+
+        // Invalid URL format (validation should handle this at struct level via #[validate(url)])
+        let invalid_url = CreateOutgoingWebhookRequest {
+            name: "Test".to_string(),
+            url: "not-a-url".to_string(),
+            secret: None,
+            events: vec!["job.completed".to_string()],
+            enabled: true,
+        };
+        // URL validation happens in struct via #[validate(url)]
+        assert!(invalid_url.validate().is_err());
+    }
+
+    #[test]
+    fn test_outgoing_webhook_delivery_serialization() {
+        let delivery = OutgoingWebhookDelivery {
+            id: "del-123".to_string(),
+            webhook_id: "wh-456".to_string(),
+            event: "job.completed".to_string(),
+            payload: serde_json::json!({"job_id": "job-789"}),
+            status: "delivered".to_string(),
+            status_code: Some(200),
+            response_body: Some("OK".to_string()),
+            error: None,
+            attempts: 1,
+            created_at: Utc::now(),
+            delivered_at: Some(Utc::now()),
+        };
+
+        let json = serde_json::to_string(&delivery).unwrap();
+        assert!(json.contains("del-123"));
+        assert!(json.contains("wh-456"));
+        assert!(json.contains("job.completed"));
+        assert!(json.contains("delivered"));
+    }
+
+    #[test]
+    fn test_outgoing_webhook_delivery_failed() {
+        let delivery = OutgoingWebhookDelivery {
+            id: "del-999".to_string(),
+            webhook_id: "wh-456".to_string(),
+            event: "job.failed".to_string(),
+            payload: serde_json::json!({}),
+            status: "failed".to_string(),
+            status_code: Some(500),
+            response_body: None,
+            error: Some("Server error".to_string()),
+            attempts: 3,
+            created_at: Utc::now(),
+            delivered_at: None,
+        };
+
+        let json = serde_json::to_string(&delivery).unwrap();
+        assert!(json.contains("\"status\":\"failed\""));
+        assert!(json.contains("\"attempts\":3"));
+        assert!(json.contains("Server error"));
+    }
+}

@@ -1023,3 +1023,205 @@ fn generate_secure_key() -> String {
     rng.fill(&mut bytes);
     base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_admin_usage_stats_from_resource_counts() {
+        let counts = ResourceCounts {
+            jobs_today: 100,
+            active_jobs: 25,
+            queues: 5,
+            workers: 10,
+            api_keys: 3,
+            schedules: 2,
+            workflows: 1,
+            webhooks: 4,
+        };
+
+        let stats: AdminUsageStats = counts.into();
+        assert_eq!(stats.jobs_today, 100);
+        assert_eq!(stats.active_jobs, 25);
+        assert_eq!(stats.queues, 5);
+        assert_eq!(stats.workers, 10);
+        assert_eq!(stats.api_keys, 3);
+    }
+
+    #[test]
+    fn test_admin_organization_serialization() {
+        let org = AdminOrganization {
+            id: "org-123".to_string(),
+            name: "Test Organization".to_string(),
+            slug: "test-org".to_string(),
+            plan_tier: "starter".to_string(),
+            billing_email: Some("billing@test.com".to_string()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            usage: AdminUsageStats {
+                jobs_today: 50,
+                active_jobs: 10,
+                queues: 3,
+                workers: 5,
+                api_keys: 2,
+            },
+        };
+
+        let json = serde_json::to_string(&org).unwrap();
+        assert!(json.contains("org-123"));
+        assert!(json.contains("Test Organization"));
+        assert!(json.contains("starter"));
+        assert!(json.contains("billing@test.com"));
+    }
+
+    #[test]
+    fn test_admin_organization_without_billing_email() {
+        let org = AdminOrganization {
+            id: "org-456".to_string(),
+            name: "No Email Org".to_string(),
+            slug: "no-email".to_string(),
+            plan_tier: "free".to_string(),
+            billing_email: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            usage: AdminUsageStats {
+                jobs_today: 0,
+                active_jobs: 0,
+                queues: 0,
+                workers: 0,
+                api_keys: 1,
+            },
+        };
+
+        let json = serde_json::to_string(&org).unwrap();
+        assert!(json.contains("no-email"));
+        assert!(json.contains("free"));
+    }
+
+    #[test]
+    fn test_list_orgs_query_defaults() {
+        let query: ListOrgsQuery = serde_json::from_str("{}").unwrap();
+        assert!(query.plan_tier.is_none());
+        assert!(query.search.is_none());
+        assert!(query.limit.is_none());
+        assert!(query.offset.is_none());
+        assert!(query.sort_by.is_none());
+        assert!(query.sort_order.is_none());
+    }
+
+    #[test]
+    fn test_list_orgs_query_with_values() {
+        let json = r#"{
+            "plan_tier": "pro",
+            "search": "test",
+            "limit": 25,
+            "offset": 50,
+            "sort_by": "name",
+            "sort_order": "asc"
+        }"#;
+        let query: ListOrgsQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.plan_tier, Some("pro".to_string()));
+        assert_eq!(query.search, Some("test".to_string()));
+        assert_eq!(query.limit, Some(25));
+        assert_eq!(query.offset, Some(50));
+        assert_eq!(query.sort_by, Some("name".to_string()));
+        assert_eq!(query.sort_order, Some("asc".to_string()));
+    }
+
+    #[test]
+    fn test_list_orgs_response_serialization() {
+        let response = ListOrgsResponse {
+            organizations: vec![],
+            total: 0,
+            limit: 50,
+            offset: 0,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"total\":0"));
+        assert!(json.contains("\"limit\":50"));
+        assert!(json.contains("\"offset\":0"));
+    }
+
+    #[test]
+    fn test_generate_secure_key_length() {
+        let key = generate_secure_key();
+        // 32 bytes base64 encoded (URL safe, no padding) = 43 characters
+        assert_eq!(key.len(), 43);
+    }
+
+    #[test]
+    fn test_generate_secure_key_uniqueness() {
+        let key1 = generate_secure_key();
+        let key2 = generate_secure_key();
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn test_generate_secure_key_characters() {
+        let key = generate_secure_key();
+        // URL-safe base64 only contains alphanumeric, -, and _
+        assert!(key
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_'));
+    }
+
+    #[test]
+    fn test_admin_create_org_request_deserialization() {
+        let json = r#"{
+            "name": "New Org",
+            "slug": "new-org",
+            "billing_email": "billing@neworg.com",
+            "plan_tier": "starter"
+        }"#;
+        let request: AdminCreateOrgRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.name, "New Org");
+        assert_eq!(request.slug, "new-org");
+        assert_eq!(
+            request.billing_email,
+            Some("billing@neworg.com".to_string())
+        );
+        assert_eq!(request.plan_tier, Some("starter".to_string()));
+    }
+
+    #[test]
+    fn test_admin_create_org_request_defaults() {
+        let json = r#"{
+            "name": "Minimal Org",
+            "slug": "minimal-org"
+        }"#;
+        let request: AdminCreateOrgRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.plan_tier, None);
+        assert_eq!(request.billing_email, None);
+    }
+
+    #[test]
+    fn test_admin_create_api_key_request_deserialization() {
+        let json = r#"{
+            "name": "Test Key",
+            "queues": ["default", "emails"]
+        }"#;
+        let request: AdminCreateApiKeyRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.name, "Test Key");
+        assert_eq!(
+            request.queues,
+            Some(vec!["default".to_string(), "emails".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_admin_api_key_response_serialization() {
+        let response = AdminApiKeyResponse {
+            id: "key-123".to_string(),
+            name: "My API Key".to_string(),
+            key: "sk_test_abc123xyz".to_string(),
+            created_at: Utc::now(),
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("key-123"));
+        assert!(json.contains("sk_test_abc123xyz"));
+        assert!(json.contains("My API Key"));
+    }
+}
