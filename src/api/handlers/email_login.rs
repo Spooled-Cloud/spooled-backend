@@ -603,6 +603,7 @@ fn mask_email(email: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use validator::Validate;
 
     #[test]
     fn test_mask_email() {
@@ -616,5 +617,145 @@ mod tests {
     fn test_mask_email_invalid() {
         assert_eq!(mask_email("invalid"), "***@***");
         assert_eq!(mask_email(""), "***@***");
+    }
+
+    #[test]
+    fn test_mask_email_edge_cases() {
+        // Three character local part
+        assert_eq!(mask_email("abc@example.com"), "a***c@example.com");
+        // Email with dots
+        assert_eq!(mask_email("first.last@domain.com"), "f***t@domain.com");
+        // Email with plus sign
+        assert_eq!(mask_email("user+tag@gmail.com"), "u***g@gmail.com");
+    }
+
+    #[test]
+    fn test_start_email_login_request_validation() {
+        // Valid email
+        let valid = StartEmailLoginRequest {
+            email: "test@example.com".to_string(),
+        };
+        assert!(valid.validate().is_ok());
+
+        // Invalid email
+        let invalid = StartEmailLoginRequest {
+            email: "not-an-email".to_string(),
+        };
+        assert!(invalid.validate().is_err());
+
+        // Empty email
+        let empty = StartEmailLoginRequest {
+            email: "".to_string(),
+        };
+        assert!(empty.validate().is_err());
+    }
+
+    #[test]
+    fn test_verify_email_login_request_validation() {
+        // Valid request
+        let valid = VerifyEmailLoginRequest {
+            email: "test@example.com".to_string(),
+            code: "123456".to_string(),
+        };
+        assert!(valid.validate().is_ok());
+
+        // Invalid email
+        let invalid_email = VerifyEmailLoginRequest {
+            email: "invalid".to_string(),
+            code: "123456".to_string(),
+        };
+        assert!(invalid_email.validate().is_err());
+
+        // Code too short
+        let short_code = VerifyEmailLoginRequest {
+            email: "test@example.com".to_string(),
+            code: "12345".to_string(),
+        };
+        assert!(short_code.validate().is_err());
+
+        // Code too long
+        let long_code = VerifyEmailLoginRequest {
+            email: "test@example.com".to_string(),
+            code: "1234567".to_string(),
+        };
+        assert!(long_code.validate().is_err());
+    }
+
+    #[test]
+    fn test_start_email_login_response_serialization() {
+        let response = StartEmailLoginResponse {
+            message: "Code sent".to_string(),
+            email_sent_to: "t***t@example.com".to_string(),
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("Code sent"));
+        assert!(json.contains("t***t@example.com"));
+    }
+
+    #[test]
+    fn test_verify_email_login_response_serialization() {
+        let response = VerifyEmailLoginResponse {
+            access_token: "eyJ...".to_string(),
+            refresh_token: "eyJ...".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+            refresh_expires_in: 2592000,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("Bearer"));
+        assert!(json.contains("access_token"));
+        assert!(json.contains("refresh_token"));
+        assert!(json.contains("86400"));
+    }
+
+    #[test]
+    fn test_claims_serialization() {
+        let claims = Claims {
+            sub: "org-123".to_string(),
+            api_key_id: "key-456".to_string(),
+            org_id: "org-123".to_string(),
+            iat: 1700000000,
+            exp: 1700003600,
+            nbf: 1700000000,
+            jti: "jti-789".to_string(),
+            queues: vec!["*".to_string()],
+            token_type: "access".to_string(),
+            email: Some("test@example.com".to_string()),
+        };
+
+        let json = serde_json::to_string(&claims).unwrap();
+        assert!(json.contains("org-123"));
+        assert!(json.contains("test@example.com"));
+        assert!(json.contains("access"));
+
+        // Deserialize back
+        let decoded: Claims = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.sub, claims.sub);
+        assert_eq!(decoded.email, claims.email);
+    }
+
+    #[test]
+    fn test_claims_without_email() {
+        let claims = Claims {
+            sub: "org-123".to_string(),
+            api_key_id: "key-456".to_string(),
+            org_id: "org-123".to_string(),
+            iat: 1700000000,
+            exp: 1700003600,
+            nbf: 1700000000,
+            jti: "jti-789".to_string(),
+            queues: vec!["emails".to_string()],
+            token_type: "access".to_string(),
+            email: None,
+        };
+
+        let json = serde_json::to_string(&claims).unwrap();
+        // Should still serialize without email
+        assert!(json.contains("org-123"));
+
+        let decoded: Claims = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.email, None);
     }
 }

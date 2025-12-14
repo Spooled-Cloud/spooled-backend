@@ -485,6 +485,11 @@ mod tests {
             billing_email: None,
             settings: serde_json::json!({}),
             custom_limits: None,
+            stripe_customer_id: None,
+            stripe_subscription_id: None,
+            stripe_subscription_status: None,
+            stripe_current_period_end: None,
+            stripe_cancel_at_period_end: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

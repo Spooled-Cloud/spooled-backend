@@ -523,3 +523,103 @@ fn constant_time_compare(a: &str, b: &str) -> bool {
     let bytes_eq = a_bytes.ct_eq(&b_bytes).into();
     len_eq && bytes_eq
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_billing_status_response_serialization() {
+        let response = BillingStatusResponse {
+            plan_tier: "starter".to_string(),
+            stripe_subscription_id: Some("sub_123".to_string()),
+            stripe_subscription_status: Some("active".to_string()),
+            stripe_current_period_end: Some(Utc::now()),
+            stripe_cancel_at_period_end: Some(false),
+            has_stripe_customer: true,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("starter"));
+        assert!(json.contains("sub_123"));
+        assert!(json.contains("active"));
+        assert!(json.contains("has_stripe_customer"));
+    }
+
+    #[test]
+    fn test_billing_status_response_without_subscription() {
+        let response = BillingStatusResponse {
+            plan_tier: "free".to_string(),
+            stripe_subscription_id: None,
+            stripe_subscription_status: None,
+            stripe_current_period_end: None,
+            stripe_cancel_at_period_end: None,
+            has_stripe_customer: false,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("free"));
+        assert!(json.contains("false")); // has_stripe_customer
+    }
+
+    #[test]
+    fn test_create_portal_request_deserialization() {
+        let json = r#"{"return_url": "https://example.com/billing"}"#;
+        let request: CreatePortalRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.return_url, "https://example.com/billing");
+    }
+
+    #[test]
+    fn test_create_portal_response_serialization() {
+        let response = CreatePortalResponse {
+            url: "https://billing.stripe.com/session/xxx".to_string(),
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("https://billing.stripe.com/session/xxx"));
+    }
+
+    #[test]
+    fn test_constant_time_compare() {
+        assert!(constant_time_compare("abc", "abc"));
+        assert!(!constant_time_compare("abc", "abd"));
+        assert!(!constant_time_compare("abc", "abcd"));
+        assert!(!constant_time_compare("", "a"));
+        assert!(constant_time_compare("", ""));
+    }
+
+    #[test]
+    fn test_stripe_event_deserialization() {
+        let json = r#"{
+            "id": "evt_123",
+            "type": "customer.subscription.updated",
+            "data": {
+                "object": {
+                    "id": "sub_123",
+                    "status": "active"
+                }
+            }
+        }"#;
+
+        let event: StripeEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event.id, "evt_123");
+        assert_eq!(event.event_type, "customer.subscription.updated");
+        assert_eq!(event.data.object["id"], "sub_123");
+        assert_eq!(event.data.object["status"], "active");
+    }
+
+    #[test]
+    fn test_stripe_signature_format() {
+        // Test signature format parsing (not actual verification)
+        let signature = "t=1700000000,v1=abc123def456";
+        let parts: Vec<&str> = signature.split(',').collect();
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0].starts_with("t="));
+        assert!(parts[1].starts_with("v1="));
+    }
+
+    #[test]
+    fn test_stripe_timestamp_tolerance() {
+        assert_eq!(STRIPE_TIMESTAMP_TOLERANCE_SECS, 300);
+    }
+}

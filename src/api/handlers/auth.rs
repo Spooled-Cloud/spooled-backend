@@ -785,4 +785,90 @@ mod tests {
         assert!(json.contains("Token expired"));
         assert!(!json.contains("claims"));
     }
+
+    #[test]
+    fn test_organization_info_serialization() {
+        let org = OrganizationInfo {
+            id: "org-123".to_string(),
+            name: "My Organization".to_string(),
+            slug: "my-org".to_string(),
+            plan_tier: "starter".to_string(),
+            billing_email: Some("billing@example.com".to_string()),
+        };
+
+        let json = serde_json::to_string(&org).unwrap();
+        assert!(json.contains("org-123"));
+        assert!(json.contains("My Organization"));
+        assert!(json.contains("my-org"));
+        assert!(json.contains("starter"));
+        assert!(json.contains("billing@example.com"));
+    }
+
+    #[test]
+    fn test_organization_info_without_billing_email() {
+        let org = OrganizationInfo {
+            id: "org-456".to_string(),
+            name: "Test Org".to_string(),
+            slug: "test-org".to_string(),
+            plan_tier: "free".to_string(),
+            billing_email: None,
+        };
+
+        let json = serde_json::to_string(&org).unwrap();
+        assert!(json.contains("org-456"));
+        assert!(json.contains("free"));
+        // billing_email should be null
+        assert!(json.contains("null") || !json.contains("billing_email"));
+    }
+
+    #[test]
+    fn test_current_user_response_with_organization() {
+        let response = CurrentUserResponse {
+            organization_id: "org-123".to_string(),
+            api_key_id: "key-456".to_string(),
+            queues: vec!["*".to_string()],
+            issued_at: Utc::now(),
+            expires_at: Utc::now(),
+            organization: Some(OrganizationInfo {
+                id: "org-123".to_string(),
+                name: "My Org".to_string(),
+                slug: "my-org".to_string(),
+                plan_tier: "pro".to_string(),
+                billing_email: None,
+            }),
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("org-123"));
+        assert!(json.contains("key-456"));
+        assert!(json.contains("organization"));
+        assert!(json.contains("My Org"));
+        assert!(json.contains("pro"));
+    }
+
+    #[test]
+    fn test_current_user_response_without_organization() {
+        let response = CurrentUserResponse {
+            organization_id: "org-123".to_string(),
+            api_key_id: "key-456".to_string(),
+            queues: vec!["emails".to_string()],
+            issued_at: Utc::now(),
+            expires_at: Utc::now(),
+            organization: None,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("org-123"));
+        assert!(json.contains("key-456"));
+        assert!(json.contains("emails"));
+        // organization should be null
+        assert!(json.contains("null"));
+    }
+
+    #[test]
+    fn test_rate_limited_error_response() {
+        let rate_limited = ErrorResponse::rate_limited();
+        assert_eq!(rate_limited.error, "rate_limit_exceeded");
+        assert!(rate_limited.message.contains("Too many"));
+    }
 }
