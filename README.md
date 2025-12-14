@@ -102,8 +102,9 @@ cargo test
 | `POST` | `/api/v1/jobs/{id}/heartbeat` | Extend a job lease (long-running jobs) |
 | `POST` | `/api/v1/schedules` | Create cron schedule |
 | `POST` | `/api/v1/workflows` | Create workflow (DAG) |
-| `POST` | `/api/v1/webhooks/{org}/github` | GitHub webhook |
-| `POST` | `/api/v1/webhooks/{org}/stripe` | Stripe webhook |
+| `POST` | `/api/v1/webhooks/{org}/github` | GitHub webhook (ingestion) |
+| `POST` | `/api/v1/webhooks/{org}/stripe` | Stripe webhook (ingestion) |
+| `POST` | `/api/v1/outgoing-webhooks` | Configure outgoing notifications |
 | `GET` | `/api/v1/ws` | WebSocket for real-time |
 | `GET` | `/api/v1/events/queues/{name}` | SSE stream of queue updates |
 
@@ -121,7 +122,9 @@ cargo test
 | `GET` | `/api/v1/admin/stats` | Platform-wide statistics |
 | `GET` | `/api/v1/admin/plans` | List available plans with limits |
 
-### Create Your First Job
+### Quick Examples
+
+#### Create Your First Job
 
 ```bash
 # 1. Create an organization (returns initial API key - save it!)
@@ -141,6 +144,68 @@ curl -X POST http://localhost:8080/api/v1/jobs \
     "payload": {"to": "user@example.com", "subject": "Hello!"},
     "priority": 0,
     "max_retries": 3
+  }'
+```
+
+#### Create a Cron Schedule (Recurring Jobs)
+
+```bash
+# Run daily sales report every day at 9 AM
+curl -X POST http://localhost:8080/api/v1/schedules \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "daily-sales-report",
+    "cron_expression": "0 9 * * *",
+    "timezone": "America/New_York",
+    "queue_name": "reports",
+    "payload_template": {"report_type": "daily_sales"}
+  }'
+```
+
+#### Create a Workflow (Job Dependencies)
+
+```bash
+# User onboarding: create account → send email → setup defaults
+curl -X POST http://localhost:8080/api/v1/workflows \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "user-onboarding",
+    "jobs": [
+      {
+        "name": "create-account",
+        "queue_name": "users",
+        "payload": {"email": "user@example.com"}
+      },
+      {
+        "name": "send-welcome",
+        "queue_name": "emails",
+        "depends_on": ["create-account"],
+        "payload": {"template": "welcome"}
+      },
+      {
+        "name": "setup-defaults",
+        "queue_name": "users",
+        "depends_on": ["create-account"],
+        "payload": {"settings": {}}
+      }
+    ]
+  }'
+```
+
+#### Configure Outgoing Webhooks (Notifications)
+
+```bash
+# Get notified in Slack when jobs fail
+curl -X POST http://localhost:8080/api/v1/outgoing-webhooks \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Slack Alerts",
+    "url": "https://hooks.slack.com/services/YOUR/WEBHOOK/URL",
+    "events": ["job.failed", "queue.paused"],
+    "secret": "your-hmac-secret"
   }'
 ```
 
