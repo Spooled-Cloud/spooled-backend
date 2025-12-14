@@ -363,3 +363,168 @@ pub async fn get_usage_info(pool: &PgPool, org_id: &str) -> Result<UsageInfo, sq
         warnings,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::LimitError;
+
+    #[test]
+    fn test_limit_exceeded_response_from_limit_error() {
+        let err = LimitError {
+            resource: "active_jobs".to_string(),
+            current: 100,
+            limit: 50,
+            plan: "free".to_string(),
+            upgrade_to: Some("starter".to_string()),
+        };
+
+        let response: LimitExceededResponse = err.into();
+        assert_eq!(response.error, "limit_exceeded");
+        assert_eq!(response.resource, "active_jobs");
+        assert_eq!(response.current, 100);
+        assert_eq!(response.limit, 50);
+        assert_eq!(response.plan, "free");
+        assert_eq!(response.upgrade_to, Some("starter".to_string()));
+    }
+
+    #[test]
+    fn test_limit_exceeded_response_serialization() {
+        let response = LimitExceededResponse {
+            error: "limit_exceeded".to_string(),
+            message: "You've reached the limit".to_string(),
+            resource: "queues".to_string(),
+            current: 10,
+            limit: 5,
+            plan: "starter".to_string(),
+            upgrade_to: Some("pro".to_string()),
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("limit_exceeded"));
+        assert!(json.contains("queues"));
+        assert!(json.contains("\"current\":10"));
+        assert!(json.contains("\"limit\":5"));
+        assert!(json.contains("pro"));
+    }
+
+    #[test]
+    fn test_limit_exceeded_response_without_upgrade() {
+        let response = LimitExceededResponse {
+            error: "limit_exceeded".to_string(),
+            message: "Maximum reached".to_string(),
+            resource: "workers".to_string(),
+            current: 200,
+            limit: 100,
+            plan: "enterprise".to_string(),
+            upgrade_to: None,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("enterprise"));
+        // upgrade_to should be skipped
+        assert!(!json.contains("upgrade_to"));
+    }
+
+    #[test]
+    fn test_feature_disabled_response_serialization() {
+        let response = FeatureDisabledResponse {
+            error: "feature_disabled".to_string(),
+            message: "Workflows are not available on free plan".to_string(),
+            feature: "workflows".to_string(),
+            plan: "free".to_string(),
+            upgrade_to: Some("starter".to_string()),
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("feature_disabled"));
+        assert!(json.contains("workflows"));
+        assert!(json.contains("free"));
+        assert!(json.contains("starter"));
+    }
+
+    #[test]
+    fn test_resource_counts_default() {
+        let counts = ResourceCounts::default();
+        assert_eq!(counts.active_jobs, 0);
+        assert_eq!(counts.queues, 0);
+        assert_eq!(counts.workers, 0);
+        assert_eq!(counts.api_keys, 0);
+        assert_eq!(counts.schedules, 0);
+        assert_eq!(counts.workflows, 0);
+        assert_eq!(counts.webhooks, 0);
+        assert_eq!(counts.jobs_today, 0);
+    }
+
+    #[test]
+    fn test_resource_counts_with_values() {
+        let counts = ResourceCounts {
+            active_jobs: 50,
+            queues: 5,
+            workers: 10,
+            api_keys: 3,
+            schedules: 2,
+            workflows: 1,
+            webhooks: 4,
+            jobs_today: 1000,
+        };
+
+        assert_eq!(counts.active_jobs, 50);
+        assert_eq!(counts.jobs_today, 1000);
+    }
+
+    #[test]
+    fn test_usage_item_serialization() {
+        let item = UsageItem {
+            current: 50,
+            limit: Some(100),
+            percentage: Some(50.0),
+            is_disabled: false,
+        };
+
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(json.contains("\"current\":50"));
+        assert!(json.contains("\"limit\":100"));
+        assert!(json.contains("\"percentage\":50.0"));
+    }
+
+    #[test]
+    fn test_usage_item_unlimited() {
+        let item = UsageItem {
+            current: 500,
+            limit: None,
+            percentage: None,
+            is_disabled: false,
+        };
+
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(json.contains("\"current\":500"));
+    }
+
+    #[test]
+    fn test_usage_item_disabled() {
+        let item = UsageItem {
+            current: 0,
+            limit: Some(0),
+            percentage: None,
+            is_disabled: true,
+        };
+
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(json.contains("\"is_disabled\":true"));
+    }
+
+    #[test]
+    fn test_usage_warning_serialization() {
+        let warning = UsageWarning {
+            resource: "active_jobs".to_string(),
+            message: "You're approaching your limit".to_string(),
+            severity: "warning".to_string(),
+        };
+
+        let json = serde_json::to_string(&warning).unwrap();
+        assert!(json.contains("active_jobs"));
+        assert!(json.contains("warning"));
+        assert!(json.contains("approaching"));
+    }
+}
