@@ -529,7 +529,7 @@ async fn test_admin_create_organization_duplicate_slug_fails() {
 
     let slug = format!(
         "unique-slug-{}",
-        uuid::Uuid::new_v4().to_string()[..8].to_string()
+        &uuid::Uuid::new_v4().to_string()[..8]
     );
 
     // Create first organization

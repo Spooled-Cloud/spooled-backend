@@ -1909,7 +1909,7 @@ async fn test_api_key_list_isolation() {
     for i in 0..3 {
         let key_id = uuid::Uuid::new_v4().to_string();
         let key_hash =
-            bcrypt::hash(&format!("sk_test_org1_key{}", i), bcrypt::DEFAULT_COST).unwrap();
+            bcrypt::hash(format!("sk_test_org1_key{}", i), bcrypt::DEFAULT_COST).unwrap();
         sqlx::query(
             "INSERT INTO api_keys (id, organization_id, name, key_hash, queues, is_active, created_at) VALUES ($1, 'list-org-1', $2, $3, ARRAY['default'], TRUE, NOW())"
         )
@@ -1925,7 +1925,7 @@ async fn test_api_key_list_isolation() {
     for i in 0..2 {
         let key_id = uuid::Uuid::new_v4().to_string();
         let key_hash =
-            bcrypt::hash(&format!("sk_test_org2_key{}", i), bcrypt::DEFAULT_COST).unwrap();
+            bcrypt::hash(format!("sk_test_org2_key{}", i), bcrypt::DEFAULT_COST).unwrap();
         sqlx::query(
             "INSERT INTO api_keys (id, organization_id, name, key_hash, queues, is_active, created_at) VALUES ($1, 'list-org-2', $2, $3, ARRAY['default'], TRUE, NOW())"
         )
@@ -4972,7 +4972,7 @@ async fn test_timezone_validation() {
     for tz in &valid_timezones {
         // These should all be valid IANA timezone formats
         assert!(
-            tz.len() > 0 && tz.len() < 50,
+            !tz.is_empty() && tz.len() < 50,
             "Timezone {} should have reasonable length",
             tz
         );
@@ -7693,7 +7693,7 @@ fn test_rate_limit_no_unknown_grouping() {
 
     // New behavior: unique per request or UA-based
     let good_id_1 = format!("req:{}", uuid::Uuid::new_v4());
-    let good_id_2 = format!("ua:a1b2c3d4");
+    let good_id_2 = "ua:a1b2c3d4".to_string();
 
     // Each unknown client gets unique bucket
     assert_ne!(good_id_1, good_id_2);
