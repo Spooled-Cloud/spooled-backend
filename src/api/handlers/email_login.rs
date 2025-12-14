@@ -24,6 +24,10 @@ const MAX_CODE_ATTEMPTS: i32 = 5;
 const CODE_VALIDITY_MINUTES: i64 = 10;
 /// Rate limit: max codes per email per hour
 const MAX_CODES_PER_HOUR: i64 = 5;
+/// Rate limit: max email checks per IP per minute
+const MAX_EMAIL_CHECKS_PER_MINUTE: i64 = 10;
+/// Rate limit: max email checks per IP per hour
+const MAX_EMAIL_CHECKS_PER_HOUR: i64 = 60;
 
 /// Check email availability request
 #[derive(Debug, Deserialize, Validate)]
@@ -44,11 +48,73 @@ pub struct CheckEmailResponse {
 /// Check if an email is already registered
 ///
 /// GET /api/v1/auth/check-email?email=...
+///
+/// Rate limited to prevent email enumeration attacks.
 pub async fn check_email(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     axum::extract::Query(query): axum::extract::Query<CheckEmailRequest>,
 ) -> AppResult<Json<CheckEmailResponse>> {
     let email = query.email.to_lowercase().trim().to_string();
+
+    // Extract IP for rate limiting
+    let client_ip = extract_client_ip(&headers);
+
+    // Rate limit: check per-minute limit
+    let recent_minute: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*) 
+        FROM email_login_codes 
+        WHERE email LIKE 'check:%' 
+          AND code = $1 
+          AND created_at > NOW() - INTERVAL '1 minute'
+        "#,
+    )
+    .bind(&client_ip)
+    .fetch_one(state.db.pool())
+    .await
+    .unwrap_or((0,));
+
+    if recent_minute.0 >= MAX_EMAIL_CHECKS_PER_MINUTE {
+        warn!(ip = %client_ip, "Email check rate limit exceeded (per minute)");
+        return Err(AppError::RateLimit(
+            "Too many requests. Please try again in a minute.".to_string(),
+        ));
+    }
+
+    // Rate limit: check per-hour limit
+    let recent_hour: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*) 
+        FROM email_login_codes 
+        WHERE email LIKE 'check:%' 
+          AND code = $1 
+          AND created_at > NOW() - INTERVAL '1 hour'
+        "#,
+    )
+    .bind(&client_ip)
+    .fetch_one(state.db.pool())
+    .await
+    .unwrap_or((0,));
+
+    if recent_hour.0 >= MAX_EMAIL_CHECKS_PER_HOUR {
+        warn!(ip = %client_ip, "Email check rate limit exceeded (per hour)");
+        return Err(AppError::RateLimit(
+            "Too many requests. Please try again later.".to_string(),
+        ));
+    }
+
+    // Log the check for rate limiting (using email_login_codes table with special prefix)
+    let _ = sqlx::query(
+        r#"
+        INSERT INTO email_login_codes (email, code, expires_at, used_at)
+        VALUES ($1, $2, NOW() + INTERVAL '1 hour', NOW())
+        "#,
+    )
+    .bind(format!("check:{}", email))
+    .bind(&client_ip)
+    .execute(state.db.pool())
+    .await;
 
     // Check if email is associated with any organization
     let exists: Option<(String,)> =
@@ -61,6 +127,34 @@ pub async fn check_email(
         available: exists.is_none(),
         exists: exists.is_some(),
     }))
+}
+
+/// Extract client IP from headers for rate limiting
+fn extract_client_ip(headers: &axum::http::HeaderMap) -> String {
+    // Check CF-Connecting-IP (Cloudflare)
+    if let Some(cf_ip) = headers
+        .get("CF-Connecting-IP")
+        .and_then(|v| v.to_str().ok())
+    {
+        return cf_ip.trim().to_string();
+    }
+
+    // Check X-Real-IP
+    if let Some(real_ip) = headers.get("X-Real-IP").and_then(|v| v.to_str().ok()) {
+        return real_ip.trim().to_string();
+    }
+
+    // Check X-Forwarded-For (first IP)
+    if let Some(forwarded) = headers.get("X-Forwarded-For").and_then(|v| v.to_str().ok()) {
+        if let Some(first_ip) = forwarded.split(',').next() {
+            let trimmed = first_ip.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+
+    "unknown".to_string()
 }
 
 /// Start email login request
