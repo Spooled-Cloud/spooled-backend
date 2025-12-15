@@ -1,23 +1,17 @@
 //! Webhook handlers
 
 use axum::{
-    body::Bytes,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     Json,
 };
 use chrono::Utc;
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 use uuid::Uuid;
 
 use crate::api::AppState;
-use crate::error::{AppError, AppResult};
-use crate::models::{CustomWebhookRequest, StripeWebhookEvent};
-
 use crate::config::Environment;
-
-type HmacSha256 = Hmac<Sha256>;
+use crate::error::{AppError, AppResult};
+use crate::models::CustomWebhookRequest;
 
 /// Maximum webhook payload size (5MB)
 const MAX_WEBHOOK_PAYLOAD_SIZE: usize = 5 * 1024 * 1024;
@@ -74,147 +68,11 @@ fn sanitize_queue_name(name: &str) -> String {
         .collect()
 }
 
-// GitHub webhook handler and verification removed as requested
+// GitHub and Stripe webhook handlers removed as requested
+// - GitHub: Not needed for this platform
+// - Stripe (for job ingestion): Removed because it used a global secret which doesn't
+//   work for multi-tenant. The /billing/webhook endpoint handles platform billing.
 // See git history for implementation details
-
-
-/// Handle Stripe webhook
-///
-/// Now requires organization_id in path
-/// Now validates webhook authorization token
-/// In production mode, requires HTTPS.
-pub async fn stripe(
-    State(state): State<AppState>,
-    Path(org_id): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> AppResult<StatusCode> {
-    // In production, require HTTPS for webhooks
-    validate_https_in_production(&state, &headers)?;
-    // Validate payload size
-    if body.len() > MAX_WEBHOOK_PAYLOAD_SIZE {
-        return Err(AppError::BadRequest(format!(
-            "Webhook payload too large: {} bytes (max: {} bytes)",
-            body.len(),
-            MAX_WEBHOOK_PAYLOAD_SIZE
-        )));
-    }
-    // Validate webhook authorization token
-    let webhook_token = headers.get("X-Webhook-Token").and_then(|v| v.to_str().ok());
-
-    let org_data: Option<(String, Option<String>)> = sqlx::query_as(
-        "SELECT id, settings->>'webhook_token' as webhook_token FROM organizations WHERE id = $1",
-    )
-    .bind(&org_id)
-    .fetch_optional(state.db.pool())
-    .await?;
-
-    let Some((_org_id, configured_token)) = org_data else {
-        return Err(AppError::NotFound(format!(
-            "Organization {} not found",
-            org_id
-        )));
-    };
-
-    // If org has configured a webhook token, validate it
-    if let Some(ref expected_token) = configured_token {
-        match webhook_token {
-            Some(provided) if constant_time_compare(provided, expected_token) => {}
-            _ => {
-                return Err(AppError::Authentication(
-                    "Invalid or missing X-Webhook-Token".to_string(),
-                ));
-            }
-        }
-    }
-
-    // Get the signature from headers
-    let signature = headers
-        .get("Stripe-Signature")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| AppError::Authentication("Missing Stripe-Signature header".to_string()))?;
-
-    // Verify signature - REQUIRED, cannot be bypassed
-    // If stripe_secret is not configured, reject the webhook to prevent forgery
-    match &state.settings.webhooks.stripe_secret {
-        Some(secret) => {
-            verify_stripe_signature(secret, &body, signature)?;
-        }
-        None => {
-            tracing::error!("Stripe webhook received but STRIPE_WEBHOOK_SECRET is not configured");
-            return Err(AppError::Internal(
-                "Webhook signature verification not configured. Set STRIPE_WEBHOOK_SECRET environment variable.".to_string()
-            ));
-        }
-    }
-
-    // Parse the payload
-    let event: StripeWebhookEvent = serde_json::from_slice(&body)
-        .map_err(|e| AppError::BadRequest(format!("Invalid JSON: {}", e)))?;
-
-    // Sanitize queue name - event_type comes from external input
-    let sanitized_type = sanitize_queue_name(&event.event_type.replace('.', "-"));
-    let queue_name = format!("stripe-{}", sanitized_type);
-
-    // Validate the final queue name
-    if !validate_queue_name(&queue_name) {
-        return Err(AppError::BadRequest(
-            "Invalid event type for queue name".to_string(),
-        ));
-    }
-
-    // Create job from webhook
-    let job_id = Uuid::new_v4().to_string();
-    let now = Utc::now();
-
-    sqlx::query(
-        r#"
-        INSERT INTO jobs (
-            id, organization_id, queue_name, status, payload, priority,
-            max_retries, timeout_seconds, created_at, updated_at, idempotency_key
-        )
-        VALUES ($1, $2, $3, 'pending', $4::JSONB, 0, 3, 300, $5, $5, $6)
-        ON CONFLICT (organization_id, idempotency_key) WHERE idempotency_key IS NOT NULL
-        DO UPDATE SET updated_at = NOW()
-        "#,
-    )
-    .bind(&job_id)
-    .bind(&org_id) // Use org_id from path
-    .bind(&queue_name)
-    .bind(serde_json::to_string(&event.data.object).unwrap_or_default())
-    .bind(now)
-    .bind(&event.id) // Use Stripe event ID as idempotency key
-    .execute(state.db.pool())
-    .await?;
-
-    // Record webhook delivery
-    sqlx::query(
-        r#"
-        INSERT INTO webhook_deliveries (id, organization_id, provider, event_type, payload, signature, matched_queue, created_at)
-        VALUES ($1, $2, 'stripe', $3, $4::JSONB, $5, $6, $7)
-        "#,
-    )
-    .bind(Uuid::new_v4().to_string())
-    .bind(&org_id) // Use org_id from path
-    .bind(&event.event_type)
-    .bind(serde_json::to_string(&event.data.object).unwrap_or_default())
-    .bind(signature)
-    .bind(&queue_name)
-    .bind(now)
-    .execute(state.db.pool())
-    .await?;
-
-    state.metrics.jobs_enqueued.inc();
-
-    // Publish to Redis with org context to prevent cross-tenant leakage
-    if let Some(ref cache) = state.cache {
-        let _ = cache
-            .publish(&format!("org:{}:queue:{}", org_id, queue_name), &job_id)
-            .await;
-    }
-
-    Ok(StatusCode::OK)
-}
 
 /// Handle custom webhook
 ///
@@ -315,74 +173,6 @@ pub async fn custom(
     Ok(StatusCode::OK)
 }
 
-// verify_github_signature removed
-
-/// Maximum age for Stripe webhook timestamps (5 minutes)
-const STRIPE_TIMESTAMP_TOLERANCE_SECS: i64 = 300;
-
-/// Verify Stripe webhook signature
-///
-/// Now validates timestamp to prevent replay attacks.
-/// Rejects webhooks with timestamps older than 5 minutes.
-fn verify_stripe_signature(secret: &str, body: &[u8], signature: &str) -> AppResult<()> {
-    // Parse Stripe signature format: t=timestamp,v1=signature
-    let mut timestamp = None;
-    let mut v1_signature = None;
-
-    for part in signature.split(',') {
-        if let Some((key, value)) = part.split_once('=') {
-            match key {
-                "t" => timestamp = Some(value),
-                "v1" => v1_signature = Some(value),
-                _ => {}
-            }
-        }
-    }
-
-    let timestamp_str = timestamp
-        .ok_or_else(|| AppError::Authentication("Missing timestamp in signature".to_string()))?;
-    let expected =
-        v1_signature.ok_or_else(|| AppError::Authentication("Missing v1 signature".to_string()))?;
-
-    // Validate timestamp to prevent replay attacks
-    let timestamp_secs: i64 = timestamp_str
-        .parse()
-        .map_err(|_| AppError::Authentication("Invalid timestamp format".to_string()))?;
-
-    let now = Utc::now().timestamp();
-    let age = now - timestamp_secs;
-
-    // Reject if timestamp is too old (replay attack) or too far in the future (clock skew attack)
-    if age > STRIPE_TIMESTAMP_TOLERANCE_SECS {
-        return Err(AppError::Authentication(format!(
-            "Webhook timestamp too old: {} seconds ago (max: {} seconds)",
-            age, STRIPE_TIMESTAMP_TOLERANCE_SECS
-        )));
-    }
-    if age < -60 {
-        // Allow 1 minute of clock skew for future timestamps
-        return Err(AppError::Authentication(
-            "Webhook timestamp is in the future".to_string(),
-        ));
-    }
-
-    // Create signed payload
-    let signed_payload = format!("{}.{}", timestamp_str, String::from_utf8_lossy(body));
-
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .map_err(|_| AppError::Internal("Invalid HMAC key".to_string()))?;
-    mac.update(signed_payload.as_bytes());
-
-    let computed = hex::encode(mac.finalize().into_bytes());
-
-    if !constant_time_compare(&computed, expected) {
-        return Err(AppError::Authentication(
-            "Invalid webhook signature".to_string(),
-        ));
-    }
-
-    Ok(())
-}
 
 /// Constant-time string comparison to prevent timing attacks
 ///

@@ -157,10 +157,7 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
             get(handlers::organizations::check_slug),
         )
         // Webhooks are authenticated via signatures, not API keys
-        .route(
-            "/webhooks/{org_id}/stripe",
-            post(handlers::webhooks::stripe),
-        )
+        // Custom webhook for organizations to receive events and create jobs
         .route(
             "/webhooks/{org_id}/custom",
             post(handlers::webhooks::custom),

@@ -584,44 +584,47 @@ Authorization: Bearer <token>
 
 ## Webhooks
 
-### GitHub Webhook
-
-```bash
-POST /api/v1/webhooks/github
-X-Hub-Signature-256: sha256=...
-Content-Type: application/json
-
-{
-  "action": "opened",
-  "pull_request": {...}
-}
-```
-
-### Stripe Webhook
-
-```bash
-POST /api/v1/webhooks/stripe
-Stripe-Signature: t=...,v1=...
-Content-Type: application/json
-
-{
-  "type": "payment_intent.succeeded",
-  "data": {...}
-}
-```
+Spooled supports custom webhooks that allow you to receive events from any source
+and automatically create jobs in your queues.
 
 ### Custom Webhook
 
+Each organization gets a unique webhook URL:
+
 ```bash
-POST /api/v1/webhooks/custom
-X-Webhook-Signature: sha256=...
+POST /api/v1/webhooks/{org_id}/custom
+X-Webhook-Token: your-configured-token
 Content-Type: application/json
 
 {
-  "queue_name": "custom_events",
-  "payload": {...}
+  "queue_name": "my-events",
+  "event_type": "order.created",
+  "payload": {
+    "order_id": 12345,
+    "customer": "John Doe"
+  },
+  "priority": 0,
+  "idempotency_key": "order-12345"
 }
 ```
+
+**Authentication:** If your organization has configured a `webhook_token` in settings,
+you must include it in the `X-Webhook-Token` header.
+
+**Response:**
+```json
+{
+  "job_id": "job_xxx",
+  "queue_name": "my-events",
+  "status": "pending"
+}
+```
+
+### Billing Webhook (Platform Admin Only)
+
+The `/api/v1/billing/webhook` endpoint handles Stripe subscription events for
+the platform billing system. This is configured in Stripe's webhook settings
+and secured with `STRIPE_BILLING_WEBHOOK_SECRET`.
 
 ---
 

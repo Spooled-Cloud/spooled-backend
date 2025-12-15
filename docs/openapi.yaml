@@ -5,12 +5,13 @@ info:
     Production-ready webhook queue service API.
     
     Spooled Cloud provides a reliable, multi-tenant job queue system with:
-    - Webhook ingestion (GitHub, Stripe, custom)
+    - Custom webhook ingestion (receive events from any source)
     - Job queue with retry logic and dead-letter queue
     - Worker coordination with heartbeat and lease management
     - Real-time job status updates via WebSocket/SSE
     - Workflow orchestration with job dependencies
     - Cron-based job scheduling
+    - Stripe billing integration for subscription management
     
     ## Authentication
     
@@ -1158,104 +1159,6 @@ paths:
           description: API key revoked
         '404':
           description: API key not found
-
-  /api/v1/webhooks/{org_id}/github:
-    parameters:
-      - name: org_id
-        in: path
-        required: true
-        schema:
-          type: string
-        description: Organization ID
-    post:
-      tags: [Webhooks]
-      summary: GitHub webhook
-      description: |
-        Receive GitHub webhook events for the specified organization.
-        
-        The webhook signature is verified using HMAC-SHA256 with the organization's
-        configured GitHub webhook secret.
-      operationId: githubWebhook
-      security: []
-      parameters:
-        - name: X-Hub-Signature-256
-          in: header
-          required: true
-          schema:
-            type: string
-          description: GitHub webhook signature (sha256=...)
-        - name: X-GitHub-Event
-          in: header
-          required: true
-          schema:
-            type: string
-          description: GitHub event type (e.g., push, pull_request)
-        - name: X-GitHub-Delivery
-          in: header
-          schema:
-            type: string
-          description: Unique delivery ID
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-      responses:
-        '200':
-          description: Webhook received and job created
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/WebhookResponse'
-        '401':
-          description: Invalid signature
-        '404':
-          description: Organization not found
-
-  /api/v1/webhooks/{org_id}/stripe:
-    parameters:
-      - name: org_id
-        in: path
-        required: true
-        schema:
-          type: string
-        description: Organization ID
-    post:
-      tags: [Webhooks]
-      summary: Stripe webhook
-      description: |
-        Receive Stripe webhook events for the specified organization.
-        
-        The webhook signature is verified using Stripe's signature scheme with
-        the organization's configured Stripe webhook secret. Timestamps older
-        than 5 minutes are rejected to prevent replay attacks.
-      operationId: stripeWebhook
-      security: []
-      parameters:
-        - name: Stripe-Signature
-          in: header
-          required: true
-          schema:
-            type: string
-          description: Stripe webhook signature (t=...,v1=...)
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-      responses:
-        '200':
-          description: Webhook received and job created
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/WebhookResponse'
-        '401':
-          description: Invalid signature or timestamp too old
-        '404':
-          description: Organization not found
 
   /api/v1/webhooks/{org_id}/custom:
     parameters:

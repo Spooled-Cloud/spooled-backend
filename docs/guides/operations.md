@@ -279,15 +279,17 @@ JWT_SECRET=your-very-long-and-random-secret-at-least-32-chars
 JWT_EXPIRATION_HOURS=24
 ```
 
-### Webhook Security
+### Billing Webhook Security
 
 ```bash
-# Required for GitHub webhooks
-GITHUB_WEBHOOK_SECRET=your-github-secret-min-16-chars
-
-# Required for Stripe webhooks
-STRIPE_WEBHOOK_SECRET=whsec_your-stripe-secret-min-16-chars
+# Required for Stripe billing webhooks (subscription management)
+STRIPE_BILLING_WEBHOOK_SECRET=whsec_your-stripe-secret-min-16-chars
 ```
+
+### Custom Webhook Security
+
+Organizations can configure a webhook token in their settings. When set, incoming
+custom webhooks must include the `X-Webhook-Token` header with the correct value.
 
 ---
 

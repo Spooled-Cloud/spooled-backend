@@ -183,16 +183,12 @@ pub struct OutgoingWebhookDelivery {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum WebhookProvider {
-    GitHub,
-    Stripe,
     Custom,
 }
 
 impl std::fmt::Display for WebhookProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WebhookProvider::GitHub => write!(f, "github"),
-            WebhookProvider::Stripe => write!(f, "stripe"),
             WebhookProvider::Custom => write!(f, "custom"),
         }
     }
@@ -219,58 +215,12 @@ pub struct WebhookDelivery {
     pub created_at: DateTime<Utc>,
 }
 
-/// GitHub webhook event
-#[derive(Debug, Deserialize)]
-pub struct GitHubWebhookEvent {
-    /// Event action (e.g., "opened", "closed")
-    pub action: Option<String>,
-    /// Repository info
-    pub repository: Option<GitHubRepository>,
-    /// Sender info
-    pub sender: Option<GitHubUser>,
-    /// Full payload for passthrough
-    #[serde(flatten)]
-    pub extra: serde_json::Value,
-}
-
-/// GitHub repository info
-#[derive(Debug, Deserialize, Serialize)]
-pub struct GitHubRepository {
-    pub id: i64,
-    pub name: String,
-    pub full_name: String,
-    pub private: bool,
-}
-
-/// GitHub user info
-#[derive(Debug, Deserialize, Serialize)]
-pub struct GitHubUser {
-    pub id: i64,
-    pub login: String,
-}
-
-/// Stripe webhook event
-#[derive(Debug, Deserialize)]
-pub struct StripeWebhookEvent {
-    /// Event ID
-    pub id: String,
-    /// Event type (e.g., "invoice.paid")
-    #[serde(rename = "type")]
-    pub event_type: String,
-    /// Event data
-    pub data: StripeEventData,
-    /// API version
-    pub api_version: Option<String>,
-    /// Creation timestamp
-    pub created: i64,
-}
-
-/// Stripe event data
-#[derive(Debug, Deserialize)]
-pub struct StripeEventData {
-    /// The object that triggered the event
-    pub object: serde_json::Value,
-}
+// Note: GitHubWebhookEvent and StripeWebhookEvent removed.
+// - GitHub webhook ingestion was removed as it's not needed for this platform.
+// - Stripe webhook ingestion (for job creation) was removed because it used a
+//   global secret which doesn't work for multi-tenant.
+// - The billing webhook in handlers/billing.rs handles platform subscription events
+//   and has its own StripeEvent struct.
 
 use validator::Validate;
 
@@ -398,47 +348,7 @@ mod tests {
 
     #[test]
     fn test_webhook_provider_display() {
-        assert_eq!(WebhookProvider::GitHub.to_string(), "github");
-        assert_eq!(WebhookProvider::Stripe.to_string(), "stripe");
         assert_eq!(WebhookProvider::Custom.to_string(), "custom");
-    }
-
-    #[test]
-    fn test_github_webhook_deserialization() {
-        let json = r#"{
-            "action": "opened",
-            "repository": {
-                "id": 123,
-                "name": "test-repo",
-                "full_name": "owner/test-repo",
-                "private": false
-            },
-            "sender": {
-                "id": 456,
-                "login": "testuser"
-            }
-        }"#;
-
-        let event: GitHubWebhookEvent = serde_json::from_str(json).unwrap();
-        assert_eq!(event.action, Some("opened".to_string()));
-        assert_eq!(event.repository.unwrap().name, "test-repo");
-    }
-
-    #[test]
-    fn test_stripe_webhook_deserialization() {
-        let json = r#"{
-            "id": "evt_123",
-            "type": "invoice.paid",
-            "data": {
-                "object": {"id": "inv_123"}
-            },
-            "api_version": "2023-10-16",
-            "created": 1234567890
-        }"#;
-
-        let event: StripeWebhookEvent = serde_json::from_str(json).unwrap();
-        assert_eq!(event.id, "evt_123");
-        assert_eq!(event.event_type, "invoice.paid");
     }
 
     #[test]

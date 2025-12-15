@@ -376,7 +376,7 @@ kill -9 <PID>
 
 1. **Read the full API documentation**: `docs/guides/api-usage.md`
 2. **Try gRPC for high-throughput workers**: See [gRPC API](api-usage.md#grpc-api)
-3. **Set up webhooks**: Configure GitHub/Stripe webhooks to create jobs automatically
+3. **Set up custom webhooks**: Use the `/webhooks/{org_id}/custom` endpoint to receive events from any source
 4. **Deploy to production**: See `docs/guides/deployment.md`
 5. **Understand the architecture**: See `docs/guides/architecture.md`
 6. **Run load tests**: See `loadtest/README.md`
