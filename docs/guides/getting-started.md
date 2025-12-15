@@ -11,12 +11,23 @@
 | Laravel Queues | Spooled |
 |----------------|---------|
 | Built into Laravel | Standalone service (works with anything) |
-| `dispatch(new SendEmail($user))` | HTTP POST to `/api/v1/jobs` |
-| `php artisan queue:work` | Workers connect via API |
+| `dispatch(new SendEmail($user))` | HTTP POST to `/api/v1/jobs` or gRPC `Enqueue` |
+| `php artisan queue:work` | Workers connect via REST or gRPC |
 | Redis/Database driver | PostgreSQL + Redis |
 | One app only | Multiple apps, any language |
 
 **Think of Spooled as "Laravel Queues as a Service"** - you get all the familiar concepts (jobs, queues, workers, retries, delays) but accessible from anywhere.
+
+### API Options
+
+Spooled offers two API protocols:
+
+| Protocol | Port | Best For |
+|----------|------|----------|
+| **REST** | 8080 | Web apps, simple integrations, admin dashboards |
+| **gRPC** | 50051 | High-throughput workers, streaming, type-safe SDKs |
+
+This guide uses REST examples. See [API Usage](./api-usage.md#grpc-api) for gRPC documentation.
 
 ---
 

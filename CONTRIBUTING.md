@@ -118,24 +118,47 @@ test(auth): add tests for JWT refresh flow
 
 ```
 src/
-├── api/          # HTTP handlers and routing
+├── api/          # REST API handlers and routing (Axum)
 ├── cache/        # Redis caching
 ├── config/       # Configuration
 ├── db/           # Database operations
 ├── error/        # Error types
-├── grpc/         # gRPC service
+├── grpc/         # gRPC service (Tonic)
+│   ├── auth.rs       # API key authentication interceptor
+│   ├── convert.rs    # Protobuf ↔ DB model conversions
+│   ├── server.rs     # Server bootstrap, health, reflection
+│   └── services/     # QueueService, WorkerService implementations
 ├── models/       # Data models
 ├── observability/# Metrics and tracing
 ├── queue/        # Queue management
 ├── scheduler/    # Cron scheduling
 ├── webhook/      # Webhook delivery
 └── worker/       # Worker implementation
+
+proto/
+└── spooled.proto     # Protocol Buffer definitions (source for tonic-build)
 ```
+
+### gRPC Development
+
+When modifying the gRPC API:
+
+1. Update `proto/spooled.proto` with your changes
+2. Run `cargo build` to regenerate Rust code via `tonic-build`
+3. Update the service implementation in `src/grpc/services/`
+4. Update conversion functions in `src/grpc/convert.rs` if adding new types
+5. Test with `grpcurl`:
+   ```bash
+   grpcurl -plaintext localhost:50051 list
+   grpcurl -plaintext -H "x-api-key: sk_test_xxx" \
+     -d '{"queue_name":"test"}' \
+     localhost:50051 spooled.v1.QueueService/Enqueue
+   ```
 
 ### Testing
 
 - Write unit tests for new functions
-- Write integration tests for API endpoints
+- Write integration tests for API endpoints (REST and gRPC)
 - Test edge cases and error conditions
 - Aim for meaningful coverage, not just high numbers
 

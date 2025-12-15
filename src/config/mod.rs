@@ -37,6 +37,14 @@ pub struct RegistrationSettings {
     /// - "closed": Organization creation is disabled (for SaaS - admin creates orgs)
     /// - "invite": Require invite code to create organization (future)
     pub mode: RegistrationMode,
+    /// Whether new signups via the email verification flow are allowed.
+    ///
+    /// This is separate from `REGISTRATION_MODE`:
+    /// - `REGISTRATION_MODE` controls *who can create organizations* (open vs closed vs invite)
+    /// - `EMAIL_SIGNUP_ENABLED` controls whether *new email-based signups* are permitted at all
+    ///
+    /// When disabled, existing accounts can still use email login, but new emails cannot sign up.
+    pub email_signup_enabled: bool,
     /// Admin API key for creating organizations when mode is "closed"
     /// This key bypasses registration restrictions
     pub admin_api_key: Option<String>,
@@ -348,6 +356,9 @@ impl Settings {
                     "invite" => RegistrationMode::Invite,
                     _ => RegistrationMode::Open,
                 },
+                email_signup_enabled: env::var("EMAIL_SIGNUP_ENABLED")
+                    .map(|v| v == "true" || v == "1" || v == "yes")
+                    .unwrap_or(true),
                 admin_api_key: env::var("ADMIN_API_KEY").ok(),
             },
             stripe: StripeSettings {
@@ -568,6 +579,7 @@ impl Settings {
             },
             registration: RegistrationSettings {
                 mode: RegistrationMode::Open,
+                email_signup_enabled: true,
                 admin_api_key: None,
             },
             stripe: StripeSettings {

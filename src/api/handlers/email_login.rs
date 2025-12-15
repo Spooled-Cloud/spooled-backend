@@ -16,6 +16,7 @@ use validator::Validate;
 use crate::api::middleware::validation::ValidatedJson;
 use crate::api::AppState;
 use crate::config::EmailProvider;
+use crate::config::RegistrationMode;
 use crate::error::{AppError, AppResult};
 
 /// Maximum login code attempts before invalidation
@@ -43,6 +44,8 @@ pub struct CheckEmailResponse {
     pub available: bool,
     /// Whether an account exists with this email
     pub exists: bool,
+    /// Whether new email signups are enabled on this deployment
+    pub signup_enabled: bool,
 }
 
 /// Check if an email is already registered
@@ -123,9 +126,13 @@ pub async fn check_email(
             .fetch_optional(state.db.pool())
             .await?;
 
+    let signup_enabled = state.settings.registration.email_signup_enabled;
+
     Ok(Json(CheckEmailResponse {
-        available: exists.is_none(),
+        // Only "available" if signup is enabled and the email isn't already registered
+        available: signup_enabled && exists.is_none(),
         exists: exists.is_some(),
+        signup_enabled,
     }))
 }
 
@@ -438,6 +445,13 @@ pub async fn verify(
             })))
         }
         None => {
+            if !state.settings.registration.email_signup_enabled {
+                // Email auth can still be used for existing accounts, but new signups are disabled.
+                return Err(AppError::Authorization(
+                    "Email signup is currently disabled. Contact support for access.".to_string(),
+                ));
+            }
+
             // New user - return signup token
             let signup_token = generate_signup_token(&state, &email).await?;
 
@@ -520,8 +534,53 @@ pub struct SignupOrganization {
 /// POST /api/v1/auth/signup/complete
 pub async fn complete_signup(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     ValidatedJson(request): ValidatedJson<CompleteSignupRequest>,
 ) -> AppResult<(axum::http::StatusCode, Json<CompleteSignupResponse>)> {
+    if !state.settings.registration.email_signup_enabled {
+        return Err(AppError::Authorization(
+            "Email signup is currently disabled. Contact support for access.".to_string(),
+        ));
+    }
+
+    // Enforce registration mode:
+    // - open: anyone can complete signup
+    // - closed: requires X-Admin-Key matching ADMIN_API_KEY
+    // - invite: not implemented yet
+    match state.settings.registration.mode {
+        RegistrationMode::Open => {}
+        RegistrationMode::Closed => {
+            let expected = state
+                .settings
+                .registration
+                .admin_api_key
+                .as_deref()
+                .unwrap_or("");
+
+            if expected.is_empty() {
+                return Err(AppError::Authorization(
+                    "Organization creation is disabled and no admin key is configured.".to_string(),
+                ));
+            }
+
+            let provided = headers
+                .get("X-Admin-Key")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+
+            if provided != expected {
+                return Err(AppError::Authorization(
+                    "Organization creation is disabled. Contact admin for access.".to_string(),
+                ));
+            }
+        }
+        RegistrationMode::Invite => {
+            return Err(AppError::Authorization(
+                "Invite-based registration is not yet implemented.".to_string(),
+            ));
+        }
+    }
+
     // Validate signup token
     let token_code = format!("signup:{}", request.signup_token);
 
@@ -1302,19 +1361,23 @@ mod tests {
         let exists_response = CheckEmailResponse {
             available: false,
             exists: true,
+            signup_enabled: true,
         };
         let json = serde_json::to_string(&exists_response).unwrap();
         assert!(json.contains("\"available\":false"));
         assert!(json.contains("\"exists\":true"));
+        assert!(json.contains("\"signup_enabled\":true"));
 
         // Email available
         let available_response = CheckEmailResponse {
             available: true,
             exists: false,
+            signup_enabled: true,
         };
         let json = serde_json::to_string(&available_response).unwrap();
         assert!(json.contains("\"available\":true"));
         assert!(json.contains("\"exists\":false"));
+        assert!(json.contains("\"signup_enabled\":true"));
     }
 
     #[test]

@@ -1,14 +1,5 @@
 # Security Policy
 
-## Supported Versions
-
-We release patches for security vulnerabilities in the following versions:
-
-| Version | Supported          |
-| ------- | ------------------ |
-| 1.x.x   | :white_check_mark: |
-| < 1.0   | :x:                |
-
 ## Reporting a Vulnerability
 
 We take security seriously. If you discover a security vulnerability, please report it responsibly.
@@ -61,7 +52,8 @@ When deploying Spooled Backend, please follow these security guidelines:
 
 ### Network Security
 
-- Run behind a reverse proxy with TLS
+- Run behind a reverse proxy with TLS for REST API (:8080)
+- Use TLS termination for gRPC (:50051) via envoy, nginx, or cloud load balancers
 - Use network policies to restrict database access
 - Don't expose metrics endpoint publicly
 - Configure appropriate CORS settings
@@ -78,12 +70,14 @@ When deploying Spooled Backend, please follow these security guidelines:
 - Don't expose Redis to the internet
 - Consider using TLS for Redis connections
 
-### API Security
+### API Security (REST & gRPC)
 
 - Rotate API keys regularly
 - Use short-lived JWT tokens
 - Implement proper rate limiting
 - Validate and sanitize all inputs
+- gRPC uses the same API key authentication (`x-api-key` or `authorization` metadata)
+- gRPC health and reflection services are public by default (disable in production if needed)
 
 ### Container Security
 
@@ -97,13 +91,15 @@ When deploying Spooled Backend, please follow these security guidelines:
 Spooled Backend includes several security features:
 
 - **Multi-tenant isolation** via PostgreSQL Row-Level Security
-- **Bcrypt password hashing** for API keys
+- **Bcrypt password hashing** for API keys (used by both REST and gRPC)
 - **JWT authentication** with configurable expiration
 - **Rate limiting** per API key
 - **HMAC webhook verification** for incoming webhooks
-- **Input validation** on all endpoints
+- **Input validation** on all endpoints (REST and gRPC)
 - **Constant-time comparison** for sensitive data
 - **Security headers** via middleware
+- **gRPC interceptors** for authentication and authorization
+- **gRPC health service** for load balancer health checks
 
 ## Vulnerability History
 

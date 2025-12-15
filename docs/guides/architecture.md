@@ -173,22 +173,52 @@ Job Complete → Webhook URL → Retry (exp backoff) → Record Result
 
 ### 6. gRPC Service (`src/grpc/`)
 
-High-performance worker communication.
+High-performance worker communication using **real gRPC** (HTTP/2 + Protobuf) via [tonic](https://github.com/hyperium/tonic).
+
+```
+src/grpc/
+├── mod.rs           # Module exports, constants, validation
+├── server.rs        # Tonic server bootstrap (health, reflection)
+├── auth.rs          # API key interceptor (bcrypt validation)
+├── convert.rs       # Protobuf ↔ DB model conversions
+└── services/
+    ├── queue_service.rs   # QueueService implementation
+    └── worker_service.rs  # WorkerService implementation
+```
+
+**Proto Definitions** (`proto/spooled.proto`):
 
 ```protobuf
 service QueueService {
+  // Unary RPCs
   rpc Enqueue(EnqueueRequest) returns (EnqueueResponse);
   rpc Dequeue(DequeueRequest) returns (DequeueResponse);
-  rpc Complete(CompleteRequest) returns (Empty);
-  rpc Fail(FailRequest) returns (Empty);
-  rpc RenewLease(RenewRequest) returns (RenewResponse);
+  rpc Complete(CompleteRequest) returns (CompleteResponse);
+  rpc Fail(FailRequest) returns (FailResponse);
+  rpc RenewLease(RenewLeaseRequest) returns (RenewLeaseResponse);
+  rpc GetJob(GetJobRequest) returns (GetJobResponse);
+  rpc GetQueueStats(GetQueueStatsRequest) returns (GetQueueStatsResponse);
+  
+  // Server-side streaming - continuous job delivery
+  rpc StreamJobs(StreamJobsRequest) returns (stream Job);
+  
+  // Bidirectional streaming - real-time job processing
+  rpc ProcessJobs(stream ProcessRequest) returns (stream ProcessResponse);
 }
 
 service WorkerService {
-  rpc Register(RegisterRequest) returns (RegisterResponse);
+  rpc Register(RegisterWorkerRequest) returns (RegisterWorkerResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc Deregister(DeregisterRequest) returns (DeregisterResponse);
 }
 ```
+
+**gRPC Features:**
+- **Port**: `:50051` (HTTP/2)
+- **Health Service**: `grpc.health.v1.Health` for load balancer probes
+- **Reflection**: Enabled for debugging with grpcurl/Postman
+- **Auth**: Same API key validation as REST (bcrypt, org context)
+- **Streaming**: `StreamJobs` for push-based job delivery, `ProcessJobs` for bidirectional workflows
 
 ---
 

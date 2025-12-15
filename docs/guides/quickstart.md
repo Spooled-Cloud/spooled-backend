@@ -53,9 +53,15 @@ INFO spooled_backend: Starting Spooled Backend v1.0.0
 INFO spooled_backend: Database connection pool established
 INFO spooled_backend: Database migrations completed
 INFO spooled_backend: Redis cache connected
-INFO spooled_backend: Server listening on 0.0.0.0:8080
+INFO spooled_backend: REST API listening on 0.0.0.0:8080
+INFO spooled_backend: gRPC API listening on 0.0.0.0:50051
 INFO spooled_backend: Metrics server listening on 0.0.0.0:9090
 ```
+
+**Ports:**
+- `:8080` - REST API (HTTP/1.1)
+- `:50051` - gRPC API (HTTP/2 + Protobuf)
+- `:9090` - Prometheus metrics
 
 ## Step 4: Verify Installation
 
@@ -369,10 +375,11 @@ kill -9 <PID>
 ## Next Steps
 
 1. **Read the full API documentation**: `docs/guides/api-usage.md`
-2. **Set up webhooks**: Configure GitHub/Stripe webhooks to create jobs automatically
-3. **Deploy to production**: See `docs/guides/deployment.md`
-4. **Understand the architecture**: See `docs/guides/architecture.md`
-5. **Run load tests**: See `loadtest/README.md`
+2. **Try gRPC for high-throughput workers**: See [gRPC API](api-usage.md#grpc-api)
+3. **Set up webhooks**: Configure GitHub/Stripe webhooks to create jobs automatically
+4. **Deploy to production**: See `docs/guides/deployment.md`
+5. **Understand the architecture**: See `docs/guides/architecture.md`
+6. **Run load tests**: See `loadtest/README.md`
 
 ---
 

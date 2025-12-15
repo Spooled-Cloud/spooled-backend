@@ -19,6 +19,7 @@ Spooled is a high-performance, multi-tenant job queue system designed for reliab
 - 📈 **Scalable**: Stateless API nodes (Kubernetes-friendly) + DB-backed locking (`FOR UPDATE SKIP LOCKED`)
 - 🗓️ **Scheduling**: Cron-based recurring jobs with timezone support
 - 🔗 **Workflows**: Job dependencies with DAG execution
+- 🔌 **Dual Protocol**: REST API (`:8080`) + real gRPC (`:50051`) with streaming support
 
 ## 🐳 Quick Start with Docker
 
@@ -56,7 +57,8 @@ curl http://localhost:8080/health
 | `REDIS_URL` | ❌ | `redis://localhost:6379` | Redis for pub/sub & caching |
 | `RUST_ENV` | ❌ | `development` | `development`/`staging`/`production` |
 | `REGISTRATION_MODE` | ❌ | `open` | `open`/`closed` - controls public registration |
-| `PORT` | ❌ | `8080` | API server port |
+| `PORT` | ❌ | `8080` | REST API server port |
+| `GRPC_PORT` | ❌ | `50051` | gRPC API server port |
 | `METRICS_PORT` | ❌ | `9090` | Prometheus metrics port |
 | `METRICS_TOKEN` | ❌ | - | If set, requires `Authorization: Bearer <token>` for `/metrics` |
 
@@ -208,6 +210,89 @@ curl -X POST http://localhost:8080/api/v1/outgoing-webhooks \
     "secret": "your-hmac-secret"
   }'
 ```
+
+## 🔌 gRPC API
+
+Spooled provides a **real gRPC API** on port `:50051` using HTTP/2 + Protobuf for high-performance worker communication.
+
+### Proto Definition
+
+The service definitions are in [`proto/spooled.proto`](proto/spooled.proto):
+
+```protobuf
+service QueueService {
+  rpc Enqueue(EnqueueRequest) returns (EnqueueResponse);
+  rpc Dequeue(DequeueRequest) returns (DequeueResponse);
+  rpc Complete(CompleteRequest) returns (CompleteResponse);
+  rpc Fail(FailRequest) returns (FailResponse);
+  rpc RenewLease(RenewLeaseRequest) returns (RenewLeaseResponse);
+  rpc GetJob(GetJobRequest) returns (GetJobResponse);
+  rpc GetQueueStats(GetQueueStatsRequest) returns (GetQueueStatsResponse);
+  
+  // Server-side streaming for continuous job delivery
+  rpc StreamJobs(StreamJobsRequest) returns (stream Job);
+  
+  // Bidirectional streaming for real-time job processing
+  rpc ProcessJobs(stream ProcessRequest) returns (stream ProcessResponse);
+}
+
+service WorkerService {
+  rpc Register(RegisterWorkerRequest) returns (RegisterWorkerResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc Deregister(DeregisterRequest) returns (DeregisterResponse);
+}
+```
+
+### gRPC Quick Start
+
+```bash
+# Test with grpcurl (install: brew install grpcurl)
+# List services (reflection enabled)
+grpcurl -plaintext localhost:50051 list
+
+# Enqueue a job
+grpcurl -plaintext \
+  -H "x-api-key: sk_live_your_key" \
+  -d '{
+    "queue_name": "emails",
+    "payload": {"to": "user@example.com"},
+    "priority": 0,
+    "max_retries": 3
+  }' \
+  localhost:50051 spooled.v1.QueueService/Enqueue
+
+# Dequeue jobs
+grpcurl -plaintext \
+  -H "x-api-key: sk_live_your_key" \
+  -d '{"queue_name": "emails", "worker_id": "worker-1", "batch_size": 10}' \
+  localhost:50051 spooled.v1.QueueService/Dequeue
+
+# Stream jobs (server streaming)
+grpcurl -plaintext \
+  -H "x-api-key: sk_live_your_key" \
+  -d '{"queue_name": "emails", "worker_id": "worker-1", "lease_duration_secs": 300}' \
+  localhost:50051 spooled.v1.QueueService/StreamJobs
+```
+
+### gRPC Features
+
+| Feature | Description |
+|---------|-------------|
+| **Health Check** | Standard gRPC health protocol (`grpc.health.v1.Health`) |
+| **Reflection** | Service discovery for debugging tools |
+| **Streaming** | Server + bidirectional streaming for efficient workers |
+| **Compression** | gzip compression supported |
+| **Auth** | `x-api-key` or `authorization: Bearer` metadata |
+
+### When to Use gRPC vs REST
+
+| Use Case | Recommended |
+|----------|-------------|
+| Web/mobile apps | REST API |
+| Dashboard/admin | REST API |
+| High-throughput workers | gRPC |
+| Streaming job delivery | gRPC StreamJobs |
+| Language with gRPC SDK | gRPC |
 
 ## 🚀 Production Deployment
 

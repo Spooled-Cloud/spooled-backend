@@ -136,15 +136,23 @@ docker build -t spooled-backend:v1.0.0 .
 ```bash
 docker run -d \
   --name spooled-backend \
-  -p 8080:8080 \
-  -p 9090:9090 \
-  -p 50051:50051 \
+  -p 8080:8080 \    # REST API
+  -p 9090:9090 \    # Prometheus metrics
+  -p 50051:50051 \  # gRPC API (HTTP/2 + Protobuf)
   -e DATABASE_URL="postgres://user:pass@host:5432/spooled" \
   -e REDIS_URL="redis://redis:6379" \
   -e JWT_SECRET="your-production-secret" \
   -e RUST_ENV="production" \
   spooled-backend:latest
 ```
+
+**Ports:**
+
+| Port | Protocol | Description |
+|------|----------|-------------|
+| 8080 | HTTP/1.1 | REST API, WebSocket, SSE |
+| 9090 | HTTP/1.1 | Prometheus metrics |
+| 50051 | HTTP/2 | gRPC API (Protobuf) |
 
 ### Docker Compose (Full Stack)
 

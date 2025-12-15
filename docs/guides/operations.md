@@ -298,7 +298,8 @@ STRIPE_WEBHOOK_SECRET=whsec_your-stripe-secret-min-16-chars
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `HOST` | `0.0.0.0` | Bind address |
-| `PORT` | `8080` | API port |
+| `PORT` | `8080` | REST API port |
+| `GRPC_PORT` | `50051` | gRPC API port (HTTP/2 + Protobuf) |
 | `METRICS_PORT` | `9090` | Prometheus metrics port |
 | `RUST_ENV` | `development` | Environment (development/staging/production) |
 
@@ -326,6 +327,15 @@ STRIPE_WEBHOOK_SECRET=whsec_your-stripe-secret-min-16-chars
 | `WORKER_LEASE_DURATION_SECS` | `30` | Job lock timeout |
 | `WORKER_MAX_CONCURRENCY` | `5` | Max jobs per worker |
 | `WORKER_FALLBACK_POLL_INTERVAL_SECS` | `5` | Poll interval when Redis unavailable |
+
+### gRPC
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GRPC_PORT` | `50051` | gRPC server port |
+| `GRPC_MAX_MESSAGE_SIZE` | `4194304` | Max message size (4MB) |
+| `GRPC_HEALTH_ENABLED` | `true` | Enable gRPC health service |
+| `GRPC_REFLECTION_ENABLED` | `true` | Enable gRPC reflection (disable in prod if needed) |
 
 ### Tracing
 

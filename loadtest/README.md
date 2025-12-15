@@ -227,9 +227,67 @@ load_test:
     - k6 run --env BASE_URL=$STAGING_URL --env API_KEY=$API_KEY loadtest/k6-load-test.js
 ```
 
+## gRPC Load Testing
+
+For testing the gRPC API (port 50051), use [ghz](https://ghz.sh/):
+
+### Installation
+
+```bash
+# macOS
+brew install ghz
+
+# Linux
+go install github.com/bojand/ghz/cmd/ghz@latest
+
+# Docker
+docker pull ghz/ghz
+```
+
+### Usage
+
+```bash
+# Smoke test - Enqueue
+ghz --insecure \
+  --proto ../proto/spooled.proto \
+  --call spooled.v1.QueueService.Enqueue \
+  --metadata '{"x-api-key":"sk_test_your_key"}' \
+  -d '{"queue_name":"test","payload":{"test":true},"max_retries":3}' \
+  -c 10 -n 1000 \
+  localhost:50051
+
+# Dequeue test
+ghz --insecure \
+  --proto ../proto/spooled.proto \
+  --call spooled.v1.QueueService.Dequeue \
+  --metadata '{"x-api-key":"sk_test_your_key"}' \
+  -d '{"queue_name":"test","worker_id":"loadtest-1","batch_size":10}' \
+  -c 10 -n 500 \
+  localhost:50051
+
+# High throughput test
+ghz --insecure \
+  --proto ../proto/spooled.proto \
+  --call spooled.v1.QueueService.Enqueue \
+  --metadata '{"x-api-key":"sk_test_your_key"}' \
+  -d '{"queue_name":"perf","payload":{"i":"{{.RequestNumber}}"},"max_retries":1}' \
+  -c 100 --rps 5000 -z 60s \
+  localhost:50051
+```
+
+### gRPC vs REST Performance
+
+Generally, gRPC offers:
+- **Lower latency**: Binary protobuf vs JSON parsing
+- **Better throughput**: HTTP/2 multiplexing, persistent connections
+- **Streaming**: Real-time job delivery without polling
+
+Run both k6 (REST) and ghz (gRPC) tests to compare for your workload.
+
 ## Further Reading
 
 - [k6 Documentation](https://k6.io/docs/)
+- [ghz Documentation](https://ghz.sh/docs/intro)
 - [Performance Testing Guide](https://k6.io/docs/testing-guides/api-load-testing/)
 - [Spooled Architecture](../docs/guides/architecture.md)
 

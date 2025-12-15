@@ -12,7 +12,8 @@ Complete guide to using the Spooled Cloud REST API.
 6. [Workflows](#workflows)
 7. [Webhooks](#webhooks)
 8. [Real-time Events](#real-time-events)
-9. [Error Handling](#error-handling)
+9. [gRPC API](#grpc-api)
+10. [Error Handling](#error-handling)
 
 ---
 
@@ -684,6 +685,252 @@ data: {"id":"job_xxx","status":"completed","result":{...}}
 event: queue.stats
 data: {"queue_name":"emails","pending":150,"processing":25}
 ```
+
+---
+
+## gRPC API
+
+Spooled provides a **real gRPC API** on port `:50051` for high-performance worker communication. The gRPC API uses HTTP/2 + Protobuf and supports streaming.
+
+### Connection
+
+```bash
+# Default endpoint
+localhost:50051
+
+# With TLS (production)
+api.spooled.cloud:50051
+```
+
+### Authentication
+
+Include your API key in gRPC metadata:
+
+```bash
+# Using x-api-key header
+grpcurl -H "x-api-key: sk_live_xxxx" ...
+
+# Using authorization header
+grpcurl -H "authorization: Bearer sk_live_xxxx" ...
+```
+
+### QueueService RPCs
+
+#### Enqueue
+
+```bash
+grpcurl -plaintext \
+  -H "x-api-key: sk_live_xxxx" \
+  -d '{
+    "queue_name": "emails",
+    "payload": {"to": "user@example.com", "subject": "Hello"},
+    "priority": 0,
+    "max_retries": 3,
+    "timeout_seconds": 300
+  }' \
+  localhost:50051 spooled.v1.QueueService/Enqueue
+```
+
+Response:
+```json
+{
+  "job_id": "job_550e8400e29b41d4",
+  "created": true
+}
+```
+
+#### Dequeue (Batch)
+
+```bash
+grpcurl -plaintext \
+  -H "x-api-key: sk_live_xxxx" \
+  -d '{
+    "queue_name": "emails",
+    "worker_id": "worker-1",
+    "lease_duration_secs": 300,
+    "batch_size": 10
+  }' \
+  localhost:50051 spooled.v1.QueueService/Dequeue
+```
+
+#### Complete
+
+```bash
+grpcurl -plaintext \
+  -H "x-api-key: sk_live_xxxx" \
+  -d '{
+    "job_id": "job_550e8400e29b41d4",
+    "worker_id": "worker-1",
+    "result": {"email_sent": true}
+  }' \
+  localhost:50051 spooled.v1.QueueService/Complete
+```
+
+#### Fail
+
+```bash
+grpcurl -plaintext \
+  -H "x-api-key: sk_live_xxxx" \
+  -d '{
+    "job_id": "job_550e8400e29b41d4",
+    "worker_id": "worker-1",
+    "error": "SMTP connection failed",
+    "retry": true
+  }' \
+  localhost:50051 spooled.v1.QueueService/Fail
+```
+
+#### RenewLease
+
+```bash
+grpcurl -plaintext \
+  -H "x-api-key: sk_live_xxxx" \
+  -d '{
+    "job_id": "job_550e8400e29b41d4",
+    "worker_id": "worker-1",
+    "extension_secs": 300
+  }' \
+  localhost:50051 spooled.v1.QueueService/RenewLease
+```
+
+#### GetJob
+
+```bash
+grpcurl -plaintext \
+  -H "x-api-key: sk_live_xxxx" \
+  -d '{"job_id": "job_550e8400e29b41d4"}' \
+  localhost:50051 spooled.v1.QueueService/GetJob
+```
+
+#### GetQueueStats
+
+```bash
+grpcurl -plaintext \
+  -H "x-api-key: sk_live_xxxx" \
+  -d '{"queue_name": "emails"}' \
+  localhost:50051 spooled.v1.QueueService/GetQueueStats
+```
+
+### Streaming RPCs
+
+#### StreamJobs (Server Streaming)
+
+Continuously receive jobs as they become available:
+
+```bash
+grpcurl -plaintext \
+  -H "x-api-key: sk_live_xxxx" \
+  -d '{
+    "queue_name": "emails",
+    "worker_id": "worker-1",
+    "lease_duration_secs": 300
+  }' \
+  localhost:50051 spooled.v1.QueueService/StreamJobs
+```
+
+Jobs are streamed as they're claimed:
+```json
+{"id": "job_1", "queue_name": "emails", "payload": {...}}
+{"id": "job_2", "queue_name": "emails", "payload": {...}}
+...
+```
+
+#### ProcessJobs (Bidirectional Streaming)
+
+Interactive job processing - send commands, receive responses:
+
+```bash
+# Interactive mode with grpcurl
+grpcurl -plaintext \
+  -H "x-api-key: sk_live_xxxx" \
+  localhost:50051 spooled.v1.QueueService/ProcessJobs
+```
+
+Send requests:
+```json
+{"dequeue": {"queue_name": "emails", "worker_id": "w1", "batch_size": 1}}
+{"complete": {"job_id": "job_1", "worker_id": "w1"}}
+{"fail": {"job_id": "job_2", "worker_id": "w1", "error": "failed"}}
+{"renew_lease": {"job_id": "job_3", "worker_id": "w1", "extension_secs": 60}}
+```
+
+### WorkerService RPCs
+
+#### Register
+
+```bash
+grpcurl -plaintext \
+  -H "x-api-key: sk_live_xxxx" \
+  -d '{
+    "queue_name": "emails",
+    "hostname": "worker-host-1",
+    "worker_type": "email-sender",
+    "max_concurrency": 10,
+    "version": "1.0.0"
+  }' \
+  localhost:50051 spooled.v1.WorkerService/Register
+```
+
+Response:
+```json
+{
+  "worker_id": "worker_abc123",
+  "lease_duration_secs": 300,
+  "heartbeat_interval_secs": 10
+}
+```
+
+#### Heartbeat
+
+```bash
+grpcurl -plaintext \
+  -H "x-api-key: sk_live_xxxx" \
+  -d '{
+    "worker_id": "worker_abc123",
+    "current_jobs": 5,
+    "status": "healthy"
+  }' \
+  localhost:50051 spooled.v1.WorkerService/Heartbeat
+```
+
+#### Deregister
+
+```bash
+grpcurl -plaintext \
+  -H "x-api-key: sk_live_xxxx" \
+  -d '{"worker_id": "worker_abc123"}' \
+  localhost:50051 spooled.v1.WorkerService/Deregister
+```
+
+### Health Check
+
+```bash
+grpcurl -plaintext localhost:50051 grpc.health.v1.Health/Check
+```
+
+### Service Discovery (Reflection)
+
+```bash
+# List all services
+grpcurl -plaintext localhost:50051 list
+
+# Describe a service
+grpcurl -plaintext localhost:50051 describe spooled.v1.QueueService
+
+# Describe a message
+grpcurl -plaintext localhost:50051 describe spooled.v1.EnqueueRequest
+```
+
+### gRPC Error Codes
+
+| gRPC Code | HTTP Equiv | Description |
+|-----------|------------|-------------|
+| `UNAUTHENTICATED` | 401 | Invalid or missing API key |
+| `PERMISSION_DENIED` | 403 | Not authorized for this resource |
+| `NOT_FOUND` | 404 | Job/queue/worker not found |
+| `INVALID_ARGUMENT` | 400 | Validation error |
+| `RESOURCE_EXHAUSTED` | 429 | Rate limited or quota exceeded |
+| `INTERNAL` | 500 | Server error |
 
 ---
 

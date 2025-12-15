@@ -87,13 +87,17 @@ futures = "0.3"
 url = "2.5"  # URL parsing for SSRF protection
 lettre = { version = "0.11.19", features = ["smtp-transport", "tokio1-native-tls", "builder"] }
 
-# gRPC (optional, requires protoc)
-# tonic = "0.12"
-# prost = "0.13"
-# prost-types = "0.13"
+# gRPC
+tonic = { version = "0.12", features = ["gzip"] }
+tonic-health = "0.12"
+tonic-reflection = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+async-stream = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
 
-# [build-dependencies]
-# tonic-build = "0.12"
+[build-dependencies]
+tonic-build = "0.12"
 
 [features]
 default = []
