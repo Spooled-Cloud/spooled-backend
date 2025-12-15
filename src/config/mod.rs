@@ -512,17 +512,8 @@ impl Settings {
         if self.server.environment == Environment::Production
             || self.server.environment == Environment::Staging
         {
-            if let Some(ref secret) = self.webhooks.github_secret {
-                // Allow empty/dummy secrets if the feature is disabled, but if set, must be secure
-                // However, GITHUB_WEBHOOK_SECRET is often optional. 
-                // If it's set to a dummy value like "disabled" or "unset", we should probably allow it or handle it.
-                // For now, let's relax the check if it's explicitly "disabled" or similar, 
-                // but if it's a real secret, it should be long.
-                // Better yet, just relax the length check to 8 chars which is still reasonable but less strict.
-                if secret.len() < 8 {
-                    anyhow::bail!("GITHUB_WEBHOOK_SECRET must be at least 8 characters in production/staging");
-                }
-            }
+            // GitHub secret check removed as requested
+            
             if let Some(ref secret) = self.webhooks.stripe_secret {
                 if secret.len() < 16 {
                     anyhow::bail!("STRIPE_WEBHOOK_SECRET must be at least 16 characters in production/staging");
