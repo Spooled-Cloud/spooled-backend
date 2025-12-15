@@ -74,6 +74,8 @@ pub struct ServerSettings {
     pub metrics_port: u16,
     /// Environment (development, staging, production)
     pub environment: Environment,
+    /// External URL for this server (used in webhook URLs, etc.)
+    pub external_url: Option<String>,
 }
 
 /// Environment type
@@ -162,11 +164,11 @@ pub struct QueueSettings {
     pub max_payload_size_bytes: usize,
 }
 
-/// Webhook verification settings
-#[derive(Debug, Clone, Deserialize)]
+/// Webhook verification settings (legacy - kept for compatibility)
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct WebhookSettings {
-    /// Stripe webhook secret
-    pub stripe_secret: Option<String>,
+    // Fields removed - /webhooks/{org_id}/stripe endpoint was removed
+    // Billing webhook uses stripe.webhook_secret from StripeSettings instead
 }
 
 /// OpenTelemetry/Tracing settings
@@ -247,6 +249,7 @@ impl Settings {
                     .unwrap_or_else(|_| "9090".to_string())
                     .parse()
                     .context("Invalid METRICS_PORT")?,
+                external_url: env::var("EXTERNAL_URL").ok(),
                 environment: match env::var("RUST_ENV")
                     .unwrap_or_else(|_| "development".to_string())
                     .as_str()
@@ -332,9 +335,7 @@ impl Settings {
                     .parse()
                     .context("Invalid QUEUE_MAX_PAYLOAD_SIZE_BYTES")?,
             },
-            webhooks: WebhookSettings {
-                stripe_secret: env::var("STRIPE_WEBHOOK_SECRET").ok(),
-            },
+            webhooks: WebhookSettings::default(),
             tracing: TracingSettings {
                 otlp_endpoint: env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok(),
                 service_name: env::var("OTEL_SERVICE_NAME")
@@ -505,18 +506,9 @@ impl Settings {
             anyhow::bail!("JWT_EXPIRATION_HOURS cannot be 0");
         }
 
-        // Validate webhook secrets have minimum length in production/staging
-        if self.server.environment == Environment::Production
-            || self.server.environment == Environment::Staging
-        {
-            // GitHub secret check removed as requested
-            
-            if let Some(ref secret) = self.webhooks.stripe_secret {
-                if secret.len() < 16 {
-                    anyhow::bail!("STRIPE_WEBHOOK_SECRET must be at least 16 characters in production/staging");
-                }
-            }
-        }
+        // Webhook secret validation removed - the old /webhooks/{org_id}/stripe
+        // endpoint was removed, and STRIPE_BILLING_WEBHOOK_SECRET is optional
+        // (billing just won't work without it)
 
         Ok(())
     }
@@ -531,6 +523,7 @@ impl Settings {
                 port: 8080,
                 metrics_port: 9090,
                 environment: Environment::Development,
+                external_url: None,
             },
             database: DatabaseSettings {
                 url: "postgres://test:test@localhost:5432/test".to_string(),
@@ -562,10 +555,7 @@ impl Settings {
                 default_timeout_secs: 300,
                 max_payload_size_bytes: 1048576,
             },
-            webhooks: WebhookSettings {
-                github_secret: None,
-                stripe_secret: None,
-            },
+            webhooks: WebhookSettings::default(),
             tracing: TracingSettings {
                 otlp_endpoint: None,
                 service_name: "spooled-backend".to_string(),

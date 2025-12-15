@@ -6,7 +6,7 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -671,12 +671,11 @@ pub async fn get_webhook_token(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
 ) -> AppResult<Json<WebhookTokenResponse>> {
-    let org: Organization =
-        sqlx::query_as("SELECT * FROM organizations WHERE id = $1")
-            .bind(&ctx.organization_id)
-            .fetch_one(state.db.pool())
-            .await
-            .map_err(|_| AppError::NotFound("Organization not found".to_string()))?;
+    let org: Organization = sqlx::query_as("SELECT * FROM organizations WHERE id = $1")
+        .bind(&ctx.organization_id)
+        .fetch_one(state.db.pool())
+        .await
+        .map_err(|_| AppError::NotFound("Organization not found".to_string()))?;
 
     let webhook_token = org
         .settings
@@ -684,12 +683,19 @@ pub async fn get_webhook_token(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let base_url = state.settings.server.external_url.clone()
+    let base_url = state
+        .settings
+        .server
+        .external_url
+        .clone()
         .unwrap_or_else(|| "https://api.spooled.cloud".to_string());
 
     Ok(Json(WebhookTokenResponse {
         webhook_token,
-        webhook_url: format!("{}/api/v1/webhooks/{}/custom", base_url, ctx.organization_id),
+        webhook_url: format!(
+            "{}/api/v1/webhooks/{}/custom",
+            base_url, ctx.organization_id
+        ),
     }))
 }
 
@@ -711,12 +717,11 @@ pub async fn regenerate_webhook_token(
     let new_token = generate_webhook_token();
 
     // Get current settings and update webhook_token
-    let org: Organization =
-        sqlx::query_as("SELECT * FROM organizations WHERE id = $1")
-            .bind(&ctx.organization_id)
-            .fetch_one(state.db.pool())
-            .await
-            .map_err(|_| AppError::NotFound("Organization not found".to_string()))?;
+    let org: Organization = sqlx::query_as("SELECT * FROM organizations WHERE id = $1")
+        .bind(&ctx.organization_id)
+        .fetch_one(state.db.pool())
+        .await
+        .map_err(|_| AppError::NotFound("Organization not found".to_string()))?;
 
     let mut settings = org.settings.clone();
     if let Some(obj) = settings.as_object_mut() {
@@ -730,7 +735,11 @@ pub async fn regenerate_webhook_token(
         .execute(state.db.pool())
         .await?;
 
-    let base_url = state.settings.server.external_url.clone()
+    let base_url = state
+        .settings
+        .server
+        .external_url
+        .clone()
         .unwrap_or_else(|| "https://api.spooled.cloud".to_string());
 
     tracing::info!(
@@ -740,7 +749,10 @@ pub async fn regenerate_webhook_token(
 
     Ok(Json(RegenerateWebhookTokenResponse {
         webhook_token: new_token,
-        webhook_url: format!("{}/api/v1/webhooks/{}/custom", base_url, ctx.organization_id),
+        webhook_url: format!(
+            "{}/api/v1/webhooks/{}/custom",
+            base_url, ctx.organization_id
+        ),
     }))
 }
 
@@ -764,12 +776,11 @@ pub async fn clear_webhook_token(
     }
 
     // Get current settings and remove webhook_token
-    let org: Organization =
-        sqlx::query_as("SELECT * FROM organizations WHERE id = $1")
-            .bind(&ctx.organization_id)
-            .fetch_one(state.db.pool())
-            .await
-            .map_err(|_| AppError::NotFound("Organization not found".to_string()))?;
+    let org: Organization = sqlx::query_as("SELECT * FROM organizations WHERE id = $1")
+        .bind(&ctx.organization_id)
+        .fetch_one(state.db.pool())
+        .await
+        .map_err(|_| AppError::NotFound("Organization not found".to_string()))?;
 
     let mut settings = org.settings.clone();
     if let Some(obj) = settings.as_object_mut() {
@@ -783,7 +794,11 @@ pub async fn clear_webhook_token(
         .execute(state.db.pool())
         .await?;
 
-    let base_url = state.settings.server.external_url.clone()
+    let base_url = state
+        .settings
+        .server
+        .external_url
+        .clone()
         .unwrap_or_else(|| "https://api.spooled.cloud".to_string());
 
     tracing::warn!(
@@ -793,7 +808,10 @@ pub async fn clear_webhook_token(
 
     Ok(Json(WebhookTokenResponse {
         webhook_token: None,
-        webhook_url: format!("{}/api/v1/webhooks/{}/custom", base_url, ctx.organization_id),
+        webhook_url: format!(
+            "{}/api/v1/webhooks/{}/custom",
+            base_url, ctx.organization_id
+        ),
     }))
 }
 

@@ -89,15 +89,15 @@ lettre = { version = "0.11.19", features = ["smtp-transport", "tokio1-native-tls
 
 # gRPC
 tonic = { version = "0.12", features = ["gzip", "tls"] }
-tonic-health = "0.12"
-tonic-reflection = "0.12"
-prost = "0.13"
-prost-types = "0.13"
+tonic-health = "0.14"
+tonic-reflection = "0.14"
+prost = "0.14"
+prost-types = "0.14"
 async-stream = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 
 [build-dependencies]
-tonic-build = "0.12"
+tonic-build = "0.14"
 
 [features]
 default = []
