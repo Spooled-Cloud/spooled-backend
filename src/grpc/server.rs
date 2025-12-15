@@ -117,12 +117,12 @@ pub async fn start_grpc_server(
             "Loading gRPC TLS certificate"
         );
 
-        let cert = tokio::fs::read_to_string(cert_path).await.map_err(|e| {
-            format!("Failed to read TLS cert from {}: {}", cert_path, e)
-        })?;
-        let key = tokio::fs::read_to_string(key_path).await.map_err(|e| {
-            format!("Failed to read TLS key from {}: {}", key_path, e)
-        })?;
+        let cert = tokio::fs::read_to_string(cert_path)
+            .await
+            .map_err(|e| format!("Failed to read TLS cert from {}: {}", cert_path, e))?;
+        let key = tokio::fs::read_to_string(key_path)
+            .await
+            .map_err(|e| format!("Failed to read TLS key from {}: {}", key_path, e))?;
 
         let identity = Identity::from_pem(cert, key);
         let tls = ServerTlsConfig::new().identity(identity);
