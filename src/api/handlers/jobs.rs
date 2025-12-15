@@ -184,7 +184,7 @@ pub async fn create(
             idempotency_key, updated_at, tags, parent_job_id, 
             completion_webhook, expires_at
         )
-        VALUES ($1, $2, $3, $4, $5::JSONB, $6, $7, $8, $9, $10, $11, $9, $12, $13, $14, $15)
+        VALUES ($1, $2, $3, $4, $5::JSONB, $6, $7, $8, $9, $10, $11, $9, $12::JSONB, $13, $14, $15)
         ON CONFLICT (organization_id, idempotency_key) 
         WHERE idempotency_key IS NOT NULL
         DO UPDATE SET updated_at = NOW() 
