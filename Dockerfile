@@ -37,8 +37,8 @@ RUN cargo build --release && rm -rf src
 COPY src ./src
 COPY migrations ./migrations
 
-# Touch source to invalidate cache for source changes
-RUN touch src/main.rs src/lib.rs
+# Touch source and build.rs to invalidate cache and force proto regeneration
+RUN touch src/main.rs src/lib.rs build.rs
 
 # Build the application
 RUN cargo build --release
