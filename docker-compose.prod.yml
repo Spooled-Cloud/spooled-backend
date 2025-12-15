@@ -21,10 +21,27 @@
 #   JWT_SECRET              - 32+ character secret for JWT signing
 #   CLOUDFLARE_TUNNEL_TOKEN - Cloudflare tunnel token (for cloudflared)
 #
+# gRPC TLS (for Cloudflare Tunnel HTTPS origin):
+#   GRPC_TLS_ENABLED        - Set to "true" to enable TLS
+#   GRPC_TLS_CERT_PATH      - Path to TLS certificate
+#   GRPC_TLS_KEY_PATH       - Path to TLS private key
+#
 # Registration Mode (for SaaS vs Self-hosted):
 #   REGISTRATION_MODE    - "open" (default, anyone can create orgs)
 #                        - "closed" (only admin can create orgs - for SaaS)
 #   ADMIN_API_KEY        - Secret key for creating orgs when mode is "closed"
+#
+# Email Configuration:
+#   EMAIL_PROVIDER       - console, resend, sendgrid, postmark, smtp
+#   EMAIL_API_KEY        - API key for the email provider
+#   EMAIL_FROM_ADDRESS   - From email address
+#   EMAIL_FROM_NAME      - From name
+#
+# Stripe Billing (optional):
+#   STRIPE_SECRET_KEY            - Stripe secret key
+#   STRIPE_BILLING_WEBHOOK_SECRET - Stripe webhook secret
+#   STRIPE_STARTER_PRICE_ID      - Starter plan price ID
+#   STRIPE_PRO_PRICE_ID          - Pro plan price ID
 #
 # Optional Environment Variables:
 #   BACKEND_IMAGE        - Docker image (default: ghcr.io/spooled-cloud/spooled-backend:latest)
@@ -35,6 +52,7 @@
 #
 # Cloudflare Tunnel Routes (configure in Zero Trust dashboard):
 #   - api.spooled.cloud     -> http://backend:8080
+#   - grpc.spooled.cloud    -> https://backend:50051 (with HTTP2 origin ON, No TLS Verify ON)
 #   - grafana.spooled.cloud -> http://grafana:3000
 
 services:
@@ -92,56 +110,112 @@ services:
       redis:
         condition: service_healthy
     environment:
+      # =====================
       # Database
+      # =====================
       DATABASE_URL: postgres://${POSTGRES_USER:-spooled}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-spooled}
       DATABASE_MAX_CONNECTIONS: ${DATABASE_MAX_CONNECTIONS:-25}
       DATABASE_MIN_CONNECTIONS: ${DATABASE_MIN_CONNECTIONS:-5}
+      DATABASE_ACQUIRE_TIMEOUT_SECS: ${DATABASE_ACQUIRE_TIMEOUT_SECS:-30}
       
+      # =====================
       # Redis
+      # =====================
       REDIS_URL: redis://redis:6379
       REDIS_POOL_SIZE: ${REDIS_POOL_SIZE:-10}
       
+      # =====================
       # Server
+      # =====================
       HOST: 0.0.0.0
       PORT: 8080
       METRICS_PORT: 9090
-      GRPC_PORT: 50051
-      
-      # URLs (update for your domain)
-      BASE_URL: ${BASE_URL:-https://api.spooled.cloud}
-      
-      # Security
-      JWT_SECRET: ${JWT_SECRET}
       RUST_ENV: ${RUST_ENV:-production}
-      ENABLE_HSTS: ${ENABLE_HSTS:-true}
-      FORCE_HTTPS: ${FORCE_HTTPS:-true}
-      
-      # Logging
       RUST_LOG: ${RUST_LOG:-info,tower_http=info}
       JSON_LOGS: ${JSON_LOGS:-true}
       
-      # Queue settings
-      QUEUE_DEFAULT_TIMEOUT: ${QUEUE_DEFAULT_TIMEOUT:-300}
-      QUEUE_MAX_RETRIES: ${QUEUE_MAX_RETRIES:-3}
+      # =====================
+      # Security
+      # =====================
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRATION_HOURS: ${JWT_EXPIRATION_HOURS:-24}
       
-      # Worker settings
-      WORKER_HEARTBEAT_INTERVAL: ${WORKER_HEARTBEAT_INTERVAL:-10}
-      WORKER_LEASE_DURATION: ${WORKER_LEASE_DURATION:-30}
-      WORKER_STALE_THRESHOLD: ${WORKER_STALE_THRESHOLD:-60}
+      # =====================
+      # gRPC TLS (for Cloudflare Tunnel)
+      # =====================
+      GRPC_TLS_ENABLED: ${GRPC_TLS_ENABLED:-false}
+      GRPC_TLS_CERT_PATH: ${GRPC_TLS_CERT_PATH:-/certs/grpc-cert.pem}
+      GRPC_TLS_KEY_PATH: ${GRPC_TLS_KEY_PATH:-/certs/grpc-key.pem}
       
-      # Rate limiting
+      # =====================
+      # Rate Limiting
+      # =====================
       RATE_LIMIT_REQUESTS_PER_SECOND: ${RATE_LIMIT_REQUESTS_PER_SECOND:-100}
-      RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:-200}
+      RATE_LIMIT_BURST_SIZE: ${RATE_LIMIT_BURST_SIZE:-200}
       
-      # OpenTelemetry (optional)
+      # =====================
+      # Queue Settings
+      # =====================
+      QUEUE_DEFAULT_MAX_RETRIES: ${QUEUE_DEFAULT_MAX_RETRIES:-3}
+      QUEUE_DEFAULT_TIMEOUT_SECS: ${QUEUE_DEFAULT_TIMEOUT_SECS:-300}
+      QUEUE_MAX_PAYLOAD_SIZE_BYTES: ${QUEUE_MAX_PAYLOAD_SIZE_BYTES:-1048576}
+      
+      # =====================
+      # Worker Settings
+      # =====================
+      WORKER_HEARTBEAT_INTERVAL_SECS: ${WORKER_HEARTBEAT_INTERVAL_SECS:-10}
+      WORKER_LEASE_DURATION_SECS: ${WORKER_LEASE_DURATION_SECS:-30}
+      WORKER_MAX_CONCURRENCY: ${WORKER_MAX_CONCURRENCY:-5}
+      WORKER_FALLBACK_POLL_INTERVAL_SECS: ${WORKER_FALLBACK_POLL_INTERVAL_SECS:-5}
+      
+      # =====================
+      # Registration / Auth
+      # =====================
+      REGISTRATION_MODE: ${REGISTRATION_MODE:-open}
+      EMAIL_SIGNUP_ENABLED: ${EMAIL_SIGNUP_ENABLED:-true}
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-}
+      
+      # =====================
+      # Email
+      # =====================
+      EMAIL_PROVIDER: ${EMAIL_PROVIDER:-console}
+      EMAIL_API_KEY: ${EMAIL_API_KEY:-}
+      EMAIL_FROM_ADDRESS: ${EMAIL_FROM_ADDRESS:-noreply@spooled.cloud}
+      EMAIL_FROM_NAME: ${EMAIL_FROM_NAME:-Spooled Cloud}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      
+      # =====================
+      # Stripe Billing
+      # =====================
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_BILLING_WEBHOOK_SECRET: ${STRIPE_BILLING_WEBHOOK_SECRET:-}
+      STRIPE_STARTER_PRICE_ID: ${STRIPE_STARTER_PRICE_ID:-}
+      STRIPE_PRO_PRICE_ID: ${STRIPE_PRO_PRICE_ID:-}
+      STRIPE_BILLING_PORTAL_CONFIG_ID: ${STRIPE_BILLING_PORTAL_CONFIG_ID:-}
+      
+      # =====================
+      # Webhooks
+      # =====================
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      
+      # =====================
+      # OpenTelemetry
+      # =====================
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
       OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-spooled-backend}
       
-      # Registration mode (SaaS vs Self-hosted)
-      # - "open": Anyone can create organizations (default, for self-hosted)
-      # - "closed": Only admin can create organizations (for SaaS)
-      REGISTRATION_MODE: ${REGISTRATION_MODE:-open}
-      ADMIN_API_KEY: ${ADMIN_API_KEY:-}
+      # =====================
+      # Metrics
+      # =====================
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+
+    volumes:
+      # Mount TLS certificates for gRPC (if using TLS)
+      - ${GRPC_CERTS_DIR:-./certs}:/certs:ro
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
       interval: 30s
@@ -157,7 +231,7 @@ services:
   # Routes traffic to backend without exposing ports
   # Configure routes in Cloudflare Zero Trust dashboard:
   #   - api.yourdomain.com -> http://backend:8080
-  #   - grpc.yourdomain.com -> http://backend:50051
+  #   - grpc.yourdomain.com -> https://backend:50051 (HTTP2 origin ON, No TLS Verify ON)
   cloudflared:
     image: cloudflare/cloudflared:latest
     container_name: spooled_cloudflared
@@ -287,186 +361,6 @@ services:
             path: /var/lib/grafana/dashboards
       EOF
 
-      # Main dashboard
-      cat > /var/lib/grafana/dashboards/spooled-overview.json << DASHBOARD
-      {
-        "annotations": {"list": []},
-        "editable": true,
-        "fiscalYearStartMonth": 0,
-        "graphTooltip": 1,
-        "id": null,
-        "links": [],
-        "liveNow": false,
-        "panels": [
-          {
-            "datasource": {"type": "prometheus", "uid": "prometheus"},
-            "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "short"}, "overrides": []},
-            "gridPos": {"h": 4, "w": 4, "x": 0, "y": 0},
-            "id": 1,
-            "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
-            "title": "Jobs Pending",
-            "type": "stat",
-            "targets": [{"expr": "spooled_jobs_pending", "refId": "A"}]
-          },
-          {
-            "datasource": {"type": "prometheus", "uid": "prometheus"},
-            "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "short"}, "overrides": []},
-            "gridPos": {"h": 4, "w": 4, "x": 4, "y": 0},
-            "id": 2,
-            "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
-            "title": "Jobs Processing",
-            "type": "stat",
-            "targets": [{"expr": "spooled_jobs_processing", "refId": "A"}]
-          },
-          {
-            "datasource": {"type": "prometheus", "uid": "prometheus"},
-            "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "short"}, "overrides": []},
-            "gridPos": {"h": 4, "w": 4, "x": 8, "y": 0},
-            "id": 3,
-            "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
-            "title": "Active Workers",
-            "type": "stat",
-            "targets": [{"expr": "spooled_workers_active", "refId": "A"}]
-          },
-          {
-            "datasource": {"type": "prometheus", "uid": "prometheus"},
-            "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "short"}, "overrides": []},
-            "gridPos": {"h": 4, "w": 4, "x": 12, "y": 0},
-            "id": 4,
-            "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
-            "title": "Healthy Workers",
-            "type": "stat",
-            "targets": [{"expr": "spooled_workers_healthy", "refId": "A"}]
-          },
-          {
-            "datasource": {"type": "prometheus", "uid": "prometheus"},
-            "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "short"}, "overrides": []},
-            "gridPos": {"h": 4, "w": 4, "x": 16, "y": 0},
-            "id": 5,
-            "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
-            "title": "DB Connections",
-            "type": "stat",
-            "targets": [{"expr": "spooled_database_connections", "refId": "A"}]
-          },
-          {
-            "datasource": {"type": "prometheus", "uid": "prometheus"},
-            "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}, "unit": "short"}, "overrides": []},
-            "gridPos": {"h": 4, "w": 4, "x": 20, "y": 0},
-            "id": 6,
-            "options": {"colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
-            "title": "Backend Up",
-            "type": "stat",
-            "targets": [{"expr": "up{job=\"spooled-backend\"}", "refId": "A"}]
-          },
-          {
-            "datasource": {"type": "prometheus", "uid": "prometheus"},
-            "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": {"legend": false, "tooltip": false, "viz": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": false, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "ops"}, "overrides": []},
-            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
-            "id": 7,
-            "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
-            "title": "Job Throughput",
-            "type": "timeseries",
-            "targets": [
-              {"expr": "rate(spooled_jobs_enqueued_total[1m])", "legendFormat": "Enqueued", "refId": "A"},
-              {"expr": "rate(spooled_jobs_completed_total[1m])", "legendFormat": "Completed", "refId": "B"},
-              {"expr": "rate(spooled_jobs_failed_total[1m])", "legendFormat": "Failed", "refId": "C"}
-            ]
-          },
-          {
-            "datasource": {"type": "prometheus", "uid": "prometheus"},
-            "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": {"legend": false, "tooltip": false, "viz": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": false, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "s"}, "overrides": []},
-            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
-            "id": 8,
-            "options": {"legend": {"calcs": ["mean", "max", "p95"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
-            "title": "Job Duration",
-            "type": "timeseries",
-            "targets": [
-              {"expr": "histogram_quantile(0.5, rate(spooled_job_duration_seconds_bucket[5m]))", "legendFormat": "p50", "refId": "A"},
-              {"expr": "histogram_quantile(0.95, rate(spooled_job_duration_seconds_bucket[5m]))", "legendFormat": "p95", "refId": "B"},
-              {"expr": "histogram_quantile(0.99, rate(spooled_job_duration_seconds_bucket[5m]))", "legendFormat": "p99", "refId": "C"}
-            ]
-          },
-          {
-            "datasource": {"type": "prometheus", "uid": "prometheus"},
-            "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": {"legend": false, "tooltip": false, "viz": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": false, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "ops"}, "overrides": []},
-            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
-            "id": 9,
-            "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
-            "title": "API Requests",
-            "type": "timeseries",
-            "targets": [
-              {"expr": "rate(spooled_api_requests_total[1m])", "legendFormat": "Requests/sec", "refId": "A"}
-            ]
-          },
-          {
-            "datasource": {"type": "prometheus", "uid": "prometheus"},
-            "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": {"legend": false, "tooltip": false, "viz": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": false, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "s"}, "overrides": []},
-            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
-            "id": 10,
-            "options": {"legend": {"calcs": ["mean", "max", "p95"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
-            "title": "API Latency",
-            "type": "timeseries",
-            "targets": [
-              {"expr": "histogram_quantile(0.5, rate(spooled_api_request_duration_bucket[5m]))", "legendFormat": "p50", "refId": "A"},
-              {"expr": "histogram_quantile(0.95, rate(spooled_api_request_duration_bucket[5m]))", "legendFormat": "p95", "refId": "B"},
-              {"expr": "histogram_quantile(0.99, rate(spooled_api_request_duration_bucket[5m]))", "legendFormat": "p99", "refId": "C"}
-            ]
-          },
-          {
-            "datasource": {"type": "prometheus", "uid": "prometheus"},
-            "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 60}, {"color": "red", "value": 300}]}, "unit": "s"}, "overrides": []},
-            "gridPos": {"h": 4, "w": 6, "x": 0, "y": 20},
-            "id": 11,
-            "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
-            "title": "Oldest Pending Job Age",
-            "type": "stat",
-            "targets": [{"expr": "spooled_job_max_age_seconds", "refId": "A"}]
-          },
-          {
-            "datasource": {"type": "prometheus", "uid": "prometheus"},
-            "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "short"}, "overrides": []},
-            "gridPos": {"h": 4, "w": 6, "x": 6, "y": 20},
-            "id": 12,
-            "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
-            "title": "Total Jobs Enqueued",
-            "type": "stat",
-            "targets": [{"expr": "spooled_jobs_enqueued_total", "refId": "A"}]
-          },
-          {
-            "datasource": {"type": "prometheus", "uid": "prometheus"},
-            "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "short"}, "overrides": []},
-            "gridPos": {"h": 4, "w": 6, "x": 12, "y": 20},
-            "id": 13,
-            "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
-            "title": "Total Jobs Completed",
-            "type": "stat",
-            "targets": [{"expr": "spooled_jobs_completed_total", "refId": "A"}]
-          },
-          {
-            "datasource": {"type": "prometheus", "uid": "prometheus"},
-            "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}, {"color": "red", "value": 10}]}, "unit": "short"}, "overrides": []},
-            "gridPos": {"h": 4, "w": 6, "x": 18, "y": 20},
-            "id": 14,
-            "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
-            "title": "Total Jobs Failed",
-            "type": "stat",
-            "targets": [{"expr": "spooled_jobs_failed_total", "refId": "A"}]
-          }
-        ],
-        "refresh": "10s",
-        "schemaVersion": 38,
-        "style": "dark",
-        "tags": ["spooled", "backend", "jobs"],
-        "templating": {"list": []},
-        "time": {"from": "now-1h", "to": "now"},
-        "timepicker": {},
-        "timezone": "browser",
-        "title": "Spooled Backend Overview",
-        "uid": "spooled-overview",
-        "version": 1
-      }
-      DASHBOARD
-
       echo "Grafana provisioning complete"
       '
     volumes:
@@ -521,4 +415,3 @@ volumes:
 networks:
   spooled-network:
     driver: bridge
-

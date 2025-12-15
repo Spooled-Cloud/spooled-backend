@@ -42,4 +42,4 @@ criterion/
 
 # Test artifacts
 *.snap.new
-.idea
+.idea!.env.example
