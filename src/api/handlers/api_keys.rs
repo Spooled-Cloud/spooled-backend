@@ -27,6 +27,12 @@ pub async fn list(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
 ) -> AppResult<Json<Vec<ApiKeySummary>>> {
+    tracing::debug!(
+        organization_id = %ctx.organization_id,
+        api_key_id = %ctx.api_key_id,
+        "Listing API keys for organization"
+    );
+
     // Use constant instead of hardcoded value
     let keys = sqlx::query_as::<_, ApiKey>(
         "SELECT * FROM api_keys WHERE organization_id = $1 ORDER BY created_at DESC LIMIT $2",
@@ -35,6 +41,12 @@ pub async fn list(
     .bind(MAX_API_KEYS_PER_PAGE)
     .fetch_all(state.db.pool())
     .await?;
+
+    tracing::debug!(
+        organization_id = %ctx.organization_id,
+        count = keys.len(),
+        "Found API keys"
+    );
 
     let summaries: Vec<ApiKeySummary> = keys.into_iter().map(Into::into).collect();
     Ok(Json(summaries))
