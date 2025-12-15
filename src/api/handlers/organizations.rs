@@ -19,9 +19,9 @@ use crate::models::{
 };
 
 /// Rate limit: max slug checks per IP per minute
-const MAX_SLUG_CHECKS_PER_MINUTE: i64 = 20;
+const MAX_SLUG_CHECKS_PER_MINUTE: i64 = 60;
 /// Rate limit: max slug checks per IP per hour
-const MAX_SLUG_CHECKS_PER_HOUR: i64 = 120;
+const MAX_SLUG_CHECKS_PER_HOUR: i64 = 300;
 
 /// Organization member representation (dashboard UI)
 ///
