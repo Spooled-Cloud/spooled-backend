@@ -1,7 +1,7 @@
 //! Configuration module for Spooled Backend
 //!
 //! This module handles loading and validating configuration from environment
-//! variables and configuration files.
+//! variables and configuration files. Supports both cloud and self-hosted deployments.
 
 pub mod plans;
 
