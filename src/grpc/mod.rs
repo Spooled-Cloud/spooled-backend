@@ -55,7 +55,9 @@ pub mod validation {
     /// Validate queue name format
     pub fn validate_queue_name(name: &str) -> Result<(), Status> {
         if name.is_empty() || name.len() > 255 {
-            return Err(Status::invalid_argument("Queue name must be 1-255 characters"));
+            return Err(Status::invalid_argument(
+                "Queue name must be 1-255 characters",
+            ));
         }
         if !name
             .chars()

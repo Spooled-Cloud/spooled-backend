@@ -5564,13 +5564,23 @@ async fn test_grpc_payload_size_validation() {
     use spooled_backend::grpc::validation::validate_queue_name;
 
     // Max payload size should be 1MB
-    assert_eq!(MAX_GRPC_PAYLOAD_SIZE, 1024 * 1024, "Max payload should be 1MB");
+    assert_eq!(
+        MAX_GRPC_PAYLOAD_SIZE,
+        1024 * 1024,
+        "Max payload should be 1MB"
+    );
 
     // Valid queue name
-    assert!(validate_queue_name("emails").is_ok(), "Valid queue name should pass");
+    assert!(
+        validate_queue_name("emails").is_ok(),
+        "Valid queue name should pass"
+    );
 
     // Invalid queue name (SQL injection attempt)
-    assert!(validate_queue_name("queue;DROP TABLE").is_err(), "SQL injection should be rejected");
+    assert!(
+        validate_queue_name("queue;DROP TABLE").is_err(),
+        "SQL injection should be rejected"
+    );
 
     // Payload size is checked in service implementation at runtime
     // This test verifies the constant is correctly defined
@@ -6628,17 +6638,36 @@ async fn test_grpc_enqueue_validates() {
     // Queue name and payload size validation happen in service implementation
 
     // Valid queue names
-    assert!(validate_queue_name("valid-queue").is_ok(), "Valid request should pass");
-    assert!(validate_queue_name("queue_v2").is_ok(), "Underscores should be valid");
-    assert!(validate_queue_name("prod.emails").is_ok(), "Dots should be valid");
+    assert!(
+        validate_queue_name("valid-queue").is_ok(),
+        "Valid request should pass"
+    );
+    assert!(
+        validate_queue_name("queue_v2").is_ok(),
+        "Underscores should be valid"
+    );
+    assert!(
+        validate_queue_name("prod.emails").is_ok(),
+        "Dots should be valid"
+    );
 
     // Invalid queue names
-    assert!(validate_queue_name("queue;DROP TABLE").is_err(), "SQL injection should fail");
+    assert!(
+        validate_queue_name("queue;DROP TABLE").is_err(),
+        "SQL injection should fail"
+    );
     assert!(validate_queue_name("").is_err(), "Empty name should fail");
-    assert!(validate_queue_name("-starts-with-dash").is_err(), "Leading dash should fail");
+    assert!(
+        validate_queue_name("-starts-with-dash").is_err(),
+        "Leading dash should fail"
+    );
 
     // Payload size constant should be 1MB
-    assert_eq!(MAX_GRPC_PAYLOAD_SIZE, 1024 * 1024, "Max payload should be 1MB");
+    assert_eq!(
+        MAX_GRPC_PAYLOAD_SIZE,
+        1024 * 1024,
+        "Max payload should be 1MB"
+    );
 }
 
 /// Test that gRPC register validates queue names

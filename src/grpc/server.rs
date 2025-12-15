@@ -89,7 +89,13 @@ mod tests {
         // Using runtime checks to satisfy clippy
         let min_size = 1024 * 1024;
         let max_size = 16 * 1024 * 1024;
-        assert!(MAX_MESSAGE_SIZE >= min_size, "Message size should be at least 1MB");
-        assert!(MAX_MESSAGE_SIZE <= max_size, "Message size should be at most 16MB");
+        assert!(
+            MAX_MESSAGE_SIZE >= min_size,
+            "Message size should be at least 1MB"
+        );
+        assert!(
+            MAX_MESSAGE_SIZE <= max_size,
+            "Message size should be at most 16MB"
+        );
     }
 }

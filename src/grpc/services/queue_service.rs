@@ -25,10 +25,9 @@ use crate::grpc::convert::{
 };
 use crate::grpc::proto::{
     queue_service_server::QueueService, CompleteRequest, CompleteResponse, DequeueRequest,
-    DequeueResponse, EnqueueRequest, EnqueueResponse, FailRequest, FailResponse,
-    GetJobRequest, GetJobResponse, GetQueueStatsRequest, GetQueueStatsResponse, Job,
-    ProcessRequest, ProcessResponse, RenewLeaseRequest, RenewLeaseResponse,
-    StreamJobsRequest,
+    DequeueResponse, EnqueueRequest, EnqueueResponse, FailRequest, FailResponse, GetJobRequest,
+    GetJobResponse, GetQueueStatsRequest, GetQueueStatsResponse, Job, ProcessRequest,
+    ProcessResponse, RenewLeaseRequest, RenewLeaseResponse, StreamJobsRequest,
 };
 use crate::models::Job as DbJob;
 use crate::observability::Metrics;
@@ -72,7 +71,9 @@ impl QueueServiceImpl {
     /// Validate queue name format
     fn validate_queue_name(name: &str) -> Result<(), Status> {
         if name.is_empty() || name.len() > 255 {
-            return Err(Status::invalid_argument("Queue name must be 1-255 characters"));
+            return Err(Status::invalid_argument(
+                "Queue name must be 1-255 characters",
+            ));
         }
         if !name
             .chars()

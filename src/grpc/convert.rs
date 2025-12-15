@@ -54,9 +54,7 @@ pub fn json_to_value(value: &serde_json::Value) -> Value {
     let kind = match value {
         serde_json::Value::Null => Kind::NullValue(0),
         serde_json::Value::Bool(b) => Kind::BoolValue(*b),
-        serde_json::Value::Number(n) => {
-            Kind::NumberValue(n.as_f64().unwrap_or(0.0))
-        }
+        serde_json::Value::Number(n) => Kind::NumberValue(n.as_f64().unwrap_or(0.0)),
         serde_json::Value::String(s) => Kind::StringValue(s.clone()),
         serde_json::Value::Array(arr) => {
             let values: Vec<Value> = arr.iter().map(json_to_value).collect();

@@ -14,8 +14,8 @@ use tracing::{info, warn};
 
 use crate::grpc::auth::authenticate_request;
 use crate::grpc::proto::{
-    worker_service_server::WorkerService, DeregisterRequest, DeregisterResponse,
-    HeartbeatRequest, HeartbeatResponse, RegisterWorkerRequest, RegisterWorkerResponse,
+    worker_service_server::WorkerService, DeregisterRequest, DeregisterResponse, HeartbeatRequest,
+    HeartbeatResponse, RegisterWorkerRequest, RegisterWorkerResponse,
 };
 use crate::observability::Metrics;
 
@@ -76,7 +76,9 @@ impl WorkerServiceImpl {
     /// Validate queue name format
     fn validate_queue_name(name: &str) -> Result<(), Status> {
         if name.is_empty() || name.len() > 255 {
-            return Err(Status::invalid_argument("Queue name must be 1-255 characters"));
+            return Err(Status::invalid_argument(
+                "Queue name must be 1-255 characters",
+            ));
         }
         if !name
             .chars()

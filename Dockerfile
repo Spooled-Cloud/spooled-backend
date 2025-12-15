@@ -8,17 +8,21 @@
 # -----------------------------------------------------------------------------
 FROM rust:1.91-bookworm AS builder
 
-# Install build dependencies
+# Install build dependencies (including protoc for gRPC)
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
+    protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 # Create app directory
 WORKDIR /app
 
-# Copy manifests first (for caching)
-COPY Cargo.toml Cargo.lock ./
+# Copy manifests and build script first (for caching)
+COPY Cargo.toml Cargo.lock build.rs ./
+
+# Copy proto files (needed for build.rs)
+COPY proto ./proto
 
 # Create dummy source files for dependency caching
 # Project has both lib.rs and main.rs
