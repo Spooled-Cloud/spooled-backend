@@ -180,6 +180,9 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
         // Organizations (except create which is public)
         .route("/organizations", get(handlers::organizations::list))
         .route("/organizations/usage", get(handlers::organizations::usage))
+        .route("/organizations/webhook-token", get(handlers::organizations::get_webhook_token))
+        .route("/organizations/webhook-token/regenerate", post(handlers::organizations::regenerate_webhook_token))
+        .route("/organizations/webhook-token/clear", post(handlers::organizations::clear_webhook_token))
         .route("/organizations/{id}", get(handlers::organizations::get))
         .route("/organizations/{id}", put(handlers::organizations::update))
         .route(

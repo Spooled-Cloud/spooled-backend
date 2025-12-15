@@ -407,6 +407,70 @@ paths:
               schema:
                 $ref: '#/components/schemas/UsageInfo'
 
+  /api/v1/organizations/webhook-token:
+    get:
+      tags: [Organizations]
+      summary: Get webhook token
+      description: |
+        Get the current webhook token and URL for receiving incoming webhooks.
+        The token is automatically generated when the organization is created.
+      operationId: getWebhookToken
+      responses:
+        '200':
+          description: Webhook token information
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookTokenResponse'
+              example:
+                webhook_token: "whk_abc123..."
+                webhook_url: "https://api.spooled.cloud/api/v1/webhooks/org-id/custom"
+
+  /api/v1/organizations/webhook-token/regenerate:
+    post:
+      tags: [Organizations]
+      summary: Regenerate webhook token
+      description: |
+        Generate a new webhook token, invalidating the old one.
+        Update your external services with the new token after regenerating.
+      operationId: regenerateWebhookToken
+      responses:
+        '200':
+          description: New webhook token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookTokenResponse'
+
+  /api/v1/organizations/webhook-token/clear:
+    post:
+      tags: [Organizations]
+      summary: Clear webhook token
+      description: |
+        Remove the webhook token, making the endpoint accept unauthenticated requests.
+        **Warning:** This is not recommended for production use.
+      operationId: clearWebhookToken
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [confirm]
+              properties:
+                confirm:
+                  type: boolean
+                  description: Must be true to confirm clearing the token
+            example:
+              confirm: true
+      responses:
+        '200':
+          description: Token cleared
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookTokenResponse'
+
   # Admin Endpoints
   /api/v1/admin/organizations:
     get:
@@ -3344,6 +3408,21 @@ components:
         delivered_at:
           type: string
           format: date-time
+
+    # Webhook Token Schema
+    WebhookTokenResponse:
+      type: object
+      required: [webhook_url]
+      properties:
+        webhook_token:
+          type: string
+          nullable: true
+          description: The webhook token (null if cleared)
+          example: "whk_abc123def456..."
+        webhook_url:
+          type: string
+          description: The webhook URL for this organization
+          example: "https://api.spooled.cloud/api/v1/webhooks/org-id/custom"
 
     # Usage and Admin Schemas
     UsageInfo:

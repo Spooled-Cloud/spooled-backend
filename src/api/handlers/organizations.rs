@@ -657,6 +657,158 @@ pub async fn usage(
     Ok(Json(usage_info))
 }
 
+/// Response for webhook token endpoints
+#[derive(Debug, Serialize)]
+pub struct WebhookTokenResponse {
+    /// The webhook token (full value)
+    pub webhook_token: Option<String>,
+    /// The webhook URL for this organization
+    pub webhook_url: String,
+}
+
+/// Get the current webhook token for the organization
+pub async fn get_webhook_token(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+) -> AppResult<Json<WebhookTokenResponse>> {
+    let org: Organization =
+        sqlx::query_as("SELECT * FROM organizations WHERE id = $1")
+            .bind(&ctx.organization_id)
+            .fetch_one(state.db.pool())
+            .await
+            .map_err(|_| AppError::NotFound("Organization not found".to_string()))?;
+
+    let webhook_token = org
+        .settings
+        .get("webhook_token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let base_url = state.settings.server.external_url.clone()
+        .unwrap_or_else(|| "https://api.spooled.cloud".to_string());
+
+    Ok(Json(WebhookTokenResponse {
+        webhook_token,
+        webhook_url: format!("{}/api/v1/webhooks/{}/custom", base_url, ctx.organization_id),
+    }))
+}
+
+/// Response for regenerating webhook token
+#[derive(Debug, Serialize)]
+pub struct RegenerateWebhookTokenResponse {
+    /// The new webhook token
+    pub webhook_token: String,
+    /// The webhook URL for this organization
+    pub webhook_url: String,
+}
+
+/// Regenerate the webhook token for the organization
+pub async fn regenerate_webhook_token(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+) -> AppResult<Json<RegenerateWebhookTokenResponse>> {
+    // Generate new webhook token
+    let new_token = generate_webhook_token();
+
+    // Get current settings and update webhook_token
+    let org: Organization =
+        sqlx::query_as("SELECT * FROM organizations WHERE id = $1")
+            .bind(&ctx.organization_id)
+            .fetch_one(state.db.pool())
+            .await
+            .map_err(|_| AppError::NotFound("Organization not found".to_string()))?;
+
+    let mut settings = org.settings.clone();
+    if let Some(obj) = settings.as_object_mut() {
+        obj.insert("webhook_token".to_string(), serde_json::json!(new_token));
+    }
+
+    sqlx::query("UPDATE organizations SET settings = $1, updated_at = $2 WHERE id = $3")
+        .bind(&settings)
+        .bind(Utc::now())
+        .bind(&ctx.organization_id)
+        .execute(state.db.pool())
+        .await?;
+
+    let base_url = state.settings.server.external_url.clone()
+        .unwrap_or_else(|| "https://api.spooled.cloud".to_string());
+
+    tracing::info!(
+        org_id = %ctx.organization_id,
+        "Webhook token regenerated"
+    );
+
+    Ok(Json(RegenerateWebhookTokenResponse {
+        webhook_token: new_token,
+        webhook_url: format!("{}/api/v1/webhooks/{}/custom", base_url, ctx.organization_id),
+    }))
+}
+
+/// Request to clear the webhook token (make webhook accept requests without token)
+#[derive(Debug, Deserialize)]
+pub struct ClearWebhookTokenRequest {
+    /// Must be true to confirm clearing the token
+    pub confirm: bool,
+}
+
+/// Clear the webhook token (disable webhook authentication)
+pub async fn clear_webhook_token(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Json(request): Json<ClearWebhookTokenRequest>,
+) -> AppResult<Json<WebhookTokenResponse>> {
+    if !request.confirm {
+        return Err(AppError::Validation(
+            "You must set confirm: true to clear the webhook token".to_string(),
+        ));
+    }
+
+    // Get current settings and remove webhook_token
+    let org: Organization =
+        sqlx::query_as("SELECT * FROM organizations WHERE id = $1")
+            .bind(&ctx.organization_id)
+            .fetch_one(state.db.pool())
+            .await
+            .map_err(|_| AppError::NotFound("Organization not found".to_string()))?;
+
+    let mut settings = org.settings.clone();
+    if let Some(obj) = settings.as_object_mut() {
+        obj.remove("webhook_token");
+    }
+
+    sqlx::query("UPDATE organizations SET settings = $1, updated_at = $2 WHERE id = $3")
+        .bind(&settings)
+        .bind(Utc::now())
+        .bind(&ctx.organization_id)
+        .execute(state.db.pool())
+        .await?;
+
+    let base_url = state.settings.server.external_url.clone()
+        .unwrap_or_else(|| "https://api.spooled.cloud".to_string());
+
+    tracing::warn!(
+        org_id = %ctx.organization_id,
+        "Webhook token cleared - webhook now accepts unauthenticated requests"
+    );
+
+    Ok(Json(WebhookTokenResponse {
+        webhook_token: None,
+        webhook_url: format!("{}/api/v1/webhooks/{}/custom", base_url, ctx.organization_id),
+    }))
+}
+
+/// Generate a secure webhook token for incoming webhooks
+fn generate_webhook_token() -> String {
+    use rand::Rng;
+    let mut rng = rand::rng();
+    let mut bytes = [0u8; 24]; // 24 bytes = 32 base64 chars
+    rng.fill(&mut bytes);
+    format!(
+        "whk_{}",
+        base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

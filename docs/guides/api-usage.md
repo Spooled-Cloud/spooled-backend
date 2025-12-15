@@ -597,26 +597,42 @@ POST https://api.spooled.cloud/api/v1/webhooks/{org_id}/custom
 
 Where `{org_id}` is your organization's UUID (e.g., `org_a1b2c3d4e5f6`).
 
-### Step 1: Configure Your Webhook Token (Optional but Recommended)
+### Step 1: Get Your Webhook Token
 
-First, set a secret token in your organization's settings. This token will be
-required for all incoming webhook requests to prevent unauthorized access.
+A webhook token is automatically generated when your organization is created.
+You can retrieve it via the API or from the dashboard under Organization Settings.
 
 ```bash
-# Update your organization settings with a webhook token
-curl -X PUT https://api.spooled.cloud/api/v1/organizations/{org_id} \
+# Get your current webhook token and URL
+curl https://api.spooled.cloud/api/v1/organizations/webhook-token \
+  -H "Authorization: Bearer sk_live_your_api_key"
+```
+
+Response:
+```json
+{
+  "webhook_token": "whk_abc123...",
+  "webhook_url": "https://api.spooled.cloud/api/v1/webhooks/{org_id}/custom"
+}
+```
+
+### Managing Your Webhook Token
+
+```bash
+# Regenerate the token (invalidates the old one)
+curl -X POST https://api.spooled.cloud/api/v1/organizations/webhook-token/regenerate \
+  -H "Authorization: Bearer sk_live_your_api_key"
+
+# Clear the token (makes endpoint accept unauthenticated requests - NOT RECOMMENDED)
+curl -X POST https://api.spooled.cloud/api/v1/organizations/webhook-token/clear \
   -H "Authorization: Bearer sk_live_your_api_key" \
   -H "Content-Type: application/json" \
-  -d '{
-    "settings": {
-      "webhook_token": "your-secret-webhook-token-min-16-chars"
-    }
-  }'
+  -d '{"confirm": true}'
 ```
 
 **Important:** 
-- Choose a strong, random token (at least 16 characters recommended)
-- Store this token securely - you'll configure it in your external service
+- Store your webhook token securely - you'll configure it in your external service
+- Regenerating the token invalidates the old one; update all external services
 - If no token is configured, the webhook endpoint is open (not recommended for production)
 
 ### Step 2: Send Webhooks to Spooled

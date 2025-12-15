@@ -603,20 +603,27 @@ pub async fn complete_signup(
         ));
     }
 
-    // Create organization
+    // Create organization with auto-generated webhook token
     let org_id = Uuid::new_v4().to_string();
     let now = Utc::now();
+
+    // Generate a secure webhook token for incoming webhooks
+    let webhook_token = generate_webhook_token();
+    let initial_settings = serde_json::json!({
+        "webhook_token": webhook_token
+    });
 
     sqlx::query(
         r#"
         INSERT INTO organizations (id, name, slug, plan_tier, billing_email, settings, created_at, updated_at)
-        VALUES ($1, $2, $3, 'free', $4, '{}', $5, $5)
+        VALUES ($1, $2, $3, 'free', $4, $5, $6, $6)
         "#,
     )
     .bind(&org_id)
     .bind(&request.name)
     .bind(&slug)
     .bind(&email)
+    .bind(&initial_settings)
     .bind(now)
     .execute(state.db.pool())
     .await
@@ -733,6 +740,18 @@ fn generate_api_key_string() -> String {
     let mut bytes = [0u8; 32];
     rng.fill(&mut bytes);
     base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes)
+}
+
+/// Generate a secure webhook token for incoming webhooks
+fn generate_webhook_token() -> String {
+    use rand::Rng;
+    let mut rng = rand::rng();
+    let mut bytes = [0u8; 24]; // 24 bytes = 32 base64 chars
+    rng.fill(&mut bytes);
+    format!(
+        "whk_{}",
+        base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes)
+    )
 }
 
 /// Send login code email

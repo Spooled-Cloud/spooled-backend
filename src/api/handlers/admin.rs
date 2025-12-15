@@ -795,11 +795,17 @@ pub async fn create_organization(
     let org_id = Uuid::new_v4().to_string();
     let now = Utc::now();
 
+    // Generate a secure webhook token for incoming webhooks
+    let webhook_token = generate_webhook_token();
+    let initial_settings = serde_json::json!({
+        "webhook_token": webhook_token
+    });
+
     // Create organization with specified plan tier
     let org = sqlx::query_as::<_, Organization>(
         r#"
         INSERT INTO organizations (id, name, slug, plan_tier, billing_email, settings, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, '{}', $6, $6)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
         RETURNING *
         "#,
     )
@@ -808,6 +814,7 @@ pub async fn create_organization(
     .bind(&request.slug)
     .bind(&plan_tier)
     .bind(&request.billing_email)
+    .bind(&initial_settings)
     .bind(now)
     .fetch_one(state.db.pool())
     .await
@@ -1022,6 +1029,18 @@ fn generate_secure_key() -> String {
     let mut bytes = [0u8; 32];
     rng.fill(&mut bytes);
     base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes)
+}
+
+/// Generate a secure webhook token for incoming webhooks
+fn generate_webhook_token() -> String {
+    use rand::Rng;
+    let mut rng = rand::rng();
+    let mut bytes = [0u8; 24]; // 24 bytes = 32 base64 chars
+    rng.fill(&mut bytes);
+    format!(
+        "whk_{}",
+        base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes)
+    )
 }
 
 #[cfg(test)]
