@@ -161,7 +161,6 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
         .route(
             "/webhooks/{org_id}/custom",
             post(handlers::webhooks::custom),
-        ),
         )
         // Stripe billing webhook (separate from job webhooks)
         .route("/billing/webhook", post(handlers::billing::webhook))

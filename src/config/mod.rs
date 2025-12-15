@@ -74,6 +74,8 @@ pub struct ServerSettings {
     pub metrics_port: u16,
     /// Environment (development, staging, production)
     pub environment: Environment,
+    /// External URL for this server (used in webhook URLs, etc.)
+    pub external_url: Option<String>,
 }
 
 /// Environment type
@@ -247,6 +249,7 @@ impl Settings {
                     .unwrap_or_else(|_| "9090".to_string())
                     .parse()
                     .context("Invalid METRICS_PORT")?,
+                external_url: env::var("EXTERNAL_URL").ok(),
                 environment: match env::var("RUST_ENV")
                     .unwrap_or_else(|_| "development".to_string())
                     .as_str()
@@ -531,6 +534,7 @@ impl Settings {
                 port: 8080,
                 metrics_port: 9090,
                 environment: Environment::Development,
+                external_url: None,
             },
             database: DatabaseSettings {
                 url: "postgres://test:test@localhost:5432/test".to_string(),
@@ -563,7 +567,6 @@ impl Settings {
                 max_payload_size_bytes: 1048576,
             },
             webhooks: WebhookSettings {
-                github_secret: None,
                 stripe_secret: None,
             },
             tracing: TracingSettings {

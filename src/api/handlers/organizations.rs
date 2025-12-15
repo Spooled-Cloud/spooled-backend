@@ -6,7 +6,7 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing::warn;
 use uuid::Uuid;
 
