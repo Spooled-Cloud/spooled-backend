@@ -193,14 +193,15 @@ impl WorkerLoop {
             }
         }
 
-        // Use queue_names (array) instead of queue_name (string)
+        // Set both queue_name (legacy, NOT NULL) and queue_names (array, new)
+        // The queue_name column has a NOT NULL constraint from initial migration.
         let result = sqlx::query(
             r#"
             INSERT INTO workers (
-                id, organization_id, queue_names, hostname, max_concurrent_jobs,
+                id, organization_id, queue_name, queue_names, hostname, max_concurrent_jobs,
                 current_job_count, status, last_heartbeat, metadata, created_at, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, 0, 'healthy', NOW(), '{}', NOW(), NOW())
+            VALUES ($1, $2, $3, $4, $5, $6, 0, 'healthy', NOW(), '{}', NOW(), NOW())
             ON CONFLICT (id) DO UPDATE SET
                 status = 'healthy',
                 last_heartbeat = NOW(),
@@ -210,7 +211,8 @@ impl WorkerLoop {
         )
         .bind(&self.config.worker_id)
         .bind(&self.config.organization_id)
-        .bind(vec![&self.config.queue_name]) // Convert to array
+        .bind(&self.config.queue_name) // Legacy queue_name (NOT NULL)
+        .bind(vec![&self.config.queue_name]) // New queue_names array
         .bind(hostname::get()?.to_string_lossy().to_string())
         .bind(self.config.max_concurrency as i32)
         .execute(&*self.db)

@@ -94,18 +94,18 @@ pub async fn register(
     let now = Utc::now();
     let max_concurrency = request.max_concurrency.unwrap_or(5);
 
-    // Use queue_names (array) column instead of queue_name (string)
-    // to match the database schema used by the worker module
+    // Set both queue_name (legacy, NOT NULL) and queue_names (array, new)
+    // The queue_name column has a NOT NULL constraint from initial migration.
     //
     // Previously, an attacker could update another org's worker status by using their ID.
     let result = sqlx::query(
         r#"
         INSERT INTO workers (
-            id, organization_id, queue_names, hostname, worker_type,
+            id, organization_id, queue_name, queue_names, hostname, worker_type,
             max_concurrent_jobs, current_job_count, status, last_heartbeat,
             metadata, version, created_at, updated_at
         )
-        VALUES ($1, $2, $3, $4, $5, $6, 0, 'healthy', $7, $8, $9, $7, $7)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 'healthy', $8, $9, $10, $8, $8)
         ON CONFLICT (id) DO UPDATE SET
             status = 'healthy',
             last_heartbeat = NOW(),
@@ -115,7 +115,8 @@ pub async fn register(
     )
     .bind(&worker_id)
     .bind(&ctx.organization_id)
-    .bind(vec![&request.queue_name]) // Convert to array
+    .bind(&request.queue_name) // Legacy queue_name (NOT NULL)
+    .bind(vec![&request.queue_name]) // New queue_names array
     .bind(&request.hostname)
     .bind(&request.worker_type)
     .bind(max_concurrency) // Use max_concurrent_jobs
