@@ -9,10 +9,12 @@ use axum::{
 };
 use chrono::Utc;
 use serde::Deserialize;
+use serde_json::json;
 use tracing::{error, info};
 
 use crate::api::middleware::validation::ValidatedJson;
 use crate::api::AppState;
+use crate::outgoing_webhooks::service::OutgoingWebhookService;
 use crate::models::{
     ApiKeyContext, CreateScheduleRequest, CreateScheduleResponse, CronSchedule, Schedule,
     UpdateScheduleRequest,
@@ -447,6 +449,31 @@ pub async fn trigger(
                 &job_id,
             )
             .await;
+    }
+
+    // Fire-and-forget outgoing webhook event (best-effort)
+    {
+        let svc = OutgoingWebhookService::new(state.db.pool_arc());
+        let org_id = ctx.organization_id.clone();
+        let org_id_payload = org_id.clone();
+        let schedule_id = id.clone();
+        let job_id_payload = job_id.clone();
+        let queue_name = schedule.queue_name.clone();
+        tokio::spawn(async move {
+            let _ = svc
+                .dispatch_event(
+                    &org_id,
+                    "schedule.triggered",
+                    json!({
+                        "event": "schedule.triggered",
+                        "organizationId": org_id_payload,
+                        "schedule": { "id": schedule_id },
+                        "job": { "id": job_id_payload, "queueName": queue_name },
+                        "timestamp": Utc::now().to_rfc3339()
+                    }),
+                )
+                .await;
+        });
     }
 
     Ok(Json(TriggerResponse {

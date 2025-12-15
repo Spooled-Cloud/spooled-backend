@@ -6,9 +6,11 @@ use axum::{
     Json,
 };
 use chrono::Utc;
+use serde_json::json;
 
 use crate::api::AppState;
 use crate::error::{AppError, AppResult};
+use crate::outgoing_webhooks::service::OutgoingWebhookService;
 use crate::models::{
     ApiKeyContext, PauseQueueRequest, PauseQueueResponse, QueueConfig, QueueConfigSummary,
     QueueStats, ResumeQueueResponse, UpsertQueueConfigRequest,
@@ -241,6 +243,29 @@ pub async fn pause(
             .await;
     }
 
+    // Fire-and-forget outgoing webhook event (best-effort)
+    {
+        let svc = OutgoingWebhookService::new(state.db.pool_arc());
+        let org_id = ctx.organization_id.clone();
+        let org_id_payload = org_id.clone();
+        let queue_name = name.clone();
+        let reason = request.reason.clone();
+        tokio::spawn(async move {
+            let _ = svc
+                .dispatch_event(
+                    &org_id,
+                    "queue.paused",
+                    json!({
+                        "event": "queue.paused",
+                        "organizationId": org_id_payload,
+                        "queue": { "name": queue_name, "paused": true, "reason": reason },
+                        "timestamp": Utc::now().to_rfc3339()
+                    }),
+                )
+                .await;
+        });
+    }
+
     Ok(Json(PauseQueueResponse {
         queue_name: name,
         paused: true,
@@ -305,6 +330,28 @@ pub async fn resume(
                 "resumed",
             )
             .await;
+    }
+
+    // Fire-and-forget outgoing webhook event (best-effort)
+    {
+        let svc = OutgoingWebhookService::new(state.db.pool_arc());
+        let org_id = ctx.organization_id.clone();
+        let org_id_payload = org_id.clone();
+        let queue_name = name.clone();
+        tokio::spawn(async move {
+            let _ = svc
+                .dispatch_event(
+                    &org_id,
+                    "queue.resumed",
+                    json!({
+                        "event": "queue.resumed",
+                        "organizationId": org_id_payload,
+                        "queue": { "name": queue_name, "resumed": true },
+                        "timestamp": Utc::now().to_rfc3339()
+                    }),
+                )
+                .await;
+        });
     }
 
     Ok(Json(ResumeQueueResponse {

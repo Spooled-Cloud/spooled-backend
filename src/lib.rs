@@ -13,6 +13,7 @@ pub mod error;
 pub mod grpc;
 pub mod models;
 pub mod observability;
+pub mod outgoing_webhooks;
 pub mod queue;
 pub mod scheduler;
 pub mod webhook;

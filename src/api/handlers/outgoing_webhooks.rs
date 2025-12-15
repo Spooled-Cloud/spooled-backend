@@ -19,6 +19,7 @@ use crate::models::{
     OutgoingWebhookSummary, TestWebhookResponse, UpdateOutgoingWebhookRequest,
     VALID_WEBHOOK_EVENTS,
 };
+use crate::outgoing_webhooks::service::OutgoingWebhookService;
 
 /// Validate that all event types are valid
 fn validate_events(events: &[String]) -> AppResult<()> {
@@ -393,6 +394,73 @@ pub async fn deliveries(
     .await?;
 
     Ok(Json(deliveries))
+}
+
+/// Retry a specific webhook delivery (replays the stored payload)
+///
+/// POST /api/v1/outgoing-webhooks/{id}/retry/{delivery_id}
+pub async fn retry_delivery(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path((id, delivery_id)): Path<(String, String)>,
+) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+    // Verify webhook belongs to organization
+    let webhook_exists: Option<(String,)> = sqlx::query_as(
+        r#"
+        SELECT id FROM outgoing_webhooks
+        WHERE id = $1 AND organization_id = $2
+        "#,
+    )
+    .bind(&id)
+    .bind(&ctx.organization_id)
+    .fetch_optional(state.db.pool())
+    .await?;
+
+    if webhook_exists.is_none() {
+        return Err(AppError::NotFound(format!("Webhook {} not found", id)));
+    }
+
+    // Verify delivery belongs to webhook
+    let delivery_exists: Option<(String,)> = sqlx::query_as(
+        r#"
+        SELECT id FROM outgoing_webhook_deliveries
+        WHERE id = $1 AND webhook_id = $2
+        "#,
+    )
+    .bind(&delivery_id)
+    .bind(&id)
+    .fetch_optional(state.db.pool())
+    .await?;
+
+    if delivery_exists.is_none() {
+        return Err(AppError::NotFound(format!(
+            "Delivery {} not found for webhook {}",
+            delivery_id, id
+        )));
+    }
+
+    let svc = OutgoingWebhookService::new(state.db.pool_arc());
+    let webhook_id = id.clone();
+    let delivery_id_clone = delivery_id.clone();
+    tokio::spawn(async move {
+        if let Err(e) = svc.retry_delivery(&webhook_id, &delivery_id_clone).await {
+            tracing::error!(
+                error = %e,
+                webhook_id = %webhook_id,
+                delivery_id = %delivery_id_clone,
+                "Retry delivery failed"
+            );
+        }
+    });
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "success": true,
+            "webhookId": id,
+            "deliveryId": delivery_id
+        })),
+    ))
 }
 
 #[cfg(test)]

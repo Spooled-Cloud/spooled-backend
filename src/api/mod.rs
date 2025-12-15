@@ -313,6 +313,10 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
             "/outgoing-webhooks/{id}/deliveries",
             get(handlers::outgoing_webhooks::deliveries),
         )
+        .route(
+            "/outgoing-webhooks/{id}/retry/{delivery_id}",
+            post(handlers::outgoing_webhooks::retry_delivery),
+        )
         // Billing endpoints
         .route("/billing/status", get(handlers::billing::status))
         .route("/billing/portal", post(handlers::billing::create_portal))
