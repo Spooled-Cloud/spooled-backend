@@ -158,16 +158,13 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
         )
         // Webhooks are authenticated via signatures, not API keys
         .route(
-            "/webhooks/{org_id}/github",
-            post(handlers::webhooks::github),
-        )
-        .route(
             "/webhooks/{org_id}/stripe",
             post(handlers::webhooks::stripe),
         )
         .route(
             "/webhooks/{org_id}/custom",
             post(handlers::webhooks::custom),
+        ),
         )
         // Stripe billing webhook (separate from job webhooks)
         .route("/billing/webhook", post(handlers::billing::webhook))

@@ -165,8 +165,6 @@ pub struct QueueSettings {
 /// Webhook verification settings
 #[derive(Debug, Clone, Deserialize)]
 pub struct WebhookSettings {
-    /// GitHub webhook secret
-    pub github_secret: Option<String>,
     /// Stripe webhook secret
     pub stripe_secret: Option<String>,
 }
@@ -335,7 +333,6 @@ impl Settings {
                     .context("Invalid QUEUE_MAX_PAYLOAD_SIZE_BYTES")?,
             },
             webhooks: WebhookSettings {
-                github_secret: env::var("GITHUB_WEBHOOK_SECRET").ok(),
                 stripe_secret: env::var("STRIPE_WEBHOOK_SECRET").ok(),
             },
             tracing: TracingSettings {
