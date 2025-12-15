@@ -42,4 +42,6 @@ criterion/
 
 # Test artifacts
 *.snap.new
-.idea!.env.example
+
+# Allow .env.example to be committed
+!.env.example
