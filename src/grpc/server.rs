@@ -88,7 +88,7 @@ pub async fn start_grpc_server(
     let worker_service = WorkerServiceImpl::new(pool.clone(), metrics.clone());
 
     // Setup health service
-    let (mut health_reporter, health_service) = health_reporter();
+    let (health_reporter, health_service) = health_reporter();
 
     // Mark services as serving
     health_reporter
