@@ -587,13 +587,45 @@ Authorization: Bearer <token>
 Spooled supports custom webhooks that allow you to receive events from any source
 and automatically create jobs in your queues.
 
-### Custom Webhook
+### Custom Webhook Overview
 
-Each organization gets a unique webhook URL:
+Each organization gets a unique webhook URL based on their organization ID:
+
+```
+POST https://api.spooled.cloud/api/v1/webhooks/{org_id}/custom
+```
+
+Where `{org_id}` is your organization's UUID (e.g., `org_a1b2c3d4e5f6`).
+
+### Step 1: Configure Your Webhook Token (Optional but Recommended)
+
+First, set a secret token in your organization's settings. This token will be
+required for all incoming webhook requests to prevent unauthorized access.
+
+```bash
+# Update your organization settings with a webhook token
+curl -X PUT https://api.spooled.cloud/api/v1/organizations/{org_id} \
+  -H "Authorization: Bearer sk_live_your_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "settings": {
+      "webhook_token": "your-secret-webhook-token-min-16-chars"
+    }
+  }'
+```
+
+**Important:** 
+- Choose a strong, random token (at least 16 characters recommended)
+- Store this token securely - you'll configure it in your external service
+- If no token is configured, the webhook endpoint is open (not recommended for production)
+
+### Step 2: Send Webhooks to Spooled
+
+Configure your external service to send webhooks to your organization's endpoint:
 
 ```bash
 POST /api/v1/webhooks/{org_id}/custom
-X-Webhook-Token: your-configured-token
+X-Webhook-Token: your-secret-webhook-token-min-16-chars
 Content-Type: application/json
 
 {
@@ -601,24 +633,110 @@ Content-Type: application/json
   "event_type": "order.created",
   "payload": {
     "order_id": 12345,
-    "customer": "John Doe"
+    "customer": "John Doe",
+    "items": ["item1", "item2"],
+    "total": 99.99
   },
   "priority": 0,
   "idempotency_key": "order-12345"
 }
 ```
 
-**Authentication:** If your organization has configured a `webhook_token` in settings,
-you must include it in the `X-Webhook-Token` header.
+**Request Fields:**
 
-**Response:**
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `queue_name` | string | Yes | Target queue for the job (1-255 chars) |
+| `payload` | object | Yes | Job data (max 5MB) |
+| `event_type` | string | No | Event type label (for logging/tracking) |
+| `priority` | integer | No | -100 to 100 (default: 0) |
+| `idempotency_key` | string | No | Prevent duplicate jobs (max 255 chars) |
+
+**Response (200 OK):**
 ```json
 {
-  "job_id": "job_xxx",
+  "job_id": "job_550e8400e29b41d4",
   "queue_name": "my-events",
   "status": "pending"
 }
 ```
+
+### Example: Receiving Webhooks from Different Services
+
+#### From a Payment Provider
+
+```bash
+# Configure your payment provider to POST to:
+# https://api.spooled.cloud/api/v1/webhooks/org_abc123/custom
+
+curl -X POST https://api.spooled.cloud/api/v1/webhooks/org_abc123/custom \
+  -H "X-Webhook-Token: your-secret-token" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "queue_name": "payments",
+    "event_type": "payment.completed",
+    "payload": {
+      "payment_id": "pay_xyz789",
+      "amount": 5000,
+      "currency": "usd",
+      "customer_email": "user@example.com"
+    },
+    "idempotency_key": "payment-pay_xyz789"
+  }'
+```
+
+#### From a Form Submission
+
+```bash
+curl -X POST https://api.spooled.cloud/api/v1/webhooks/org_abc123/custom \
+  -H "X-Webhook-Token: your-secret-token" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "queue_name": "form-submissions",
+    "event_type": "contact.form",
+    "payload": {
+      "name": "Jane Doe",
+      "email": "jane@example.com",
+      "message": "I have a question about..."
+    }
+  }'
+```
+
+#### From a CI/CD Pipeline
+
+```bash
+curl -X POST https://api.spooled.cloud/api/v1/webhooks/org_abc123/custom \
+  -H "X-Webhook-Token: $SPOOLED_WEBHOOK_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "queue_name": "deployments",
+    "event_type": "deploy.triggered",
+    "priority": 10,
+    "payload": {
+      "repo": "my-app",
+      "branch": "main",
+      "commit": "abc123def",
+      "environment": "production"
+    },
+    "idempotency_key": "deploy-abc123def-production"
+  }'
+```
+
+### Error Responses
+
+| Status | Description |
+|--------|-------------|
+| 200 | Job created successfully |
+| 400 | Invalid request (missing queue_name, invalid JSON, etc.) |
+| 401 | Invalid or missing `X-Webhook-Token` |
+| 404 | Organization not found |
+
+### Security Best Practices
+
+1. **Always configure a webhook token** for production use
+2. **Use HTTPS** - webhooks are rejected over HTTP in production
+3. **Use idempotency keys** - external services may retry failed deliveries
+4. **Validate on your worker** - the payload comes from external sources
 
 ### Billing Webhook (Platform Admin Only)
 

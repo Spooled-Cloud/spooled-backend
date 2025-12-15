@@ -1167,14 +1167,38 @@ paths:
         required: true
         schema:
           type: string
-        description: Organization ID
+        description: Organization ID (UUID)
+        example: org_a1b2c3d4e5f6
     post:
       tags: [Webhooks]
       summary: Custom webhook
       description: |
-        Receive custom webhook events for the specified organization.
+        Receive webhook events from any external source and create jobs automatically.
         
-        Optionally validates X-Webhook-Token header if configured for the organization.
+        Each organization has a unique webhook URL. Configure your external services
+        (payment providers, form handlers, CI/CD pipelines, etc.) to POST events here.
+        
+        ## Authentication
+        
+        If your organization has configured a `webhook_token` in settings, you must
+        include it in the `X-Webhook-Token` header. Without a configured token, the
+        endpoint is open (not recommended for production).
+        
+        To configure a webhook token:
+        ```
+        PUT /api/v1/organizations/{org_id}
+        {
+          "settings": {
+            "webhook_token": "your-secret-token-min-16-chars"
+          }
+        }
+        ```
+        
+        ## Security
+        
+        - In production, HTTPS is required (HTTP webhooks are rejected)
+        - Use idempotency keys to handle retries from external services
+        - The payload is stored as-is, validate in your worker
       operationId: customWebhook
       security: []
       parameters:
@@ -1182,13 +1206,47 @@ paths:
           in: header
           schema:
             type: string
-          description: Optional webhook authentication token
+          description: |
+            Webhook authentication token. Required if the organization has configured
+            a `webhook_token` in their settings.
+          example: your-secret-webhook-token
       requestBody:
         required: true
         content:
           application/json:
             schema:
               $ref: '#/components/schemas/CustomWebhookRequest'
+            examples:
+              payment:
+                summary: Payment webhook
+                value:
+                  queue_name: payments
+                  event_type: payment.completed
+                  payload:
+                    payment_id: pay_xyz789
+                    amount: 5000
+                    currency: usd
+                  idempotency_key: payment-pay_xyz789
+              form:
+                summary: Form submission
+                value:
+                  queue_name: form-submissions
+                  event_type: contact.form
+                  payload:
+                    name: Jane Doe
+                    email: jane@example.com
+                    message: I have a question
+              deployment:
+                summary: CI/CD deployment
+                value:
+                  queue_name: deployments
+                  event_type: deploy.triggered
+                  priority: 10
+                  payload:
+                    repo: my-app
+                    branch: main
+                    commit: abc123def
+                  idempotency_key: deploy-abc123def
       responses:
         '200':
           description: Webhook received and job created
@@ -1196,8 +1254,25 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/WebhookResponse'
+              example:
+                job_id: job_550e8400e29b41d4
+                queue_name: payments
+                status: pending
+        '400':
+          description: Invalid request (missing queue_name, payload too large, etc.)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '401':
-          description: Invalid webhook token
+          description: Invalid or missing X-Webhook-Token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: authentication_error
+                message: Invalid or missing X-Webhook-Token
         '404':
           description: Organization not found
 
