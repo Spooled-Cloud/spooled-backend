@@ -79,7 +79,9 @@ pub async fn start_grpc_server(
 
     // Load TLS configuration
     let tls_config = GrpcTlsConfig::from_env();
-    tls_config.validate().map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))?;
+    tls_config
+        .validate()
+        .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
 
     // Create service implementations
     let queue_service = QueueServiceImpl::new(pool.clone(), metrics.clone());
