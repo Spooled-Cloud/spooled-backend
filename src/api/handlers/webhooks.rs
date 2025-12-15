@@ -173,7 +173,6 @@ pub async fn custom(
     Ok(StatusCode::OK)
 }
 
-
 /// Constant-time string comparison to prevent timing attacks
 ///
 /// The early return on length mismatch leaks timing information.

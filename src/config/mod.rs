@@ -506,7 +506,7 @@ impl Settings {
             anyhow::bail!("JWT_EXPIRATION_HOURS cannot be 0");
         }
 
-        // Webhook secret validation removed - the old /webhooks/{org_id}/stripe 
+        // Webhook secret validation removed - the old /webhooks/{org_id}/stripe
         // endpoint was removed, and STRIPE_BILLING_WEBHOOK_SECRET is optional
         // (billing just won't work without it)
 
