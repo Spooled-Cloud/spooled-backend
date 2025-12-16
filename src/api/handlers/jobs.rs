@@ -261,7 +261,7 @@ pub async fn create(
 /// POST /api/v1/jobs/claim
 ///
 /// This endpoint is designed for worker processes. It atomically leases jobs
-/// using PostgreSQL FOR UPDATE SKIP LOCKED.
+/// using PostgreSQL FOR UPDATE SKIP LOCKED. Uses batch claiming for efficiency.
 pub async fn claim(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
@@ -271,7 +271,7 @@ pub async fn claim(
     let limit = request
         .limit
         .unwrap_or(1)
-        .clamp(1, MAX_JOBS_PER_PAGE as i32) as usize;
+        .clamp(1, MAX_JOBS_PER_PAGE as i32);
     let lease_duration_secs = request.lease_duration_secs.unwrap_or(30);
 
     let queue = QueueManager::new(
@@ -279,26 +279,25 @@ pub async fn claim(
         state.cache.as_ref().map(|c| Arc::new(c.clone())),
     );
 
-    let mut jobs: Vec<ClaimedJob> = Vec::with_capacity(limit);
-    for _ in 0..limit {
-        let job = queue
-            .dequeue(
-                &ctx.organization_id,
-                &request.queue_name,
-                &request.worker_id,
-                lease_duration_secs,
-            )
-            .await?;
-        match job {
-            Some(j) => {
-                // Metrics: claimed job transitions pending -> processing
-                state.metrics.jobs_processing.inc();
-                state.metrics.jobs_pending.dec();
-                jobs.push(j.into());
-            }
-            None => break,
-        }
+    // Use batch dequeue for efficiency (single DB round-trip)
+    let claimed_jobs = queue
+        .dequeue_batch(
+            &ctx.organization_id,
+            &request.queue_name,
+            &request.worker_id,
+            lease_duration_secs,
+            limit,
+        )
+        .await?;
+
+    // Update metrics for all claimed jobs
+    let claimed_count = claimed_jobs.len() as i64;
+    if claimed_count > 0 {
+        state.metrics.jobs_processing.add(claimed_count);
+        state.metrics.jobs_pending.sub(claimed_count);
     }
+
+    let jobs: Vec<ClaimedJob> = claimed_jobs.into_iter().map(Into::into).collect();
 
     Ok(Json(ClaimJobsResponse { jobs }))
 }
@@ -570,7 +569,7 @@ pub async fn stats(
 
 /// Bulk enqueue multiple jobs
 ///
-/// Now requires authenticated context - previously fell back to "default-org"
+/// Uses batch INSERT with UNNEST for better performance (single round-trip).
 /// SECURITY: Enforces plan limits before creating jobs
 pub async fn bulk_enqueue(
     State(state): State<AppState>,
@@ -594,16 +593,19 @@ pub async fn bulk_enqueue(
         .default_timeout_seconds
         .unwrap_or(state.settings.queue.default_timeout_secs);
 
-    let mut succeeded = Vec::new();
-    let mut failed = Vec::new();
+    // Prepare arrays for batch INSERT using UNNEST
+    let mut job_ids: Vec<String> = Vec::with_capacity(request.jobs.len());
+    let mut statuses: Vec<String> = Vec::with_capacity(request.jobs.len());
+    let mut payloads: Vec<String> = Vec::with_capacity(request.jobs.len());
+    let mut priorities: Vec<i32> = Vec::with_capacity(request.jobs.len());
+    let mut scheduled_ats: Vec<Option<chrono::DateTime<Utc>>> =
+        Vec::with_capacity(request.jobs.len());
+    let mut idempotency_keys: Vec<Option<String>> = Vec::with_capacity(request.jobs.len());
+    let mut indexes: Vec<i32> = Vec::with_capacity(request.jobs.len());
 
-    // Track successful enqueues to correctly update metrics on partial failure
-    let mut successful_count: u64 = 0;
-
-    for (index, job_item) in request.jobs.into_iter().enumerate() {
+    for (index, job_item) in request.jobs.iter().enumerate() {
         let job_id = Uuid::new_v4().to_string();
         let priority = job_item.priority.unwrap_or(default_priority);
-
         let initial_status = if job_item.scheduled_at.is_some() && job_item.scheduled_at > Some(now)
         {
             "scheduled"
@@ -611,53 +613,117 @@ pub async fn bulk_enqueue(
             "pending"
         };
 
-        let result = sqlx::query_as::<_, (String,)>(
-            r#"
+        job_ids.push(job_id);
+        statuses.push(initial_status.to_string());
+        payloads.push(serde_json::to_string(&job_item.payload).unwrap_or_default());
+        priorities.push(priority);
+        scheduled_ats.push(job_item.scheduled_at);
+        idempotency_keys.push(job_item.idempotency_key.clone());
+        indexes.push(index as i32);
+    }
+
+    // Batch INSERT using UNNEST - single database round-trip
+    // Returns: (index, returned_job_id, input_job_id) to determine which were created vs deduplicated
+    let results: Result<Vec<(i32, String, String)>, sqlx::Error> = sqlx::query_as(
+        r#"
+        WITH input_jobs AS (
+            SELECT 
+                idx,
+                jid,
+                stat,
+                pay,
+                pri,
+                sch,
+                idem
+            FROM UNNEST(
+                $1::INT[],
+                $2::TEXT[],
+                $3::TEXT[],
+                $4::TEXT[],
+                $5::INT[],
+                $6::TIMESTAMPTZ[],
+                $7::TEXT[]
+            ) AS t(idx, jid, stat, pay, pri, sch, idem)
+        ),
+        inserted AS (
             INSERT INTO jobs (
                 id, organization_id, queue_name, status, payload, priority,
                 max_retries, timeout_seconds, created_at, scheduled_at,
                 idempotency_key, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5::JSONB, $6, $7, $8, $9, $10, $11, $9)
+            SELECT 
+                ij.jid,
+                $8,
+                $9,
+                ij.stat,
+                ij.pay::JSONB,
+                ij.pri,
+                $10,
+                $11,
+                $12,
+                ij.sch,
+                ij.idem,
+                $12
+            FROM input_jobs ij
             ON CONFLICT (organization_id, idempotency_key) 
             WHERE idempotency_key IS NOT NULL
-            DO UPDATE SET updated_at = NOW() 
-            RETURNING id
-            "#,
+            DO UPDATE SET updated_at = NOW()
+            RETURNING id, idempotency_key
         )
-        .bind(&job_id)
-        .bind(&org_id)
-        .bind(&request.queue_name)
-        .bind(initial_status)
-        .bind(serde_json::to_string(&job_item.payload).unwrap_or_default())
-        .bind(priority)
-        .bind(default_max_retries)
-        .bind(default_timeout)
-        .bind(now)
-        .bind(job_item.scheduled_at)
-        .bind(&job_item.idempotency_key)
-        .fetch_one(state.db.pool())
-        .await;
+        SELECT 
+            ij.idx,
+            COALESCE(ins.id, ij.jid) as returned_id,
+            ij.jid as input_id
+        FROM input_jobs ij
+        LEFT JOIN inserted ins ON (
+            ins.idempotency_key IS NOT NULL AND ins.idempotency_key = ij.idem
+        ) OR (
+            ij.idem IS NULL AND ins.id = ij.jid
+        )
+        ORDER BY ij.idx
+        "#,
+    )
+    .bind(&indexes)
+    .bind(&job_ids)
+    .bind(&statuses)
+    .bind(&payloads)
+    .bind(&priorities)
+    .bind(&scheduled_ats)
+    .bind(&idempotency_keys)
+    .bind(&org_id)
+    .bind(&request.queue_name)
+    .bind(default_max_retries)
+    .bind(default_timeout)
+    .bind(now)
+    .fetch_all(state.db.pool())
+    .await;
 
-        match result {
-            Ok((returned_id,)) => {
-                let created = returned_id == job_id;
+    let mut succeeded = Vec::new();
+    let mut failed = Vec::new();
+    let mut successful_count: u64 = 0;
+    let total_jobs = indexes.len(); // Save count before potential move
+
+    match results {
+        Ok(rows) => {
+            for (index, returned_id, input_id) in rows {
+                let created = returned_id == input_id;
                 if created {
-                    // Track count locally, update metrics at end
                     successful_count += 1;
                 }
                 succeeded.push(crate::models::BulkJobResult {
-                    index,
+                    index: index as usize,
                     job_id: returned_id,
                     created,
                 });
             }
-            Err(e) => {
-                // Sanitize error message to prevent SQL injection details leaking
-                tracing::debug!(error = %e, index = index, "Bulk enqueue job failed");
+        }
+        Err(e) => {
+            // If batch insert fails entirely, report all as failed
+            tracing::error!(error = %e, "Bulk enqueue batch insert failed");
+            for index in 0..total_jobs {
                 failed.push(crate::models::BulkJobError {
                     index,
-                    error: "Failed to create job".to_string(), // Generic error
+                    error: "Failed to create job".to_string(),
                 });
             }
         }
@@ -667,12 +733,10 @@ pub async fn bulk_enqueue(
     let failure_count = failed.len();
     let total = success_count + failure_count;
 
-    // Update metrics and usage counters only after all jobs processed
-    // Previously metrics were updated per-job, which could leave inconsistent state on partial failure
+    // Update metrics and usage counters
     if successful_count > 0 {
         state.metrics.jobs_enqueued.inc_by(successful_count);
 
-        // Increment daily job counter for plan limit tracking
         if let Err(e) =
             increment_daily_jobs(state.db.pool(), &org_id, successful_count as i32).await
         {
@@ -777,7 +841,17 @@ pub async fn list_dlq(
     let limit = query.limit.unwrap_or(50).clamp(1, MAX_JOBS_PER_PAGE);
     let offset = query.offset.unwrap_or(0).max(0);
 
-    let jobs = match &query.queue_name {
+    // Validate queue_name to prevent injection (same as list())
+    let validated_queue = query.queue_name.as_ref().and_then(|q| {
+        if validate_queue_name_filter(q) {
+            Some(q.clone())
+        } else {
+            tracing::warn!(queue_name = %q, "Invalid queue_name filter ignored in list_dlq");
+            None
+        }
+    });
+
+    let jobs = match &validated_queue {
         Some(queue) => {
             sqlx::query_as::<_, Job>(
                 "SELECT * FROM jobs WHERE status = 'deadletter' AND organization_id = $1 AND queue_name = $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4",
@@ -818,6 +892,7 @@ pub async fn retry_dlq(
     let limit = request.safe_limit();
 
     // First, count how many jobs would be retried (to check limits)
+    // Note: Using subquery with LIMIT since COUNT(*) ignores LIMIT clause
     let job_count: i64 = if let Some(ref job_ids) = request.job_ids {
         sqlx::query_scalar(
             "SELECT COUNT(*) FROM jobs WHERE id = ANY($1) AND organization_id = $2 AND status = 'deadletter'"
@@ -828,7 +903,7 @@ pub async fn retry_dlq(
         .await?
     } else if let Some(ref queue_name) = request.queue_name {
         sqlx::query_scalar(
-            "SELECT COUNT(*) FROM jobs WHERE organization_id = $1 AND queue_name = $2 AND status = 'deadletter' LIMIT $3"
+            "SELECT COUNT(*) FROM (SELECT 1 FROM jobs WHERE organization_id = $1 AND queue_name = $2 AND status = 'deadletter' LIMIT $3) sub"
         )
         .bind(&ctx.organization_id)
         .bind(queue_name)
@@ -837,7 +912,7 @@ pub async fn retry_dlq(
         .await?
     } else {
         sqlx::query_scalar(
-            "SELECT COUNT(*) FROM jobs WHERE organization_id = $1 AND status = 'deadletter' LIMIT $2"
+            "SELECT COUNT(*) FROM (SELECT 1 FROM jobs WHERE organization_id = $1 AND status = 'deadletter' LIMIT $2) sub"
         )
         .bind(&ctx.organization_id)
         .bind(limit)
@@ -847,7 +922,9 @@ pub async fn retry_dlq(
 
     // Check job limits before retrying (DLQ retry adds to active jobs count)
     if job_count > 0 {
-        if let Err(response) = check_job_limits(state.db.pool(), &ctx.organization_id, job_count as u64).await {
+        if let Err(response) =
+            check_job_limits(state.db.pool(), &ctx.organization_id, job_count as u64).await
+        {
             return Err(AppError::LimitExceeded(Box::new(response)));
         }
     }
