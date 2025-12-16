@@ -245,6 +245,9 @@ service WorkerService {
 
 ### gRPC Quick Start
 
+> **Note**: The default gRPC port is `50051`. If this port is in use (e.g., by Multipass on macOS), 
+> set `GRPC_PORT=50052` or another available port. See [gRPC Server Guide](docs/guides/grpc-server.md) for details.
+
 ```bash
 # Test with grpcurl (install: brew install grpcurl)
 # List services (reflection enabled)
@@ -388,6 +391,7 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317 ./target/release/spooled-backend
 
 - [Quick Start Guide](docs/guides/quickstart.md)
 - [API Usage Guide](docs/guides/api-usage.md)
+- [gRPC Server Guide](docs/guides/grpc-server.md) - Configuration, testing, and troubleshooting
 - [Architecture](docs/guides/architecture.md)
 - [Deployment Guide](docs/guides/deployment.md)
 - [Operations Guide](docs/guides/operations.md)

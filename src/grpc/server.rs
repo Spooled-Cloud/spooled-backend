@@ -98,9 +98,10 @@ pub async fn start_grpc_server(
         .set_serving::<WorkerServiceServer<WorkerServiceImpl>>()
         .await;
 
-    // Setup reflection service
+    // Setup reflection service with health service descriptor
     let reflection_service = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(FILE_DESCRIPTOR_SET)
+        .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
         .build_v1()?;
 
     // Build server with optional TLS
@@ -135,8 +136,9 @@ pub async fn start_grpc_server(
     }
 
     // Configure and run server
-    server
-        .max_frame_size(MAX_MESSAGE_SIZE as u32)
+    info!(%addr, "Binding gRPC server to address");
+
+    match server
         .accept_http1(false)
         .add_service(health_service)
         .add_service(reflection_service)
@@ -151,9 +153,17 @@ pub async fn start_grpc_server(
                 .max_encoding_message_size(MAX_MESSAGE_SIZE),
         )
         .serve(addr)
-        .await?;
-
-    Ok(())
+        .await
+    {
+        Ok(_) => {
+            info!("gRPC server stopped normally");
+            Ok(())
+        }
+        Err(e) => {
+            warn!(error = ?e, error_str = %e, "gRPC server error");
+            Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        }
+    }
 }
 
 #[cfg(test)]

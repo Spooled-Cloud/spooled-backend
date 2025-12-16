@@ -2,3 +2,5 @@
 ALTER TABLE email_login_codes ALTER COLUMN code TYPE VARCHAR(255);
 
 
+
+

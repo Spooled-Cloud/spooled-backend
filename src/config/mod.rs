@@ -72,6 +72,8 @@ pub struct ServerSettings {
     pub port: u16,
     /// Metrics port for Prometheus scraping
     pub metrics_port: u16,
+    /// gRPC port for gRPC server
+    pub grpc_port: u16,
     /// Environment (development, staging, production)
     pub environment: Environment,
     /// External URL for this server (used in webhook URLs, etc.)
@@ -249,6 +251,10 @@ impl Settings {
                     .unwrap_or_else(|_| "9090".to_string())
                     .parse()
                     .context("Invalid METRICS_PORT")?,
+                grpc_port: env::var("GRPC_PORT")
+                    .unwrap_or_else(|_| "50051".to_string())
+                    .parse()
+                    .context("Invalid GRPC_PORT")?,
                 external_url: env::var("EXTERNAL_URL").ok(),
                 environment: match env::var("RUST_ENV")
                     .unwrap_or_else(|_| "development".to_string())
@@ -522,6 +528,7 @@ impl Settings {
                 host: "127.0.0.1".to_string(),
                 port: 8080,
                 metrics_port: 9090,
+                grpc_port: 50051,
                 environment: Environment::Development,
                 external_url: None,
             },

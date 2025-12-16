@@ -18,6 +18,7 @@ use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
 use crate::cache::RedisCache;
+use crate::config::PlanLimits;
 use crate::models::CronSchedule;
 use crate::observability::Metrics;
 
@@ -611,63 +612,124 @@ impl Scheduler {
             self.metrics.jobs_deadlettered.inc_by(deadlettered);
         }
 
-        // Cleanup old completed/cancelled jobs (retention: 30 days)
-        let result = sqlx::query(
-            r#"
-            DELETE FROM jobs
-            WHERE 
-                status IN ('completed', 'cancelled')
-                AND completed_at < NOW() - INTERVAL '30 days'
-            "#,
-        )
-        .execute(&*self.db)
-        .await?;
-
-        let cleaned = result.rows_affected();
-        if cleaned > 0 {
+        // Cleanup old data based on each organization's plan tier + custom overrides
+        // This respects per-org custom_limits overrides for job_retention_days and history_retention_days
+        let total_cleaned = self.cleanup_old_data_by_org().await?;
+        if total_cleaned > 0 {
             info!(
-                count = cleaned,
-                "Cleaned up old completed jobs (30 day retention)"
-            );
-        }
-
-        // Cleanup old job history (retention: 7 days)
-        let result = sqlx::query(
-            r#"
-            DELETE FROM job_history
-            WHERE created_at < NOW() - INTERVAL '7 days'
-            "#,
-        )
-        .execute(&*self.db)
-        .await?;
-
-        let history_cleaned = result.rows_affected();
-        if history_cleaned > 0 {
-            info!(
-                count = history_cleaned,
-                "Cleaned up old job history (7 day retention)"
-            );
-        }
-
-        // Cleanup old webhook deliveries (retention: 14 days)
-        let result = sqlx::query(
-            r#"
-            DELETE FROM webhook_deliveries
-            WHERE created_at < NOW() - INTERVAL '14 days'
-            "#,
-        )
-        .execute(&*self.db)
-        .await?;
-
-        let webhooks_cleaned = result.rows_affected();
-        if webhooks_cleaned > 0 {
-            info!(
-                count = webhooks_cleaned,
-                "Cleaned up old webhook deliveries (14 day retention)"
+                count = total_cleaned,
+                "Cleaned up old data (tier-based retention with custom overrides)"
             );
         }
 
         Ok(())
+    }
+
+    /// Cleanup old data respecting per-organization retention limits
+    ///
+    /// Queries all organizations and applies cleanup based on their plan tier
+    /// plus any custom_limits overrides for job_retention_days and history_retention_days
+    async fn cleanup_old_data_by_org(&self) -> Result<u64> {
+        #[derive(sqlx::FromRow)]
+        struct OrgRetention {
+            id: String,
+            plan_tier: String,
+            custom_limits: Option<serde_json::Value>,
+        }
+
+        // Get all organizations with their plan and custom limits
+        let orgs: Vec<OrgRetention> =
+            sqlx::query_as("SELECT id, plan_tier, custom_limits FROM organizations")
+                .fetch_all(&*self.db)
+                .await?;
+
+        let mut total_cleaned: u64 = 0;
+
+        for org in orgs {
+            // Get effective limits (plan defaults + custom overrides)
+            let limits =
+                PlanLimits::for_tier_with_overrides(&org.plan_tier, org.custom_limits.as_ref());
+
+            let job_retention_days = limits.job_retention_days as i32;
+            let history_retention_days = limits.history_retention_days as i32;
+
+            // Cleanup old completed/cancelled jobs for this org
+            let result = sqlx::query(
+                r#"
+                DELETE FROM jobs
+                WHERE organization_id = $1
+                  AND status IN ('completed', 'cancelled')
+                  AND completed_at < NOW() - ($2 || ' days')::INTERVAL
+                "#,
+            )
+            .bind(&org.id)
+            .bind(job_retention_days)
+            .execute(&*self.db)
+            .await?;
+
+            let jobs_cleaned = result.rows_affected();
+            if jobs_cleaned > 0 {
+                debug!(
+                    org_id = %org.id,
+                    count = jobs_cleaned,
+                    retention_days = job_retention_days,
+                    "Cleaned up old jobs"
+                );
+                total_cleaned += jobs_cleaned;
+            }
+
+            // Cleanup old job history for this org (via jobs table)
+            let result = sqlx::query(
+                r#"
+                DELETE FROM job_history jh
+                USING jobs j
+                WHERE jh.job_id = j.id
+                  AND j.organization_id = $1
+                  AND jh.created_at < NOW() - ($2 || ' days')::INTERVAL
+                "#,
+            )
+            .bind(&org.id)
+            .bind(history_retention_days)
+            .execute(&*self.db)
+            .await?;
+
+            let history_cleaned = result.rows_affected();
+            if history_cleaned > 0 {
+                debug!(
+                    org_id = %org.id,
+                    count = history_cleaned,
+                    retention_days = history_retention_days,
+                    "Cleaned up old job history"
+                );
+                total_cleaned += history_cleaned;
+            }
+
+            // Cleanup old webhook deliveries for this org
+            let result = sqlx::query(
+                r#"
+                DELETE FROM webhook_deliveries
+                WHERE organization_id = $1
+                  AND created_at < NOW() - ($2 || ' days')::INTERVAL
+                "#,
+            )
+            .bind(&org.id)
+            .bind(history_retention_days)
+            .execute(&*self.db)
+            .await?;
+
+            let webhooks_cleaned = result.rows_affected();
+            if webhooks_cleaned > 0 {
+                debug!(
+                    org_id = %org.id,
+                    count = webhooks_cleaned,
+                    retention_days = history_retention_days,
+                    "Cleaned up old webhook deliveries"
+                );
+                total_cleaned += webhooks_cleaned;
+            }
+        }
+
+        Ok(total_cleaned)
     }
 }
 

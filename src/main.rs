@@ -108,8 +108,9 @@ async fn main() -> Result<()> {
     // Create shutdown channel for all components
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    // Start gRPC server (optional, on port 50051)
-    let grpc_addr: SocketAddr = format!("{}:50051", settings.server.host).parse()?;
+    // Start gRPC server (optional, configured via GRPC_PORT env var)
+    let grpc_addr: SocketAddr =
+        format!("{}:{}", settings.server.host, settings.server.grpc_port).parse()?;
     let grpc_db = Arc::new(db.clone());
     let grpc_metrics = state.metrics.clone();
     let grpc_shutdown_rx = shutdown_rx.clone();
@@ -120,7 +121,12 @@ async fn main() -> Result<()> {
         // Run until shutdown
         let mut rx = grpc_shutdown_rx;
         tokio::select! {
-            _ = grpc::start_grpc_server(grpc_addr, grpc_db, grpc_metrics) => {}
+            result = grpc::start_grpc_server(grpc_addr, grpc_db, grpc_metrics) => {
+                match result {
+                    Ok(_) => info!("gRPC server stopped"),
+                    Err(e) => error!(error = %e, "gRPC server failed to start"),
+                }
+            }
             _ = rx.changed() => {
                 if *rx.borrow() {
                     info!("gRPC server shutdown signal received");
@@ -128,7 +134,7 @@ async fn main() -> Result<()> {
             }
         }
     });
-    info!(%grpc_addr, "gRPC server listening");
+    info!(%grpc_addr, "gRPC server starting");
 
     // Start background scheduler
     let scheduler = Scheduler::new(

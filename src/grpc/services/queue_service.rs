@@ -203,7 +203,7 @@ impl QueueService for QueueServiceImpl {
                 tags, created_at, updated_at
             )
             VALUES ($1, $2, $3, $4, $5::JSONB, $6, $7, $8, $9, $10, $11::JSONB, $12, $12)
-            ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL
+            ON CONFLICT (organization_id, idempotency_key) WHERE idempotency_key IS NOT NULL
             DO UPDATE SET updated_at = EXCLUDED.updated_at
             RETURNING id, (xmax = 0) as created
             "#,
@@ -567,8 +567,7 @@ impl QueueService for QueueServiceImpl {
                 COUNT(*) FILTER (WHERE status = 'failed') as failed,
                 COUNT(*) FILTER (WHERE status = 'deadletter') as deadletter,
                 COUNT(*) as total,
-                EXTRACT(EPOCH FROM (NOW() - MIN(created_at)))::BIGINT * 1000 
-                    FILTER (WHERE status = 'pending') as max_age_ms
+                EXTRACT(EPOCH FROM (NOW() - MIN(created_at) FILTER (WHERE status = 'pending')))::BIGINT * 1000 as max_age_ms
             FROM jobs
             WHERE queue_name = $1 AND organization_id = $2
             "#,
