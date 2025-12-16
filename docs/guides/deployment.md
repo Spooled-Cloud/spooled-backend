@@ -310,10 +310,26 @@ helm install redis bitnami/redis \
 - [ ] Change `JWT_SECRET` from default
 - [ ] Use strong database passwords
 - [ ] Enable TLS/HTTPS (via ingress or load balancer)
+- [ ] Enable gRPC TLS (required for Cloudflare Tunnel HTTPS origin)
 - [ ] Configure network policies
 - [ ] Set up proper RBAC
 - [ ] Enable audit logging
 - [ ] Review and restrict CORS settings
+
+### gRPC TLS (Cloudflare Tunnel)
+
+If using Cloudflare Tunnel with HTTPS origin for gRPC:
+
+- [ ] `GRPC_TLS_ENABLED=true` (enabled by default in docker-compose.prod.yml)
+- [ ] Certificate files in `./certs/` directory (included in repo)
+- [ ] Cloudflare Tunnel: Service Type = HTTPS, No TLS Verify = ON, HTTP2 = ON
+
+To disable gRPC TLS (for local dev or when TLS terminates at load balancer):
+
+```yaml
+environment:
+  GRPC_TLS_ENABLED: "false"
+```
 
 ### Database
 

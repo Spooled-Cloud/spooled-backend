@@ -63,6 +63,9 @@ curl http://localhost:8080/health
 | `REGISTRATION_MODE` | ❌ | `open` | `open`/`closed` - controls public registration |
 | `PORT` | ❌ | `8080` | REST API server port |
 | `GRPC_PORT` | ❌ | `50051` | gRPC API server port |
+| `GRPC_TLS_ENABLED` | ❌ | `true` (prod) | Enable TLS for gRPC (required for Cloudflare Tunnel) |
+| `GRPC_TLS_CERT_PATH` | ❌ | `/certs/grpc-cert.pem` | Path to TLS certificate (PEM) |
+| `GRPC_TLS_KEY_PATH` | ❌ | `/certs/grpc-key.pem` | Path to TLS private key (PEM) |
 | `METRICS_PORT` | ❌ | `9090` | Prometheus metrics port |
 | `METRICS_TOKEN` | ❌ | - | If set, requires `Authorization: Bearer <token>` for `/metrics` |
 
@@ -276,6 +279,20 @@ Spooled provides a **real gRPC API** using HTTP/2 + Protobuf for high-performanc
 
 - **Spooled Cloud (TLS)**: `grpc.spooled.cloud:443`
 - **Self-hosted / local**: `localhost:50051` (or whatever `GRPC_PORT` is set to)
+
+### gRPC TLS (Cloudflare Tunnel)
+
+When using Cloudflare Tunnel with HTTPS origin, gRPC TLS is **required** because HTTP/2 needs TLS at the origin.
+
+The production docker-compose includes:
+- **TLS enabled by default** (`GRPC_TLS_ENABLED=true`)
+- **Self-signed certificates** in `./certs/` (10-year validity)
+- Works with Cloudflare Tunnel when "No TLS Verify" is enabled
+
+To disable TLS for local development:
+```bash
+GRPC_TLS_ENABLED=false cargo run
+```
 
 ### Proto Definition
 

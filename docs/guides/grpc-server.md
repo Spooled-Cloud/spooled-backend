@@ -51,6 +51,55 @@ GRPC_TLS_KEY_PATH=/etc/ssl/private/grpc.key \
 cargo run --release --bin spooled-backend
 ```
 
+### TLS Configuration
+
+gRPC TLS is **required** when using Cloudflare Tunnel (or similar proxies) with HTTPS origin, because HTTP/2 over HTTPS requires TLS at the origin.
+
+#### Using Self-Signed Certificates (Recommended for Cloudflare Tunnel)
+
+The production docker-compose includes pre-generated self-signed certificates in the `certs/` directory. These work with Cloudflare Tunnel when "No TLS Verify" is enabled.
+
+**Default setup (docker-compose.prod.yml):**
+- TLS is enabled by default
+- Certificates are mounted from `./certs/grpc-cert.pem` and `./certs/grpc-key.pem`
+- Valid for 10 years
+
+**Cloudflare Tunnel configuration:**
+- Service Type: `HTTPS`
+- URL: `backend:50051`
+- HTTP2 connection: `ON`
+- No TLS Verify: `ON` (required for self-signed certs)
+
+#### Generating New Certificates
+
+To generate fresh self-signed certificates:
+
+```bash
+# Generate 10-year self-signed certificate
+openssl req -x509 -newkey rsa:2048 \
+  -keyout certs/grpc-key.pem \
+  -out certs/grpc-cert.pem \
+  -days 3650 -nodes \
+  -subj "/CN=backend"
+```
+
+#### Disabling TLS
+
+For local development or when TLS is terminated at a load balancer:
+
+```bash
+# Via environment variable
+GRPC_TLS_ENABLED=false cargo run
+
+# In docker-compose, override the environment:
+services:
+  backend:
+    environment:
+      GRPC_TLS_ENABLED: "false"
+```
+
+**Warning:** Without TLS, gRPC cannot be used through Cloudflare Tunnel with HTTPS origin type. Use HTTP origin type instead (which may not support HTTP/2 properly).
+
 ## Available Services
 
 ### 1. QueueService (`spooled.v1.QueueService`)
