@@ -134,6 +134,126 @@ impl QueueManager {
     /// Maximum lease duration (1 hour)
     const MAX_LEASE_DURATION_SECS: i64 = 3600;
 
+    /// Maximum batch size for dequeue
+    const MAX_BATCH_SIZE: i32 = 100;
+
+    /// Dequeue multiple jobs in a single query using FOR UPDATE SKIP LOCKED
+    ///
+    /// This is more efficient than calling dequeue() in a loop as it uses
+    /// a single database round-trip to claim multiple jobs.
+    #[instrument(
+        name = "queue.dequeue_batch",
+        skip(self),
+        fields(
+            org_id = %org_id,
+            queue_name = %queue_name,
+            worker_id = %worker_id,
+            batch_size = %batch_size
+        )
+    )]
+    pub async fn dequeue_batch(
+        &self,
+        org_id: &str,
+        queue_name: &str,
+        worker_id: &str,
+        lease_duration_secs: i64,
+        batch_size: i32,
+    ) -> Result<Vec<Job>> {
+        // Bound lease duration and batch size
+        let safe_lease_duration =
+            lease_duration_secs.clamp(Self::MIN_LEASE_DURATION_SECS, Self::MAX_LEASE_DURATION_SECS);
+        let safe_batch_size = batch_size.clamp(1, Self::MAX_BATCH_SIZE);
+
+        // Check if queue is paused before dequeuing
+        let queue_enabled: Option<(bool,)> = sqlx::query_as(
+            "SELECT enabled FROM queue_config WHERE organization_id = $1 AND queue_name = $2",
+        )
+        .bind(org_id)
+        .bind(queue_name)
+        .fetch_optional(&*self.db)
+        .await?;
+
+        if let Some((enabled,)) = queue_enabled {
+            if !enabled {
+                debug!(queue = %queue_name, "Queue is paused, skipping dequeue");
+                return Ok(Vec::new());
+            }
+        }
+
+        let now = Utc::now();
+        let lease_expires = now + Duration::seconds(safe_lease_duration);
+
+        // Use CTE to select and update multiple jobs atomically
+        // Each job gets the same lease_id prefix with a unique suffix
+        let lease_id_prefix = Uuid::new_v4().to_string();
+
+        let jobs: Vec<Job> = sqlx::query_as(
+            r#"
+            WITH eligible_jobs AS (
+                SELECT id
+                FROM jobs
+                WHERE 
+                    organization_id = $5 
+                    AND queue_name = $6
+                    AND status IN ('pending', 'scheduled')
+                    AND (scheduled_at IS NULL OR scheduled_at <= $4)
+                    AND (expires_at IS NULL OR expires_at > $4)
+                    AND (dependencies_met IS NULL OR dependencies_met = TRUE)
+                ORDER BY priority DESC, created_at ASC
+                LIMIT $7
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE jobs
+            SET 
+                status = 'processing',
+                assigned_worker_id = $1,
+                lease_id = $2 || '-' || jobs.id,
+                lease_expires_at = $3,
+                started_at = $4,
+                updated_at = $4
+            FROM eligible_jobs
+            WHERE jobs.id = eligible_jobs.id
+            RETURNING jobs.*
+            "#,
+        )
+        .bind(worker_id)
+        .bind(&lease_id_prefix)
+        .bind(lease_expires)
+        .bind(now)
+        .bind(org_id)
+        .bind(queue_name)
+        .bind(safe_batch_size)
+        .fetch_all(&*self.db)
+        .await?;
+
+        // Record history for each claimed job (batch operation, don't fail on history errors)
+        for job in &jobs {
+            debug!(job_id = %job.id, worker_id = %worker_id, "Job dequeued in batch");
+            let _ = self
+                .record_history(
+                    &job.id,
+                    "processing",
+                    serde_json::json!({
+                        "worker_id": worker_id,
+                        "lease_id": format!("{}-{}", lease_id_prefix, job.id),
+                        "batch_claim": true
+                    }),
+                )
+                .await;
+        }
+
+        if !jobs.is_empty() {
+            info!(
+                count = jobs.len(),
+                queue = %queue_name,
+                worker_id = %worker_id,
+                "Batch dequeued jobs"
+            );
+        }
+
+        Ok(jobs)
+    }
+
     /// Dequeue a job using FOR UPDATE SKIP LOCKED (atomic, non-blocking)
     ///
     /// This is the critical path for job processing. Uses PostgreSQL's
@@ -262,6 +382,7 @@ impl QueueManager {
     ///
     /// This version includes organization validation to prevent
     /// workers from completing jobs belonging to different organizations.
+    /// Uses a transaction to ensure job completion and dependency updates are atomic.
     #[instrument(
         name = "queue.complete",
         skip(self, result),
@@ -274,7 +395,12 @@ impl QueueManager {
         org_id: Option<&str>,
         result: Option<serde_json::Value>,
     ) -> Result<()> {
-        let query = match (worker_id, org_id) {
+        // Use transaction to ensure atomicity of job completion and dependency updates
+        let mut tx = self.db.begin().await?;
+
+        let result_json = result.clone().and_then(|r| serde_json::to_string(&r).ok());
+
+        let query_result = match (worker_id, org_id) {
             // Verify both worker and organization ownership
             (Some(wid), Some(oid)) => {
                 sqlx::query(
@@ -291,11 +417,11 @@ impl QueueManager {
                       AND status = 'processing'
                     "#,
                 )
-                .bind(result.clone().and_then(|r| serde_json::to_string(&r).ok()))
+                .bind(&result_json)
                 .bind(job_id)
                 .bind(wid)
                 .bind(oid)
-                .execute(&*self.db)
+                .execute(&mut *tx)
                 .await?
             }
             // Worker verification only (for backward compatibility)
@@ -313,10 +439,10 @@ impl QueueManager {
                       AND status = 'processing'
                     "#,
                 )
-                .bind(result.clone().and_then(|r| serde_json::to_string(&r).ok()))
+                .bind(&result_json)
                 .bind(job_id)
                 .bind(wid)
-                .execute(&*self.db)
+                .execute(&mut *tx)
                 .await?
             }
             // No worker verification (for internal use only)
@@ -332,20 +458,22 @@ impl QueueManager {
                     WHERE id = $2
                     "#,
                 )
-                .bind(result.clone().and_then(|r| serde_json::to_string(&r).ok()))
+                .bind(&result_json)
                 .bind(job_id)
-                .execute(&*self.db)
+                .execute(&mut *tx)
                 .await?
             }
         };
 
-        if query.rows_affected() == 0 && worker_id.is_some() {
+        if query_result.rows_affected() == 0 && worker_id.is_some() {
+            tx.rollback().await?;
             warn!(job_id = %job_id, "Job completion failed - not owned by worker or not processing");
             return Err(anyhow::anyhow!("Job not found or not owned by worker"));
         }
 
         // Update dependencies_met for child jobs that depend on this job
         // A child job's dependencies are met when ALL its parent jobs are completed
+        // This runs in the same transaction to ensure atomicity
         let update_result = sqlx::query(
             r#"
             UPDATE jobs
@@ -365,8 +493,11 @@ impl QueueManager {
             "#,
         )
         .bind(job_id)
-        .execute(&*self.db)
+        .execute(&mut *tx)
         .await?;
+
+        // Commit the transaction
+        tx.commit().await?;
 
         if update_result.rows_affected() > 0 {
             info!(
