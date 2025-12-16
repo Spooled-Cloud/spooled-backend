@@ -19,7 +19,7 @@ Spooled is a high-performance, multi-tenant job queue system designed for reliab
 - 📈 **Scalable**: Stateless API nodes (Kubernetes-friendly) + DB-backed locking (`FOR UPDATE SKIP LOCKED`)
 - 🗓️ **Scheduling**: Cron-based recurring jobs with timezone support
 - 🔗 **Workflows**: Job dependencies with DAG execution
-- 🔌 **Dual Protocol**: REST API (`:8080`) + real gRPC (`:50052`) with streaming support
+- 🔌 **Dual Protocol**: REST API (`:8080`) + real gRPC (`GRPC_PORT`, default `:50051`) with streaming support
 - 💎 **Tier-Based Limits**: Automatic enforcement across all endpoints (HTTP, gRPC, workflows, schedules)
 - 💀 **Dead Letter Queue**: Automatic retry and purge operations for failed jobs
 - 🔔 **Webhooks**: Outgoing webhook delivery with automatic retries and status tracking
@@ -140,8 +140,7 @@ cargo test
 | `POST` | `/api/v1/outgoing-webhooks` | Configure outgoing notifications |
 | `GET` | `/api/v1/outgoing-webhooks/{id}/deliveries` | Get delivery history |
 | `POST` | `/api/v1/outgoing-webhooks/{id}/retry/{delivery_id}` | Retry failed delivery |
-| `POST` | `/api/v1/webhooks/{org}/github` | GitHub webhook (ingestion) |
-| `POST` | `/api/v1/webhooks/{org}/stripe` | Stripe webhook (ingestion) |
+| `POST` | `/api/v1/webhooks/{org_id}/custom` | Incoming webhook (ingestion → creates jobs) |
 
 #### Real-Time
 
@@ -271,7 +270,12 @@ curl -X POST http://localhost:8080/api/v1/outgoing-webhooks \
 
 ## 🔌 gRPC API
 
-Spooled provides a **real gRPC API** on port `:50051` using HTTP/2 + Protobuf for high-performance worker communication.
+Spooled provides a **real gRPC API** using HTTP/2 + Protobuf for high-performance worker communication.
+
+### Endpoints
+
+- **Spooled Cloud (TLS)**: `grpc.spooled.cloud:443`
+- **Self-hosted / local**: `localhost:50051` (or whatever `GRPC_PORT` is set to)
 
 ### Proto Definition
 

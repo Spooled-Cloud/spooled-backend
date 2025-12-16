@@ -1149,16 +1149,16 @@ data: {"queue_name":"emails","pending":150,"processing":25}
 
 ## gRPC API
 
-Spooled provides a **real gRPC API** on port `:50051` for high-performance worker communication. The gRPC API uses HTTP/2 + Protobuf and supports streaming.
+Spooled provides a **real gRPC API** for high-performance worker communication. The gRPC API uses HTTP/2 + Protobuf and supports streaming.
 
 ### Connection
 
 ```bash
-# Default endpoint
+# Local / self-hosted (default)
 localhost:50051
 
-# With TLS (production)
-api.spooled.cloud:50051
+# Spooled Cloud (TLS over 443)
+grpc.spooled.cloud:443
 ```
 
 ### Authentication

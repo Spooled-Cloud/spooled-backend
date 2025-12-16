@@ -452,7 +452,11 @@ import grpc
 from spooled_pb2 import StreamJobsRequest
 from spooled_pb2_grpc import QueueServiceStub
 
-channel = grpc.secure_channel('api.spooled.cloud:50051', grpc.ssl_channel_credentials())
+# Spooled Cloud (TLS over 443)
+channel = grpc.secure_channel('grpc.spooled.cloud:443', grpc.ssl_channel_credentials())
+
+# Self-hosted / local dev (no TLS by default)
+# channel = grpc.insecure_channel('localhost:50051')
 stub = QueueServiceStub(channel)
 
 request = StreamJobsRequest(

@@ -129,7 +129,9 @@ const worker = new SpooledWorker({
   apiKey: process.env.SPOOLED_API_KEY!,
   queue: 'emails',
   transport: 'grpc',  // Use gRPC streaming
-  grpcHost: 'api.spooled.cloud:50051'
+  // Spooled Cloud (TLS)
+  grpcHost: 'grpc.spooled.cloud:443'
+  // For self-hosted local dev (no TLS): grpcHost: 'localhost:50051'
 });
 ```
 

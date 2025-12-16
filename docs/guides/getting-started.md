@@ -25,7 +25,7 @@ Spooled offers two API protocols:
 | Protocol | Port | Best For |
 |----------|------|----------|
 | **REST** | 8080 | Web apps, simple integrations, admin dashboards |
-| **gRPC** | 50051 | High-throughput workers, streaming, type-safe SDKs |
+| **gRPC** | 50051 (self-hosted) / 443 (Spooled Cloud via `grpc.spooled.cloud`) | High-throughput workers, streaming, type-safe SDKs |
 
 This guide uses REST examples. See [API Usage](./api-usage.md#grpc-api) for gRPC documentation.
 

@@ -106,6 +106,21 @@ grpcurl -plaintext \
   localhost:50052 spooled.v1.QueueService/GetQueueStats
 ```
 
+### Spooled Cloud Endpoint
+
+For Spooled Cloud, gRPC is exposed as **TLS on 443**:
+
+- `grpc.spooled.cloud:443` (TLS)
+
+Example:
+
+```bash
+grpcurl \
+  -H "x-api-key: sk_live_xxxx" \
+  -d '{"queue_name":"my-queue"}' \
+  grpc.spooled.cloud:443 spooled.v1.QueueService/GetQueueStats
+```
+
 ## Testing with grpcurl
 
 [grpcurl](https://github.com/fullstorydev/grpcurl) is a command-line tool for interacting with gRPC servers.
@@ -178,7 +193,7 @@ The proto file is compiled during the build process via `build.rs` using `tonic-
 │                    Spooled Backend                          │
 ├─────────────────────────────────────────────────────────────┤
 │  HTTP API (axum)          │  gRPC API (tonic)               │
-│  Port: 8080               │  Port: 50051/50052              │
+│  Port: 8080               │  Port: GRPC_PORT (default 50051)│
 ├───────────────────────────┼─────────────────────────────────┤
 │  REST endpoints           │  QueueService                   │
 │  WebSocket                │  WorkerService                  │
