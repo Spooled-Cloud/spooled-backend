@@ -132,8 +132,11 @@ INFO spooled_backend: Metrics server listening on 0.0.0.0:9090
 
 **Ports:**
 - `:8080` - REST API (HTTP/1.1)
-- `:50051` - gRPC API (HTTP/2 + Protobuf)
+- `:50051` - gRPC API (HTTP/2 + Protobuf) (self-hosted)
 - `:9090` - Prometheus metrics
+
+**Spooled Cloud gRPC endpoint:**
+- `grpc.spooled.cloud:443` (TLS)
 
 ### Step 4: Verify Installation
 

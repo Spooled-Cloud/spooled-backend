@@ -229,7 +229,10 @@ load_test:
 
 ## gRPC Load Testing
 
-For testing the gRPC API (port 50051), use [ghz](https://ghz.sh/):
+For testing the gRPC API, use [ghz](https://ghz.sh/).
+
+- Self-hosted/local: `localhost:50051` (or your `GRPC_PORT`)
+- Spooled Cloud (TLS): `grpc.spooled.cloud:443`
 
 ### Installation
 
