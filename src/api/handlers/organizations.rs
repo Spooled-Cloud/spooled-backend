@@ -234,13 +234,7 @@ pub async fn generate_slug(
     let base_slug: String = name
         .to_lowercase()
         .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c
-            } else {
-                '-'
-            }
-        })
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
 
     // Clean up consecutive hyphens and trim
@@ -251,7 +245,12 @@ pub async fn generate_slug(
         .join("-");
 
     // Ensure it doesn't start with a number
-    if base_slug.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+    if base_slug
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(false)
+    {
         base_slug = format!("org-{}", base_slug);
     }
 

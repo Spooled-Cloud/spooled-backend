@@ -102,7 +102,8 @@ pub async fn create(
 
     // Check job limits (daily + active) before creating workflow jobs
     let job_count = request.jobs.len() as u64;
-    if let Err(response) = check_job_limits(state.db.pool(), &ctx.organization_id, job_count).await {
+    if let Err(response) = check_job_limits(state.db.pool(), &ctx.organization_id, job_count).await
+    {
         return Err(AppError::LimitExceeded(Box::new(response)));
     }
 
@@ -218,8 +219,12 @@ pub async fn create(
         .inc_by(request.jobs.len() as u64);
 
     // Increment daily job counter for plan limit tracking
-    if let Err(e) =
-        crate::api::middleware::limits::increment_daily_jobs(state.db.pool(), &ctx.organization_id, job_count as i32).await
+    if let Err(e) = crate::api::middleware::limits::increment_daily_jobs(
+        state.db.pool(),
+        &ctx.organization_id,
+        job_count as i32,
+    )
+    .await
     {
         warn!(error = %e, org_id = %ctx.organization_id, "Failed to increment daily job counter");
     }

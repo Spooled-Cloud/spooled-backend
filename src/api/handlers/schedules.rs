@@ -11,7 +11,9 @@ use chrono::Utc;
 use serde::Deserialize;
 use tracing::{error, info};
 
-use crate::api::middleware::limits::{check_job_limits_generic, increment_daily_jobs, LimitCheckError};
+use crate::api::middleware::limits::{
+    check_job_limits_generic, increment_daily_jobs, LimitCheckError,
+};
 use crate::api::middleware::validation::ValidatedJson;
 use crate::api::AppState;
 use crate::models::{
@@ -396,11 +398,12 @@ pub async fn trigger(
         .map_err(|e| match e {
             LimitCheckError::Database(msg) => {
                 error!(error = %msg, "Failed to check job limits for schedule trigger");
-                (StatusCode::INTERNAL_SERVER_ERROR, "Failed to check limits".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to check limits".to_string(),
+                )
             }
-            LimitCheckError::LimitExceeded(err) => {
-                (StatusCode::FORBIDDEN, err.to_string())
-            }
+            LimitCheckError::LimitExceeded(err) => (StatusCode::FORBIDDEN, err.to_string()),
         })?;
 
     // Create job immediately

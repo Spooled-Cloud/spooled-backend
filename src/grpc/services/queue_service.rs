@@ -18,7 +18,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info};
 
-use crate::api::middleware::limits::{check_job_limits_generic, increment_daily_jobs, LimitCheckError};
+use crate::api::middleware::limits::{
+    check_job_limits_generic, increment_daily_jobs, LimitCheckError,
+};
 use crate::grpc::auth::{authenticate_from_metadata, authenticate_request};
 use crate::grpc::convert::{
     datetime_to_timestamp, job_to_proto, jobs_to_proto, struct_to_json_opt,
@@ -186,9 +188,7 @@ impl QueueService for QueueServiceImpl {
                     error!(error = %msg, "Failed to check job limits");
                     Status::internal("Failed to check job limits")
                 }
-                LimitCheckError::LimitExceeded(err) => {
-                    Status::resource_exhausted(err.to_string())
-                }
+                LimitCheckError::LimitExceeded(err) => Status::resource_exhausted(err.to_string()),
             })?;
 
         let job_id = uuid::Uuid::new_v4().to_string();

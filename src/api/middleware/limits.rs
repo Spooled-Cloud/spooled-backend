@@ -233,9 +233,7 @@ pub async fn check_job_limits(pool: &PgPool, org_id: &str, job_count: u64) -> Re
                 tracing::error!(error = %msg, "Failed during limit check");
                 (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
             }
-            LimitCheckError::LimitExceeded(err) => {
-                LimitExceededResponse::from(err).into_response()
-            }
+            LimitCheckError::LimitExceeded(err) => LimitExceededResponse::from(err).into_response(),
         })
 }
 
