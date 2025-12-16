@@ -327,12 +327,11 @@ pub async fn retry(
     .await?;
 
     // Recalculate completed/failed job counts
-    let (completed_count,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM jobs WHERE workflow_id = $1 AND status = 'completed'",
-    )
-    .bind(&workflow_id)
-    .fetch_one(state.db.pool())
-    .await?;
+    let (completed_count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM jobs WHERE workflow_id = $1 AND status = 'completed'")
+            .bind(&workflow_id)
+            .fetch_one(state.db.pool())
+            .await?;
 
     let (failed_count,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM jobs WHERE workflow_id = $1 AND status IN ('failed', 'deadletter')",
@@ -341,14 +340,12 @@ pub async fn retry(
     .fetch_one(state.db.pool())
     .await?;
 
-    sqlx::query(
-        "UPDATE workflows SET completed_jobs = $1, failed_jobs = $2 WHERE id = $3",
-    )
-    .bind(completed_count as i32)
-    .bind(failed_count as i32)
-    .bind(&workflow_id)
-    .execute(state.db.pool())
-    .await?;
+    sqlx::query("UPDATE workflows SET completed_jobs = $1, failed_jobs = $2 WHERE id = $3")
+        .bind(completed_count as i32)
+        .bind(failed_count as i32)
+        .bind(&workflow_id)
+        .execute(state.db.pool())
+        .await?;
 
     info!(
         workflow_id = %workflow_id,
