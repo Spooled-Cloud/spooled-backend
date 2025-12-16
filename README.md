@@ -10,16 +10,20 @@ Spooled is a high-performance, multi-tenant job queue system designed for reliab
 
 ## ✨ Features
 
-- 🚀 **High Performance**: Built on Rust + Tokio + PostgreSQL (throughput depends on workload and hardware)
+- 🚀 **High Performance**: Built on Rust + Tokio + PostgreSQL with Redis caching (~28x faster auth)
 - 🔒 **Multi-Tenant**: PostgreSQL Row-Level Security (RLS) for data isolation
 - 📊 **Observable**: Prometheus metrics, Grafana dashboards, optional OpenTelemetry export (`--features otel`)
 - 🔄 **Reliable**: At-least-once processing with leases + retries (use idempotency keys for exactly-once effects)
 - ⚡ **Real-Time**: WebSocket + SSE for live job/queue updates
-- 🔐 **Secure**: Bcrypt API keys, JWT auth, HMAC webhook verification
+- 🔐 **Secure**: Bcrypt API keys with Redis caching, JWT auth, HMAC webhook verification
 - 📈 **Scalable**: Stateless API nodes (Kubernetes-friendly) + DB-backed locking (`FOR UPDATE SKIP LOCKED`)
 - 🗓️ **Scheduling**: Cron-based recurring jobs with timezone support
 - 🔗 **Workflows**: Job dependencies with DAG execution
-- 🔌 **Dual Protocol**: REST API (`:8080`) + real gRPC (`:50051`) with streaming support
+- 🔌 **Dual Protocol**: REST API (`:8080`) + real gRPC (`:50052`) with streaming support
+- 💎 **Tier-Based Limits**: Automatic enforcement across all endpoints (HTTP, gRPC, workflows, schedules)
+- 💀 **Dead Letter Queue**: Automatic retry and purge operations for failed jobs
+- 🔔 **Webhooks**: Outgoing webhook delivery with automatic retries and status tracking
+- 💳 **Billing**: Stripe integration for subscriptions and usage tracking
 
 ## 🐳 Quick Start with Docker
 
@@ -90,25 +94,79 @@ cargo test
 
 ### API Endpoints
 
+#### Core Job Management
+
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/health` | Health check |
-| `POST` | `/api/v1/organizations` | Create organization (returns initial API key) |
-| `GET` | `/api/v1/organizations/usage` | Get plan usage info |
-| `POST` | `/api/v1/jobs` | Create a job |
+| `POST` | `/api/v1/jobs` | Create a job (enforces plan limits) |
 | `GET` | `/api/v1/jobs` | List jobs |
-| `POST` | `/api/v1/jobs/bulk` | Bulk enqueue jobs |
+| `POST` | `/api/v1/jobs/bulk` | Bulk enqueue jobs (enforces plan limits) |
 | `POST` | `/api/v1/jobs/claim` | Claim (lease) jobs for worker processing |
 | `POST` | `/api/v1/jobs/{id}/complete` | Mark a job completed (worker ack) |
 | `POST` | `/api/v1/jobs/{id}/fail` | Mark a job failed (worker nack) |
 | `POST` | `/api/v1/jobs/{id}/heartbeat` | Extend a job lease (long-running jobs) |
+| `GET` | `/api/v1/jobs/stats` | Get job statistics |
+
+#### Dead Letter Queue (DLQ)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/v1/jobs/dlq` | List jobs in dead letter queue |
+| `POST` | `/api/v1/jobs/dlq/retry` | Retry jobs from DLQ (enforces plan limits) |
+| `POST` | `/api/v1/jobs/dlq/purge` | Purge jobs from DLQ |
+
+#### Organizations
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/api/v1/organizations` | Create organization (returns initial API key) |
+| `GET` | `/api/v1/organizations/usage` | Get plan usage and limits |
+| `GET` | `/api/v1/organizations/check-slug` | Check if slug is available |
+| `POST` | `/api/v1/organizations/generate-slug` | Generate unique slug from name |
+
+#### Schedules & Workflows
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
 | `POST` | `/api/v1/schedules` | Create cron schedule |
-| `POST` | `/api/v1/workflows` | Create workflow (DAG) |
+| `POST` | `/api/v1/schedules/{id}/trigger` | Manually trigger schedule (enforces plan limits) |
+| `POST` | `/api/v1/workflows` | Create workflow/DAG (enforces plan limits) |
+
+#### Webhooks
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/api/v1/outgoing-webhooks` | Configure outgoing notifications |
+| `GET` | `/api/v1/outgoing-webhooks/{id}/deliveries` | Get delivery history |
+| `POST` | `/api/v1/outgoing-webhooks/{id}/retry/{delivery_id}` | Retry failed delivery |
 | `POST` | `/api/v1/webhooks/{org}/github` | GitHub webhook (ingestion) |
 | `POST` | `/api/v1/webhooks/{org}/stripe` | Stripe webhook (ingestion) |
-| `POST` | `/api/v1/outgoing-webhooks` | Configure outgoing notifications |
+
+#### Real-Time
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
 | `GET` | `/api/v1/ws` | WebSocket for real-time |
+| `GET` | `/api/v1/events` | SSE stream of all events |
 | `GET` | `/api/v1/events/queues/{name}` | SSE stream of queue updates |
+| `GET` | `/api/v1/events/jobs/{id}` | SSE stream of job updates |
+
+#### Authentication
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/api/v1/auth/login` | Exchange API key for JWT |
+| `POST` | `/api/v1/auth/refresh` | Refresh JWT token |
+| `POST` | `/api/v1/auth/email/start` | Start email-based login |
+| `POST` | `/api/v1/auth/email/verify` | Verify email login code |
+
+#### Billing
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/v1/billing/status` | Get billing status |
+| `POST` | `/api/v1/billing/portal` | Create Stripe customer portal session |
 
 #### Admin API (requires `X-Admin-Key` header)
 
@@ -243,10 +301,18 @@ service WorkerService {
 }
 ```
 
-### gRPC Quick Start
+### gRPC Features
+
+- ⚡ **~28x faster** than HTTP (with Redis cache: ~50ms vs 1400ms per operation)
+- 🛡️ **Automatic plan limit enforcement** on enqueue operations
+- 📦 **Batch operations** for higher throughput
+- 🔄 **Streaming support** for real-time job processing
+- 🔐 **Secure authentication** via API key metadata (x-api-key header)
 
 > **Note**: The default gRPC port is `50051`. If this port is in use (e.g., by Multipass on macOS), 
 > set `GRPC_PORT=50052` or another available port. See [gRPC Server Guide](docs/guides/grpc-server.md) for details.
+
+### gRPC Quick Start
 
 ```bash
 # Test with grpcurl (install: brew install grpcurl)
@@ -296,6 +362,71 @@ grpcurl -plaintext \
 | High-throughput workers | gRPC |
 | Streaming job delivery | gRPC StreamJobs |
 | Language with gRPC SDK | gRPC |
+
+## 💎 Plan Limits & Tiers
+
+Spooled enforces tier-based limits automatically across all endpoints to prevent abuse and enable fair multi-tenancy.
+
+### Available Tiers
+
+| Tier | Active Jobs | Daily Jobs | Queues | Workers | Webhooks | Schedules | Workflows |
+|------|-------------|------------|--------|---------|----------|-----------|-----------|
+| **Free** | 10 | 1,000 | 5 | 3 | 2 | 5 | 2 |
+| **Starter** | 100 | 100,000 | 25 | 25 | 10 | 25 | 10 |
+| **Enterprise** | Unlimited | Unlimited | Unlimited | Unlimited | Unlimited | Unlimited | Unlimited |
+
+### Limit Enforcement
+
+Limits are **automatically enforced** on:
+
+- ✅ **HTTP API**: `POST /jobs`, `POST /jobs/bulk`
+- ✅ **gRPC API**: `Enqueue` operation
+- ✅ **Workflows**: Counts all jobs in the workflow
+- ✅ **Schedules**: When triggered (manual or automatic)
+- ✅ **DLQ Retry**: When retrying jobs from dead letter queue
+- ✅ **Workers**: Registration and concurrent operations
+- ✅ **Queues**: Creation and configuration
+- ✅ **Webhooks**: Creation and updates
+
+### Limit Exceeded Response
+
+When a limit is exceeded, the API returns `403 Forbidden`:
+
+```json
+{
+  "error": "limit_exceeded",
+  "message": "active jobs limit reached (10/10). Upgrade to starter for higher limits.",
+  "resource": "active_jobs",
+  "current": 10,
+  "limit": 10,
+  "plan": "free",
+  "upgrade_to": "starter"
+}
+```
+
+For gRPC, the status code is `RESOURCE_EXHAUSTED` with a descriptive message.
+
+### Performance Characteristics
+
+**HTTP API** (with Redis caching enabled):
+- First request (cache miss): ~100ms (includes bcrypt)
+- Subsequent requests (cache hit): ~50ms (Redis lookup + DB operation)
+- **~28x faster** with cache compared to bcrypt-only
+
+**gRPC API**:
+- Batch operations: ~50ms per batch
+- Streaming: Real-time job delivery with minimal latency
+- Recommended for high-throughput workers
+
+### Custom Limits
+
+Enterprise customers can request custom limits via `custom_limits` in the database:
+
+```sql
+UPDATE organizations 
+SET custom_limits = '{"max_active_jobs": 10000, "max_jobs_per_day": 1000000}'::jsonb
+WHERE id = 'org-id';
+```
 
 ## 🚀 Production Deployment
 
