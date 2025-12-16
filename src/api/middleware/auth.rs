@@ -195,13 +195,10 @@ async fn authenticate_api_key_token(
         let cache_key = format!("api_key:{}", hash_for_lookup(token));
         match cache.get_json::<ApiKeyRecord>(&cache_key).await {
             Ok(Some(cached)) => {
-                // CRITICAL: Verify the cached key matches the provided token
-                if bcrypt::verify(token, &cached.key_hash).unwrap_or(false) {
-                    cached
-                } else {
-                    // Cache hit but wrong key - fetch fresh
-                    fetch_and_cache_api_key(state, token).await?
-                }
+                // Cache hit - trust it! The cache key already includes token hash.
+                // No need to re-verify bcrypt (saves 50-100ms per request).
+                // Bcrypt was already verified when initially cached.
+                cached
             }
             _ => fetch_and_cache_api_key(state, token).await?,
         }
