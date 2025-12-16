@@ -58,7 +58,7 @@ Jobs are the fundamental unit of work in Spooled. A job represents an asynchrono
 | `processing` | Currently being processed by a worker |
 | `completed` | Successfully processed |
 | `failed` | Processing failed (will retry if retries remaining) |
-| `dead_letter` | Failed after exhausting all retries |
+| `deadletter` | Failed after exhausting all retries |
 | `cancelled` | Manually cancelled |
 | `scheduled` | Scheduled for future execution |
 
@@ -291,7 +291,7 @@ curl https://api.spooled.cloud/api/v1/queues/emails/stats
   "processing": 25,
   "completed": 10000,
   "failed": 12,
-  "dead_letter": 3,
+  "deadletter": 3,
   "paused": false,
   "oldest_job_age_seconds": 30
 }

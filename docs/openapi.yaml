@@ -304,19 +304,21 @@ paths:
                 $ref: '#/components/schemas/ValidateTokenResponse'
 
   # Email-based Authentication
-  /api/v1/auth/email/check:
-    post:
+  /api/v1/auth/check-email:
+    get:
       tags: [Authentication]
       summary: Check email availability
       description: Check if an email is already registered
       operationId: checkEmail
       security: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/CheckEmailRequest'
+      parameters:
+        - name: email
+          in: query
+          required: true
+          schema:
+            type: string
+            format: email
+          description: Email address to check
       responses:
         '200':
           description: Email check result
@@ -375,7 +377,7 @@ paths:
         '404':
           description: No pending verification found
 
-  /api/v1/auth/email/complete-signup:
+  /api/v1/auth/signup/complete:
     post:
       tags: [Authentication]
       summary: Complete signup
@@ -2396,6 +2398,41 @@ paths:
                   $ref: '#/components/schemas/OutgoingWebhookDelivery'
         '404':
           description: Webhook not found
+
+  /api/v1/outgoing-webhooks/{id}/retry/{delivery_id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Webhook ID
+      - name: delivery_id
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Delivery ID
+    post:
+      tags: [Outgoing Webhooks]
+      summary: Retry webhook delivery
+      description: Trigger a retry for a specific outgoing webhook delivery attempt
+      operationId: retryOutgoingWebhookDelivery
+      responses:
+        '200':
+          description: Retry initiated
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, message]
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+        '404':
+          description: Webhook or delivery not found
 
 components:
   securitySchemes:

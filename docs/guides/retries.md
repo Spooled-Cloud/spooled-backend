@@ -161,7 +161,7 @@ Jobs that fail after exhausting all retries are moved to the Dead Letter Queue (
 ### View DLQ Jobs
 
 ```bash
-curl "https://api.spooled.cloud/api/v1/jobs?status=dead_letter" \
+curl "https://api.spooled.cloud/api/v1/jobs/dlq?limit=50" \
   -H "Authorization: Bearer sk_live_YOUR_API_KEY"
 ```
 
@@ -173,7 +173,7 @@ Response:
     {
       "id": "job_xxx",
       "queue_name": "emails",
-      "status": "dead_letter",
+      "status": "deadletter",
       "payload": {"to": "user@example.com"},
       "error_message": "SMTP server unavailable after 5 retries",
       "retry_count": 5,
@@ -189,7 +189,7 @@ Response:
 ### Filter DLQ by Queue
 
 ```bash
-curl "https://api.spooled.cloud/api/v1/jobs?status=dead_letter&queue_name=emails" \
+curl "https://api.spooled.cloud/api/v1/jobs/dlq?queue_name=emails&limit=50" \
   -H "Authorization: Bearer sk_live_YOUR_API_KEY"
 ```
 
@@ -225,8 +225,13 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs/dlq/retry \
 Retry all DLQ jobs for a queue:
 
 ```bash
-curl -X POST https://api.spooled.cloud/api/v1/queues/emails/dlq/retry-all \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY"
+curl -X POST https://api.spooled.cloud/api/v1/jobs/dlq/retry \
+  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "queue_name": "emails",
+    "limit": 100
+  }'
 ```
 
 ### Purge DLQ
@@ -247,7 +252,7 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs/dlq/purge \
 ### Export DLQ for Analysis
 
 ```bash
-curl "https://api.spooled.cloud/api/v1/jobs?status=dead_letter&limit=1000" \
+curl "https://api.spooled.cloud/api/v1/jobs/dlq?limit=100&offset=0" \
   -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
   -H "Accept: application/json" \
   > dlq_export.json
@@ -305,10 +310,14 @@ rate(spooled_jobs_dead_letter_total[5m]) > 1
 Get notified when jobs fail completely:
 
 ```bash
-curl -X POST https://api.spooled.cloud/api/v1/webhooks/subscriptions \
+curl -X POST https://api.spooled.cloud/api/v1/outgoing-webhooks \
+  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
   -d '{
+    "name": "DLQ Alerts",
+    "url": "https://api.example.com/webhooks/job-failures",
     "events": ["job.dead_letter"],
-    "url": "https://api.example.com/webhooks/job-failures"
+    "secret": "your_webhook_secret"
   }'
 ```
 
@@ -347,7 +356,7 @@ Response:
 ```json
 {
   "id": "job_xxx",
-  "status": "dead_letter",
+  "status": "deadletter",
   "retry_count": 5,
   "max_retries": 5,
   "history": [
@@ -358,7 +367,7 @@ Response:
     {"status": "processing", "at": "2024-01-15T10:00:08Z"},
     {"status": "failed", "at": "2024-01-15T10:00:12Z", "error": "Connection timeout"},
     ...
-    {"status": "dead_letter", "at": "2024-01-15T10:05:00Z"}
+    {"status": "deadletter", "at": "2024-01-15T10:05:00Z"}
   ]
 }
 ```

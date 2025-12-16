@@ -17,7 +17,7 @@ Complete guide to receiving and sending webhooks with Spooled Cloud.
 
 Spooled supports webhooks in two directions:
 
-1. **Incoming webhooks** — Receive events from external services (Stripe, GitHub, etc.) and automatically create jobs
+1. **Incoming webhooks** — Receive events from any external service and automatically create jobs
 2. **Outgoing webhooks** — Send notifications when jobs complete, fail, or hit DLQ
 
 ---
@@ -33,59 +33,17 @@ Spooled supports webhooks in two directions:
 └──────────┘     └─────────────┘     └─────────┘     └──────────┘
 ```
 
-### Built-in Integrations
+### Supported Incoming Webhooks
 
-Spooled has built-in support for:
+Spooled currently supports **one** incoming webhook endpoint per organization:
 
-| Service | Endpoint | Signature |
-|---------|----------|-----------|
-| Stripe | `/api/v1/webhooks/{org_id}/stripe` | Stripe-Signature header |
-| GitHub | `/api/v1/webhooks/{org_id}/github` | X-Hub-Signature-256 |
-| Custom | `/api/v1/webhooks/{org_id}/custom` | X-Webhook-Token |
+| Type | Endpoint | Authentication |
+|------|----------|----------------|
+| Custom | `/api/v1/webhooks/{org_id}/custom` | `X-Webhook-Token` (optional, recommended) |
 
-### Stripe Webhooks
-
-1. Configure in Stripe Dashboard:
-   - Endpoint URL: `https://api.spooled.cloud/api/v1/webhooks/{org_id}/stripe`
-   - Get the webhook signing secret
-
-2. Store the secret in your Spooled organization settings
-
-3. Events create jobs in the `stripe-events` queue:
-
-```json
-{
-  "id": "job_xxx",
-  "queue_name": "stripe-events",
-  "payload": {
-    "type": "payment_intent.succeeded",
-    "data": {
-      "object": { ... }
-    }
-  }
-}
-```
-
-### GitHub Webhooks
-
-1. Configure in GitHub repository settings:
-   - Payload URL: `https://api.spooled.cloud/api/v1/webhooks/{org_id}/github`
-   - Content type: `application/json`
-   - Secret: Your webhook secret
-
-2. Events create jobs in the `github-events` queue:
-
-```json
-{
-  "id": "job_xxx",
-  "queue_name": "github-events",
-  "payload": {
-    "action": "opened",
-    "pull_request": { ... },
-    "repository": { ... }
-  }
-}
-```
+If a webhook token is configured for the organization, the request must include the
+`X-Webhook-Token` header. If no token is configured, the endpoint is open (not
+recommended for production).
 
 ---
 
@@ -165,37 +123,6 @@ curl -X POST https://api.spooled.cloud/api/v1/organizations/webhook-token/clear 
 
 ## Signature Verification
 
-### HMAC-SHA256 (Stripe Style)
-
-Spooled verifies Stripe signatures automatically. For custom implementations:
-
-```python
-import hmac
-import hashlib
-
-def verify_signature(payload: bytes, signature: str, secret: str) -> bool:
-    expected = hmac.new(
-        secret.encode(),
-        payload,
-        hashlib.sha256
-    ).hexdigest()
-    
-    return hmac.compare_digest(f"sha256={expected}", signature)
-```
-
-### GitHub Signature
-
-```python
-def verify_github_signature(payload: bytes, signature: str, secret: str) -> bool:
-    expected = hmac.new(
-        secret.encode(),
-        payload,
-        hashlib.sha256
-    ).hexdigest()
-    
-    return hmac.compare_digest(f"sha256={expected}", signature)
-```
-
 ### Custom Webhook Token
 
 For custom webhooks, we use a simple token-based authentication:
@@ -242,7 +169,7 @@ When job completes, Spooled POSTs to your URL:
 Subscribe to events for all jobs:
 
 ```bash
-curl -X POST https://api.spooled.cloud/api/v1/webhooks/subscriptions \
+curl -X POST https://api.spooled.cloud/api/v1/outgoing-webhooks \
   -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
   -d '{
     "name": "Job Notifications",
@@ -250,6 +177,18 @@ curl -X POST https://api.spooled.cloud/api/v1/webhooks/subscriptions \
     "events": ["job.completed", "job.failed", "job.dead_letter"],
     "secret": "your_webhook_secret"
   }'
+```
+
+You can inspect deliveries and retry individual delivery attempts:
+
+```bash
+# List delivery history
+curl https://api.spooled.cloud/api/v1/outgoing-webhooks/{id}/deliveries \
+  -H "Authorization: Bearer sk_live_YOUR_API_KEY"
+
+# Retry a specific delivery
+curl -X POST https://api.spooled.cloud/api/v1/outgoing-webhooks/{id}/retry/{delivery_id} \
+  -H "Authorization: Bearer sk_live_YOUR_API_KEY"
 ```
 
 ### Event Types

@@ -503,7 +503,7 @@ Response:
   "processing": 0,
   "completed": 0,
   "failed": 0,
-  "dead_letter": 0
+  "deadletter": 0
 }
 ```
 
@@ -635,7 +635,7 @@ Jobs that exhaust all retries are moved to the DLQ:
 
 ```bash
 # List DLQ jobs
-curl "http://localhost:8080/api/v1/jobs?status=dead_letter" \
+curl "http://localhost:8080/api/v1/jobs/dlq?queue_name=emails&limit=100" \
   -H "Authorization: Bearer sk_live_..."
 
 # Retry a DLQ job
@@ -643,8 +643,10 @@ curl -X POST http://localhost:8080/api/v1/jobs/job_xyz/retry \
   -H "Authorization: Bearer sk_live_..."
 
 # Bulk retry all DLQ jobs for a queue
-curl -X POST http://localhost:8080/api/v1/queues/emails/dlq/retry-all \
-  -H "Authorization: Bearer sk_live_..."
+curl -X POST http://localhost:8080/api/v1/jobs/dlq/retry \
+  -H "Authorization: Bearer sk_live_..." \
+  -H "Content-Type: application/json" \
+  -d '{"queue_name":"emails","limit":100}'
 ```
 
 ### Priority Queues
