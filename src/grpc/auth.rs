@@ -125,7 +125,8 @@ async fn validate_api_key(pool: &PgPool, token: &str) -> Result<GrpcAuthContext,
     // Extract key prefix for efficient indexed lookup
     let key_prefix: String = token.chars().take(8).collect();
 
-    // Fetch candidate keys with matching prefix
+    // Fetch candidate keys with matching prefix.
+    // Use a higher LIMIT to handle many keys sharing the same prefix (e.g. sk_test_).
     let records: Vec<ApiKeyRecord> = sqlx::query_as(
         r#"
         SELECT id, organization_id, key_hash, queues, rate_limit
@@ -133,7 +134,7 @@ async fn validate_api_key(pool: &PgPool, token: &str) -> Result<GrpcAuthContext,
         WHERE is_active = TRUE 
           AND (key_prefix = $1 OR key_prefix IS NULL)
           AND (expires_at IS NULL OR expires_at > NOW())
-        LIMIT 10
+        LIMIT 100
         "#,
     )
     .bind(&key_prefix)

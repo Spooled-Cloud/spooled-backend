@@ -420,26 +420,24 @@ pub async fn retry_delivery(
         .map_err(|_| AppError::Validation("Invalid delivery ID format".to_string()))?;
 
     // Verify webhook belongs to organization
-    let webhook: Option<OutgoingWebhook> = sqlx::query_as(
-        "SELECT * FROM outgoing_webhooks WHERE id = $1 AND organization_id = $2",
-    )
-    .bind(&webhook_uuid)
-    .bind(&ctx.organization_id)
-    .fetch_optional(state.db.pool())
-    .await?;
+    let webhook: Option<OutgoingWebhook> =
+        sqlx::query_as("SELECT * FROM outgoing_webhooks WHERE id = $1 AND organization_id = $2")
+            .bind(webhook_uuid)
+            .bind(&ctx.organization_id)
+            .fetch_optional(state.db.pool())
+            .await?;
 
     if webhook.is_none() {
         return Err(AppError::NotFound("Webhook not found".to_string()));
     }
 
     // Verify delivery exists and belongs to webhook
-    let delivery: Option<OutgoingWebhookDelivery> = sqlx::query_as(
-        "SELECT * FROM outgoing_webhook_deliveries WHERE id = $1 AND webhook_id = $2",
-    )
-    .bind(&delivery_uuid)
-    .bind(&webhook_uuid)
-    .fetch_optional(state.db.pool())
-    .await?;
+    let delivery: Option<OutgoingWebhookDelivery> =
+        sqlx::query_as("SELECT * FROM outgoing_webhook_deliveries WHERE id = $1 AND webhook_id = $2")
+            .bind(delivery_uuid)
+            .bind(webhook_uuid)
+            .fetch_optional(state.db.pool())
+            .await?;
 
     if delivery.is_none() {
         return Err(AppError::NotFound("Delivery not found".to_string()));
@@ -457,7 +455,7 @@ pub async fn retry_delivery(
         WHERE id = $1
         "#,
     )
-    .bind(&delivery_uuid)
+    .bind(delivery_uuid)
     .execute(state.db.pool())
     .await?;
 
