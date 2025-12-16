@@ -68,12 +68,15 @@ impl OutgoingWebhookService {
         for webhook in webhooks {
             let delivery_id = uuid::Uuid::new_v4();
             let payload = payload.clone();
-            
+
             // Spawn a task for each delivery to not block the main request
             let service = self.clone();
             let event_clone = event.clone();
             tokio::spawn(async move {
-                if let Err(e) = service.deliver(webhook, event_clone, payload, delivery_id).await {
+                if let Err(e) = service
+                    .deliver(webhook, event_clone, payload, delivery_id)
+                    .await
+                {
                     error!(error = %e, "Failed to deliver webhook");
                 }
             });
@@ -90,7 +93,7 @@ impl OutgoingWebhookService {
         delivery_id: uuid::Uuid,
     ) -> Result<()> {
         let signature = self.generate_signature(&payload)?;
-        
+
         let body = serde_json::json!({
             "id": delivery_id,
             "event": event,
@@ -102,29 +105,32 @@ impl OutgoingWebhookService {
     }
 
     pub async fn retry_delivery(&self, delivery_id: uuid::Uuid) -> Result<()> {
-        // Fetch delivery details
-        let delivery = sqlx::query!(
+        // Fetch delivery details using runtime query (no compile-time check)
+        let row = sqlx::query(
             r#"
-            SELECT d.*, w.url, w.secret 
+            SELECT d.webhook_id, d.event, d.status, d.payload, d.attempts, d.created_at,
+                   w.url, w.secret 
             FROM outgoing_webhook_deliveries d
             JOIN outgoing_webhooks w ON d.webhook_id = w.id
-            WHERE d.id = $1::text
+            WHERE d.id = $1
             "#,
-            delivery_id.to_string()
         )
+        .bind(delivery_id.to_string())
         .fetch_optional(&self.pool)
         .await?
         .ok_or_else(|| anyhow::anyhow!("Delivery not found"))?;
 
-        if delivery.status == "success" {
+        use sqlx::Row;
+        let status: String = row.get("status");
+        if status == "success" {
             return Ok(());
         }
 
         let webhook = OutgoingWebhook {
-            id: delivery.webhook_id,
+            id: row.get("webhook_id"),
             organization_id: String::new(), // Not needed for delivery
-            url: delivery.url,
-            secret: delivery.secret,
+            url: row.get("url"),
+            secret: row.get("secret"),
             events: vec![], // Not needed
             enabled: true,
             failure_count: 0,
@@ -136,18 +142,22 @@ impl OutgoingWebhookService {
         };
 
         // Reconstruct signature (or use stored one if we had it, but we generate fresh)
-        let payload: serde_json::Value = serde_json::from_value(delivery.payload)?;
+        let payload: serde_json::Value = row.get("payload");
         let signature = self.generate_signature(&payload)?;
-        
+        let event: String = row.get("event");
+        let created_at: chrono::DateTime<Utc> = row.get("created_at");
+        let attempts: i32 = row.get("attempts");
+
         // Construct body (same as original)
         let body = serde_json::json!({
             "id": delivery_id,
-            "event": delivery.event,
-            "created_at": delivery.created_at,
+            "event": event,
+            "created_at": created_at,
             "data": payload,
         });
 
-        self.try_deliver(&webhook, &body, &signature, delivery.attempts + 1).await
+        self.try_deliver(&webhook, &body, &signature, attempts + 1)
+            .await
     }
 
     async fn try_deliver(
@@ -158,17 +168,22 @@ impl OutgoingWebhookService {
         attempt: i32,
     ) -> Result<()> {
         let start = Utc::now();
-        
+
         // Validate URL prevents SSRF
         if let Err(e) = self.validate_url(&webhook.url) {
-            self.record_attempt(&webhook.id, body, 0, Some(&e.to_string()), attempt, start).await?;
+            self.record_attempt(&webhook.id, body, 0, Some(&e.to_string()), attempt, start)
+                .await?;
             return Err(e);
         }
 
-        let response = self.client
+        let response = self
+            .client
             .post(&webhook.url)
             .header("X-Spooled-Signature", signature)
-            .header("X-Spooled-Event", body["event"].as_str().unwrap_or_default())
+            .header(
+                "X-Spooled-Event",
+                body["event"].as_str().unwrap_or_default(),
+            )
             .json(body)
             .send()
             .await;
@@ -183,18 +198,33 @@ impl OutgoingWebhookService {
                     None
                 };
 
-                self.record_attempt(&webhook.id, body, status as i32, error.as_deref(), attempt, start).await?;
-                
+                self.record_attempt(
+                    &webhook.id,
+                    body,
+                    status as i32,
+                    error.as_deref(),
+                    attempt,
+                    start,
+                )
+                .await?;
+
                 if !success && attempt < self.max_attempts {
                     // Schedule retry (in a real system, this would be a delayed job)
                     // For now, we just log it
-                    warn!("Webhook delivery failed (attempt {}/{}), should retry", attempt, self.max_attempts);
+                    warn!(
+                        "Webhook delivery failed (attempt {}/{}), should retry",
+                        attempt, self.max_attempts
+                    );
                 }
             }
             Err(e) => {
-                self.record_attempt(&webhook.id, body, 0, Some(&e.to_string()), attempt, start).await?;
+                self.record_attempt(&webhook.id, body, 0, Some(&e.to_string()), attempt, start)
+                    .await?;
                 if attempt < self.max_attempts {
-                    warn!("Webhook delivery error (attempt {}/{}), should retry: {}", attempt, self.max_attempts, e);
+                    warn!(
+                        "Webhook delivery error (attempt {}/{}), should retry: {}",
+                        attempt, self.max_attempts, e
+                    );
                 }
             }
         }
@@ -217,7 +247,7 @@ impl OutgoingWebhookService {
             "failed"
         };
 
-        sqlx::query!(
+        sqlx::query(
             r#"
             INSERT INTO outgoing_webhook_deliveries (
                 webhook_id, event, status, payload, 
@@ -226,16 +256,16 @@ impl OutgoingWebhookService {
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             "#,
-            webhook_id,
-            request_payload["event"].as_str().unwrap_or("unknown"),
-            status,
-            request_payload,
-            response_status,
-            response_body,
-            attempt_count,
-            started_at,
-            Utc::now()
         )
+        .bind(webhook_id)
+        .bind(request_payload["event"].as_str().unwrap_or("unknown"))
+        .bind(status)
+        .bind(request_payload)
+        .bind(response_status)
+        .bind(response_body)
+        .bind(attempt_count)
+        .bind(started_at)
+        .bind(Utc::now())
         .execute(&self.pool)
         .await?;
 

@@ -1971,9 +1971,18 @@ async fn test_minimal_job() {
     assert!(result.result.is_none(), "result should be NULL");
     assert!(result.last_error.is_none(), "last_error should be NULL");
     assert!(result.tags.is_none(), "tags should be NULL");
-    assert!(result.parent_job_id.is_none(), "parent_job_id should be NULL");
-    assert!(result.completion_webhook.is_none(), "completion_webhook should be NULL");
-    assert!(result.idempotency_key.is_none(), "idempotency_key should be NULL");
+    assert!(
+        result.parent_job_id.is_none(),
+        "parent_job_id should be NULL"
+    );
+    assert!(
+        result.completion_webhook.is_none(),
+        "completion_webhook should be NULL"
+    );
+    assert!(
+        result.idempotency_key.is_none(),
+        "idempotency_key should be NULL"
+    );
 }
 
 /// Test edge case: unicode in job data

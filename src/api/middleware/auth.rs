@@ -63,9 +63,7 @@ pub async fn authenticate_api_key(
         .headers()
         .get("Authorization")
         .and_then(|v| v.to_str().ok())
-        .and_then(|header| {
-            header.strip_prefix("Bearer ").map(|s| s.to_string())
-        });
+        .and_then(|header| header.strip_prefix("Bearer ").map(|s| s.to_string()));
 
     // Fallback to query parameter 'token' or 'api_key'
     let token = if let Some(t) = token_from_header {
@@ -82,13 +80,14 @@ pub async fn authenticate_api_key(
                 }
             }
         }
-        
+
         match found_token {
             Some(t) => t,
             None => {
                 return Err((
                     StatusCode::UNAUTHORIZED,
-                    "Missing or invalid Authorization header or token/api_key query parameter".to_string(),
+                    "Missing or invalid Authorization header or token/api_key query parameter"
+                        .to_string(),
                 ));
             }
         }
