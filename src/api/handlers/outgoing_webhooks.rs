@@ -432,12 +432,13 @@ pub async fn retry_delivery(
     }
 
     // Verify delivery exists and belongs to webhook
-    let delivery: Option<OutgoingWebhookDelivery> =
-        sqlx::query_as("SELECT * FROM outgoing_webhook_deliveries WHERE id = $1 AND webhook_id = $2")
-            .bind(delivery_uuid)
-            .bind(webhook_uuid)
-            .fetch_optional(state.db.pool())
-            .await?;
+    let delivery: Option<OutgoingWebhookDelivery> = sqlx::query_as(
+        "SELECT * FROM outgoing_webhook_deliveries WHERE id = $1 AND webhook_id = $2",
+    )
+    .bind(delivery_uuid)
+    .bind(webhook_uuid)
+    .fetch_optional(state.db.pool())
+    .await?;
 
     if delivery.is_none() {
         return Err(AppError::NotFound("Delivery not found".to_string()));
