@@ -247,6 +247,7 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
         .route("/workflows", post(handlers::workflows::create))
         .route("/workflows/{id}", get(handlers::workflows::get))
         .route("/workflows/{id}/cancel", post(handlers::workflows::cancel))
+        .route("/workflows/{id}/retry", post(handlers::workflows::retry))
         // Job dependencies
         .route(
             "/jobs/{id}/dependencies",

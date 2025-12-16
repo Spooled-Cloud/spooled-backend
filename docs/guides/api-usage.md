@@ -720,6 +720,28 @@ POST /api/v1/workflows/{workflow_id}/cancel
 Authorization: Bearer <token>
 ```
 
+### Retry Failed Workflow
+
+Retry all failed jobs in a workflow. This resets failed/deadletter jobs back to pending,
+clears retry counts, and resumes the workflow. Only workflows with status `failed` can be retried.
+
+```bash
+POST /api/v1/workflows/{workflow_id}/retry
+Authorization: Bearer <token>
+```
+
+Response:
+```json
+{
+  "id": "wf_abc123",
+  "name": "Data Processing Pipeline",
+  "status": "running",
+  "total_jobs": 5,
+  "completed_jobs": 3,
+  "failed_jobs": 0
+}
+```
+
 ### Job Dependencies
 
 Get a job's dependencies:

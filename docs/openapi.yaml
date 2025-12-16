@@ -1850,6 +1850,36 @@ paths:
               schema:
                 $ref: '#/components/schemas/WorkflowResponse'
 
+  /api/v1/workflows/{id}/retry:
+    post:
+      tags: [Workflows]
+      summary: Retry failed workflow
+      description: |
+        Retry all failed jobs in a workflow. This resets failed/deadletter jobs
+        back to pending status, clears retry counts and error messages, and
+        resumes the workflow.
+        
+        Only workflows with status 'failed' can be retried.
+      operationId: retryWorkflow
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Workflow retry initiated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkflowResponse'
+        '400':
+          description: Workflow cannot be retried (not in failed status)
+        '404':
+          description: Workflow not found
+
   /api/v1/jobs/{id}/dependencies:
     get:
       tags: [Workflows]

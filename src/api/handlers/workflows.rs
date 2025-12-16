@@ -264,6 +264,143 @@ pub async fn create(
     }))
 }
 
+/// Retry failed jobs in a workflow
+///
+/// Resets all failed/deadletter jobs back to pending and resumes the workflow.
+pub async fn retry(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path(workflow_id): Path<String>,
+) -> AppResult<Json<WorkflowResponse>> {
+    // First verify workflow belongs to this organization and is in a retryable state
+    let workflow: Workflow =
+        sqlx::query_as("SELECT * FROM workflows WHERE id = $1 AND organization_id = $2")
+            .bind(&workflow_id)
+            .bind(&ctx.organization_id)
+            .fetch_optional(state.db.pool())
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("Workflow {} not found", workflow_id)))?;
+
+    // Only allow retry on failed workflows
+    if workflow.status_enum() != crate::models::WorkflowStatus::Failed {
+        return Err(AppError::BadRequest(format!(
+            "Cannot retry workflow with status '{}'. Only failed workflows can be retried.",
+            workflow.status
+        )));
+    }
+
+    // Reset failed/deadletter jobs back to pending and clear retry counts
+    let updated = sqlx::query(
+        r#"
+        UPDATE jobs
+        SET status = 'pending',
+            retry_count = 0,
+            error_message = NULL,
+            started_at = NULL,
+            completed_at = NULL,
+            updated_at = NOW()
+        WHERE workflow_id = $1 
+          AND organization_id = $2 
+          AND status IN ('failed', 'deadletter')
+        "#,
+    )
+    .bind(&workflow_id)
+    .bind(&ctx.organization_id)
+    .execute(state.db.pool())
+    .await?;
+
+    let jobs_retried = updated.rows_affected();
+
+    // Update workflow status back to running
+    sqlx::query(
+        r#"
+        UPDATE workflows 
+        SET status = 'running', 
+            completed_at = NULL,
+            updated_at = NOW()
+        WHERE id = $1 AND organization_id = $2
+        "#,
+    )
+    .bind(&workflow_id)
+    .bind(&ctx.organization_id)
+    .execute(state.db.pool())
+    .await?;
+
+    // Recalculate completed/failed job counts
+    let (completed_count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM jobs WHERE workflow_id = $1 AND status = 'completed'",
+    )
+    .bind(&workflow_id)
+    .fetch_one(state.db.pool())
+    .await?;
+
+    let (failed_count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM jobs WHERE workflow_id = $1 AND status IN ('failed', 'deadletter')",
+    )
+    .bind(&workflow_id)
+    .fetch_one(state.db.pool())
+    .await?;
+
+    sqlx::query(
+        "UPDATE workflows SET completed_jobs = $1, failed_jobs = $2 WHERE id = $3",
+    )
+    .bind(completed_count as i32)
+    .bind(failed_count as i32)
+    .bind(&workflow_id)
+    .execute(state.db.pool())
+    .await?;
+
+    info!(
+        workflow_id = %workflow_id,
+        org_id = %ctx.organization_id,
+        jobs_retried = jobs_retried,
+        "Retried workflow"
+    );
+
+    // Notify Redis that workflow was retried
+    if let Some(ref cache) = state.cache {
+        let _ = cache
+            .publish(
+                &format!("org:{}:workflow:{}", ctx.organization_id, workflow_id),
+                "retried",
+            )
+            .await;
+
+        // Also notify queue channels that jobs are ready
+        let queues: Vec<(String,)> = sqlx::query_as(
+            r#"
+            SELECT DISTINCT queue_name 
+            FROM jobs 
+            WHERE workflow_id = $1 AND status = 'pending' AND dependencies_met = TRUE
+            "#,
+        )
+        .bind(&workflow_id)
+        .fetch_all(state.db.pool())
+        .await
+        .unwrap_or_default();
+
+        for (queue_name,) in queues {
+            let _ = cache
+                .publish(
+                    &format!("org:{}:queue:{}", ctx.organization_id, queue_name),
+                    "workflow_job_ready",
+                )
+                .await;
+        }
+    }
+
+    // Fetch and return the updated workflow
+    let workflow: Workflow =
+        sqlx::query_as("SELECT * FROM workflows WHERE id = $1 AND organization_id = $2")
+            .bind(&workflow_id)
+            .bind(&ctx.organization_id)
+            .fetch_optional(state.db.pool())
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("Workflow {} not found", workflow_id)))?;
+
+    Ok(Json(workflow.into()))
+}
+
 /// Cancel a workflow
 ///
 pub async fn cancel(
