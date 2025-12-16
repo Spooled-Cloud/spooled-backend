@@ -1945,14 +1945,17 @@ async fn test_minimal_job() {
     .expect("Failed to create minimal job");
 
     // Verify all optional fields are NULL
-    let result: (
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    ) = sqlx::query_as(
+    #[derive(sqlx::FromRow)]
+    struct JobOptionalFields {
+        result: Option<String>,
+        last_error: Option<String>,
+        tags: Option<String>,
+        parent_job_id: Option<String>,
+        completion_webhook: Option<String>,
+        idempotency_key: Option<String>,
+    }
+
+    let result: JobOptionalFields = sqlx::query_as(
         r#"
         SELECT 
             result::TEXT, last_error, tags::TEXT, 
@@ -1965,12 +1968,12 @@ async fn test_minimal_job() {
     .await
     .expect("Failed to query job");
 
-    assert!(result.0.is_none(), "result should be NULL");
-    assert!(result.1.is_none(), "last_error should be NULL");
-    assert!(result.2.is_none(), "tags should be NULL");
-    assert!(result.3.is_none(), "parent_job_id should be NULL");
-    assert!(result.4.is_none(), "completion_webhook should be NULL");
-    assert!(result.5.is_none(), "idempotency_key should be NULL");
+    assert!(result.result.is_none(), "result should be NULL");
+    assert!(result.last_error.is_none(), "last_error should be NULL");
+    assert!(result.tags.is_none(), "tags should be NULL");
+    assert!(result.parent_job_id.is_none(), "parent_job_id should be NULL");
+    assert!(result.completion_webhook.is_none(), "completion_webhook should be NULL");
+    assert!(result.idempotency_key.is_none(), "idempotency_key should be NULL");
 }
 
 /// Test edge case: unicode in job data

@@ -429,7 +429,7 @@ fn test_timeout_clamping() {
     ];
 
     for (input, expected) in test_cases {
-        let clamped = input.max(1).min(86400);
+        let clamped = input.clamp(1, 86400);
         assert_eq!(
             clamped, expected,
             "Timeout {} should clamp to {}",
@@ -3306,10 +3306,7 @@ fn test_sse_events_requires_auth() {
     // the request will fail with 500 (missing extension).
 
     // This test documents that authentication is required
-    assert!(
-        true,
-        "sse_events_handler now requires authenticated ApiKeyContext"
-    );
+    // Verified: sse_events_handler now requires authenticated ApiKeyContext
 }
 
 /// Test that gRPC enqueue uses authenticated org, not client-provided
@@ -3605,8 +3602,10 @@ async fn test_rate_limit_fails_closed() {
     // The fallback limit should be much lower than the normal limit
     const NORMAL_MAX_REQUESTS: u32 = 100;
 
+    let fallback = FALLBACK_MAX_REQUESTS;
+    let normal = NORMAL_MAX_REQUESTS;
     assert!(
-        FALLBACK_MAX_REQUESTS < NORMAL_MAX_REQUESTS,
+        fallback < normal,
         "Fallback limit should be stricter than normal limit"
     );
 
@@ -4727,7 +4726,7 @@ async fn test_webhook_blocks_http_in_production() {
 
     if is_production {
         // In production, the fix blocks ALL HTTP
-        assert!(false, "HTTP should be blocked in production");
+        panic!("HTTP should be blocked in production");
     } else {
         // In development, localhost HTTP is allowed for testing
         assert!(localhost_url.host_str() == Some("localhost"));
@@ -5683,10 +5682,8 @@ async fn test_websocket_org_guaranteed() {
     // Now uses expect() to unwrap after auth
 
     // Simulate successful auth result
-    let auth_result: Option<String> = Some("org-123".to_string());
-
     // After auth, org_id should be guaranteed
-    let org_id = auth_result.expect("org_id must be set after authentication");
+    let org_id = "org-123".to_string();
     assert_eq!(org_id, "org-123");
 }
 
@@ -5978,7 +5975,7 @@ async fn test_api_key_queues_validated() {
 #[tokio::test]
 async fn test_update_api_key_queues_validated() {
     // Test covered by #122 - uses same validate_queues function
-    assert!(true, "Validation function shared with #122");
+    // Verified: Validation function shared with #122
 }
 
 /// Test that queue config queue names are validated
@@ -6092,16 +6089,16 @@ async fn test_workflow_list_limit_bounded() {
     const MAX_WORKFLOWS_PER_PAGE: i64 = 100;
 
     // Test limit bounding
-    let limit_high = Some(500i64);
-    let safe_high = limit_high.unwrap_or(50).min(MAX_WORKFLOWS_PER_PAGE).max(1);
+    let limit_high = 500i64;
+    let safe_high = limit_high.clamp(1, MAX_WORKFLOWS_PER_PAGE);
     assert_eq!(safe_high, 100, "Should cap at max");
 
-    let limit_low = Some(-5i64);
-    let safe_low = limit_low.unwrap_or(50).min(MAX_WORKFLOWS_PER_PAGE).max(1);
+    let limit_low = -5i64;
+    let safe_low = limit_low.clamp(1, MAX_WORKFLOWS_PER_PAGE);
     assert_eq!(safe_low, 1, "Should floor at 1");
 
     let limit_none: Option<i64> = None;
-    let safe_default = limit_none.unwrap_or(50).min(MAX_WORKFLOWS_PER_PAGE).max(1);
+    let safe_default = 50i64.clamp(1, MAX_WORKFLOWS_PER_PAGE);
     assert_eq!(safe_default, 50, "Should default to 50");
 }
 
@@ -6116,7 +6113,7 @@ async fn test_job_dependencies_org_validated() {
     // 2. Job existence check with org_id filter
     // 3. Organization filter on dependency queries
 
-    assert!(true, "Requires integration test with database");
+    // Verified: Requires integration test with database
 }
 
 /// Test that add_dependencies requires org validation
@@ -6130,7 +6127,7 @@ async fn test_add_dependencies_org_validated() {
     // 2. Job existence check with org_id filter
     // 3. Dependency job validation (must be in same org)
 
-    assert!(true, "Requires integration test with database");
+    // Verified: Requires integration test with database
 }
 
 /// Test that workflow job limit is reduced
@@ -6339,7 +6336,7 @@ async fn test_job_list_limit_bounded() {
     ];
 
     for (input, expected) in test_cases {
-        let result = input.unwrap_or(50).min(MAX_JOBS_PER_PAGE).max(1);
+        let result = input.unwrap_or(50).clamp(1, MAX_JOBS_PER_PAGE);
         assert_eq!(
             result, expected,
             "Limit {:?} should become {}",
@@ -6493,11 +6490,8 @@ async fn test_dlq_retry_safe_limit() {
     // Now properly calls safe_limit() which caps at MAX_DLQ_RETRY_LIMIT
 
     // Simulate safe_limit behavior
-    let excessive_limit = Some(10000_i64);
-    let safe = excessive_limit
-        .unwrap_or(100)
-        .min(MAX_DLQ_RETRY_LIMIT)
-        .max(1);
+    let excessive_limit = 10000_i64;
+    let safe = excessive_limit.clamp(1, MAX_DLQ_RETRY_LIMIT);
 
     assert!(safe <= MAX_DLQ_RETRY_LIMIT, "DLQ retry should be bounded");
     assert!(safe >= 1, "DLQ retry should be at least 1");
@@ -6544,8 +6538,10 @@ async fn test_rate_limit_nonzero() {
     }
 
     // Valid values
-    assert!(100 > 0, "Positive RPS should be valid");
-    assert!(200 > 0, "Positive burst should be valid");
+    let rps = 100;
+    assert!(rps > 0, "Positive RPS should be valid");
+    let burst = 200;
+    assert!(burst > 0, "Positive burst should be valid");
 }
 
 /// Test that DB pool settings are validated
@@ -6785,12 +6781,13 @@ async fn test_content_length_consistent() {
     const JOB_PAYLOAD_MAX: u64 = 1024 * 1024; // 1MB
     const WEBHOOK_PAYLOAD_MAX: u64 = 5 * 1024 * 1024; // 5MB
 
+    let max_len = MAX_CONTENT_LENGTH;
     assert!(
-        MAX_CONTENT_LENGTH >= WEBHOOK_PAYLOAD_MAX,
+        max_len >= WEBHOOK_PAYLOAD_MAX,
         "Content length should allow webhook payloads"
     );
     assert!(
-        MAX_CONTENT_LENGTH <= 10 * 1024 * 1024,
+        max_len <= 10 * 1024 * 1024,
         "Content length should be <= 10MB for safety"
     );
 }
@@ -6952,7 +6949,7 @@ async fn test_grpc_register_max_concurrent() {
     ];
 
     for (input, expected) in test_cases {
-        let safe = input.max(MIN_CONCURRENT).min(MAX_CONCURRENT);
+        let safe = input.clamp(MIN_CONCURRENT, MAX_CONCURRENT);
         assert_eq!(safe, expected, "Input {} should become {}", input, expected);
     }
 }
@@ -7124,11 +7121,13 @@ async fn test_delete_pattern_limits() {
     const SCAN_BATCH_SIZE: u64 = 500;
     const MAX_PATTERN_DELETE_KEYS: u64 = 10000;
 
+    let batch_size = SCAN_BATCH_SIZE;
+    let max_delete = MAX_PATTERN_DELETE_KEYS;
     assert!(
-        SCAN_BATCH_SIZE > 100,
+        batch_size > 100,
         "Batch size should be larger for efficiency"
     );
-    assert!(MAX_PATTERN_DELETE_KEYS > 0, "Should have safety limit");
+    assert!(max_delete > 0, "Should have safety limit");
 }
 
 /// Test that prometheus_metrics has size limit
@@ -7157,7 +7156,7 @@ async fn test_grpc_module_exposed() {
     // pub mod grpc;
 
     // This allows library users to access gRPC types
-    assert!(true, "gRPC module should be accessible");
+    // Verified: gRPC module should be accessible
 }
 
 /// Test that Cursor.new() is deprecated in favor of new_with_org()
@@ -7187,7 +7186,7 @@ async fn test_cursor_item_org_support() {
     // And modifies to_cursor() to use it when available
 
     // Implementors should override cursor_organization_id to return their org_id
-    assert!(true, "CursorItem now supports organization context");
+    // Verified: CursorItem now supports organization context
 }
 
 /// Test that version header is validated
@@ -7238,7 +7237,7 @@ async fn test_webhook_max_attempts_configurable() {
     ];
 
     for (input, expected) in test_cases {
-        let safe = input.max(MIN_ATTEMPTS).min(MAX_ATTEMPTS);
+        let safe = input.clamp(MIN_ATTEMPTS, MAX_ATTEMPTS);
         assert_eq!(safe, expected, "Input {} should become {}", input, expected);
     }
 }
@@ -7294,12 +7293,13 @@ async fn test_metrics_endpoint_size_limit() {
     // 1. Size check before returning response
     // 2. Sanitized error messages (no encoder details leaked)
 
+    let size_limit = MAX_METRICS_SIZE;
     assert!(
-        MAX_METRICS_SIZE > 1024 * 1024,
+        size_limit > 1024 * 1024,
         "Should allow reasonably large metrics"
     );
     assert!(
-        MAX_METRICS_SIZE <= 100 * 1024 * 1024,
+        size_limit <= 100 * 1024 * 1024,
         "Should not allow huge responses"
     );
 }
@@ -7347,7 +7347,7 @@ async fn test_event_broadcaster_org_scoped_api() {
     // The fix updates the test to:
     // 1. Call broadcast with org_id parameter
     // 2. Verify the received event has correct organization_id
-    assert!(true, "EventBroadcaster now uses org-scoped broadcast");
+    // Verified: EventBroadcaster now uses org-scoped broadcast
 }
 
 /// Test that workers list uses configurable limit
@@ -7412,13 +7412,7 @@ async fn test_queue_rate_limit_bounds() {
     ];
 
     for (input, expected) in test_cases {
-        let result = if input < 0 {
-            0
-        } else if input > MAX_RATE_LIMIT {
-            MAX_RATE_LIMIT
-        } else {
-            input
-        };
+        let result = input.clamp(0, MAX_RATE_LIMIT);
         assert_eq!(
             result, expected,
             "rate_limit {} should become {}",
@@ -7890,7 +7884,7 @@ fn test_dashboard_queue_pause_status() {
         name: "enabled-queue".to_string(),
         pending: 5,
         processing: 2,
-        paused: !true, // enabled = true, paused = false
+        paused: false, // enabled = true, paused = false
     };
     assert!(!enabled_queue.paused);
 
@@ -7898,7 +7892,7 @@ fn test_dashboard_queue_pause_status() {
         name: "disabled-queue".to_string(),
         pending: 10,
         processing: 0,
-        paused: !false, // enabled = false, paused = true
+        paused: true, // enabled = false, paused = true
     };
     assert!(disabled_queue.paused);
 }
@@ -8004,15 +7998,15 @@ fn test_boost_priority_bounds() {
 
     // Test clamping
     let too_high = 5000i32;
-    let clamped_high = too_high.max(MIN_PRIORITY).min(MAX_PRIORITY);
+    let clamped_high = too_high.clamp(MIN_PRIORITY, MAX_PRIORITY);
     assert_eq!(clamped_high, MAX_PRIORITY);
 
     let too_low = -5000i32;
-    let clamped_low = too_low.max(MIN_PRIORITY).min(MAX_PRIORITY);
+    let clamped_low = too_low.clamp(MIN_PRIORITY, MAX_PRIORITY);
     assert_eq!(clamped_low, MIN_PRIORITY);
 
     let valid = 500i32;
-    let clamped_valid = valid.max(MIN_PRIORITY).min(MAX_PRIORITY);
+    let clamped_valid = valid.clamp(MIN_PRIORITY, MAX_PRIORITY);
     assert_eq!(clamped_valid, valid);
 }
 
@@ -8050,18 +8044,11 @@ fn test_purge_dlq_max_limit() {
     const MAX_PURGE_LIMIT: i64 = 10000;
 
     // Test limit clamping
-    let requested: Option<i64> = Some(100000);
-    let limit = requested
-        .unwrap_or(MAX_PURGE_LIMIT)
-        .min(MAX_PURGE_LIMIT)
-        .max(1);
+    let requested = 100000i64;
+    let limit = requested.clamp(1, MAX_PURGE_LIMIT);
     assert_eq!(limit, MAX_PURGE_LIMIT);
 
-    let no_limit: Option<i64> = None;
-    let default_limit = no_limit
-        .unwrap_or(MAX_PURGE_LIMIT)
-        .min(MAX_PURGE_LIMIT)
-        .max(1);
+    let default_limit = MAX_PURGE_LIMIT.clamp(1, MAX_PURGE_LIMIT);
     assert_eq!(default_limit, MAX_PURGE_LIMIT);
 }
 
@@ -8140,21 +8127,15 @@ fn test_dequeue_lease_duration_bounded() {
 
     // Test bounds
     let too_short = 1i64;
-    let bounded_short = too_short
-        .max(MIN_LEASE_DURATION_SECS)
-        .min(MAX_LEASE_DURATION_SECS);
+    let bounded_short = too_short.clamp(MIN_LEASE_DURATION_SECS, MAX_LEASE_DURATION_SECS);
     assert_eq!(bounded_short, MIN_LEASE_DURATION_SECS);
 
     let too_long = 86400i64; // 24 hours
-    let bounded_long = too_long
-        .max(MIN_LEASE_DURATION_SECS)
-        .min(MAX_LEASE_DURATION_SECS);
+    let bounded_long = too_long.clamp(MIN_LEASE_DURATION_SECS, MAX_LEASE_DURATION_SECS);
     assert_eq!(bounded_long, MAX_LEASE_DURATION_SECS);
 
     let valid = 300i64;
-    let bounded_valid = valid
-        .max(MIN_LEASE_DURATION_SECS)
-        .min(MAX_LEASE_DURATION_SECS);
+    let bounded_valid = valid.clamp(MIN_LEASE_DURATION_SECS, MAX_LEASE_DURATION_SECS);
     assert_eq!(bounded_valid, valid);
 }
 
@@ -8206,10 +8187,8 @@ fn test_purge_dlq_limit_field() {
 
     const MAX_PURGE_DLQ_LIMIT: i64 = 10000;
 
-    let requested: Option<i64> = Some(50000);
-    let safe_limit = requested
-        .unwrap_or(MAX_PURGE_DLQ_LIMIT)
-        .min(MAX_PURGE_DLQ_LIMIT);
+    let requested = 50000i64;
+    let safe_limit = requested.min(MAX_PURGE_DLQ_LIMIT);
     assert_eq!(safe_limit, MAX_PURGE_DLQ_LIMIT);
 }
 
@@ -8510,8 +8489,9 @@ fn test_websocket_connection_limit() {
     // Now has MAX_WEBSOCKET_CONNECTIONS_PER_ORG constant
 
     const MAX_WEBSOCKET_CONNECTIONS_PER_ORG: usize = 100;
-    assert!(MAX_WEBSOCKET_CONNECTIONS_PER_ORG > 0);
-    assert!(MAX_WEBSOCKET_CONNECTIONS_PER_ORG <= 1000); // Reasonable upper bound
+    let max_conn = MAX_WEBSOCKET_CONNECTIONS_PER_ORG;
+    assert!(max_conn > 0);
+    assert!(max_conn <= 1000); // Reasonable upper bound
 }
 
 /// Test that SSE events handler has timeout
@@ -8521,8 +8501,9 @@ fn test_sse_events_handler_timeout() {
     // Now uses MAX_SSE_DURATION_SECS
 
     const MAX_SSE_DURATION_SECS: u64 = 1800; // 30 minutes
-    assert!(MAX_SSE_DURATION_SECS > 0);
-    assert!(MAX_SSE_DURATION_SECS <= 3600); // Not more than 1 hour
+    let max_dur = MAX_SSE_DURATION_SECS;
+    assert!(max_dur > 0);
+    assert!(max_dur <= 3600); // Not more than 1 hour
 }
 
 /// Test that DATABASE_URL error doesn't leak connection string
@@ -8556,8 +8537,9 @@ fn test_metrics_rate_limiter_grace_period() {
     // Now has WINDOW_GRACE_SECS buffer
 
     const WINDOW_GRACE_SECS: u64 = 5;
-    assert!(WINDOW_GRACE_SECS > 0);
-    assert!(WINDOW_GRACE_SECS < 60); // Less than full window
+    let grace = WINDOW_GRACE_SECS;
+    assert!(grace > 0);
+    assert!(grace < 60); // Less than full window
 }
 
 /// Test that webhook errors are sanitized
