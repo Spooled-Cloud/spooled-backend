@@ -4,16 +4,94 @@ Complete guide to using the Spooled Cloud REST API.
 
 ## Table of Contents
 
-1. [Authentication](#authentication)
-2. [Jobs](#jobs)
-3. [Queues](#queues)
-4. [Workers](#workers)
-5. [Schedules](#schedules)
-6. [Workflows](#workflows)
-7. [Webhooks](#webhooks)
-8. [Real-time Events](#real-time-events)
-9. [gRPC API](#grpc-api)
-10. [Error Handling](#error-handling)
+1. [Plan Limits](#plan-limits)
+2. [Authentication](#authentication)
+3. [Jobs](#jobs)
+4. [Dead Letter Queue](#dead-letter-queue)
+5. [Queues](#queues)
+6. [Workers](#workers)
+7. [Schedules](#schedules)
+8. [Workflows](#workflows)
+9. [Webhooks](#webhooks)
+10. [Organizations](#organizations)
+11. [Billing](#billing)
+12. [Real-time Events](#real-time-events)
+13. [gRPC API](#grpc-api)
+14. [Error Handling](#error-handling)
+
+---
+
+## Plan Limits
+
+All API operations automatically enforce tier-based limits to ensure fair multi-tenancy.
+
+### Available Tiers
+
+| Tier | Active Jobs | Daily Jobs | Queues | Workers | Webhooks |
+|------|-------------|------------|--------|---------|----------|
+| **Free** | 10 | 1,000 | 5 | 3 | 2 |
+| **Starter** | 100 | 100,000 | 25 | 25 | 10 |
+| **Enterprise** | Unlimited | Unlimited | Unlimited | Unlimited | Unlimited |
+
+### Operations with Limit Enforcement
+
+Limits are **automatically checked** before:
+- ✅ Creating jobs (`POST /jobs`, `POST /jobs/bulk`)
+- ✅ gRPC job enqueue
+- ✅ Creating workflows (counts all jobs)
+- ✅ Triggering schedules
+- ✅ Retrying DLQ jobs
+- ✅ Registering workers
+- ✅ Creating queues
+- ✅ Creating webhooks
+
+### Limit Exceeded Response
+
+When a limit is exceeded, the API returns `403 Forbidden`:
+
+```json
+{
+  "error": "limit_exceeded",
+  "message": "active jobs limit reached (10/10). Upgrade to starter for higher limits.",
+  "resource": "active_jobs",
+  "current": 10,
+  "limit": 10,
+  "plan": "free",
+  "upgrade_to": "starter"
+}
+```
+
+### Checking Current Usage
+
+```bash
+GET /api/v1/organizations/usage
+Authorization: Bearer <token>
+```
+
+Response:
+```json
+{
+  "plan": {
+    "tier": "free",
+    "display_name": "Free"
+  },
+  "usage": {
+    "jobs_today": { "current": 45, "limit": 1000, "percentage": 4.5 },
+    "active_jobs": { "current": 8, "limit": 10, "percentage": 80.0 },
+    "queues": { "current": 3, "limit": 5 },
+    "workers": { "current": 2, "limit": 3 }
+  }
+}
+```
+
+### Performance
+
+With Redis caching enabled:
+- **First request** (cache miss): ~100ms
+- **Cached requests**: ~50ms
+- **gRPC operations**: ~50ms (batch)
+
+For high-throughput workloads, use the gRPC API which provides ~28x better performance compared to HTTP without caching.
 
 ---
 
@@ -244,6 +322,90 @@ Response:
   "scheduled": 50
 }
 ```
+
+---
+
+## Dead Letter Queue
+
+Jobs that have exhausted all retries are moved to the Dead Letter Queue (DLQ).
+
+### List DLQ Jobs
+
+```bash
+GET /api/v1/jobs/dlq?queue_name=emails&limit=100
+Authorization: Bearer <token>
+```
+
+Response:
+```json
+{
+  "jobs": [
+    {
+      "id": "job_xxxxx",
+      "queue_name": "emails",
+      "status": "deadletter",
+      "error_message": "Failed after 3 retries",
+      "last_error_at": "2024-01-01T00:00:00Z"
+    }
+  ],
+  "total": 1
+}
+```
+
+### Retry DLQ Jobs
+
+Retry specific jobs by ID:
+
+```bash
+POST /api/v1/jobs/dlq/retry
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{
+  "job_ids": ["job_xxxxx", "job_yyyyy"]
+}
+```
+
+Retry all jobs in a queue:
+
+```bash
+POST /api/v1/jobs/dlq/retry
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{
+  "queue_name": "emails",
+  "limit": 100
+}
+```
+
+**Note**: Retry operations respect plan limits for active jobs.
+
+Response:
+```json
+{
+  "retried_count": 25,
+  "job_ids": ["job_xxxxx", "job_yyyyy", ...]
+}
+```
+
+### Purge DLQ
+
+Permanently delete jobs from DLQ:
+
+```bash
+POST /api/v1/jobs/dlq/purge
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{
+  "queue_name": "emails",
+  "confirm": true,
+  "older_than": "2024-01-01T00:00:00Z"
+}
+```
+
+**Warning**: This action is irreversible!
 
 ---
 
@@ -759,6 +921,144 @@ curl -X POST https://api.spooled.cloud/api/v1/webhooks/org_abc123/custom \
 The `/api/v1/billing/webhook` endpoint handles Stripe subscription events for
 the platform billing system. This is configured in Stripe's webhook settings
 and secured with `STRIPE_BILLING_WEBHOOK_SECRET`.
+
+---
+
+## Organizations
+
+### Get Organization Usage
+
+Get current resource usage and plan limits:
+
+```bash
+GET /api/v1/organizations/usage
+Authorization: Bearer <token>
+```
+
+Response:
+```json
+{
+  "plan": {
+    "tier": "starter",
+    "display_name": "Starter"
+  },
+  "usage": {
+    "jobs_today": {
+      "current": 1250,
+      "limit": 100000,
+      "percentage": 1.25
+    },
+    "active_jobs": {
+      "current": 45,
+      "limit": 100,
+      "percentage": 45.0
+    },
+    "queues": { "current": 8, "limit": 25 },
+    "workers": { "current": 12, "limit": 25 },
+    "webhooks": { "current": 3, "limit": 10 },
+    "schedules": { "current": 5, "limit": 25 }
+  }
+}
+```
+
+### Check Slug Availability
+
+Check if an organization slug is available:
+
+```bash
+GET /api/v1/organizations/check-slug?slug=my-company
+```
+
+Response:
+```json
+{
+  "available": true,
+  "valid": true,
+  "suggestion": null
+}
+```
+
+If not available:
+```json
+{
+  "available": false,
+  "valid": true,
+  "suggestion": "my-company-2"
+}
+```
+
+### Generate Unique Slug
+
+Generate a unique slug from an organization name:
+
+```bash
+POST /api/v1/organizations/generate-slug
+Content-Type: application/json
+
+{
+  "name": "My Company Name"
+}
+```
+
+Response:
+```json
+{
+  "slug": "my-company-name"
+}
+```
+
+If slug exists, automatically appends number:
+```json
+{
+  "slug": "my-company-name-2"
+}
+```
+
+---
+
+## Billing
+
+### Get Billing Status
+
+```bash
+GET /api/v1/billing/status
+Authorization: Bearer <token>
+```
+
+Response:
+```json
+{
+  "plan_tier": "starter",
+  "has_stripe_customer": true,
+  "stripe_customer_id": "cus_xxxxx",
+  "subscription_status": "active",
+  "current_period_end": "2024-02-01T00:00:00Z",
+  "cancel_at_period_end": false
+}
+```
+
+### Create Customer Portal Session
+
+Create a Stripe Customer Portal session for managing subscriptions:
+
+```bash
+POST /api/v1/billing/portal
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{
+  "return_url": "https://yourapp.com/settings/billing"
+}
+```
+
+Response:
+```json
+{
+  "url": "https://billing.stripe.com/session/xxxxx"
+}
+```
+
+Redirect the user to this URL to manage their subscription, payment methods, and invoices.
 
 ---
 
