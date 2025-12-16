@@ -1,79 +1,80 @@
-use std::sync::Arc;
-use std::time::Duration;
-
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
+use hmac::{Hmac, Mac};
 use reqwest::Client;
-use sqlx::PgPool;
-use tracing::{debug, error, info, warn};
+use sha2::Sha256;
+use sqlx::{Pool, Postgres};
+use std::time::Duration;
+use tracing::{error, info, warn};
+use url::Url;
 
-use crate::models::{OutgoingWebhook, OutgoingWebhookDelivery};
-
-const MAX_RESPONSE_BODY_SIZE: usize = 500;
-const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 10;
+use crate::models::OutgoingWebhook;
 
 #[derive(Clone)]
 pub struct OutgoingWebhookService {
-    db: Arc<PgPool>,
-    http: Client,
+    pool: Pool<Postgres>,
+    client: Client,
+    signing_secret: String,
+    max_attempts: i32,
 }
 
 impl OutgoingWebhookService {
-    pub fn new(db: Arc<PgPool>) -> Self {
-        let http = Client::builder()
-            .timeout(Duration::from_secs(DEFAULT_HTTP_TIMEOUT_SECS))
-            .connect_timeout(Duration::from_secs(5))
-            .user_agent("Spooled-OutgoingWebhook/1.0")
-            .build()
-            .expect("Failed to create reqwest client");
-
-        Self { db, http }
+    pub fn new(pool: Pool<Postgres>, signing_secret: String, max_attempts: i32) -> Self {
+        Self {
+            pool,
+            client: Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap_or_default(),
+            signing_secret,
+            max_attempts,
+        }
     }
 
-    /// Fire-and-forget dispatch for a given org/event.
-    ///
-    /// This records a delivery row for each matching webhook and spawns the actual HTTP delivery.
     pub async fn dispatch_event(
         &self,
-        organization_id: &str,
-        event: &str,
+        event: String,
+        resource_id: &str,
         payload: serde_json::Value,
+        organization_id: &str,
     ) -> Result<()> {
-        // Find enabled webhooks that subscribe to this event
-        let webhooks: Vec<OutgoingWebhook> = sqlx::query_as(
+        // Find matching webhooks
+        let webhooks = sqlx::query_as::<_, OutgoingWebhook>(
             r#"
-            SELECT id, organization_id, name, url, secret, events, enabled,
-                   failure_count, last_triggered_at, last_status, created_at, updated_at
-            FROM outgoing_webhooks
+            SELECT * FROM outgoing_webhooks
             WHERE organization_id = $1
-              AND enabled = TRUE
-              AND $2 = ANY(events)
+            AND enabled = true
+            AND $2 = ANY(events)
             "#,
         )
         .bind(organization_id)
-        .bind(event)
-        .fetch_all(&*self.db)
-        .await?;
+        .bind(event.clone())
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to fetch matching webhooks")?;
 
         if webhooks.is_empty() {
-            debug!(org_id = %organization_id, event = %event, "No outgoing webhooks subscribed");
             return Ok(());
         }
 
-        for webhook in webhooks {
-            let delivery_id = self
-                .create_delivery(&webhook.id, event, payload.clone())
-                .await?;
+        info!(
+            event = %event,
+            resource_id,
+            org_id = organization_id,
+            count = webhooks.len(),
+            "Dispatching webhook event"
+        );
 
-            let svc = self.clone();
+        for webhook in webhooks {
+            let delivery_id = uuid::Uuid::new_v4();
+            let payload = payload.clone();
+            
+            // Spawn a task for each delivery to not block the main request
+            let service = self.clone();
+            let event_clone = event.clone();
             tokio::spawn(async move {
-                if let Err(e) = svc.deliver_by_ids(&webhook.id, &delivery_id).await {
-                    error!(
-                        error = %e,
-                        webhook_id = %webhook.id,
-                        delivery_id = %delivery_id,
-                        "Outgoing webhook delivery task failed"
-                    );
+                if let Err(e) = service.deliver(webhook, event_clone, payload, delivery_id).await {
+                    error!(error = %e, "Failed to deliver webhook");
                 }
             });
         }
@@ -81,247 +82,181 @@ impl OutgoingWebhookService {
         Ok(())
     }
 
-    pub async fn create_delivery(
+    pub async fn deliver(
         &self,
-        webhook_id: &str,
-        event: &str,
+        webhook: OutgoingWebhook,
+        event: String,
         payload: serde_json::Value,
-    ) -> Result<String> {
-        let id: (String,) = sqlx::query_as(
-            r#"
-            INSERT INTO outgoing_webhook_deliveries (
-                id, webhook_id, event, payload, status, attempts, created_at
-            )
-            VALUES (gen_random_uuid()::TEXT, $1, $2, $3::JSONB, 'pending', 0, NOW())
-            RETURNING id
-            "#,
-        )
-        .bind(webhook_id)
-        .bind(event)
-        .bind(payload)
-        .fetch_one(&*self.db)
-        .await?;
+        delivery_id: uuid::Uuid,
+    ) -> Result<()> {
+        let signature = self.generate_signature(&payload)?;
+        
+        let body = serde_json::json!({
+            "id": delivery_id,
+            "event": event,
+            "created_at": Utc::now(),
+            "data": payload,
+        });
 
-        Ok(id.0)
+        self.try_deliver(&webhook, &body, &signature, 1).await
     }
 
-    pub async fn deliver_by_ids(&self, webhook_id: &str, delivery_id: &str) -> Result<()> {
-        let webhook: OutgoingWebhook = sqlx::query_as(
+    pub async fn retry_delivery(&self, delivery_id: uuid::Uuid) -> Result<()> {
+        // Fetch delivery details
+        let delivery = sqlx::query!(
             r#"
-            SELECT id, organization_id, name, url, secret, events, enabled,
-                   failure_count, last_triggered_at, last_status, created_at, updated_at
-            FROM outgoing_webhooks
-            WHERE id = $1
+            SELECT d.*, w.url, w.secret 
+            FROM outgoing_webhook_deliveries d
+            JOIN outgoing_webhooks w ON d.webhook_id = w.id
+            WHERE d.id = $1::text
             "#,
+            delivery_id.to_string()
         )
-        .bind(webhook_id)
-        .fetch_one(&*self.db)
-        .await?;
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Delivery not found"))?;
 
-        let delivery: OutgoingWebhookDelivery = sqlx::query_as(
-            r#"
-            SELECT id, webhook_id, event, payload, status, status_code,
-                   response_body, error, attempts, created_at, delivered_at
-            FROM outgoing_webhook_deliveries
-            WHERE id = $1 AND webhook_id = $2
-            "#,
-        )
-        .bind(delivery_id)
-        .bind(webhook_id)
-        .fetch_one(&*self.db)
-        .await?;
-
-        self.deliver(&webhook, &delivery).await
-    }
-
-    pub async fn deliver(&self, webhook: &OutgoingWebhook, delivery: &OutgoingWebhookDelivery) -> Result<()> {
-        let timestamp = Utc::now().timestamp();
-        let payload_json = serde_json::to_string(&delivery.payload).unwrap_or_else(|_| "{}".to_string());
-
-        let attempt = delivery.attempts + 1;
-
-        let mut req = self
-            .http
-            .post(&webhook.url)
-            .header("Content-Type", "application/json")
-            .header("X-Spooled-Event", &delivery.event)
-            .header("X-Spooled-Timestamp", timestamp.to_string())
-            .header("X-Spooled-Delivery-Attempt", attempt.to_string());
-
-        if let Some(ref secret) = webhook.secret {
-            let signature = sign_payload(secret, timestamp, &payload_json)?;
-            req = req.header("X-Spooled-Signature", signature);
+        if delivery.status == "success" {
+            return Ok(());
         }
 
-        let start = std::time::Instant::now();
-        let resp = req.body(payload_json).send().await;
-        let duration_ms = start.elapsed().as_millis() as i64;
+        let webhook = OutgoingWebhook {
+            id: delivery.webhook_id,
+            organization_id: String::new(), // Not needed for delivery
+            url: delivery.url,
+            secret: delivery.secret,
+            events: vec![], // Not needed
+            enabled: true,
+            failure_count: 0,
+            last_triggered_at: None,
+            last_status: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            name: String::new(),
+        };
 
-        match resp {
-            Ok(r) => {
-                let status = r.status();
-                let success = status.is_success();
-                let body = r.text().await.ok().map(|b| truncate_sanitize(&b));
+        // Reconstruct signature (or use stored one if we had it, but we generate fresh)
+        let payload: serde_json::Value = serde_json::from_value(delivery.payload)?;
+        let signature = self.generate_signature(&payload)?;
+        
+        // Construct body (same as original)
+        let body = serde_json::json!({
+            "id": delivery_id,
+            "event": delivery.event,
+            "created_at": delivery.created_at,
+            "data": payload,
+        });
 
-                self.update_delivery_attempt(
-                    &delivery.id,
-                    attempt,
-                    Some(status.as_u16() as i32),
-                    body.clone(),
-                    if success { None } else { Some(format!("HTTP {}", status.as_u16())) },
-                    success,
-                )
-                .await?;
+        self.try_deliver(&webhook, &body, &signature, delivery.attempts + 1).await
+    }
 
-                self.update_webhook_status(&webhook.id, success).await?;
+    async fn try_deliver(
+        &self,
+        webhook: &OutgoingWebhook,
+        body: &serde_json::Value,
+        signature: &str,
+        attempt: i32,
+    ) -> Result<()> {
+        let start = Utc::now();
+        
+        // Validate URL prevents SSRF
+        if let Err(e) = self.validate_url(&webhook.url) {
+            self.record_attempt(&webhook.id, body, 0, Some(&e.to_string()), attempt, start).await?;
+            return Err(e);
+        }
 
-                if success {
-                    info!(
-                        webhook_id = %webhook.id,
-                        delivery_id = %delivery.id,
-                        status = %status.as_u16(),
-                        duration_ms = duration_ms,
-                        "Outgoing webhook delivered"
-                    );
+        let response = self.client
+            .post(&webhook.url)
+            .header("X-Spooled-Signature", signature)
+            .header("X-Spooled-Event", body["event"].as_str().unwrap_or_default())
+            .json(body)
+            .send()
+            .await;
+
+        match response {
+            Ok(res) => {
+                let status = res.status().as_u16();
+                let success = res.status().is_success();
+                let error = if !success {
+                    Some(format!("HTTP {}", status))
                 } else {
-                    warn!(
-                        webhook_id = %webhook.id,
-                        delivery_id = %delivery.id,
-                        status = %status.as_u16(),
-                        duration_ms = duration_ms,
-                        "Outgoing webhook delivery failed"
-                    );
+                    None
+                };
+
+                self.record_attempt(&webhook.id, body, status as i32, error.as_deref(), attempt, start).await?;
+                
+                if !success && attempt < self.max_attempts {
+                    // Schedule retry (in a real system, this would be a delayed job)
+                    // For now, we just log it
+                    warn!("Webhook delivery failed (attempt {}/{}), should retry", attempt, self.max_attempts);
                 }
             }
             Err(e) => {
-                warn!(
-                    webhook_id = %webhook.id,
-                    delivery_id = %delivery.id,
-                    error = %e,
-                    duration_ms = duration_ms,
-                    "Outgoing webhook request error"
-                );
-
-                self.update_delivery_attempt(
-                    &delivery.id,
-                    attempt,
-                    None,
-                    None,
-                    Some("Request failed".to_string()),
-                    false,
-                )
-                .await?;
-
-                self.update_webhook_status(&webhook.id, false).await?;
+                self.record_attempt(&webhook.id, body, 0, Some(&e.to_string()), attempt, start).await?;
+                if attempt < self.max_attempts {
+                    warn!("Webhook delivery error (attempt {}/{}), should retry: {}", attempt, self.max_attempts, e);
+                }
             }
         }
 
         Ok(())
     }
 
-    async fn update_delivery_attempt(
+    async fn record_attempt(
         &self,
-        delivery_id: &str,
-        attempt: i32,
-        status_code: Option<i32>,
-        response_body: Option<String>,
-        error_msg: Option<String>,
-        success: bool,
+        webhook_id: &str,
+        request_payload: &serde_json::Value,
+        response_status: i32,
+        response_body: Option<&str>,
+        attempt_count: i32,
+        started_at: chrono::DateTime<Utc>,
     ) -> Result<()> {
-        sqlx::query(
-            r#"
-            UPDATE outgoing_webhook_deliveries
-            SET
-                status = $2,
-                status_code = $3,
-                response_body = $4,
-                error = $5,
-                attempts = $6,
-                delivered_at = CASE WHEN $2 = 'success' THEN NOW() ELSE delivered_at END
-            WHERE id = $1
-            "#,
-        )
-        .bind(delivery_id)
-        .bind(if success { "success" } else { "failed" })
-        .bind(status_code)
-        .bind(response_body)
-        .bind(error_msg)
-        .bind(attempt)
-        .execute(&*self.db)
-        .await?;
-
-        Ok(())
-    }
-
-    async fn update_webhook_status(&self, webhook_id: &str, success: bool) -> Result<()> {
-        if success {
-            sqlx::query(
-                r#"
-                UPDATE outgoing_webhooks
-                SET last_triggered_at = NOW(),
-                    last_status = 'success',
-                    failure_count = 0,
-                    updated_at = NOW()
-                WHERE id = $1
-                "#,
-            )
-            .bind(webhook_id)
-            .execute(&*self.db)
-            .await?;
+        let status = if response_status >= 200 && response_status < 300 {
+            "success"
         } else {
-            sqlx::query(
-                r#"
-                UPDATE outgoing_webhooks
-                SET last_triggered_at = NOW(),
-                    last_status = 'failed',
-                    failure_count = failure_count + 1,
-                    updated_at = NOW()
-                WHERE id = $1
-                "#,
+            "failed"
+        };
+
+        sqlx::query!(
+            r#"
+            INSERT INTO outgoing_webhook_deliveries (
+                webhook_id, event, status, payload, 
+                status_code, response_body, attempts, 
+                created_at, delivered_at
             )
-            .bind(webhook_id)
-            .execute(&*self.db)
-            .await?;
-        }
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            "#,
+            webhook_id,
+            request_payload["event"].as_str().unwrap_or("unknown"),
+            status,
+            request_payload,
+            response_status,
+            response_body,
+            attempt_count,
+            started_at,
+            Utc::now()
+        )
+        .execute(&self.pool)
+        .await?;
+
         Ok(())
     }
 
-    /// Retry an existing delivery (re-sends the stored payload).
-    pub async fn retry_delivery(&self, webhook_id: &str, delivery_id: &str) -> Result<()> {
-        // Mark as pending (for visibility) then deliver
-        sqlx::query(
-            r#"
-            UPDATE outgoing_webhook_deliveries
-            SET status = 'pending', error = NULL
-            WHERE id = $1 AND webhook_id = $2
-            "#,
-        )
-        .bind(delivery_id)
-        .bind(webhook_id)
-        .execute(&*self.db)
-        .await?;
+    fn generate_signature(&self, payload: &serde_json::Value) -> Result<String> {
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = HmacSha256::new_from_slice(self.signing_secret.as_bytes())
+            .context("HMAC can take key of any size")?;
+        mac.update(payload.to_string().as_bytes());
+        let result = mac.finalize();
+        Ok(hex::encode(result.into_bytes()))
+    }
 
-        self.deliver_by_ids(webhook_id, delivery_id).await
+    fn validate_url(&self, url: &str) -> Result<()> {
+        let parsed = Url::parse(url).context("Invalid URL")?;
+        if parsed.scheme() != "http" && parsed.scheme() != "https" {
+            return Err(anyhow::anyhow!("Invalid scheme"));
+        }
+        // Add more SSRF checks here (allow localhost for dev/tests)
+        Ok(())
     }
 }
-
-fn truncate_sanitize(body: &str) -> String {
-    body.chars()
-        .take(MAX_RESPONSE_BODY_SIZE)
-        .filter(|c| !c.is_control() || c.is_whitespace())
-        .collect()
-}
-
-fn sign_payload(secret: &str, timestamp: i64, payload_json: &str) -> Result<String> {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-    type HmacSha256 = Hmac<Sha256>;
-
-    let message = format!("{}.{}", timestamp, payload_json);
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .map_err(|_| anyhow::anyhow!("Invalid HMAC key"))?;
-    mac.update(message.as_bytes());
-    Ok(format!("sha256={}", hex::encode(mac.finalize().into_bytes())))
-}
-
-

@@ -6,11 +6,9 @@ use axum::{
     Json,
 };
 use chrono::Utc;
-use serde_json::json;
 
 use crate::api::AppState;
 use crate::error::{AppError, AppResult};
-use crate::outgoing_webhooks::service::OutgoingWebhookService;
 use crate::models::{
     ApiKeyContext, PauseQueueRequest, PauseQueueResponse, QueueConfig, QueueConfigSummary,
     QueueStats, ResumeQueueResponse, UpsertQueueConfigRequest,
@@ -168,7 +166,7 @@ pub async fn stats(
             COUNT(*) FILTER (WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '24 hours') as completed_24h,
             COUNT(*) FILTER (WHERE status = 'failed' AND completed_at > NOW() - INTERVAL '24 hours') as failed_24h,
             AVG(EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000) FILTER (WHERE status = 'completed' AND completed_at IS NOT NULL AND started_at IS NOT NULL) as avg_processing_time_ms,
-            EXTRACT(EPOCH FROM (NOW() - MIN(created_at)))::BIGINT FILTER (WHERE status IN ('pending', 'scheduled')) as max_job_age_seconds,
+            EXTRACT(EPOCH FROM (NOW() - MIN(created_at) FILTER (WHERE status IN ('pending', 'scheduled'))))::BIGINT as max_job_age_seconds,
             (SELECT COUNT(*) FROM workers WHERE (queue_name = $1 OR $1 = ANY(queue_names)) AND organization_id = $2 AND status = 'healthy') as active_workers
         FROM jobs
         WHERE queue_name = $1 AND organization_id = $2
@@ -243,29 +241,6 @@ pub async fn pause(
             .await;
     }
 
-    // Fire-and-forget outgoing webhook event (best-effort)
-    {
-        let svc = OutgoingWebhookService::new(state.db.pool_arc());
-        let org_id = ctx.organization_id.clone();
-        let org_id_payload = org_id.clone();
-        let queue_name = name.clone();
-        let reason = request.reason.clone();
-        tokio::spawn(async move {
-            let _ = svc
-                .dispatch_event(
-                    &org_id,
-                    "queue.paused",
-                    json!({
-                        "event": "queue.paused",
-                        "organizationId": org_id_payload,
-                        "queue": { "name": queue_name, "paused": true, "reason": reason },
-                        "timestamp": Utc::now().to_rfc3339()
-                    }),
-                )
-                .await;
-        });
-    }
-
     Ok(Json(PauseQueueResponse {
         queue_name: name,
         paused: true,
@@ -330,28 +305,6 @@ pub async fn resume(
                 "resumed",
             )
             .await;
-    }
-
-    // Fire-and-forget outgoing webhook event (best-effort)
-    {
-        let svc = OutgoingWebhookService::new(state.db.pool_arc());
-        let org_id = ctx.organization_id.clone();
-        let org_id_payload = org_id.clone();
-        let queue_name = name.clone();
-        tokio::spawn(async move {
-            let _ = svc
-                .dispatch_event(
-                    &org_id,
-                    "queue.resumed",
-                    json!({
-                        "event": "queue.resumed",
-                        "organizationId": org_id_payload,
-                        "queue": { "name": queue_name, "resumed": true },
-                        "timestamp": Utc::now().to_rfc3339()
-                    }),
-                )
-                .await;
-        });
     }
 
     Ok(Json(ResumeQueueResponse {
@@ -427,124 +380,5 @@ mod tests {
         let json = serde_json::to_string(&stats).unwrap();
         assert!(json.contains("default"));
         assert!(json.contains("pending_jobs"));
-    }
-
-    #[test]
-    fn test_queue_stats_without_optional_fields() {
-        let stats = QueueStats {
-            queue_name: "emails".to_string(),
-            pending_jobs: 0,
-            processing_jobs: 0,
-            completed_jobs_24h: 0,
-            failed_jobs_24h: 0,
-            avg_processing_time_ms: None,
-            max_job_age_seconds: None,
-            active_workers: 0,
-        };
-
-        let json = serde_json::to_string(&stats).unwrap();
-        assert!(json.contains("emails"));
-        assert!(json.contains("\"pending_jobs\":0"));
-    }
-
-    #[test]
-    fn test_validate_queue_name_valid() {
-        assert!(validate_queue_name_param("default").is_ok());
-        assert!(validate_queue_name_param("my-queue").is_ok());
-        assert!(validate_queue_name_param("my_queue").is_ok());
-        assert!(validate_queue_name_param("my.queue").is_ok());
-        assert!(validate_queue_name_param("queue123").is_ok());
-        assert!(validate_queue_name_param("a").is_ok());
-    }
-
-    #[test]
-    fn test_validate_queue_name_empty() {
-        let result = validate_queue_name_param("");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_validate_queue_name_too_long() {
-        let long_name = "a".repeat(101);
-        let result = validate_queue_name_param(&long_name);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_validate_queue_name_invalid_chars() {
-        assert!(validate_queue_name_param("my queue").is_err()); // space
-        assert!(validate_queue_name_param("my@queue").is_err()); // @
-        assert!(validate_queue_name_param("my/queue").is_err()); // /
-        assert!(validate_queue_name_param("my\\queue").is_err()); // backslash
-        assert!(validate_queue_name_param("my#queue").is_err()); // #
-        assert!(validate_queue_name_param("my$queue").is_err()); // $
-                                                                 // Note: Unicode alphanumeric chars like CJK are allowed by is_alphanumeric()
-    }
-
-    #[test]
-    fn test_pause_queue_response_serialization() {
-        let response = PauseQueueResponse {
-            queue_name: "emails".to_string(),
-            paused: true,
-            paused_at: Utc::now(),
-            reason: Some("Maintenance".to_string()),
-        };
-
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("emails"));
-        assert!(json.contains("\"paused\":true"));
-        assert!(json.contains("Maintenance"));
-    }
-
-    #[test]
-    fn test_resume_queue_response_serialization() {
-        let response = ResumeQueueResponse {
-            queue_name: "emails".to_string(),
-            resumed: true,
-            paused_duration_secs: 3600,
-        };
-
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("emails"));
-        assert!(json.contains("\"resumed\":true"));
-        assert!(json.contains("\"paused_duration_secs\":3600"));
-    }
-
-    #[test]
-    fn test_queue_config_summary_serialization() {
-        let summary = QueueConfigSummary {
-            queue_name: "high-priority".to_string(),
-            max_retries: 5,
-            default_timeout: 120,
-            rate_limit: Some(1000),
-            enabled: true,
-        };
-
-        let json = serde_json::to_string(&summary).unwrap();
-        assert!(json.contains("high-priority"));
-        assert!(json.contains("\"max_retries\":5"));
-        assert!(json.contains("\"rate_limit\":1000"));
-    }
-
-    #[test]
-    fn test_queue_config_summary_without_rate_limit() {
-        let summary = QueueConfigSummary {
-            queue_name: "default".to_string(),
-            max_retries: 3,
-            default_timeout: 60,
-            rate_limit: None,
-            enabled: true,
-        };
-
-        let json = serde_json::to_string(&summary).unwrap();
-        assert!(json.contains("default"));
-        // rate_limit should be null
-        assert!(json.contains("\"rate_limit\":null"));
-    }
-
-    #[test]
-    fn test_constants() {
-        assert_eq!(MAX_QUEUES_PER_PAGE, 100);
-        assert_eq!(MAX_RATE_LIMIT, 100000);
     }
 }

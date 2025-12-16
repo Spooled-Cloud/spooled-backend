@@ -6,13 +6,11 @@ use axum::{
     Json,
 };
 use chrono::Utc;
-use serde_json::json;
 use uuid::Uuid;
 
 use crate::api::middleware::ValidatedJson;
 use crate::api::AppState;
 use crate::error::{AppError, AppResult};
-use crate::outgoing_webhooks::service::OutgoingWebhookService;
 use crate::models::{
     ApiKeyContext, RegisterWorkerRequest, RegisterWorkerResponse, Worker, WorkerHeartbeatRequest,
     WorkerSummary,
@@ -135,29 +133,6 @@ pub async fn register(
 
     state.metrics.workers_active.inc();
     state.metrics.workers_healthy.inc();
-
-    // Fire-and-forget outgoing webhook event (best-effort)
-    {
-        let svc = OutgoingWebhookService::new(state.db.pool_arc());
-        let org_id = ctx.organization_id.clone();
-        let org_id_payload = org_id.clone();
-        let worker_id_payload = worker_id.clone();
-        let queue_name_payload = request.queue_name.clone();
-        tokio::spawn(async move {
-            let _ = svc
-                .dispatch_event(
-                    &org_id,
-                    "worker.registered",
-                    json!({
-                        "event": "worker.registered",
-                        "organizationId": org_id_payload,
-                        "worker": { "id": worker_id_payload, "queueName": queue_name_payload },
-                        "timestamp": Utc::now().to_rfc3339()
-                    }),
-                )
-                .await;
-        });
-    }
 
     Ok((
         StatusCode::CREATED,
@@ -298,28 +273,6 @@ pub async fn deregister(
                 &format!("deregistered:{}", id),
             )
             .await;
-    }
-
-    // Fire-and-forget outgoing webhook event (best-effort)
-    {
-        let svc = OutgoingWebhookService::new(state.db.pool_arc());
-        let org_id = ctx.organization_id.clone();
-        let org_id_payload = org_id.clone();
-        let worker_id_payload = id.clone();
-        tokio::spawn(async move {
-            let _ = svc
-                .dispatch_event(
-                    &org_id,
-                    "worker.deregistered",
-                    json!({
-                        "event": "worker.deregistered",
-                        "organizationId": org_id_payload,
-                        "worker": { "id": worker_id_payload },
-                        "timestamp": Utc::now().to_rfc3339()
-                    }),
-                )
-                .await;
-        });
     }
 
     Ok(StatusCode::NO_CONTENT)

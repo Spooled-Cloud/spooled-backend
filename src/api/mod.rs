@@ -144,20 +144,7 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
         // Email login flow (passwordless)
         .route("/auth/email/start", post(handlers::email_login::start))
         .route("/auth/email/verify", post(handlers::email_login::verify))
-        // Complete signup after email verification
-        .route(
-            "/auth/signup/complete",
-            post(handlers::email_login::complete_signup),
-        )
-        // Email availability check (for signup)
-        .route("/auth/check-email", get(handlers::email_login::check_email))
-        // Slug availability check (for signup)
-        .route(
-            "/organizations/check-slug",
-            get(handlers::organizations::check_slug),
-        )
         // Webhooks are authenticated via signatures, not API keys
-        // Custom webhook for organizations to receive events and create jobs
         .route(
             "/webhooks/{org_id}/custom",
             post(handlers::webhooks::custom),
@@ -179,18 +166,6 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
         // Organizations (except create which is public)
         .route("/organizations", get(handlers::organizations::list))
         .route("/organizations/usage", get(handlers::organizations::usage))
-        .route(
-            "/organizations/webhook-token",
-            get(handlers::organizations::get_webhook_token),
-        )
-        .route(
-            "/organizations/webhook-token/regenerate",
-            post(handlers::organizations::regenerate_webhook_token),
-        )
-        .route(
-            "/organizations/webhook-token/clear",
-            post(handlers::organizations::clear_webhook_token),
-        )
         .route("/organizations/{id}", get(handlers::organizations::get))
         .route("/organizations/{id}", put(handlers::organizations::update))
         .route(
@@ -204,18 +179,17 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
         // Jobs - CRUD
         .route("/jobs", get(handlers::jobs::list))
         .route("/jobs", post(handlers::jobs::create))
-        // Worker processing (polling/acking)
-        .route("/jobs/claim", post(handlers::jobs::claim))
-        .route("/jobs/{id}/complete", post(handlers::jobs::complete))
-        .route("/jobs/{id}/fail", post(handlers::jobs::fail))
-        .route("/jobs/{id}/heartbeat", post(handlers::jobs::heartbeat))
         .route("/jobs/stats", get(handlers::jobs::stats))
         .route("/jobs/status", get(handlers::jobs::batch_status))
         .route("/jobs/bulk", post(handlers::jobs::bulk_enqueue))
+        .route("/jobs/claim", post(handlers::jobs::claim))
         .route("/jobs/{id}", get(handlers::jobs::get))
         .route("/jobs/{id}", delete(handlers::jobs::cancel))
         .route("/jobs/{id}/retry", post(handlers::jobs::retry))
         .route("/jobs/{id}/priority", put(handlers::jobs::boost_priority))
+        .route("/jobs/{id}/complete", post(handlers::jobs::complete))
+        .route("/jobs/{id}/fail", post(handlers::jobs::fail))
+        .route("/jobs/{id}/heartbeat", post(handlers::jobs::heartbeat))
         // Dead Letter Queue Management
         .route("/jobs/dlq", get(handlers::jobs::list_dlq))
         .route("/jobs/dlq/retry", post(handlers::jobs::retry_dlq))
@@ -312,10 +286,6 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
         .route(
             "/outgoing-webhooks/{id}/deliveries",
             get(handlers::outgoing_webhooks::deliveries),
-        )
-        .route(
-            "/outgoing-webhooks/{id}/retry/{delivery_id}",
-            post(handlers::outgoing_webhooks::retry_delivery),
         )
         // Billing endpoints
         .route("/billing/status", get(handlers::billing::status))

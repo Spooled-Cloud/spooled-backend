@@ -9,7 +9,6 @@ use std::sync::Arc;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic_health::server::health_reporter;
 use tracing::{info, warn};
-use tokio_stream::wrappers::TcpListenerStream;
 
 use crate::grpc::proto::queue_service_server::QueueServiceServer;
 use crate::grpc::proto::worker_service_server::WorkerServiceServer;
@@ -76,10 +75,6 @@ pub async fn start_grpc_server(
     db: Arc<crate::db::Database>,
     metrics: Arc<Metrics>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Bind explicitly so failures surface as clear OS errors (instead of generic "transport error")
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    info!(%addr, "gRPC TCP listener bound");
-
     let pool = db.pool_arc();
 
     // Load TLS configuration
@@ -155,7 +150,7 @@ pub async fn start_grpc_server(
                 .max_decoding_message_size(MAX_MESSAGE_SIZE)
                 .max_encoding_message_size(MAX_MESSAGE_SIZE),
         )
-        .serve_with_incoming(TcpListenerStream::new(listener))
+        .serve(addr)
         .await?;
 
     Ok(())

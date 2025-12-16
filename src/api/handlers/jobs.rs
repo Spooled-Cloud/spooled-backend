@@ -9,7 +9,6 @@ use chrono::Utc;
 use std::sync::Arc;
 use tracing::info;
 use uuid::Uuid;
-use serde_json::json;
 
 use crate::api::middleware::limits::{check_job_limits, check_payload_size, increment_daily_jobs};
 use crate::api::middleware::ValidatedJson;
@@ -22,7 +21,6 @@ use crate::models::{
     ListJobsQuery,
 };
 use crate::queue::QueueManager;
-use crate::outgoing_webhooks::service::OutgoingWebhookService;
 use axum::extract::Extension;
 
 /// Maximum jobs per list request
@@ -145,7 +143,7 @@ pub async fn create(
     Extension(ctx): Extension<ApiKeyContext>,
     ValidatedJson(request): ValidatedJson<CreateJobRequest>,
 ) -> AppResult<(StatusCode, Json<CreateJobResponse>)> {
-    let org_id = ctx.organization_id.clone();
+    let org_id = ctx.organization_id;
 
     // Check payload size against plan limits
     let payload_json = serde_json::to_string(&request.payload).unwrap_or_default();
@@ -245,38 +243,6 @@ pub async fn create(
             .await;
     }
 
-    // Fire-and-forget outgoing webhook event (best-effort)
-    {
-        let svc = OutgoingWebhookService::new(state.db.pool_arc());
-        let org_id = ctx.organization_id.clone();
-        let org_id_payload = org_id.clone();
-        let queue_name = request.queue_name.clone();
-        let payload = request.payload.clone();
-        let scheduled_at = request.scheduled_at;
-        let returned_id_clone = returned_id.clone();
-        let initial_status_clone = initial_status.to_string();
-        tokio::spawn(async move {
-            let _ = svc
-                .dispatch_event(
-                    &org_id,
-                    "job.created",
-                    json!({
-                        "event": "job.created",
-                        "organizationId": org_id_payload,
-                        "job": {
-                            "id": returned_id_clone,
-                            "queueName": queue_name,
-                            "status": initial_status_clone,
-                            "scheduledAt": scheduled_at,
-                            "payload": payload
-                        },
-                        "timestamp": Utc::now().to_rfc3339()
-                    }),
-                )
-                .await;
-        });
-    }
-
     Ok((
         if created {
             StatusCode::CREATED
@@ -328,30 +294,6 @@ pub async fn claim(
                 // Metrics: claimed job transitions pending -> processing
                 state.metrics.jobs_processing.inc();
                 state.metrics.jobs_pending.dec();
-
-                // Fire-and-forget outgoing webhook event (best-effort)
-                {
-                    let svc = OutgoingWebhookService::new(state.db.pool_arc());
-                    let org_id = ctx.organization_id.clone();
-                    let org_id_payload = org_id.clone();
-                    let job_id = j.id.clone();
-                    let queue_name = j.queue_name.clone();
-                    tokio::spawn(async move {
-                        let _ = svc
-                            .dispatch_event(
-                                &org_id,
-                                "job.started",
-                                json!({
-                                    "event": "job.started",
-                                    "organizationId": org_id_payload,
-                                    "job": { "id": job_id, "queueName": queue_name, "status": "processing" },
-                                    "timestamp": Utc::now().to_rfc3339()
-                                }),
-                            )
-                            .await;
-                    });
-                }
-
                 jobs.push(j.into());
             }
             None => break,
@@ -388,28 +330,6 @@ pub async fn complete(
     // Metrics: processing -> completed
     state.metrics.jobs_processing.dec();
     state.metrics.jobs_completed.inc();
-
-    // Fire-and-forget outgoing webhook event (best-effort)
-    {
-        let svc = OutgoingWebhookService::new(state.db.pool_arc());
-        let org_id = ctx.organization_id.clone();
-        let org_id_payload = org_id.clone();
-        let job_id = id.clone();
-        tokio::spawn(async move {
-            let _ = svc
-                .dispatch_event(
-                    &org_id,
-                    "job.completed",
-                    json!({
-                        "event": "job.completed",
-                        "organizationId": org_id_payload,
-                        "job": { "id": job_id, "status": "completed" },
-                        "timestamp": Utc::now().to_rfc3339()
-                    }),
-                )
-                .await;
-        });
-    }
 
     Ok((StatusCode::OK, Json(serde_json::json!({ "success": true }))))
 }
@@ -454,29 +374,6 @@ pub async fn fail(
     // Metrics: processing -> pending (retry) OR processing -> deadletter.
     // We don't know which without re-fetching; keep counters conservative.
     state.metrics.jobs_processing.dec();
-
-    // Fire-and-forget outgoing webhook event (best-effort)
-    {
-        let svc = OutgoingWebhookService::new(state.db.pool_arc());
-        let org_id = ctx.organization_id.clone();
-        let org_id_payload = org_id.clone();
-        let job_id = id.clone();
-        let err = request.error.clone();
-        tokio::spawn(async move {
-            let _ = svc
-                .dispatch_event(
-                    &org_id,
-                    "job.failed",
-                    json!({
-                        "event": "job.failed",
-                        "organizationId": org_id_payload,
-                        "job": { "id": job_id, "status": "failed", "error": err },
-                        "timestamp": Utc::now().to_rfc3339()
-                    }),
-                )
-                .await;
-        });
-    }
 
     Ok((StatusCode::OK, Json(serde_json::json!({ "success": true }))))
 }
@@ -587,28 +484,6 @@ pub async fn cancel(
             .await;
     }
 
-    // Fire-and-forget outgoing webhook event (best-effort)
-    {
-        let svc = OutgoingWebhookService::new(state.db.pool_arc());
-        let org_id = ctx.organization_id.clone();
-        let org_id_payload = org_id.clone();
-        let job_id = id.clone();
-        tokio::spawn(async move {
-            let _ = svc
-                .dispatch_event(
-                    &org_id,
-                    "job.cancelled",
-                    json!({
-                        "event": "job.cancelled",
-                        "organizationId": org_id_payload,
-                        "job": { "id": job_id, "status": "cancelled" },
-                        "timestamp": Utc::now().to_rfc3339()
-                    }),
-                )
-                .await;
-        });
-    }
-
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -702,7 +577,7 @@ pub async fn bulk_enqueue(
     Extension(ctx): Extension<ApiKeyContext>,
     ValidatedJson(request): ValidatedJson<crate::models::BulkEnqueueRequest>,
 ) -> AppResult<Json<crate::models::BulkEnqueueResponse>> {
-    let org_id = ctx.organization_id.clone();
+    let org_id = ctx.organization_id;
     let job_count = request.jobs.len() as u64;
 
     // Check job limits (daily + active) before creating

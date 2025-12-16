@@ -58,28 +58,53 @@ pub async fn authenticate_api_key(
     mut request: Request,
     next: Next,
 ) -> Result<Response, (StatusCode, String)> {
-    let auth_header = request
+    // Check Authorization header first
+    let token_from_header = request
         .headers()
         .get("Authorization")
-        .and_then(|v| v.to_str().ok());
+        .and_then(|v| v.to_str().ok())
+        .and_then(|header| {
+            if header.starts_with("Bearer ") {
+                Some(header[7..].to_string())
+            } else {
+                None
+            }
+        });
 
-    let token = match auth_header {
-        Some(header) if header.starts_with("Bearer ") => &header[7..],
-        _ => {
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                "Missing or invalid Authorization header".to_string(),
-            ));
+    // Fallback to query parameter 'token' or 'api_key'
+    let token = if let Some(t) = token_from_header {
+        t
+    } else {
+        let query = request.uri().query().unwrap_or("");
+        let mut found_token = None;
+        for pair in query.split('&') {
+            let mut parts = pair.splitn(2, '=');
+            if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
+                if key == "token" || key == "api_key" {
+                    found_token = Some(value.to_string());
+                    break;
+                }
+            }
+        }
+        
+        match found_token {
+            Some(t) => t,
+            None => {
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    "Missing or invalid Authorization header or token/api_key query parameter".to_string(),
+                ));
+            }
         }
     };
 
     // Detect token type: JWT tokens start with "eyJ" (base64 encoded JSON header)
     let context = if token.starts_with("eyJ") {
         // JWT token authentication
-        authenticate_jwt_token(&state, token).await?
+        authenticate_jwt_token(&state, &token).await?
     } else {
         // API key authentication (starts with "sk_")
-        authenticate_api_key_token(&state, token).await?
+        authenticate_api_key_token(&state, &token).await?
     };
 
     // Store context for downstream handlers
