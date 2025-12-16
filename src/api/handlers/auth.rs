@@ -190,7 +190,7 @@ pub async fn login(
         FROM api_keys
         WHERE is_active = TRUE 
           AND (key_prefix = $1 OR key_prefix IS NULL)
-        LIMIT 10
+        LIMIT 100
         "#,
     )
     .bind(&key_prefix)

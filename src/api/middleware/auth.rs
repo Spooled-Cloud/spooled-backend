@@ -251,13 +251,13 @@ async fn fetch_api_key(
 
     // Use key_prefix for indexed lookup - dramatically reduces bcrypt verifications
     // The (key_prefix = $1 OR key_prefix IS NULL) handles legacy keys without prefix
-    // LIMIT 10 prevents excessive results even with prefix collisions
+    // LIMIT 100 prevents excessive results even with prefix collisions
     let records: Vec<ApiKeyRecord> = sqlx::query_as(
         "SELECT id, organization_id, key_hash, queues, rate_limit, is_active, expires_at 
          FROM api_keys 
          WHERE is_active = TRUE 
            AND (key_prefix = $1 OR key_prefix IS NULL)
-         LIMIT 10",
+         LIMIT 100",
     )
     .bind(&key_prefix)
     .fetch_all(state.db.pool())
