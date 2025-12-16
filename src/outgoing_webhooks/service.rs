@@ -211,7 +211,7 @@ impl OutgoingWebhookService {
         attempt_count: i32,
         started_at: chrono::DateTime<Utc>,
     ) -> Result<()> {
-        let status = if response_status >= 200 && response_status < 300 {
+        let status = if (200..300).contains(&response_status) {
             "success"
         } else {
             "failed"

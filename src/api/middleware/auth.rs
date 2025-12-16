@@ -64,11 +64,7 @@ pub async fn authenticate_api_key(
         .get("Authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|header| {
-            if header.starts_with("Bearer ") {
-                Some(header[7..].to_string())
-            } else {
-                None
-            }
+            header.strip_prefix("Bearer ").map(|s| s.to_string())
         });
 
     // Fallback to query parameter 'token' or 'api_key'
