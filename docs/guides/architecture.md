@@ -548,9 +548,46 @@ For high-volume queues, consider partitioning by:
 
 ---
 
+## Key Performance Highlights
+
+| Metric | Value |
+|--------|-------|
+| Jobs per second per node | 10,000+ |
+| P99 enqueue latency | <50ms |
+| Uptime SLA (Pro plan) | 99.99% |
+| Language | Rust (memory-safe, zero-cost abstractions) |
+
+---
+
+## Request Limits
+
+| Resource | Limit |
+|----------|-------|
+| Request body | 5MB |
+| Job payload | 1MB |
+| gRPC payload | 1MB |
+| Webhook payload | 5MB |
+| List page size | 100 |
+| Bulk enqueue | 100 jobs |
+
+---
+
+## Deployment Options
+
+| Option | Best For | Maintenance |
+|--------|----------|-------------|
+| Managed Cloud | Most teams | Zero maintenance |
+| Docker Compose | Development, small deployments | Basic ops required |
+| Kubernetes/Helm | Large scale, air-gapped | Full ops team |
+
+---
+
 ## Further Reading
 
 - [Deployment Guide](./deployment.md)
+- [API Usage Guide](./api-usage.md)
+- [gRPC Server Guide](./grpc-server.md)
+- [Operations Guide](./operations.md)
 - [API Reference](../openapi.yaml)
 - [Load Testing](../../loadtest/README.md)
 

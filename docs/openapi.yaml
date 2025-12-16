@@ -95,6 +95,8 @@ tags:
     description: Configure webhooks for receiving notifications when events occur
   - name: Real-time
     description: WebSocket and Server-Sent Events for real-time updates
+  - name: Billing
+    description: Subscription and billing management via Stripe
   - name: Admin
     description: Platform administration (requires X-Admin-Key header)
 
@@ -300,6 +302,200 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ValidateTokenResponse'
+
+  # Email-based Authentication
+  /api/v1/auth/email/check:
+    post:
+      tags: [Authentication]
+      summary: Check email availability
+      description: Check if an email is already registered
+      operationId: checkEmail
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckEmailRequest'
+      responses:
+        '200':
+          description: Email check result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckEmailResponse'
+
+  /api/v1/auth/email/start:
+    post:
+      tags: [Authentication]
+      summary: Start email login
+      description: |
+        Start the email-based login flow. Sends a verification code to the provided email.
+        If the email is not registered, creates a new account.
+      operationId: startEmailLogin
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartEmailLoginRequest'
+      responses:
+        '200':
+          description: Verification code sent
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StartEmailLoginResponse'
+        '429':
+          description: Too many requests - rate limited
+
+  /api/v1/auth/email/verify:
+    post:
+      tags: [Authentication]
+      summary: Verify email code
+      description: Verify the code sent to the user's email and complete login
+      operationId: verifyEmailCode
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerifyEmailRequest'
+      responses:
+        '200':
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmailLoginResponse'
+        '400':
+          description: Invalid or expired code
+        '404':
+          description: No pending verification found
+
+  /api/v1/auth/email/complete-signup:
+    post:
+      tags: [Authentication]
+      summary: Complete signup
+      description: Complete the signup process by creating an organization
+      operationId: completeSignup
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompleteSignupRequest'
+      responses:
+        '200':
+          description: Signup completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CompleteSignupResponse'
+        '400':
+          description: Invalid token or organization name
+
+  # Billing Endpoints
+  /api/v1/billing/status:
+    get:
+      tags: [Billing]
+      summary: Get billing status
+      description: Get the current billing status for the organization
+      operationId: getBillingStatus
+      responses:
+        '200':
+          description: Billing status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillingStatus'
+
+  /api/v1/billing/portal:
+    post:
+      tags: [Billing]
+      summary: Create portal session
+      description: Create a Stripe Customer Portal session for managing subscriptions
+      operationId: createBillingPortal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePortalRequest'
+      responses:
+        '200':
+          description: Portal session URL
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatePortalResponse'
+
+  /api/v1/billing/webhook:
+    post:
+      tags: [Billing]
+      summary: Stripe webhook
+      description: |
+        Webhook endpoint for Stripe events. Secured with STRIPE_BILLING_WEBHOOK_SECRET.
+        Handles subscription lifecycle events.
+      operationId: stripeWebhook
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Webhook processed
+        '400':
+          description: Invalid webhook signature
+
+  /api/v1/organizations/check-slug:
+    get:
+      tags: [Organizations]
+      summary: Check slug availability
+      description: Check if an organization slug is available
+      operationId: checkSlug
+      security: []
+      parameters:
+        - name: slug
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Slug to check
+      responses:
+        '200':
+          description: Slug availability
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckSlugResponse'
+
+  /api/v1/organizations/generate-slug:
+    post:
+      tags: [Organizations]
+      summary: Generate unique slug
+      description: Generate a unique slug from an organization name
+      operationId: generateSlug
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenerateSlugRequest'
+      responses:
+        '200':
+          description: Generated slug
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenerateSlugResponse'
 
   /api/v1/organizations:
     get:
@@ -612,6 +808,83 @@ paths:
                 items:
                   $ref: '#/components/schemas/PlanLimits'
 
+  /api/v1/admin/organizations:
+    post:
+      tags: [Admin]
+      summary: Create organization (admin)
+      description: Create a new organization with specified plan
+      operationId: adminCreateOrganization
+      security:
+        - AdminKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminCreateOrganizationRequest'
+      responses:
+        '201':
+          description: Organization created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminCreateOrganizationResponse'
+
+  /api/v1/admin/organizations/{id}/api-keys:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      tags: [Admin]
+      summary: Create API key for organization
+      description: Create an API key for a specific organization
+      operationId: adminCreateApiKey
+      security:
+        - AdminKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateApiKeyRequest'
+      responses:
+        '201':
+          description: API key created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateApiKeyResponse'
+
+  /api/v1/admin/organizations/{id}/reset-usage:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      tags: [Admin]
+      summary: Reset organization usage
+      description: Reset daily usage counters for an organization
+      operationId: adminResetUsage
+      security:
+        - AdminKeyAuth: []
+      responses:
+        '200':
+          description: Usage reset
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reset:
+                    type: boolean
+                  organization_id:
+                    type: string
+
   /api/v1/jobs:
     get:
       tags: [Jobs]
@@ -736,6 +1009,115 @@ paths:
                 $ref: '#/components/schemas/Job'
         '409':
           description: Job cannot be retried
+
+  /api/v1/jobs/claim:
+    post:
+      tags: [Jobs]
+      summary: Claim jobs for processing
+      description: |
+        Claim one or more jobs from a queue for processing.
+        Jobs are leased to the worker for a configurable duration (default 5 minutes).
+        If not completed before lease expiry, jobs are released for other workers.
+      operationId: claimJobs
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClaimJobsRequest'
+      responses:
+        '200':
+          description: Jobs claimed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClaimJobsResponse'
+        '404':
+          description: Queue not found
+
+  /api/v1/jobs/{id}/complete:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      tags: [Jobs]
+      summary: Complete job
+      description: Mark a claimed job as successfully completed
+      operationId: completeJob
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompleteJobRequest'
+      responses:
+        '200':
+          description: Job completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '404':
+          description: Job not found
+        '409':
+          description: Job not in processing state or lease expired
+
+  /api/v1/jobs/{id}/fail:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      tags: [Jobs]
+      summary: Fail job
+      description: |
+        Mark a claimed job as failed. If retries remain, job will be rescheduled.
+        If no retries remain, job moves to dead-letter queue.
+      operationId: failJob
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FailJobRequest'
+      responses:
+        '200':
+          description: Job failed (will retry or go to DLQ)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '404':
+          description: Job not found
+
+  /api/v1/jobs/{id}/heartbeat:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      tags: [Jobs]
+      summary: Renew job lease
+      description: Extend the lease on a processing job to prevent it being reclaimed
+      operationId: jobHeartbeat
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/HeartbeatJobRequest'
+      responses:
+        '200':
+          description: Lease renewed
+        '404':
+          description: Job not found
+        '409':
+          description: Job not in processing state
 
   /api/v1/jobs/stats:
     get:
@@ -1042,6 +1424,33 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ResumeQueueResponse'
+        '404':
+          description: Queue not found
+
+  /api/v1/queues/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      tags: [Queues]
+      summary: Delete queue
+      description: |
+        Delete a queue and optionally all its jobs.
+        Use with caution - this operation is destructive.
+      operationId: deleteQueue
+      parameters:
+        - name: delete_jobs
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: Also delete all jobs in the queue
+      responses:
+        '204':
+          description: Queue deleted
         '404':
           description: Queue not found
 
@@ -3642,6 +4051,329 @@ components:
           type: object
           additionalProperties:
             type: integer
+
+    # Job Processing Schemas
+    ClaimJobsRequest:
+      type: object
+      required: [queue_name]
+      properties:
+        queue_name:
+          type: string
+          description: Queue to claim jobs from
+        worker_id:
+          type: string
+          description: Worker identifier (for tracking)
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 1
+          description: Maximum number of jobs to claim
+        lease_duration_secs:
+          type: integer
+          minimum: 30
+          maximum: 3600
+          default: 300
+          description: Lease duration in seconds
+
+    ClaimJobsResponse:
+      type: object
+      required: [jobs]
+      properties:
+        jobs:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClaimedJob'
+
+    ClaimedJob:
+      type: object
+      required: [id, queue_name, status, payload, lease_expires_at]
+      properties:
+        id:
+          type: string
+        queue_name:
+          type: string
+        status:
+          type: string
+        payload:
+          type: object
+        priority:
+          type: integer
+        retry_count:
+          type: integer
+        max_retries:
+          type: integer
+        timeout_seconds:
+          type: integer
+        lease_expires_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+
+    CompleteJobRequest:
+      type: object
+      properties:
+        result:
+          type: object
+          description: Optional result data to store with the job
+        worker_id:
+          type: string
+
+    FailJobRequest:
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          maxLength: 1000
+          description: Reason for failure
+        worker_id:
+          type: string
+        no_retry:
+          type: boolean
+          default: false
+          description: Skip retries and go directly to DLQ
+
+    HeartbeatJobRequest:
+      type: object
+      properties:
+        extension_secs:
+          type: integer
+          minimum: 30
+          maximum: 3600
+          default: 300
+          description: Extend lease by this many seconds
+        worker_id:
+          type: string
+
+    # Email Authentication Schemas
+    CheckEmailRequest:
+      type: object
+      required: [email]
+      properties:
+        email:
+          type: string
+          format: email
+
+    CheckEmailResponse:
+      type: object
+      required: [exists, can_login]
+      properties:
+        exists:
+          type: boolean
+        can_login:
+          type: boolean
+        needs_signup:
+          type: boolean
+
+    StartEmailLoginRequest:
+      type: object
+      required: [email]
+      properties:
+        email:
+          type: string
+          format: email
+
+    StartEmailLoginResponse:
+      type: object
+      required: [sent]
+      properties:
+        sent:
+          type: boolean
+        is_new_user:
+          type: boolean
+
+    VerifyEmailRequest:
+      type: object
+      required: [email, code]
+      properties:
+        email:
+          type: string
+          format: email
+        code:
+          type: string
+          minLength: 6
+          maxLength: 6
+
+    EmailLoginResponse:
+      type: object
+      required: [access_token, refresh_token, token_type, expires_in]
+      properties:
+        access_token:
+          type: string
+        refresh_token:
+          type: string
+        token_type:
+          type: string
+          enum: [Bearer]
+        expires_in:
+          type: integer
+        refresh_expires_in:
+          type: integer
+        user_id:
+          type: string
+        email:
+          type: string
+        organizations:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              name:
+                type: string
+              role:
+                type: string
+        needs_onboarding:
+          type: boolean
+        signup_token:
+          type: string
+          description: Token for completing signup (if needs_onboarding is true)
+
+    CompleteSignupRequest:
+      type: object
+      required: [signup_token, organization_name, organization_slug]
+      properties:
+        signup_token:
+          type: string
+        organization_name:
+          type: string
+          minLength: 3
+          maxLength: 100
+        organization_slug:
+          type: string
+          minLength: 3
+          maxLength: 50
+
+    CompleteSignupResponse:
+      type: object
+      required: [access_token, refresh_token, organization]
+      properties:
+        access_token:
+          type: string
+        refresh_token:
+          type: string
+        token_type:
+          type: string
+        expires_in:
+          type: integer
+        organization:
+          $ref: '#/components/schemas/Organization'
+        api_key:
+          type: string
+          description: Initial API key (shown only once)
+
+    # Billing Schemas
+    BillingStatus:
+      type: object
+      required: [plan_tier]
+      properties:
+        plan_tier:
+          type: string
+          enum: [free, starter, pro, enterprise]
+        has_stripe_customer:
+          type: boolean
+        stripe_customer_id:
+          type: string
+        subscription_status:
+          type: string
+          enum: [active, canceled, past_due, trialing, incomplete]
+        current_period_end:
+          type: string
+          format: date-time
+        cancel_at_period_end:
+          type: boolean
+
+    CreatePortalRequest:
+      type: object
+      required: [return_url]
+      properties:
+        return_url:
+          type: string
+          format: uri
+
+    CreatePortalResponse:
+      type: object
+      required: [url]
+      properties:
+        url:
+          type: string
+          format: uri
+          description: Stripe Customer Portal URL
+
+    # Slug Schemas
+    CheckSlugResponse:
+      type: object
+      required: [available, valid]
+      properties:
+        available:
+          type: boolean
+        valid:
+          type: boolean
+        suggestion:
+          type: string
+          description: Suggested alternative if not available
+
+    GenerateSlugRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+
+    GenerateSlugResponse:
+      type: object
+      required: [slug]
+      properties:
+        slug:
+          type: string
+
+    # Admin Schemas
+    AdminCreateOrganizationRequest:
+      type: object
+      required: [name, slug]
+      properties:
+        name:
+          type: string
+          minLength: 3
+          maxLength: 100
+        slug:
+          type: string
+          minLength: 3
+          maxLength: 50
+        billing_email:
+          type: string
+          format: email
+        plan_tier:
+          type: string
+          enum: [free, starter, pro, enterprise]
+          default: free
+        settings:
+          type: object
+
+    AdminCreateOrganizationResponse:
+      type: object
+      required: [id, name, slug, plan_tier, api_key]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        slug:
+          type: string
+        plan_tier:
+          type: string
+        api_key:
+          type: string
+          description: Initial API key (shown only once)
+        api_key_id:
+          type: string
+        created_at:
+          type: string
+          format: date-time
 
 security:
   - bearerAuth: []

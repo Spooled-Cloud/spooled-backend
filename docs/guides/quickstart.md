@@ -2,13 +2,85 @@
 
 Get up and running with Spooled Cloud in 5 minutes.
 
-## Prerequisites
+## Table of Contents
+
+1. [Cloud vs Self-Hosted](#cloud-vs-self-hosted)
+2. [Cloud Quickstart](#cloud-quickstart)
+3. [Self-Hosted Quickstart](#self-hosted-quickstart)
+4. [SDK Examples](#sdk-examples)
+5. [Worker Patterns](#worker-patterns)
+6. [Common Operations](#common-operations)
+7. [Real-time Updates](#real-time-updates)
+8. [Monitoring](#monitoring)
+9. [Key Concepts](#key-concepts)
+10. [Troubleshooting](#troubleshooting)
+
+---
+
+## Cloud vs Self-Hosted
+
+| Feature | Cloud (api.spooled.cloud) | Self-Hosted |
+|---------|---------------------------|-------------|
+| Setup time | 2 minutes | 10 minutes |
+| Maintenance | Zero | You manage |
+| Scaling | Automatic | Manual |
+| Best for | Production, teams | Development, air-gapped |
+
+---
+
+## Cloud Quickstart
+
+### Prerequisites
+
+- A Spooled Cloud account — [Sign up for free](https://spooled.cloud/signup)
+- An API key — Available in your [dashboard](https://spooled.cloud/account/api-keys)
+
+### Step 1: Queue Your First Job
+
+```bash
+curl -X POST https://api.spooled.cloud/api/v1/jobs \
+  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "queue": "my-queue",
+    "payload": {
+      "event": "user.created",
+      "user_id": "usr_123",
+      "email": "alice@example.com"
+    },
+    "idempotency_key": "user-created-usr_123"
+  }'
+```
+
+### Step 2: Process Jobs
+
+```bash
+# Claim up to 5 jobs
+curl -X POST https://api.spooled.cloud/api/v1/jobs/claim \
+  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -d '{"queue": "my-queue", "limit": 5}'
+
+# Complete a job
+curl -X POST https://api.spooled.cloud/api/v1/jobs/job_xyz123/complete \
+  -H "Authorization: Bearer sk_live_YOUR_API_KEY"
+
+# Or fail it (will retry)
+curl -X POST https://api.spooled.cloud/api/v1/jobs/job_xyz123/fail \
+  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -d '{"reason": "Connection timeout"}'
+```
+
+---
+
+## Self-Hosted Quickstart
+
+### Prerequisites
 
 - Docker & Docker Compose
 - Rust 1.85+ (for local development)
 - curl or httpie
 
-## Step 1: Start the Services
+### Step 1: Start the Services
 
 ```bash
 cd spooled-backend
@@ -30,7 +102,7 @@ spooled-prometheus   running             9091/tcp
 spooled-grafana      running             3000/tcp
 ```
 
-## Step 2: Configure Environment
+### Step 2: Configure Environment
 
 ```bash
 # Copy the example environment file
@@ -40,7 +112,7 @@ cp .env.example .env
 # For production, you MUST change JWT_SECRET and passwords
 ```
 
-## Step 3: Run the Backend
+### Step 3: Run the Backend
 
 ```bash
 # Run the server (migrations run automatically on first start)
@@ -63,7 +135,7 @@ INFO spooled_backend: Metrics server listening on 0.0.0.0:9090
 - `:50051` - gRPC API (HTTP/2 + Protobuf)
 - `:9090` - Prometheus metrics
 
-## Step 4: Verify Installation
+### Step 4: Verify Installation
 
 ```bash
 curl http://localhost:8080/health
@@ -74,7 +146,7 @@ Expected response:
 {"status":"healthy","version":"1.0.0","database":true,"cache":true}
 ```
 
-## Step 5: Create Your Organization
+### Step 5: Create Your Organization
 
 Every tenant in Spooled has an organization. When you create one, you get an initial API key:
 
@@ -102,11 +174,7 @@ Response:
 
 ⚠️ **IMPORTANT**: Save the `api_key` value immediately! It's only shown once and cannot be retrieved later.
 
-You can create additional API keys later via the dashboard or API.
-
-## Step 6: Create Your First Job
-
-Now use your API key to create a job:
+### Step 6: Create Your First Job
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/jobs \
@@ -138,50 +206,195 @@ Response:
 }
 ```
 
-## Step 7: List Your Jobs
+---
+
+## SDK Examples
+
+> **Note**: SDKs are under active development. For production use today, use the cURL/HTTP API examples above.
+
+### Node.js
 
 ```bash
-curl http://localhost:8080/api/v1/jobs \
-  -H "Authorization: Bearer sk_live_abc123xyz789..."
+npm install @spooled/sdk
 ```
 
-Response:
-```json
-{
-  "jobs": [
-    {
-      "id": "job_m1n2o3p4",
-      "queue_name": "emails",
-      "status": "pending",
-      "payload": {"to": "user@example.com", "subject": "Welcome!", "body": "This is my first job!"},
-      "priority": 0,
-      "max_retries": 3,
-      "created_at": "2024-12-09T10:02:00Z"
+```typescript
+import { SpooledClient } from '@spooled/sdk';
+
+const client = new SpooledClient({
+  apiKey: process.env.SPOOLED_API_KEY!,
+  // For self-hosted: baseUrl: 'http://localhost:8080'
+});
+
+// Queue a job
+const job = await client.jobs.enqueue({
+  queue: 'email-notifications',
+  payload: {
+    to: 'user@example.com',
+    subject: 'Welcome!',
+    template: 'welcome',
+  },
+  idempotencyKey: `welcome-${userId}`,
+  maxRetries: 5,
+});
+
+console.log(`Queued job: ${job.id}`);
+```
+
+### Python
+
+```bash
+pip install spooled-sdk
+```
+
+```python
+from spooled import SpooledClient
+import os
+
+client = SpooledClient(
+    api_key=os.environ["SPOOLED_API_KEY"],
+    # For self-hosted: base_url="http://localhost:8080"
+)
+
+# Queue a background job
+job = client.jobs.enqueue(
+    queue="image-processing",
+    payload={
+        "image_url": "https://example.com/image.jpg",
+        "operations": ["resize", "compress"],
+        "output_format": "webp"
+    },
+    idempotency_key=f"process-image-{image_id}",
+    max_retries=3
+)
+
+print(f"Queued job: {job.id}")
+```
+
+### Go
+
+```bash
+go get github.com/spooled-cloud/spooled-go
+```
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+    "os"
+    
+    "github.com/spooled-cloud/spooled-go"
+)
+
+func main() {
+    client := spooled.NewClient(os.Getenv("SPOOLED_API_KEY"))
+    // For self-hosted: client.SetBaseURL("http://localhost:8080")
+    
+    job, err := client.Jobs.Enqueue(context.Background(), &spooled.EnqueueParams{
+        Queue: "webhook-delivery",
+        Payload: map[string]interface{}{
+            "url":     "https://customer.example.com/webhook",
+            "event":   "order.completed",
+            "payload": orderData,
+        },
+        IdempotencyKey: "order-webhook-" + orderId,
+        MaxRetries:     5,
+    })
+    
+    if err != nil {
+        log.Fatal(err)
     }
-  ],
-  "total": 1,
-  "page": 1,
-  "per_page": 50
+    
+    log.Printf("Queued job: %s", job.ID)
 }
 ```
 
-## Step 8: Get Queue Statistics
+---
+
+## Worker Patterns
+
+### Node.js Worker
+
+```typescript
+import { SpooledWorker } from '@spooled/sdk';
+
+const worker = new SpooledWorker({
+  apiKey: process.env.SPOOLED_API_KEY!,
+  queue: 'email-notifications',
+  concurrency: 10,
+});
+
+worker.on('job', async (job) => {
+  const { to, subject, template } = job.payload;
+  
+  try {
+    await sendEmail({ to, subject, template });
+    await job.complete();
+    console.log(`Sent email to ${to}`);
+  } catch (error) {
+    await job.fail({ reason: error.message });
+  }
+});
+
+worker.start();
+console.log('Worker started, listening for jobs...');
+```
+
+### Python Worker
+
+```python
+from spooled import SpooledWorker
+import os
+
+worker = SpooledWorker(
+    api_key=os.environ["SPOOLED_API_KEY"],
+    queue="image-processing"
+)
+
+@worker.job_handler
+async def process_image(job):
+    image_url = job.payload["image_url"]
+    operations = job.payload["operations"]
+    
+    # Process the image
+    result = await run_image_pipeline(image_url, operations)
+    
+    # Store the result
+    await job.complete(result={"output_url": result.url})
+    
+worker.run()
+```
+
+### Simple Polling Worker (cURL/Bash)
 
 ```bash
-curl http://localhost:8080/api/v1/queues/emails/stats \
-  -H "Authorization: Bearer sk_live_abc123xyz789..."
-```
+#!/bin/bash
+API_KEY="sk_live_..."
+BASE_URL="http://localhost:8080"  # or https://api.spooled.cloud
 
-Response:
-```json
-{
-  "queue_name": "emails",
-  "pending": 1,
-  "processing": 0,
-  "completed": 0,
-  "failed": 0,
-  "dead_letter": 0
-}
+while true; do
+  # Claim a job
+  JOB=$(curl -s -X POST "$BASE_URL/api/v1/jobs/claim" \
+    -H "Authorization: Bearer $API_KEY" \
+    -H "Content-Type: application/json" \
+    -d '{"queue": "my-queue", "limit": 1}')
+  
+  JOB_ID=$(echo $JOB | jq -r '.jobs[0].id // empty')
+  
+  if [ -n "$JOB_ID" ]; then
+    echo "Processing job: $JOB_ID"
+    
+    # Your processing logic here...
+    
+    # Complete the job
+    curl -s -X POST "$BASE_URL/api/v1/jobs/$JOB_ID/complete" \
+      -H "Authorization: Bearer $API_KEY"
+  else
+    sleep 1  # No jobs, wait before polling again
+  fi
+done
 ```
 
 ---
@@ -259,6 +472,41 @@ curl -X POST http://localhost:8080/api/v1/jobs/job_m1n2o3p4/cancel \
   -H "Authorization: Bearer sk_live_..."
 ```
 
+### List Jobs with Filtering
+
+```bash
+# Filter by status
+curl "http://localhost:8080/api/v1/jobs?status=pending" \
+  -H "Authorization: Bearer sk_live_..."
+
+# Filter by queue
+curl "http://localhost:8080/api/v1/jobs?queue_name=emails" \
+  -H "Authorization: Bearer sk_live_..."
+
+# Combine filters with pagination
+curl "http://localhost:8080/api/v1/jobs?status=failed&queue_name=emails&limit=50" \
+  -H "Authorization: Bearer sk_live_..."
+```
+
+### Get Queue Statistics
+
+```bash
+curl http://localhost:8080/api/v1/queues/emails/stats \
+  -H "Authorization: Bearer sk_live_..."
+```
+
+Response:
+```json
+{
+  "queue_name": "emails",
+  "pending": 1,
+  "processing": 0,
+  "completed": 0,
+  "failed": 0,
+  "dead_letter": 0
+}
+```
+
 ---
 
 ## Real-time Updates
@@ -296,6 +544,19 @@ curl -N http://localhost:8080/api/v1/events/queues/emails \
   -H "Authorization: Bearer sk_live_..."
 ```
 
+### Event Types
+
+| Event | Description |
+|-------|-------------|
+| `job.created` | New job enqueued |
+| `job.processing` | Job claimed by worker |
+| `job.completed` | Job finished successfully |
+| `job.failed` | Job failed (will retry if retries remaining) |
+| `job.dead_letter` | Job moved to DLQ after exhausting retries |
+| `job.cancelled` | Job was cancelled |
+| `queue.paused` | Queue processing paused |
+| `queue.resumed` | Queue processing resumed |
+
 ---
 
 ## Monitoring
@@ -307,13 +568,107 @@ curl http://localhost:9090/metrics
 ```
 
 Key metrics to watch:
-- `spooled_jobs_pending` - Jobs waiting to be processed
-- `spooled_jobs_processing` - Jobs currently in progress
-- `spooled_job_max_age_seconds` - Age of oldest pending job (alert if > 300s!)
+
+| Metric | Description | Alert Threshold |
+|--------|-------------|-----------------|
+| `spooled_jobs_pending` | Jobs waiting to be processed | > 1000 |
+| `spooled_jobs_processing` | Jobs currently in progress | - |
+| `spooled_job_max_age_seconds` | Age of oldest pending job | > 300s |
+| `spooled_jobs_dead_letter` | Jobs in dead-letter queue | > 0 |
+| `spooled_workers_active` | Active workers | < expected |
+| `spooled_api_requests_total` | Total API requests | - |
+| `spooled_api_request_duration_seconds` | Request latency | P99 > 1s |
 
 ### Grafana Dashboard
 
 Open http://localhost:3000 (login: admin/admin)
+
+Pre-built dashboard includes:
+- Job throughput (enqueued/completed/failed per minute)
+- Queue depth by queue name
+- Worker health and activity
+- API latency percentiles
+- Error rates
+
+---
+
+## Key Concepts
+
+### Idempotency
+
+Use `idempotency_key` to prevent duplicate processing:
+
+```json
+{
+  "queue": "emails",
+  "payload": {"to": "user@example.com"},
+  "idempotency_key": "welcome-email-user123"
+}
+```
+
+If a job with the same key exists, the request returns the existing job instead of creating a duplicate.
+
+### Automatic Retries
+
+Failed jobs retry automatically with exponential backoff:
+
+```
+Attempt 1: immediate
+Attempt 2: 1 second delay
+Attempt 3: 2 seconds delay
+Attempt 4: 4 seconds delay
+...
+```
+
+Configure per job:
+```json
+{
+  "max_retries": 5,
+  "backoff_multiplier": 2.0,
+  "backoff_max_delay": 3600
+}
+```
+
+### Dead-Letter Queue (DLQ)
+
+Jobs that exhaust all retries are moved to the DLQ:
+
+```bash
+# List DLQ jobs
+curl "http://localhost:8080/api/v1/jobs?status=dead_letter" \
+  -H "Authorization: Bearer sk_live_..."
+
+# Retry a DLQ job
+curl -X POST http://localhost:8080/api/v1/jobs/job_xyz/retry \
+  -H "Authorization: Bearer sk_live_..."
+
+# Bulk retry all DLQ jobs for a queue
+curl -X POST http://localhost:8080/api/v1/queues/emails/dlq/retry-all \
+  -H "Authorization: Bearer sk_live_..."
+```
+
+### Priority Queues
+
+Higher priority jobs are processed first:
+
+```json
+{
+  "queue": "emails",
+  "payload": {"type": "password_reset"},
+  "priority": 10
+}
+```
+
+Priority scale: 0 (lowest) to 100 (highest). Default is 0.
+
+### Job Leases
+
+Jobs are claimed with a lease (default 5 minutes). If not completed/failed before lease expires, the job is released for another worker.
+
+Workers should:
+1. Renew lease for long-running jobs
+2. Complete/fail jobs promptly
+3. Handle graceful shutdown
 
 ---
 
@@ -369,16 +724,44 @@ kill -9 <PID>
 - Verify the key starts with `sk_live_` or `sk_test_`
 - Check the key hasn't been revoked
 - Ensure you're using the correct organization's key
+- Check key hasn't expired (if expiration was set)
+
+### "Rate Limited"
+
+```json
+{
+  "error": "rate_limit_exceeded",
+  "message": "Too many requests",
+  "retry_after": 60
+}
+```
+
+- Check your plan's rate limits
+- Implement exponential backoff in clients
+- Use bulk operations where possible
+
+### "Job Stuck in Processing"
+
+```bash
+# Check for expired leases (will be auto-recovered)
+curl "http://localhost:8080/api/v1/jobs?status=processing" \
+  -H "Authorization: Bearer sk_live_..."
+
+# Force-fail a stuck job
+curl -X POST http://localhost:8080/api/v1/jobs/job_xyz/fail \
+  -H "Authorization: Bearer sk_live_..." \
+  -d '{"reason": "Manual intervention - stuck job"}'
+```
 
 ---
 
 ## Next Steps
 
-1. **Read the full API documentation**: `docs/guides/api-usage.md`
-2. **Try gRPC for high-throughput workers**: See [gRPC API](api-usage.md#grpc-api)
-3. **Set up custom webhooks**: Use the `/webhooks/{org_id}/custom` endpoint to receive events from any source
-4. **Deploy to production**: See `docs/guides/deployment.md`
-5. **Understand the architecture**: See `docs/guides/architecture.md`
+1. **Read the full API documentation**: [API Usage Guide](api-usage.md)
+2. **Try gRPC for high-throughput workers**: [gRPC Server Guide](grpc-server.md)
+3. **Set up custom webhooks**: [Webhooks Guide](webhooks.md)
+4. **Deploy to production**: [Deployment Guide](deployment.md)
+5. **Understand the architecture**: [Architecture Guide](architecture.md)
 6. **Run load tests**: See `loadtest/README.md`
 
 ---
@@ -387,3 +770,4 @@ kill -9 <PID>
 
 - GitHub Issues: https://github.com/spooled-cloud/spooled-backend/issues
 - Documentation: https://docs.spooled.cloud
+- Email: support@spooled.cloud

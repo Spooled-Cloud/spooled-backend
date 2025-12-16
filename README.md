@@ -520,13 +520,26 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317 ./target/release/spooled-backend
 
 ## 📚 Documentation
 
-- [Quick Start Guide](docs/guides/quickstart.md)
-- [API Usage Guide](docs/guides/api-usage.md)
-- [gRPC Server Guide](docs/guides/grpc-server.md) - Configuration, testing, and troubleshooting
-- [Architecture](docs/guides/architecture.md)
-- [Deployment Guide](docs/guides/deployment.md)
-- [Operations Guide](docs/guides/operations.md)
-- [OpenAPI Spec](docs/openapi.yaml)
+### Getting Started
+- [Quick Start Guide](docs/guides/quickstart.md) — Get running in 5 minutes
+- [Getting Started (Laravel users)](docs/guides/getting-started.md) — Familiar concepts for Laravel developers
+
+### Core Concepts
+- [Jobs & Queues](docs/guides/jobs.md) — Job lifecycle, creation, and processing
+- [Workers](docs/guides/workers.md) — Building production workers
+- [Retries & DLQ](docs/guides/retries.md) — Retry configuration and dead letter queue
+- [Webhooks](docs/guides/webhooks.md) — Incoming and outgoing webhooks
+
+### Reference
+- [API Usage Guide](docs/guides/api-usage.md) — Complete REST API reference
+- [gRPC Server Guide](docs/guides/grpc-server.md) — High-performance gRPC API
+- [SDKs](docs/guides/sdks.md) — Node.js, Python, Go SDKs
+- [OpenAPI Spec](docs/openapi.yaml) — OpenAPI 3.1 specification
+
+### Operations
+- [Architecture](docs/guides/architecture.md) — System design and data flow
+- [Deployment Guide](docs/guides/deployment.md) — Docker, Kubernetes, production checklist
+- [Operations Guide](docs/guides/operations.md) — Monitoring, maintenance, troubleshooting
 
 ## 🏗️ Architecture
 

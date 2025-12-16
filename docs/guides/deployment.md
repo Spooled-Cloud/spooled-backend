@@ -4,14 +4,47 @@ This guide covers deploying Spooled Cloud in various environments.
 
 ## Table of Contents
 
-1. [Prerequisites](#prerequisites)
-2. [Local Development](#local-development)
+1. [Deployment Options](#deployment-options)
+2. [Managed Cloud](#managed-cloud)
+3. [Prerequisites](#prerequisites)
+4. [Local Development](#local-development)
 3. [Docker Deployment](#docker-deployment)
 4. [Kubernetes Deployment](#kubernetes-deployment)
 5. [Production Checklist](#production-checklist)
 6. [Monitoring & Observability](#monitoring--observability)
 7. [Scaling Guidelines](#scaling-guidelines)
 8. [Troubleshooting](#troubleshooting)
+
+---
+
+## Deployment Options
+
+| Option | Best For | Maintenance |
+|--------|----------|-------------|
+| **Managed Cloud** | Most teams | Zero maintenance |
+| **Docker Compose** | Development, small deployments | Basic ops |
+| **Kubernetes** | Large scale, air-gapped | Full ops team |
+| **Bare Metal** | Maximum control | Expert ops |
+
+---
+
+## Managed Cloud
+
+The easiest way to get started is with the managed service at [spooled.cloud](https://spooled.cloud).
+
+**Benefits:**
+- ✓ No infrastructure to manage
+- ✓ Automatic scaling and updates
+- ✓ Built-in monitoring and alerting
+- ✓ 99.9% SLA (Pro and Enterprise plans)
+- ✓ SOC 2 Type II compliance
+
+**Getting Started:**
+1. Sign up at https://spooled.cloud/signup
+2. Create an organization and get your API key
+3. Start queuing jobs immediately
+
+For teams that need self-hosting (air-gapped, data residency, etc.), continue to the sections below.
 
 ---
 
