@@ -144,6 +144,7 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
         // Email login flow (passwordless)
         .route("/auth/email/start", post(handlers::email_login::start))
         .route("/auth/email/verify", post(handlers::email_login::verify))
+        .route("/auth/check-email", get(handlers::email_login::check_email))
         // Webhooks are authenticated via signatures, not API keys
         .route(
             "/webhooks/{org_id}/custom",
