@@ -186,6 +186,19 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
             "/organizations/{id}",
             delete(handlers::organizations::delete),
         )
+        // Organization webhook token management
+        .route(
+            "/organizations/webhook-token",
+            get(handlers::organizations::get_webhook_token),
+        )
+        .route(
+            "/organizations/webhook-token/regenerate",
+            post(handlers::organizations::regenerate_webhook_token),
+        )
+        .route(
+            "/organizations/webhook-token/clear",
+            post(handlers::organizations::clear_webhook_token),
+        )
         // Jobs - CRUD
         .route("/jobs", get(handlers::jobs::list))
         .route("/jobs", post(handlers::jobs::create))
@@ -297,6 +310,10 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
         .route(
             "/outgoing-webhooks/{id}/deliveries",
             get(handlers::outgoing_webhooks::deliveries),
+        )
+        .route(
+            "/outgoing-webhooks/{id}/retry/{delivery_id}",
+            post(handlers::outgoing_webhooks::retry_delivery),
         )
         // Billing endpoints
         .route("/billing/status", get(handlers::billing::status))

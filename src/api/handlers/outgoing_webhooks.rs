@@ -9,6 +9,7 @@ use axum::{
     Extension, Json,
 };
 use chrono::Utc;
+use serde::Serialize;
 use uuid::Uuid;
 use validator::Validate;
 
@@ -393,4 +394,75 @@ pub async fn deliveries(
     .await?;
 
     Ok(Json(deliveries))
+}
+
+/// Response for retry delivery
+#[derive(Debug, Serialize)]
+pub struct RetryDeliveryResponse {
+    /// Whether the retry was successful
+    pub success: bool,
+    /// Status message
+    pub message: String,
+}
+
+/// Retry a specific webhook delivery
+///
+/// POST /api/v1/outgoing-webhooks/{id}/retry/{delivery_id}
+pub async fn retry_delivery(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path((webhook_id, delivery_id)): Path<(String, String)>,
+) -> AppResult<Json<RetryDeliveryResponse>> {
+    // Parse UUIDs
+    let webhook_uuid = Uuid::parse_str(&webhook_id)
+        .map_err(|_| AppError::Validation("Invalid webhook ID format".to_string()))?;
+    let delivery_uuid = Uuid::parse_str(&delivery_id)
+        .map_err(|_| AppError::Validation("Invalid delivery ID format".to_string()))?;
+
+    // Verify webhook belongs to organization
+    let webhook: Option<OutgoingWebhook> = sqlx::query_as(
+        "SELECT * FROM outgoing_webhooks WHERE id = $1 AND organization_id = $2",
+    )
+    .bind(&webhook_uuid)
+    .bind(&ctx.organization_id)
+    .fetch_optional(state.db.pool())
+    .await?;
+
+    if webhook.is_none() {
+        return Err(AppError::NotFound("Webhook not found".to_string()));
+    }
+
+    // Verify delivery exists and belongs to webhook
+    let delivery: Option<OutgoingWebhookDelivery> = sqlx::query_as(
+        "SELECT * FROM outgoing_webhook_deliveries WHERE id = $1 AND webhook_id = $2",
+    )
+    .bind(&delivery_uuid)
+    .bind(&webhook_uuid)
+    .fetch_optional(state.db.pool())
+    .await?;
+
+    if delivery.is_none() {
+        return Err(AppError::NotFound("Delivery not found".to_string()));
+    }
+
+    // Reset the delivery status to pending for retry
+    sqlx::query(
+        r#"
+        UPDATE outgoing_webhook_deliveries 
+        SET status = 'pending', 
+            attempts = attempts + 1,
+            error = NULL,
+            status_code = NULL,
+            response_body = NULL
+        WHERE id = $1
+        "#,
+    )
+    .bind(&delivery_uuid)
+    .execute(state.db.pool())
+    .await?;
+
+    Ok(Json(RetryDeliveryResponse {
+        success: true,
+        message: "Delivery queued for retry".to_string(),
+    }))
 }
