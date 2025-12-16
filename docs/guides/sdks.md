@@ -411,7 +411,11 @@ For high-throughput workers, use the gRPC API.
 ### Connection
 
 ```
-api.spooled.cloud:50051
+# Spooled Cloud (TLS over 443)
+grpc.spooled.cloud:443
+
+# Self-hosted / local (default)
+localhost:50051
 ```
 
 ### Proto File
@@ -448,17 +452,32 @@ service WorkerService {
 # List services
 grpcurl -plaintext localhost:50051 list
 
+# (Spooled Cloud) List services
+grpcurl grpc.spooled.cloud:443 list
+
 # Enqueue job
 grpcurl -plaintext \
   -H "x-api-key: sk_live_xxx" \
   -d '{"queue_name": "emails", "payload": {"to": "user@example.com"}}' \
   localhost:50051 spooled.v1.QueueService/Enqueue
 
+# (Spooled Cloud) Enqueue job
+grpcurl \
+  -H "x-api-key: sk_live_xxx" \
+  -d '{"queue_name": "emails", "payload": {"to": "user@example.com"}}' \
+  grpc.spooled.cloud:443 spooled.v1.QueueService/Enqueue
+
 # Stream jobs
 grpcurl -plaintext \
   -H "x-api-key: sk_live_xxx" \
   -d '{"queue_name": "emails", "worker_id": "w1"}' \
   localhost:50051 spooled.v1.QueueService/StreamJobs
+
+# (Spooled Cloud) Stream jobs
+grpcurl \
+  -H "x-api-key: sk_live_xxx" \
+  -d '{"queue_name": "emails", "worker_id": "w1"}' \
+  grpc.spooled.cloud:443 spooled.v1.QueueService/StreamJobs
 ```
 
 See [gRPC Server Guide](./grpc-server.md) for complete documentation.
