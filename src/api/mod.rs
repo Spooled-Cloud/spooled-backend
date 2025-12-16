@@ -166,6 +166,14 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
         // Organizations (except create which is public)
         .route("/organizations", get(handlers::organizations::list))
         .route("/organizations/usage", get(handlers::organizations::usage))
+        .route(
+            "/organizations/check-slug",
+            get(handlers::organizations::check_slug),
+        )
+        .route(
+            "/organizations/generate-slug",
+            post(handlers::organizations::generate_slug),
+        )
         .route("/organizations/{id}", get(handlers::organizations::get))
         .route("/organizations/{id}", put(handlers::organizations::update))
         .route(

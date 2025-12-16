@@ -11,6 +11,7 @@ use chrono::Utc;
 use serde::Deserialize;
 use tracing::{error, info};
 
+use crate::api::middleware::limits::{check_job_limits_generic, increment_daily_jobs, LimitCheckError};
 use crate::api::middleware::validation::ValidatedJson;
 use crate::api::AppState;
 use crate::models::{
@@ -389,6 +390,19 @@ pub async fn trigger(
 
     let schedule = schedule.ok_or((StatusCode::NOT_FOUND, "Schedule not found".to_string()))?;
 
+    // Check job limits before creating job from schedule trigger
+    check_job_limits_generic(state.db.pool(), &ctx.organization_id, 1)
+        .await
+        .map_err(|e| match e {
+            LimitCheckError::Database(msg) => {
+                error!(error = %msg, "Failed to check job limits for schedule trigger");
+                (StatusCode::INTERNAL_SERVER_ERROR, "Failed to check limits".to_string())
+            }
+            LimitCheckError::LimitExceeded(err) => {
+                (StatusCode::FORBIDDEN, err.to_string())
+            }
+        })?;
+
     // Create job immediately
     let job_id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now();
@@ -438,6 +452,11 @@ pub async fn trigger(
     .ok();
 
     info!(schedule_id = %id, job_id = %job_id, org_id = %ctx.organization_id, "Schedule triggered manually");
+
+    // Increment daily job counter for plan limit tracking
+    if let Err(e) = increment_daily_jobs(state.db.pool(), &ctx.organization_id, 1).await {
+        tracing::warn!(error = %e, org_id = %ctx.organization_id, "Failed to increment daily job counter");
+    }
 
     // Publish to Redis to notify workers of new job
     if let Some(ref cache) = state.cache {

@@ -199,6 +199,85 @@ pub async fn check_slug(
     }))
 }
 
+/// Request body for generating a slug
+#[derive(Debug, Deserialize)]
+pub struct GenerateSlugRequest {
+    /// Organization name to generate slug from
+    pub name: String,
+}
+
+/// Response for slug generation
+#[derive(Debug, Serialize)]
+pub struct GenerateSlugResponse {
+    /// Generated slug
+    pub slug: String,
+}
+
+/// Generate a unique slug from an organization name
+///
+/// POST /api/v1/organizations/generate-slug
+///
+/// Takes an organization name and generates a URL-safe, unique slug.
+pub async fn generate_slug(
+    State(state): State<AppState>,
+    Json(request): Json<GenerateSlugRequest>,
+) -> AppResult<Json<GenerateSlugResponse>> {
+    let name = request.name.trim();
+
+    if name.is_empty() || name.len() > 200 {
+        return Err(AppError::Validation(
+            "Name must be 1-200 characters".to_string(),
+        ));
+    }
+
+    // Convert name to slug: lowercase, replace spaces/special chars with hyphens
+    let base_slug: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+
+    // Clean up consecutive hyphens and trim
+    let mut base_slug: String = base_slug
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+
+    // Ensure it doesn't start with a number
+    if base_slug.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+        base_slug = format!("org-{}", base_slug);
+    }
+
+    // Truncate if too long (leave room for unique suffix)
+    if base_slug.len() > 80 {
+        base_slug = base_slug[..80].to_string();
+        // Trim trailing hyphen if present
+        base_slug = base_slug.trim_end_matches('-').to_string();
+    }
+
+    // Check if base slug is available
+    let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM organizations WHERE slug = $1")
+        .bind(&base_slug)
+        .fetch_optional(state.db.pool())
+        .await?;
+
+    let final_slug = if exists.is_some() {
+        // Add unique suffix
+        format!("{}-{}", base_slug, &Uuid::new_v4().to_string()[..6])
+    } else {
+        base_slug
+    };
+
+    Ok(Json(GenerateSlugResponse { slug: final_slug }))
+}
+
 /// Extract client IP from headers for rate limiting
 fn extract_client_ip(headers: &axum::http::HeaderMap) -> String {
     // Check CF-Connecting-IP (Cloudflare)

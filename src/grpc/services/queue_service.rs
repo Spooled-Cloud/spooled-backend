@@ -18,6 +18,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info};
 
+use crate::api::middleware::limits::{check_job_limits_generic, increment_daily_jobs, LimitCheckError};
 use crate::grpc::auth::{authenticate_from_metadata, authenticate_request};
 use crate::grpc::convert::{
     datetime_to_timestamp, job_to_proto, jobs_to_proto, struct_to_json_opt,
@@ -177,6 +178,19 @@ impl QueueService for QueueServiceImpl {
             )));
         }
 
+        // Check job limits (daily + active) before creating
+        check_job_limits_generic(self.pool.as_ref(), &auth.organization_id, 1)
+            .await
+            .map_err(|e| match e {
+                LimitCheckError::Database(msg) => {
+                    error!(error = %msg, "Failed to check job limits");
+                    Status::internal("Failed to check job limits")
+                }
+                LimitCheckError::LimitExceeded(err) => {
+                    Status::resource_exhausted(err.to_string())
+                }
+            })?;
+
         let job_id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now();
         let scheduled_at = timestamp_to_datetime_opt(req.scheduled_at);
@@ -235,7 +249,16 @@ impl QueueService for QueueServiceImpl {
         let returned_id: String = result.get("id");
         let created: bool = result.get("created");
 
-        self.metrics.jobs_enqueued.inc();
+        // Update metrics and usage counters
+        if created {
+            self.metrics.jobs_enqueued.inc();
+
+            // Increment daily job counter for plan limit tracking
+            if let Err(e) = increment_daily_jobs(self.pool.as_ref(), &auth.organization_id, 1).await
+            {
+                tracing::warn!(error = %e, org_id = %auth.organization_id, "Failed to increment daily job counter");
+            }
+        }
 
         info!(
             job_id = %returned_id,

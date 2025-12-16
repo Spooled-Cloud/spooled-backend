@@ -808,6 +808,7 @@ pub async fn list_dlq(
 /// Retry jobs from dead-letter queue
 ///
 /// Now uses safe_limit method
+/// SECURITY: Enforces plan limits before retrying jobs
 pub async fn retry_dlq(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
@@ -815,6 +816,41 @@ pub async fn retry_dlq(
 ) -> AppResult<Json<crate::models::RetryDlqResponse>> {
     // Use safe_limit method to enforce bounds
     let limit = request.safe_limit();
+
+    // First, count how many jobs would be retried (to check limits)
+    let job_count: i64 = if let Some(ref job_ids) = request.job_ids {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM jobs WHERE id = ANY($1) AND organization_id = $2 AND status = 'deadletter'"
+        )
+        .bind(job_ids)
+        .bind(&ctx.organization_id)
+        .fetch_one(state.db.pool())
+        .await?
+    } else if let Some(ref queue_name) = request.queue_name {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM jobs WHERE organization_id = $1 AND queue_name = $2 AND status = 'deadletter' LIMIT $3"
+        )
+        .bind(&ctx.organization_id)
+        .bind(queue_name)
+        .bind(limit)
+        .fetch_one(state.db.pool())
+        .await?
+    } else {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM jobs WHERE organization_id = $1 AND status = 'deadletter' LIMIT $2"
+        )
+        .bind(&ctx.organization_id)
+        .bind(limit)
+        .fetch_one(state.db.pool())
+        .await?
+    };
+
+    // Check job limits before retrying (DLQ retry adds to active jobs count)
+    if job_count > 0 {
+        if let Err(response) = check_job_limits(state.db.pool(), &ctx.organization_id, job_count as u64).await {
+            return Err(AppError::LimitExceeded(Box::new(response)));
+        }
+    }
 
     // Build query based on filters - ALL queries now include organization_id
     let retried_jobs: Vec<(String,)> = if let Some(ref job_ids) = request.job_ids {

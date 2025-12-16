@@ -12,7 +12,10 @@ use std::collections::HashMap;
 use tracing::{info, warn};
 
 use crate::{
-    api::{middleware::ValidatedJson, AppState},
+    api::{
+        middleware::{limits::check_job_limits, ValidatedJson},
+        AppState,
+    },
     error::{AppError, AppResult},
     models::{
         AddDependenciesRequest, AddDependenciesResponse, ApiKeyContext, CreateWorkflowRequest,
@@ -88,6 +91,7 @@ pub async fn get(
 /// Create a new workflow
 ///
 /// Now uses organization context from authentication
+/// SECURITY: Enforces plan limits before creating workflow jobs
 pub async fn create(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
@@ -95,6 +99,12 @@ pub async fn create(
 ) -> AppResult<Json<CreateWorkflowResponse>> {
     let workflow_id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now();
+
+    // Check job limits (daily + active) before creating workflow jobs
+    let job_count = request.jobs.len() as u64;
+    if let Err(response) = check_job_limits(state.db.pool(), &ctx.organization_id, job_count).await {
+        return Err(AppError::LimitExceeded(Box::new(response)));
+    }
 
     // Validate dependencies (check for cycles and missing references)
     let job_keys: std::collections::HashSet<&str> =
@@ -206,6 +216,13 @@ pub async fn create(
         .metrics
         .jobs_enqueued
         .inc_by(request.jobs.len() as u64);
+
+    // Increment daily job counter for plan limit tracking
+    if let Err(e) =
+        crate::api::middleware::limits::increment_daily_jobs(state.db.pool(), &ctx.organization_id, job_count as i32).await
+    {
+        warn!(error = %e, org_id = %ctx.organization_id, "Failed to increment daily job counter");
+    }
 
     // Notify Redis about new workflow and pending jobs
     if let Some(ref cache) = state.cache {

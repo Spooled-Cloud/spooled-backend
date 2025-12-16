@@ -175,30 +175,68 @@ pub async fn check_resource_limit(
         .map_err(|e| LimitExceededResponse::from(e).into_response())
 }
 
-/// Check job creation limits (both daily and active)
-pub async fn check_job_limits(pool: &PgPool, org_id: &str, job_count: u64) -> Result<(), Response> {
-    let (plan_tier, custom_limits) = get_org_plan_and_limits(pool, org_id).await.map_err(|e| {
-        tracing::error!(error = %e, "Failed to get org plan tier");
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
-    })?;
+/// Error type for limit check failures (usable by HTTP, gRPC, etc.)
+#[derive(Debug, Clone)]
+pub enum LimitCheckError {
+    /// Database error during limit check
+    Database(String),
+    /// Job limit exceeded
+    LimitExceeded(crate::config::LimitError),
+}
+
+impl std::fmt::Display for LimitCheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LimitCheckError::Database(msg) => write!(f, "Database error: {}", msg),
+            LimitCheckError::LimitExceeded(err) => write!(f, "{}", err),
+        }
+    }
+}
+
+impl std::error::Error for LimitCheckError {}
+
+/// Check job creation limits (both daily and active) - generic version
+/// Returns LimitCheckError which can be converted to HTTP Response or gRPC Status
+pub async fn check_job_limits_generic(
+    pool: &PgPool,
+    org_id: &str,
+    job_count: u64,
+) -> Result<(), LimitCheckError> {
+    let (plan_tier, custom_limits) = get_org_plan_and_limits(pool, org_id)
+        .await
+        .map_err(|e| LimitCheckError::Database(e.to_string()))?;
 
     let limits = PlanLimits::for_tier_with_overrides(&plan_tier, custom_limits.as_ref());
-    let counts = get_resource_counts(pool, org_id).await.map_err(|e| {
-        tracing::error!(error = %e, "Failed to get resource counts");
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
-    })?;
+    let counts = get_resource_counts(pool, org_id)
+        .await
+        .map_err(|e| LimitCheckError::Database(e.to_string()))?;
 
     // Check daily limit
     limits
         .check_limit("jobs_per_day", counts.jobs_today, job_count)
-        .map_err(|e| LimitExceededResponse::from(e).into_response())?;
+        .map_err(LimitCheckError::LimitExceeded)?;
 
     // Check active jobs limit
     limits
         .check_limit("active_jobs", counts.active_jobs, job_count)
-        .map_err(|e| LimitExceededResponse::from(e).into_response())?;
+        .map_err(LimitCheckError::LimitExceeded)?;
 
     Ok(())
+}
+
+/// Check job creation limits (both daily and active) - HTTP version
+pub async fn check_job_limits(pool: &PgPool, org_id: &str, job_count: u64) -> Result<(), Response> {
+    check_job_limits_generic(pool, org_id, job_count)
+        .await
+        .map_err(|e| match e {
+            LimitCheckError::Database(msg) => {
+                tracing::error!(error = %msg, "Failed during limit check");
+                (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
+            }
+            LimitCheckError::LimitExceeded(err) => {
+                LimitExceededResponse::from(err).into_response()
+            }
+        })
 }
 
 /// Check payload size against plan limits
