@@ -18,7 +18,6 @@ use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
 use crate::cache::RedisCache;
-use crate::config::PlanLimits;
 use crate::models::CronSchedule;
 use crate::observability::Metrics;
 
@@ -274,8 +273,8 @@ impl Scheduler {
     /// Process cron schedules and create jobs
     ///
     /// Uses transaction to prevent duplicate jobs if schedule update fails
+    /// Each schedule is processed in its own transaction to ensure locks are effective
     async fn process_cron_schedules(&self) -> Result<()> {
-        // Get schedules that are due
         #[derive(sqlx::FromRow)]
         struct ScheduleRecord {
             id: String,
@@ -289,33 +288,63 @@ impl Scheduler {
             tags: Option<serde_json::Value>,
         }
 
-        let schedules: Vec<ScheduleRecord> = sqlx::query_as(
+        // First, get IDs of schedules that are due (without lock, just to know what to process)
+        let schedule_ids: Vec<(String,)> = sqlx::query_as(
             r#"
-            SELECT id, organization_id, cron_expression, queue_name, 
-                   payload_template, priority, max_retries, timeout_seconds, tags
+            SELECT id
             FROM schedules
             WHERE is_active = TRUE
               AND next_run_at IS NOT NULL
               AND next_run_at <= NOW()
-            FOR UPDATE SKIP LOCKED
+            LIMIT 100
             "#,
         )
         .fetch_all(&*self.db)
         .await?;
 
+        // Process each schedule in its own transaction with proper locking
+        let mut schedules_to_process = Vec::new();
+        for (schedule_id,) in schedule_ids {
+            // Start transaction and lock the specific schedule
+            let mut tx = self.db.begin().await?;
+
+            let schedule: Option<ScheduleRecord> = sqlx::query_as(
+                r#"
+                SELECT id, organization_id, cron_expression, queue_name, 
+                       payload_template, priority, max_retries, timeout_seconds, tags
+                FROM schedules
+                WHERE id = $1
+                  AND is_active = TRUE
+                  AND next_run_at IS NOT NULL
+                  AND next_run_at <= NOW()
+                FOR UPDATE SKIP LOCKED
+                "#,
+            )
+            .bind(&schedule_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+            if let Some(s) = schedule {
+                schedules_to_process.push((s, tx));
+            } else {
+                // Schedule was already processed by another instance, rollback
+                tx.rollback().await?;
+            }
+        }
+
+        // Alias for backward compatibility with existing loop
+        let schedules = schedules_to_process;
+
         let mut processed = 0;
         let now = Utc::now();
 
-        for schedule in schedules {
+        for (schedule, mut tx) in schedules {
             // Calculate next run time FIRST (before any DB operations)
             let next_run = CronSchedule::parse(&schedule.cron_expression)
                 .ok()
                 .and_then(|c| c.next_run_after(now));
 
-            // Use transaction to ensure atomicity - prevent duplicate jobs
-            let mut tx = self.db.begin().await?;
-
-            // Create job from schedule
+            // Transaction already started with lock - create job from schedule
             let job_id = uuid::Uuid::new_v4().to_string();
             let run_id = uuid::Uuid::new_v4().to_string();
 
@@ -627,106 +656,118 @@ impl Scheduler {
 
     /// Cleanup old data respecting per-organization retention limits
     ///
-    /// Queries all organizations and applies cleanup based on their plan tier
-    /// plus any custom_limits overrides for job_retention_days and history_retention_days
+    /// Uses JOIN-based queries for efficiency (single query per resource type).
+    /// Plan tier retention: free=3d, starter=14d, pro=30d, enterprise=90d
+    /// Custom limits can override via custom_limits.job_retention_days/history_retention_days
     async fn cleanup_old_data_by_org(&self) -> Result<u64> {
-        #[derive(sqlx::FromRow)]
-        struct OrgRetention {
-            id: String,
-            plan_tier: String,
-            custom_limits: Option<serde_json::Value>,
-        }
-
-        // Get all organizations with their plan and custom limits
-        let orgs: Vec<OrgRetention> =
-            sqlx::query_as("SELECT id, plan_tier, custom_limits FROM organizations")
-                .fetch_all(&*self.db)
-                .await?;
-
         let mut total_cleaned: u64 = 0;
 
-        for org in orgs {
-            // Get effective limits (plan defaults + custom overrides)
-            let limits =
-                PlanLimits::for_tier_with_overrides(&org.plan_tier, org.custom_limits.as_ref());
-
-            let job_retention_days = limits.job_retention_days as i32;
-            let history_retention_days = limits.history_retention_days as i32;
-
-            // Cleanup old completed/cancelled jobs for this org
-            let result = sqlx::query(
-                r#"
-                DELETE FROM jobs
-                WHERE organization_id = $1
-                  AND status IN ('completed', 'cancelled')
-                  AND completed_at < NOW() - ($2 || ' days')::INTERVAL
-                "#,
+        // Cleanup old completed/cancelled jobs using JOIN with organizations table
+        // Uses CASE to determine retention based on plan_tier, with custom_limits override
+        let result = sqlx::query(
+            r#"
+            DELETE FROM jobs
+            WHERE id IN (
+                SELECT j.id
+                FROM jobs j
+                JOIN organizations o ON j.organization_id = o.id
+                WHERE j.status IN ('completed', 'cancelled')
+                  AND j.completed_at < NOW() - (
+                    COALESCE(
+                        (o.custom_limits->>'job_retention_days')::INT,
+                        CASE o.plan_tier
+                            WHEN 'enterprise' THEN 90
+                            WHEN 'pro' THEN 30
+                            WHEN 'starter' THEN 14
+                            ELSE 3  -- free tier default
+                        END
+                    ) || ' days'
+                  )::INTERVAL
+                LIMIT 10000  -- Batch limit to prevent long-running transactions
             )
-            .bind(&org.id)
-            .bind(job_retention_days)
-            .execute(&*self.db)
-            .await?;
+            "#,
+        )
+        .execute(&*self.db)
+        .await?;
 
-            let jobs_cleaned = result.rows_affected();
-            if jobs_cleaned > 0 {
-                debug!(
-                    org_id = %org.id,
-                    count = jobs_cleaned,
-                    retention_days = job_retention_days,
-                    "Cleaned up old jobs"
-                );
-                total_cleaned += jobs_cleaned;
-            }
+        let jobs_cleaned = result.rows_affected();
+        if jobs_cleaned > 0 {
+            debug!(
+                count = jobs_cleaned,
+                "Cleaned up old jobs (tier-based retention)"
+            );
+            total_cleaned += jobs_cleaned;
+        }
 
-            // Cleanup old job history for this org (via jobs table)
-            let result = sqlx::query(
-                r#"
-                DELETE FROM job_history jh
-                USING jobs j
-                WHERE jh.job_id = j.id
-                  AND j.organization_id = $1
-                  AND jh.created_at < NOW() - ($2 || ' days')::INTERVAL
-                "#,
+        // Cleanup old job history using JOIN
+        let result = sqlx::query(
+            r#"
+            DELETE FROM job_history
+            WHERE id IN (
+                SELECT jh.id
+                FROM job_history jh
+                JOIN jobs j ON jh.job_id = j.id
+                JOIN organizations o ON j.organization_id = o.id
+                WHERE jh.created_at < NOW() - (
+                    COALESCE(
+                        (o.custom_limits->>'history_retention_days')::INT,
+                        CASE o.plan_tier
+                            WHEN 'enterprise' THEN 90
+                            WHEN 'pro' THEN 30
+                            WHEN 'starter' THEN 7
+                            ELSE 1  -- free tier default
+                        END
+                    ) || ' days'
+                )::INTERVAL
+                LIMIT 10000
             )
-            .bind(&org.id)
-            .bind(history_retention_days)
-            .execute(&*self.db)
-            .await?;
+            "#,
+        )
+        .execute(&*self.db)
+        .await?;
 
-            let history_cleaned = result.rows_affected();
-            if history_cleaned > 0 {
-                debug!(
-                    org_id = %org.id,
-                    count = history_cleaned,
-                    retention_days = history_retention_days,
-                    "Cleaned up old job history"
-                );
-                total_cleaned += history_cleaned;
-            }
+        let history_cleaned = result.rows_affected();
+        if history_cleaned > 0 {
+            debug!(
+                count = history_cleaned,
+                "Cleaned up old job history (tier-based retention)"
+            );
+            total_cleaned += history_cleaned;
+        }
 
-            // Cleanup old webhook deliveries for this org
-            let result = sqlx::query(
-                r#"
-                DELETE FROM webhook_deliveries
-                WHERE organization_id = $1
-                  AND created_at < NOW() - ($2 || ' days')::INTERVAL
-                "#,
+        // Cleanup old webhook deliveries using JOIN
+        let result = sqlx::query(
+            r#"
+            DELETE FROM webhook_deliveries
+            WHERE id IN (
+                SELECT wd.id
+                FROM webhook_deliveries wd
+                JOIN organizations o ON wd.organization_id = o.id
+                WHERE wd.created_at < NOW() - (
+                    COALESCE(
+                        (o.custom_limits->>'history_retention_days')::INT,
+                        CASE o.plan_tier
+                            WHEN 'enterprise' THEN 90
+                            WHEN 'pro' THEN 30
+                            WHEN 'starter' THEN 7
+                            ELSE 1  -- free tier default
+                        END
+                    ) || ' days'
+                )::INTERVAL
+                LIMIT 10000
             )
-            .bind(&org.id)
-            .bind(history_retention_days)
-            .execute(&*self.db)
-            .await?;
+            "#,
+        )
+        .execute(&*self.db)
+        .await?;
 
-            let webhooks_cleaned = result.rows_affected();
-            if webhooks_cleaned > 0 {
-                debug!(
-                    org_id = %org.id,
-                    count = webhooks_cleaned,
-                    retention_days = history_retention_days,
-                    "Cleaned up old webhook deliveries"
-                );
-                total_cleaned += webhooks_cleaned;
-            }
+        let webhooks_cleaned = result.rows_affected();
+        if webhooks_cleaned > 0 {
+            debug!(
+                count = webhooks_cleaned,
+                "Cleaned up old webhook deliveries (tier-based retention)"
+            );
+            total_cleaned += webhooks_cleaned;
         }
 
         Ok(total_cleaned)
