@@ -150,8 +150,14 @@ pub async fn create_portal(
     ];
 
     // Add configuration if specified
-    if let Some(ref config_id) = state.stripe.billing_portal_config_id {
-        form_params.push(("configuration", config_id.as_str()));
+    if let Some(config_id) = state
+        .stripe
+        .billing_portal_config_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        form_params.push(("configuration", config_id));
     }
 
     let response = client
@@ -284,6 +290,22 @@ async fn handle_checkout_completed(state: &AppState, event: &StripeEvent) -> App
         .await?;
 
         info!(org_id = %org_id, customer_id = %customer_id, "Linked Stripe customer to organization");
+
+        // Important: webhook event order is not guaranteed. In practice we often see
+        // customer.subscription.created arrive before checkout.session.completed, which means
+        // subscription updates can't be applied yet (org has no stripe_customer_id at that time).
+        // To ensure the org tier is correct immediately after checkout completes, reconcile from Stripe now.
+        if let Some(subscription_id) = subscription_id {
+            if let Err(e) = reconcile_org_from_subscription_id(state, org_id, subscription_id).await
+            {
+                warn!(
+                    org_id = %org_id,
+                    subscription_id = %subscription_id,
+                    error = %e,
+                    "Failed to reconcile org plan tier from subscription after checkout"
+                );
+            }
+        }
     }
 
     Ok(())
@@ -306,7 +328,7 @@ async fn handle_subscription_updated(state: &AppState, event: &StripeEvent) -> A
         let period_end = current_period_end.and_then(|ts| DateTime::from_timestamp(ts, 0));
 
         // Update organization
-        sqlx::query(
+        let result = sqlx::query(
             r#"
             UPDATE organizations 
             SET 
@@ -328,13 +350,105 @@ async fn handle_subscription_updated(state: &AppState, event: &StripeEvent) -> A
         .execute(state.db.pool())
         .await?;
 
-        info!(
-            customer_id = %customer_id,
-            status = %status,
-            plan_tier = ?plan_tier,
-            "Updated subscription status"
-        );
+        if result.rows_affected() == 0 {
+            // Likely received subscription event before checkout completed linked customer -> org.
+            warn!(
+                customer_id = %customer_id,
+                subscription_id = ?subscription_id,
+                status = %status,
+                plan_tier = ?plan_tier,
+                "Subscription update received but no org is linked to this Stripe customer yet"
+            );
+        } else {
+            info!(
+                customer_id = %customer_id,
+                status = %status,
+                plan_tier = ?plan_tier,
+                "Updated subscription status"
+            );
+        }
     }
+
+    Ok(())
+}
+
+/// Fetch the Stripe subscription object and use it to update the organization's billing fields.
+///
+/// This is used to repair the common webhook ordering issue where subscription events arrive
+/// before checkout.session.completed links stripe_customer_id to the org.
+async fn reconcile_org_from_subscription_id(
+    state: &AppState,
+    org_id: &str,
+    subscription_id: &str,
+) -> AppResult<()> {
+    let stripe_secret = state
+        .stripe
+        .secret_key
+        .as_ref()
+        .ok_or_else(|| AppError::Internal("Stripe is not configured".to_string()))?;
+
+    let client = reqwest::Client::new();
+    let url = format!("https://api.stripe.com/v1/subscriptions/{}", subscription_id);
+
+    let response = client
+        .get(url)
+        .header("Authorization", format!("Bearer {}", stripe_secret))
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to fetch subscription from Stripe: {}", e)))?;
+
+    if !response.status().is_success() {
+        let error_text = response.text().await.unwrap_or_default();
+        return Err(AppError::Internal(format!(
+            "Stripe subscription fetch failed: {}",
+            error_text
+        )));
+    }
+
+    let subscription: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to parse Stripe subscription JSON: {}", e)))?;
+
+    let customer_id = subscription["customer"].as_str();
+    let status = subscription["status"].as_str();
+    let current_period_end = subscription["current_period_end"].as_i64();
+    let cancel_at_period_end = subscription["cancel_at_period_end"].as_bool();
+    let plan_tier = determine_plan_tier(&subscription, state);
+    let period_end = current_period_end.and_then(|ts| DateTime::from_timestamp(ts, 0));
+
+    sqlx::query(
+        r#"
+        UPDATE organizations
+        SET
+            stripe_customer_id = COALESCE($1, stripe_customer_id),
+            stripe_subscription_id = $2,
+            stripe_subscription_status = $3,
+            stripe_current_period_end = $4,
+            stripe_cancel_at_period_end = $5,
+            plan_tier = COALESCE($6, plan_tier),
+            updated_at = NOW()
+        WHERE id = $7
+        "#,
+    )
+    .bind(customer_id)
+    .bind(subscription_id)
+    .bind(status)
+    .bind(period_end)
+    .bind(cancel_at_period_end)
+    .bind(&plan_tier)
+    .bind(org_id)
+    .execute(state.db.pool())
+    .await?;
+
+    info!(
+        org_id = %org_id,
+        subscription_id = %subscription_id,
+        customer_id = ?customer_id,
+        status = ?status,
+        plan_tier = ?plan_tier,
+        "Reconciled org billing from Stripe subscription"
+    );
 
     Ok(())
 }

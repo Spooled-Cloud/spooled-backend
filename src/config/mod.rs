@@ -370,7 +370,12 @@ impl Settings {
                 webhook_secret: env::var("STRIPE_BILLING_WEBHOOK_SECRET").ok(),
                 starter_price_id: env::var("STRIPE_STARTER_PRICE_ID").ok(),
                 pro_price_id: env::var("STRIPE_PRO_PRICE_ID").ok(),
-                billing_portal_config_id: env::var("STRIPE_BILLING_PORTAL_CONFIG_ID").ok(),
+                billing_portal_config_id: env::var("STRIPE_BILLING_PORTAL_CONFIG_ID")
+                    .ok()
+                    .and_then(|v| {
+                        let trimmed = v.trim().to_string();
+                        (!trimmed.is_empty()).then_some(trimmed)
+                    }),
             },
             email: EmailSettings {
                 provider: match env::var("EMAIL_PROVIDER")
