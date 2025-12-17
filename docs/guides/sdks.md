@@ -47,9 +47,9 @@ const client = new SpooledClient({
   // baseUrl: 'http://localhost:8080'  // For self-hosted
 });
 
-// Queue a job
-const job = await client.jobs.enqueue({
-  queue: 'emails',
+// Create a job
+const job = await client.jobs.create({
+  queueName: 'emails',
   payload: {
     to: 'user@example.com',
     subject: 'Welcome!',
@@ -66,16 +66,16 @@ console.log(`Queued job: ${job.id}`);
 
 ```typescript
 // Jobs
-const job = await client.jobs.enqueue({ queue, payload });
+const job = await client.jobs.create({ queueName, payload });
 const job = await client.jobs.get(jobId);
-const jobs = await client.jobs.list({ queue, status, limit });
+const jobs = await client.jobs.list({ queueName, status, limit });
 await client.jobs.cancel(jobId);
 await client.jobs.retry(jobId);
 
 // Bulk operations
 const result = await client.jobs.bulkEnqueue([
-  { queue: 'emails', payload: { id: 1 } },
-  { queue: 'emails', payload: { id: 2 } }
+  { queueName: 'emails', payload: { id: 1 } },
+  { queueName: 'emails', payload: { id: 2 } }
 ]);
 
 // Queues
@@ -100,7 +100,7 @@ await client.schedules.trigger(scheduleId);
 ```typescript
 const worker = new SpooledWorker({
   apiKey: process.env.SPOOLED_API_KEY!,
-  queue: 'emails',
+  queueName: 'emails',
   concurrency: 10
 });
 
@@ -160,16 +160,16 @@ client = SpooledClient(
     # base_url="http://localhost:8080"  # For self-hosted
 )
 
-# Queue a job
-job = client.jobs.enqueue(
-    queue="image-processing",
-    payload={
+# Create a job
+job = client.jobs.create({
+    "queue_name": "image-processing",
+    "payload": {
         "image_url": "https://example.com/image.jpg",
         "operations": ["resize", "compress"]
     },
-    idempotency_key=f"process-image-{image_id}",
-    max_retries=3
-)
+    "idempotency_key": f"process-image-{image_id}",
+    "max_retries": 3
+})
 
 print(f"Queued job: {job.id}")
 ```
@@ -178,17 +178,19 @@ print(f"Queued job: {job.id}")
 
 ```python
 # Jobs
-job = client.jobs.enqueue(queue=queue, payload=payload)
+job = client.jobs.create({"queue_name": queue_name, "payload": payload})
 job = client.jobs.get(job_id)
-jobs = client.jobs.list(queue=queue, status="pending", limit=50)
+jobs = client.jobs.list(queue_name=queue_name, status="pending", limit=50)
 client.jobs.cancel(job_id)
 client.jobs.retry(job_id)
 
 # Bulk operations
-result = client.jobs.bulk_enqueue([
-    {"queue": "emails", "payload": {"id": 1}},
-    {"queue": "emails", "payload": {"id": 2}}
-])
+result = client.jobs.bulk_enqueue({
+    "jobs": [
+        {"queue_name": "emails", "payload": {"id": 1}},
+        {"queue_name": "emails", "payload": {"id": 2}}
+    ]
+})
 
 # Queues
 queues = client.queues.list()
@@ -527,7 +529,7 @@ SPOOLED_BASE_URL=https://api.spooled.cloud
 
 ```typescript
 try {
-  const job = await client.jobs.enqueue({ ... });
+  const job = await client.jobs.create({ ... });
 } catch (error) {
   if (error.code === 'rate_limited') {
     await delay(error.retryAfter);
@@ -549,8 +551,8 @@ interface EmailPayload {
   template: string;
 }
 
-const job = await client.jobs.enqueue<EmailPayload>({
-  queue: 'emails',
+const job = await client.jobs.create<EmailPayload>({
+  queueName: 'emails',
   payload: {
     to: 'user@example.com',
     subject: 'Welcome!',

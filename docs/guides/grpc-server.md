@@ -392,8 +392,9 @@ const client = new SpooledClient({
 });
 
 // Use gRPC for job operations
-const job = await client.queues.enqueue('my-queue', {
-  data: { key: 'value' },
+const { jobId } = await grpcClient.queue.enqueue({
+  queueName: 'my-queue',
+  payload: { key: 'value' },
 });
 ```
 

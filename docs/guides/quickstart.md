@@ -42,7 +42,7 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs \
   -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "queue": "my-queue",
+    "queue_name": "my-queue",
     "payload": {
       "event": "user.created",
       "user_id": "usr_123",
@@ -58,7 +58,7 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs \
 # Claim up to 5 jobs
 curl -X POST https://api.spooled.cloud/api/v1/jobs/claim \
   -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
-  -d '{"queue": "my-queue", "limit": 5}'
+  -d '{"queue_name": "my-queue", "limit": 5}'
 
 # Complete a job
 curl -X POST https://api.spooled.cloud/api/v1/jobs/job_xyz123/complete \
@@ -229,9 +229,9 @@ const client = new SpooledClient({
   // For self-hosted: baseUrl: 'http://localhost:8080'
 });
 
-// Queue a job
-const job = await client.jobs.enqueue({
-  queue: 'email-notifications',
+// Create a job
+const job = await client.jobs.create({
+  queueName: 'email-notifications',
   payload: {
     to: 'user@example.com',
     subject: 'Welcome!',
@@ -259,17 +259,17 @@ client = SpooledClient(
     # For self-hosted: base_url="http://localhost:8080"
 )
 
-# Queue a background job
-job = client.jobs.enqueue(
-    queue="image-processing",
-    payload={
+# Create a background job
+job = client.jobs.create({
+    "queue_name": "image-processing",
+    "payload": {
         "image_url": "https://example.com/image.jpg",
         "operations": ["resize", "compress"],
         "output_format": "webp"
     },
-    idempotency_key=f"process-image-{image_id}",
-    max_retries=3
-)
+    "idempotency_key": f"process-image-{image_id}",
+    "max_retries": 3
+})
 
 print(f"Queued job: {job.id}")
 ```
@@ -325,7 +325,7 @@ import { SpooledWorker } from '@spooled/sdk';
 
 const worker = new SpooledWorker({
   apiKey: process.env.SPOOLED_API_KEY!,
-  queue: 'email-notifications',
+  queueName: 'email-notifications',
   concurrency: 10,
 });
 
