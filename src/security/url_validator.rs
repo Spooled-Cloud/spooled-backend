@@ -230,10 +230,11 @@ fn validate_hostname(host: &str, options: &UrlValidationOptions) -> Result<(), U
     let host_lower = host.to_lowercase();
 
     // In development, allow localhost if configured
-    if !options.is_production && options.allow_localhost_in_dev {
-        if host_lower == "localhost" || host_lower == "127.0.0.1" {
-            return Ok(());
-        }
+    if !options.is_production
+        && options.allow_localhost_in_dev
+        && (host_lower == "localhost" || host_lower == "127.0.0.1")
+    {
+        return Ok(());
     }
 
     // Check exact matches
@@ -266,10 +267,8 @@ fn validate_ip_address(
     options: &UrlValidationOptions,
 ) -> Result<(), UrlValidationError> {
     // In development, allow localhost
-    if !options.is_production && options.allow_localhost_in_dev {
-        if ip.is_loopback() {
-            return Ok(());
-        }
+    if !options.is_production && options.allow_localhost_in_dev && ip.is_loopback() {
+        return Ok(());
     }
 
     // Check loopback
