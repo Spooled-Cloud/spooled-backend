@@ -238,7 +238,7 @@ services:
     image: cloudflare/cloudflared:latest
     container_name: spooled_cloudflared
     restart: unless-stopped
-    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    command: --protocol http2 tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
     depends_on:
       - backend
     networks:
