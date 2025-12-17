@@ -2,9 +2,16 @@
 //!
 //! Sets up the tonic gRPC server with all services, health checks, and reflection.
 //! Supports optional TLS for Cloudflare Tunnel compatibility.
+//!
+//! Performance optimizations:
+//! - HTTP/2 keepalive for connection reuse
+//! - TCP keepalive for long-lived connections
+//! - TCP_NODELAY to disable Nagle's algorithm
+//! - Configurable concurrency limits
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic_health::server::health_reporter;
@@ -18,6 +25,24 @@ use crate::observability::Metrics;
 
 /// Maximum message size for gRPC requests (4MB)
 const MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
+
+/// HTTP/2 keepalive interval (seconds) - ping to keep connection alive
+const HTTP2_KEEPALIVE_INTERVAL_SECS: u64 = 10;
+
+/// HTTP/2 keepalive timeout (seconds) - timeout for keepalive ping
+const HTTP2_KEEPALIVE_TIMEOUT_SECS: u64 = 20;
+
+/// TCP keepalive interval (seconds)
+const TCP_KEEPALIVE_SECS: u64 = 60;
+
+/// Initial connection window size (bytes) - larger for better throughput
+const INITIAL_CONNECTION_WINDOW_SIZE: u32 = 1024 * 1024; // 1MB
+
+/// Initial stream window size (bytes)
+const INITIAL_STREAM_WINDOW_SIZE: u32 = 512 * 1024; // 512KB
+
+/// Maximum concurrent streams per connection
+const MAX_CONCURRENT_STREAMS: u32 = 200;
 
 /// gRPC TLS configuration loaded from environment
 pub struct GrpcTlsConfig {
@@ -104,8 +129,27 @@ pub async fn start_grpc_server(
         .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
         .build_v1()?;
 
-    // Build server with optional TLS
-    let mut server = Server::builder();
+    // Build server with performance optimizations
+    let mut server = Server::builder()
+        // HTTP/2 keepalive - keeps connections alive and reduces latency
+        .http2_keepalive_interval(Some(Duration::from_secs(HTTP2_KEEPALIVE_INTERVAL_SECS)))
+        .http2_keepalive_timeout(Some(Duration::from_secs(HTTP2_KEEPALIVE_TIMEOUT_SECS)))
+        // TCP keepalive for long-lived connections
+        .tcp_keepalive(Some(Duration::from_secs(TCP_KEEPALIVE_SECS)))
+        // Disable Nagle's algorithm for lower latency
+        .tcp_nodelay(true)
+        // Larger window sizes for better throughput
+        .initial_connection_window_size(Some(INITIAL_CONNECTION_WINDOW_SIZE))
+        .initial_stream_window_size(Some(INITIAL_STREAM_WINDOW_SIZE))
+        // Concurrency limit
+        .max_concurrent_streams(Some(MAX_CONCURRENT_STREAMS));
+
+    info!(
+        http2_keepalive_interval_secs = HTTP2_KEEPALIVE_INTERVAL_SECS,
+        tcp_nodelay = true,
+        max_concurrent_streams = MAX_CONCURRENT_STREAMS,
+        "gRPC server configured with performance optimizations"
+    );
 
     // Configure TLS if enabled
     if tls_config.enabled {

@@ -24,10 +24,16 @@ impl Database {
     ///
     /// URL is no longer logged to prevent credential exposure in logs
     pub async fn connect(settings: &DatabaseSettings) -> Result<Self> {
-        // Don't log the database URL as it may contain credentials
+        // Check if we should test connections before acquiring (adds ~5ms latency)
+        // Default to false in production for better performance
+        let test_before_acquire = std::env::var("DATABASE_TEST_BEFORE_ACQUIRE")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+
         info!(
             max_connections = settings.max_connections,
             min_connections = settings.min_connections,
+            test_before_acquire = test_before_acquire,
             "Connecting to database"
         );
 
@@ -37,7 +43,7 @@ impl Database {
             .acquire_timeout(Duration::from_secs(settings.acquire_timeout_secs))
             .idle_timeout(Duration::from_secs(600))
             .max_lifetime(Duration::from_secs(3600))
-            .test_before_acquire(true)
+            .test_before_acquire(test_before_acquire)
             .connect(&settings.url)
             .await
             // Don't include URL in error message to prevent credential exposure
