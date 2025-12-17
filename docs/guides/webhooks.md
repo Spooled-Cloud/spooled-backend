@@ -355,6 +355,19 @@ def reconcile_stripe_events():
 
 Webhook endpoints must use HTTPS in production. Spooled will refuse to send to HTTP endpoints.
 
+### 7. SSRF Protection
+
+In production, Spooled validates webhook URLs to prevent Server-Side Request Forgery (SSRF) attacks:
+
+- ❌ Private IP ranges (10.x.x.x, 172.16-31.x.x, 192.168.x.x)
+- ❌ Loopback addresses (127.x.x.x, localhost, ::1)
+- ❌ Link-local addresses (169.254.x.x, fe80::)
+- ❌ Cloud metadata endpoints (169.254.169.254)
+- ❌ Internal hostnames (.local, .internal, .corp)
+- ❌ HTTP URLs (must use HTTPS)
+
+This ensures webhooks can only target legitimate external services.
+
 ---
 
 ## Troubleshooting

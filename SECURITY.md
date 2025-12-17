@@ -100,6 +100,21 @@ Spooled Backend includes several security features:
 - **Security headers** via middleware
 - **gRPC interceptors** for authentication and authorization
 - **gRPC health service** for load balancer health checks
+- **SSRF protection** for outgoing webhook URLs
+
+### SSRF Protection
+
+Outgoing webhook URLs are validated in production to prevent Server-Side Request Forgery attacks:
+
+- ❌ Private IP ranges (RFC 1918: 10.x.x.x, 172.16-31.x.x, 192.168.x.x)
+- ❌ Loopback addresses (127.x.x.x, localhost, ::1)
+- ❌ Link-local addresses (169.254.x.x, fe80::)
+- ❌ Cloud metadata endpoints (169.254.169.254, metadata.google.internal)
+- ❌ Internal hostnames (.local, .internal, .corp, .lan)
+- ❌ HTTP URLs (HTTPS required in production)
+- ❌ CGNAT ranges (100.64.0.0/10)
+
+DNS resolution is also validated to prevent DNS rebinding attacks.
 
 ## Vulnerability History
 

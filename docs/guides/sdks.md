@@ -21,8 +21,8 @@ Spooled provides official SDKs for popular languages, plus REST and gRPC APIs fo
 | SDK | Status | Package |
 |-----|--------|---------|
 | **Node.js** | ✅ Available | `@spooled/sdk` |
-| **Python** | 🚧 In Development | `spooled-sdk` |
-| **Go** | 🚧 In Development | `github.com/spooled-cloud/spooled-go` |
+| **Python** | ✅ Available | `spooled` |
+| **Go** | 🚧 Coming Soon | `github.com/spooled-cloud/spooled-go` |
 | **REST API** | ✅ Stable | Any HTTP client |
 | **gRPC API** | ✅ Stable | Any gRPC client |
 
@@ -142,7 +142,10 @@ const worker = new SpooledWorker({
 ### Installation
 
 ```bash
-pip install spooled-sdk
+pip install spooled
+
+# With all extras (gRPC, realtime)
+pip install spooled[all]
 ```
 
 ### Quick Start
@@ -504,9 +507,9 @@ Community-maintained SDKs (not officially supported):
 | Enqueue jobs | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Bulk enqueue | ✅ | ✅ | ✅ | ✅ | ❌ |
 | Worker class | ✅ | ✅ | ✅ | DIY | DIY |
-| gRPC streaming | ✅ | 🚧 | ✅ | ❌ | ✅ |
+| gRPC streaming | ✅ | ✅ | ✅ | ❌ | ✅ |
 | Auto retry | ✅ | ✅ | ✅ | DIY | DIY |
-| Type safety | ✅ | 🔶 | ✅ | ❌ | ✅ |
+| Type safety | ✅ | ✅ | ✅ | ❌ | ✅ |
 
 ---
 
@@ -574,3 +577,4 @@ const client = new SpooledClient({
 - [Jobs Guide](./jobs.md) — Job creation and processing
 - [Workers Guide](./workers.md) — Building production workers
 - [API Reference](./api-usage.md) — Complete API documentation
+
