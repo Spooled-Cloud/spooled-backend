@@ -150,7 +150,7 @@ const BLOCKED_HOSTNAME_SUFFIXES: &[&str] = &[
 /// use spooled_backend::security::{validate_webhook_url, UrlValidationOptions};
 ///
 /// let opts = UrlValidationOptions::default();
-/// 
+///
 /// // Valid HTTPS URL
 /// assert!(validate_webhook_url("https://example.com/webhook", &opts).is_ok());
 ///
@@ -160,18 +160,19 @@ const BLOCKED_HOSTNAME_SUFFIXES: &[&str] = &[
 /// // Blocked - internal hostname
 /// assert!(validate_webhook_url("https://postgres:5432/", &opts).is_err());
 /// ```
-pub fn validate_webhook_url(url: &str, options: &UrlValidationOptions) -> Result<(), UrlValidationError> {
+pub fn validate_webhook_url(
+    url: &str,
+    options: &UrlValidationOptions,
+) -> Result<(), UrlValidationError> {
     // Parse URL
-    let parsed = url::Url::parse(url)
-        .map_err(|e| UrlValidationError::InvalidFormat(e.to_string()))?;
+    let parsed =
+        url::Url::parse(url).map_err(|e| UrlValidationError::InvalidFormat(e.to_string()))?;
 
     // 1. Validate scheme
     validate_scheme(&parsed, options)?;
 
     // 2. Get and validate host
-    let host = parsed
-        .host_str()
-        .ok_or(UrlValidationError::MissingHost)?;
+    let host = parsed.host_str().ok_or(UrlValidationError::MissingHost)?;
 
     // 3. Check if host is in blocked list
     validate_hostname(host, options)?;
@@ -180,11 +181,11 @@ pub fn validate_webhook_url(url: &str, options: &UrlValidationOptions) -> Result
     // IPv6 addresses from URL parsing come with brackets like "[::1]"
     // We need to strip them before parsing
     let host_for_ip_parse = if host.starts_with('[') && host.ends_with(']') {
-        &host[1..host.len()-1]
+        &host[1..host.len() - 1]
     } else {
         host
     };
-    
+
     if let Ok(ip) = host_for_ip_parse.parse::<IpAddr>() {
         validate_ip_address(&ip, options)?;
     }
@@ -198,14 +199,17 @@ pub fn validate_webhook_url(url: &str, options: &UrlValidationOptions) -> Result
 }
 
 /// Validate URL scheme
-fn validate_scheme(url: &url::Url, options: &UrlValidationOptions) -> Result<(), UrlValidationError> {
+fn validate_scheme(
+    url: &url::Url,
+    options: &UrlValidationOptions,
+) -> Result<(), UrlValidationError> {
     match url.scheme() {
         "https" => Ok(()),
         "http" => {
             if options.is_production {
                 return Err(UrlValidationError::HttpNotAllowed);
             }
-            
+
             // In development, only allow HTTP for localhost
             if options.allow_localhost_in_dev {
                 if let Some(host) = url.host_str() {
@@ -214,7 +218,7 @@ fn validate_scheme(url: &url::Url, options: &UrlValidationOptions) -> Result<(),
                     }
                 }
             }
-            
+
             Err(UrlValidationError::HttpNotAllowed)
         }
         scheme => Err(UrlValidationError::InvalidScheme(scheme.to_string())),
@@ -233,13 +237,19 @@ fn validate_hostname(host: &str, options: &UrlValidationOptions) -> Result<(), U
     }
 
     // Check exact matches
-    if BLOCKED_HOSTNAMES.iter().any(|&blocked| host_lower == blocked) {
+    if BLOCKED_HOSTNAMES
+        .iter()
+        .any(|&blocked| host_lower == blocked)
+    {
         warn!(hostname = %host, "Blocked webhook hostname (exact match)");
         return Err(UrlValidationError::BlockedHostname);
     }
 
     // Check suffixes
-    if BLOCKED_HOSTNAME_SUFFIXES.iter().any(|&suffix| host_lower.ends_with(suffix)) {
+    if BLOCKED_HOSTNAME_SUFFIXES
+        .iter()
+        .any(|&suffix| host_lower.ends_with(suffix))
+    {
         warn!(hostname = %host, "Blocked webhook hostname (suffix match)");
         return Err(UrlValidationError::BlockedHostname);
     }
@@ -251,7 +261,10 @@ fn validate_hostname(host: &str, options: &UrlValidationOptions) -> Result<(), U
 }
 
 /// Validate an IP address
-fn validate_ip_address(ip: &IpAddr, options: &UrlValidationOptions) -> Result<(), UrlValidationError> {
+fn validate_ip_address(
+    ip: &IpAddr,
+    options: &UrlValidationOptions,
+) -> Result<(), UrlValidationError> {
     // In development, allow localhost
     if !options.is_production && options.allow_localhost_in_dev {
         if ip.is_loopback() {
@@ -411,7 +424,11 @@ fn validate_ipv6(ip: &Ipv6Addr) -> Result<(), UrlValidationError> {
 ///
 /// This prevents DNS rebinding attacks where a hostname initially resolves to a public IP
 /// but later resolves to an internal IP.
-fn validate_dns_resolution(host: &str, port: u16, options: &UrlValidationOptions) -> Result<(), UrlValidationError> {
+fn validate_dns_resolution(
+    host: &str,
+    port: u16,
+    options: &UrlValidationOptions,
+) -> Result<(), UrlValidationError> {
     // If host is already an IP, skip DNS resolution (already validated)
     if host.parse::<IpAddr>().is_ok() {
         return Ok(());
@@ -508,7 +525,7 @@ mod tests {
     #[test]
     fn test_blocked_private_ips() {
         let opts = test_options();
-        
+
         // RFC 1918 ranges
         assert!(validate_webhook_url("https://10.0.0.1/webhook", &opts).is_err());
         assert!(validate_webhook_url("https://10.255.255.255/webhook", &opts).is_err());
@@ -521,18 +538,21 @@ mod tests {
     #[test]
     fn test_blocked_metadata_endpoints() {
         let opts = test_options();
-        
+
         // AWS metadata
         assert!(validate_webhook_url("https://169.254.169.254/latest/meta-data/", &opts).is_err());
-        
+
         // GCP metadata
-        assert!(validate_webhook_url("https://metadata.google.internal/computeMetadata/", &opts).is_err());
+        assert!(
+            validate_webhook_url("https://metadata.google.internal/computeMetadata/", &opts)
+                .is_err()
+        );
     }
 
     #[test]
     fn test_blocked_internal_hostnames() {
         let opts = test_options();
-        
+
         assert!(validate_webhook_url("https://postgres:5432/", &opts).is_err());
         assert!(validate_webhook_url("https://redis:6379/", &opts).is_err());
         assert!(validate_webhook_url("https://elasticsearch:9200/", &opts).is_err());
@@ -542,7 +562,7 @@ mod tests {
     #[test]
     fn test_blocked_internal_suffixes() {
         let opts = test_options();
-        
+
         assert!(validate_webhook_url("https://my-service.internal/", &opts).is_err());
         assert!(validate_webhook_url("https://app.local/", &opts).is_err());
         assert!(validate_webhook_url("https://backend.svc.cluster.local/", &opts).is_err());
@@ -551,7 +571,7 @@ mod tests {
     #[test]
     fn test_invalid_schemes() {
         let opts = test_options();
-        
+
         assert!(matches!(
             validate_webhook_url("ftp://example.com/webhook", &opts),
             Err(UrlValidationError::InvalidScheme(_))
@@ -570,13 +590,13 @@ mod tests {
     #[test]
     fn test_ipv6_addresses() {
         let opts = test_options();
-        
+
         // Loopback (::1)
         assert!(validate_webhook_url("https://[::1]/webhook", &opts).is_err());
-        
+
         // Link-local (fe80::/10)
         assert!(validate_webhook_url("https://[fe80::1]/webhook", &opts).is_err());
-        
+
         // Unique local (fc00::/7, fd00::/8)
         assert!(validate_webhook_url("https://[fd00::1]/webhook", &opts).is_err());
         assert!(validate_webhook_url("https://[fc00::1]/webhook", &opts).is_err());
@@ -585,7 +605,7 @@ mod tests {
     #[test]
     fn test_invalid_urls() {
         let opts = test_options();
-        
+
         assert!(matches!(
             validate_webhook_url("not-a-url", &opts),
             Err(UrlValidationError::InvalidFormat(_))
@@ -599,12 +619,12 @@ mod tests {
     #[test]
     fn test_172_range_boundary() {
         let opts = test_options();
-        
+
         // 172.16-31 should be blocked
         assert!(validate_webhook_url("https://172.16.0.1/", &opts).is_err());
         assert!(validate_webhook_url("https://172.20.0.1/", &opts).is_err());
         assert!(validate_webhook_url("https://172.31.0.1/", &opts).is_err());
-        
+
         // 172.15 and 172.32 should be allowed (if public)
         // Note: These might still be blocked by DNS resolution in real scenarios
     }
@@ -612,10 +632,9 @@ mod tests {
     #[test]
     fn test_cgnat_range() {
         let opts = test_options();
-        
+
         // Carrier-grade NAT (100.64.0.0/10)
         assert!(validate_webhook_url("https://100.64.0.1/", &opts).is_err());
         assert!(validate_webhook_url("https://100.127.255.255/", &opts).is_err());
     }
 }
-
