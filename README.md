@@ -11,6 +11,7 @@ Spooled is a high-performance, multi-tenant job queue system designed for reliab
 ## ✨ Features
 
 - 🚀 **High Performance**: Built on Rust + Tokio + PostgreSQL with Redis caching (~28x faster auth)
+- ⚡ **Optimized gRPC**: HTTP/2 keepalive, TCP optimizations, and connection pooling for ~3x faster throughput
 - 🔒 **Multi-Tenant**: PostgreSQL Row-Level Security (RLS) for data isolation
 - 📊 **Observable**: Prometheus metrics, Grafana dashboards, optional OpenTelemetry export (`--features otel`)
 - 🔄 **Reliable**: At-least-once processing with leases + retries (use idempotency keys for exactly-once effects)
@@ -287,7 +288,9 @@ When using Cloudflare Tunnel with HTTPS origin, gRPC TLS is **required** because
 The production docker-compose includes:
 - **TLS enabled by default** (`GRPC_TLS_ENABLED=true`)
 - **Self-signed certificates** in `./certs/` (10-year validity)
-- Works with Cloudflare Tunnel when "No TLS Verify" is enabled
+- **Performance Optimized**: HTTP/2 keepalives, TCP_NODELAY, and tuned connection windows
+
+For best performance with **Cloudflare Tunnel**, disable internal TLS (`GRPC_TLS_ENABLED=false`) and use `http://backend:50051` as the service origin. This eliminates the internal TLS handshake overhead.
 
 To disable TLS for local development:
 ```bash

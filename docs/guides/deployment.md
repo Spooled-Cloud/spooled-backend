@@ -318,18 +318,29 @@ helm install redis bitnami/redis \
 
 ### gRPC TLS (Cloudflare Tunnel)
 
-If using Cloudflare Tunnel with HTTPS origin for gRPC:
+To minimize latency with Cloudflare Tunnel, use HTTP/2 over HTTP (plaintext) between `cloudflared` and the backend, letting Cloudflare handle the public TLS termination.
+
+#### Optimized Configuration (Recommended)
+
+1. **Docker Compose**: Disable internal TLS to remove handshake overhead (~100ms savings).
+   ```yaml
+   environment:
+     GRPC_TLS_ENABLED: "false"
+   ```
+
+2. **Cloudflare Tunnel Config**:
+   - **Service**: `http://backend:50051` (Note: `http`, not `https`)
+   - **Settings**:
+     - [x] HTTP2 Connection
+     - [ ] No TLS Verify (Not needed for HTTP)
+
+#### Legacy/Direct Configuration (with Internal TLS)
+
+If you need end-to-end encryption within your private network or are exposing the port directly:
 
 - [ ] `GRPC_TLS_ENABLED=true` (enabled by default in docker-compose.prod.yml)
 - [ ] Certificate files in `./certs/` directory (included in repo)
 - [ ] Cloudflare Tunnel: Service Type = HTTPS, No TLS Verify = ON, HTTP2 = ON
-
-To disable gRPC TLS (for local dev or when TLS terminates at load balancer):
-
-```yaml
-environment:
-  GRPC_TLS_ENABLED: "false"
-```
 
 ### Database
 

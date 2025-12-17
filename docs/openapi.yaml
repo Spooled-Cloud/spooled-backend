@@ -757,7 +757,7 @@ paths:
                 $ref: '#/components/schemas/AdminOrganizationDetail'
         '404':
           description: Organization not found
-    put:
+    patch:
       tags: [Admin]
       summary: Update organization
       description: Update organization settings including plan tier
@@ -781,12 +781,15 @@ paths:
       tags: [Admin]
       summary: Delete organization
       description: |
-        Delete an organization and all its data. Use `hard=true` for permanent deletion.
+        Delete an organization and all its data.
+        
+        - **Soft delete** (default): Marks organization as deleted.
+        - **Hard delete** (`hard_delete=true`): Permanently removes organization and all related data (jobs, workflows, workers, etc.).
       operationId: adminDeleteOrganization
       security:
         - AdminKeyAuth: []
       parameters:
-        - name: hard
+        - name: hard_delete
           in: query
           schema:
             type: boolean
