@@ -530,51 +530,51 @@ pub async fn delete_organization(
     if query.hard_delete.unwrap_or(false) {
         // Hard delete - manually delete related data first (some tables lack ON DELETE CASCADE)
         // Order matters due to foreign key constraints
-        
+
         // 1. Delete job dependencies (references jobs)
         sqlx::query("DELETE FROM job_dependencies WHERE organization_id = $1")
             .bind(&id)
             .execute(state.db.pool())
             .await?;
-        
+
         // 2. Delete jobs (references workflows, queues)
         sqlx::query("DELETE FROM jobs WHERE organization_id = $1")
             .bind(&id)
             .execute(state.db.pool())
             .await?;
-        
+
         // 3. Delete workflows (references organizations)
         sqlx::query("DELETE FROM workflows WHERE organization_id = $1")
             .bind(&id)
             .execute(state.db.pool())
             .await?;
-        
+
         // 4. Delete other related tables (these have CASCADE but be explicit)
         sqlx::query("DELETE FROM workers WHERE organization_id = $1")
             .bind(&id)
             .execute(state.db.pool())
             .await?;
-        
+
         sqlx::query("DELETE FROM schedules WHERE organization_id = $1")
             .bind(&id)
             .execute(state.db.pool())
             .await?;
-        
+
         sqlx::query("DELETE FROM api_keys WHERE organization_id = $1")
             .bind(&id)
             .execute(state.db.pool())
             .await?;
-        
+
         sqlx::query("DELETE FROM outgoing_webhooks WHERE organization_id = $1")
             .bind(&id)
             .execute(state.db.pool())
             .await?;
-        
+
         sqlx::query("DELETE FROM queue_configs WHERE organization_id = $1")
             .bind(&id)
             .execute(state.db.pool())
             .await?;
-        
+
         // 5. Finally delete the organization
         sqlx::query("DELETE FROM organizations WHERE id = $1")
             .bind(&id)
