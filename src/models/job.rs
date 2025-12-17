@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use validator::Validate;
 
+use crate::security::{validate_webhook_url as validate_url_ssrf, UrlValidationOptions};
+
 /// Job status enumeration
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
 #[sqlx(type_name = "text", rename_all = "lowercase")]
@@ -124,57 +126,15 @@ pub struct Job {
 pub const MAX_JOB_PAYLOAD_SIZE: usize = 1024 * 1024;
 
 /// Validate webhook URL for SSRF protection
+///
+/// Uses the centralized URL validator from the security module.
 fn validate_webhook_url(url: &str) -> Result<(), validator::ValidationError> {
-    // Parse URL
-    let parsed = match url::Url::parse(url) {
-        Ok(u) => u,
-        Err(_) => {
-            let mut err = validator::ValidationError::new("invalid_url");
-            err.message = Some(std::borrow::Cow::Borrowed("Invalid URL format"));
-            return Err(err);
-        }
-    };
-
-    // Must be HTTPS in production
-    let is_production = std::env::var("RUST_ENV")
-        .map(|v| v == "production")
-        .unwrap_or(false);
-
-    if is_production && parsed.scheme() != "https" {
-        let mut err = validator::ValidationError::new("https_required");
-        err.message = Some(std::borrow::Cow::Borrowed(
-            "Webhook URL must use HTTPS in production",
-        ));
-        return Err(err);
-    }
-
-    // Check for private/internal IPs (SSRF protection)
-    if let Some(host) = parsed.host_str() {
-        let is_private = host == "localhost" 
-            || host == "127.0.0.1"
-            || host.starts_with("192.168.")
-            || host.starts_with("10.")
-            || host.starts_with("172.16.")
-            || host.starts_with("172.17.")
-            || host.starts_with("172.18.")
-            || host.starts_with("172.19.")
-            || host.starts_with("172.2")
-            || host.starts_with("172.30.")
-            || host.starts_with("172.31.")
-            || host == "169.254.169.254" // AWS metadata
-            || host.ends_with(".internal")
-            || host.ends_with(".local");
-
-        if is_private && is_production {
-            let mut err = validator::ValidationError::new("private_ip");
-            err.message = Some(std::borrow::Cow::Borrowed(
-                "Webhook URL cannot point to private/internal addresses",
-            ));
-            return Err(err);
-        }
-    }
-
-    Ok(())
+    let options = UrlValidationOptions::default();
+    validate_url_ssrf(url, &options).map_err(|e| {
+        let mut err = validator::ValidationError::new("invalid_webhook_url");
+        err.message = Some(std::borrow::Cow::Owned(e.to_string()));
+        err
+    })
 }
 
 /// Validate job payload size

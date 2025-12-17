@@ -25,6 +25,7 @@ mod models;
 mod observability;
 mod queue;
 mod scheduler;
+mod security;
 mod webhook;
 mod worker;
 

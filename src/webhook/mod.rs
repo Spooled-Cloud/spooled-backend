@@ -5,6 +5,7 @@
 //! - Delivery tracking and logging
 //! - Timeout handling
 //! - Signature generation for authenticity
+//! - SSRF protection via centralized URL validation
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,6 +19,7 @@ use sqlx::PgPool;
 use tracing::{error, info, warn};
 
 use crate::models::Job;
+use crate::security::{validate_webhook_url, UrlValidationOptions};
 
 /// Minimum signing secret length for security
 const MIN_SIGNING_SECRET_LENGTH: usize = 32;
@@ -172,80 +174,16 @@ impl WebhookService {
 
     /// Validate webhook URL to prevent SSRF attacks
     ///
-    /// Prevents requests to internal/private networks
-    /// Now blocks localhost HTTP in production mode
-    /// Returns generic error to avoid URL leakage in response
+    /// Uses the centralized URL validator from the security module.
+    /// Prevents requests to internal/private networks, cloud metadata endpoints,
+    /// and known internal hostnames.
     fn validate_url(&self, url: &str) -> Result<(), String> {
-        let parsed = url::Url::parse(url).map_err(|e| format!("Invalid URL: {}", e))?;
-
-        // Check if we're in production mode (via environment variable)
-        let is_production = std::env::var("RUST_ENV")
-            .map(|v| v == "production")
-            .unwrap_or(false);
-
-        // Only allow HTTPS (or HTTP for localhost in dev ONLY)
-        match parsed.scheme() {
-            "https" => {}
-            "http" => {
-                // Block HTTP entirely in production
-                if is_production {
-                    return Err("HTTP webhooks not allowed in production - use HTTPS".to_string());
-                }
-
-                // Allow HTTP only for localhost in development
-                if let Some(host) = parsed.host_str() {
-                    if host != "localhost" && host != "127.0.0.1" {
-                        return Err("HTTP only allowed for localhost in development".to_string());
-                    }
-                }
-            }
-            _ => return Err("Only HTTPS URLs are allowed".to_string()),
-        }
-
-        // Block internal/private IPs
-        if let Some(host) = parsed.host_str() {
-            // Block common internal hostnames
-            let blocked_hosts = [
-                "localhost",
-                "127.0.0.1",
-                "::1",
-                "0.0.0.0",
-                "metadata",
-                "metadata.google",
-                "169.254.169.254", // AWS/GCP metadata
-                "metadata.google.internal",
-            ];
-
-            // Allow localhost only in non-production (checked above for HTTP)
-            if parsed.scheme() == "https" && blocked_hosts.contains(&host) {
-                return Err(format!("Blocked host: {}", host));
-            }
-
-            // Block private IP ranges
-            if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-                if ip.is_loopback() || ip.is_unspecified() {
-                    return Err("Loopback addresses not allowed".to_string());
-                }
-                // Check for private ranges
-                match ip {
-                    std::net::IpAddr::V4(ipv4) => {
-                        if ipv4.is_private() || ipv4.is_link_local() {
-                            return Err("Private IP addresses not allowed".to_string());
-                        }
-                    }
-                    std::net::IpAddr::V6(ipv6) => {
-                        // IPv6 loopback already checked above
-                        // Check for link-local, unique local, etc.
-                        let segments = ipv6.segments();
-                        if segments[0] == 0xfe80 || segments[0] == 0xfc00 || segments[0] == 0xfd00 {
-                            return Err("Private IPv6 addresses not allowed".to_string());
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
+        let options = UrlValidationOptions::default();
+        validate_webhook_url(url, &options).map_err(|e| {
+            // Return generic error to avoid URL leakage
+            warn!(url = %url, error = %e, "Webhook URL validation failed");
+            "Invalid webhook URL".to_string()
+        })
     }
 
     /// Try to deliver a webhook once

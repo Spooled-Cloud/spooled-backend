@@ -6,9 +6,9 @@ use sha2::Sha256;
 use sqlx::{Pool, Postgres};
 use std::time::Duration;
 use tracing::{error, info, warn};
-use url::Url;
 
 use crate::models::OutgoingWebhook;
+use crate::security::{validate_webhook_url as validate_url_ssrf, UrlValidationOptions};
 
 #[derive(Clone)]
 pub struct OutgoingWebhookService {
@@ -281,12 +281,14 @@ impl OutgoingWebhookService {
         Ok(hex::encode(result.into_bytes()))
     }
 
+    /// Validate webhook URL to prevent SSRF attacks
+    ///
+    /// Uses the centralized URL validator from the security module.
     fn validate_url(&self, url: &str) -> Result<()> {
-        let parsed = Url::parse(url).context("Invalid URL")?;
-        if parsed.scheme() != "http" && parsed.scheme() != "https" {
-            return Err(anyhow::anyhow!("Invalid scheme"));
-        }
-        // Add more SSRF checks here (allow localhost for dev/tests)
-        Ok(())
+        let options = UrlValidationOptions::default();
+        validate_url_ssrf(url, &options).map_err(|e| {
+            warn!(url = %url, error = %e, "Webhook URL validation failed (SSRF protection)");
+            anyhow::anyhow!("Invalid webhook URL: {}", e)
+        })
     }
 }

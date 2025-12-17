@@ -18,5 +18,7 @@ pub mod observability;
 pub mod outgoing_webhooks;
 pub mod queue;
 pub mod scheduler;
+/// Security module - URL validation, SSRF protection, etc.
+pub mod security;
 pub mod webhook;
 pub mod worker;

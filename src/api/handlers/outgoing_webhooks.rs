@@ -2,6 +2,13 @@
 //!
 //! CRUD operations for managing outgoing webhook configurations.
 //! These webhooks send notifications to external URLs when events occur.
+//!
+//! # Security
+//! All webhook URLs are validated against SSRF attacks:
+//! - Private IP ranges are blocked
+//! - Internal hostnames are blocked  
+//! - Cloud metadata endpoints are blocked
+//! - HTTPS is required in production
 
 use axum::{
     extract::{Path, State},
@@ -20,6 +27,7 @@ use crate::models::{
     OutgoingWebhookSummary, TestWebhookResponse, UpdateOutgoingWebhookRequest,
     VALID_WEBHOOK_EVENTS,
 };
+use crate::security::{validate_webhook_url, UrlValidationOptions};
 
 /// Validate that all event types are valid
 fn validate_events(events: &[String]) -> AppResult<()> {
@@ -62,6 +70,10 @@ pub async fn list(
 /// Create a new outgoing webhook
 ///
 /// POST /api/v1/outgoing-webhooks
+///
+/// # Security
+/// The URL is validated against SSRF attacks. Private IPs, internal hostnames,
+/// and cloud metadata endpoints are blocked. HTTPS is required in production.
 pub async fn create(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
@@ -75,15 +87,17 @@ pub async fn create(
     // Validate event types
     validate_events(&request.events)?;
 
-    // Validate URL scheme (only HTTPS in production)
-    let parsed_url = url::Url::parse(&request.url)
-        .map_err(|e| AppError::Validation(format!("Invalid URL: {}", e)))?;
-
-    if parsed_url.scheme() != "https" && parsed_url.scheme() != "http" {
-        return Err(AppError::Validation(
-            "URL must use HTTP or HTTPS scheme".to_string(),
-        ));
-    }
+    // SECURITY: Validate URL against SSRF attacks
+    let url_options = UrlValidationOptions::default();
+    validate_webhook_url(&request.url, &url_options).map_err(|e| {
+        tracing::warn!(
+            url = %request.url,
+            error = %e,
+            organization_id = %ctx.organization_id,
+            "Webhook URL rejected (SSRF protection)"
+        );
+        AppError::Validation(format!("Invalid webhook URL: {}", e))
+    })?;
 
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
@@ -151,6 +165,9 @@ pub async fn get(
 /// Update an outgoing webhook
 ///
 /// PUT /api/v1/outgoing-webhooks/{id}
+///
+/// # Security
+/// If URL is being updated, it is validated against SSRF attacks.
 pub async fn update(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
@@ -165,6 +182,21 @@ pub async fn update(
     // Validate event types if provided
     if let Some(ref events) = request.events {
         validate_events(events)?;
+    }
+
+    // SECURITY: Validate URL against SSRF attacks if being updated
+    if let Some(ref url) = request.url {
+        let url_options = UrlValidationOptions::default();
+        validate_webhook_url(url, &url_options).map_err(|e| {
+            tracing::warn!(
+                url = %url,
+                error = %e,
+                organization_id = %ctx.organization_id,
+                webhook_id = %id,
+                "Webhook URL update rejected (SSRF protection)"
+            );
+            AppError::Validation(format!("Invalid webhook URL: {}", e))
+        })?;
     }
 
     // Check if webhook exists
@@ -254,6 +286,11 @@ pub async fn delete(
 /// Test an outgoing webhook by sending a test payload
 ///
 /// POST /api/v1/outgoing-webhooks/{id}/test
+///
+/// # Security
+/// The stored URL is re-validated before making the request to prevent
+/// SSRF attacks (in case validation rules were updated or URL was stored
+/// before validation was added).
 pub async fn test(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
@@ -274,6 +311,19 @@ pub async fn test(
     .await?;
 
     let webhook = webhook.ok_or_else(|| AppError::NotFound(format!("Webhook {} not found", id)))?;
+
+    // SECURITY: Re-validate URL before making request
+    let url_options = UrlValidationOptions::default();
+    validate_webhook_url(&webhook.url, &url_options).map_err(|e| {
+        tracing::warn!(
+            url = %webhook.url,
+            error = %e,
+            webhook_id = %id,
+            organization_id = %ctx.organization_id,
+            "Webhook test blocked (SSRF protection)"
+        );
+        AppError::Validation(format!("Webhook URL no longer valid: {}", e))
+    })?;
 
     // Create test payload
     let test_payload = serde_json::json!({
