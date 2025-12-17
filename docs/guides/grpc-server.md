@@ -347,16 +347,18 @@ The server automatically applies:
 | Deployment | Throughput | Latency (p99) | Notes |
 |------------|------------|---------------|-------|
 | Local (no TLS) | ~10k req/s | < 5ms | Fastest for development |
-| Cloudflare (TLS) | ~2k req/s | ~50ms | Standard production setup |
-| Cloudflare (No TLS) | ~5k req/s | ~20ms | Optimized production (see below) |
+| Cloudflare (TLS) | ~2k req/s | ~50ms | Production through Cloudflare Tunnel |
+| Direct (with TLS) | ~5k req/s | ~10ms | Direct connection, no proxy |
 
-### Optimization: Disable Internal TLS
+### Cloudflare Tunnel Configuration
 
-When using Cloudflare Tunnel, you can eliminate the internal TLS handshake overhead (~100ms) by terminating TLS at the Cloudflare edge and using HTTP/2 plaintext to the backend.
+Cloudflare Tunnel **requires HTTPS** for HTTP/2 (gRPC). You cannot use plaintext HTTP.
 
-1. Set `GRPC_TLS_ENABLED=false` in docker-compose
-2. Configure Tunnel service as `http://backend:50051` (not https)
-3. Ensure "HTTP2 Connection" is enabled in Cloudflare dashboard
+**Required settings:**
+1. `GRPC_TLS_ENABLED=true` in docker-compose (default)
+2. Service Type: `HTTPS`, URL: `backend:50051`
+3. HTTP2 Connection: `ON`
+4. No TLS Verify: `ON` (for self-signed certificates)
 
 ### Connection Pooling
 
@@ -372,7 +374,7 @@ For continuous job processing, prefer:
 The gRPC API is supported by the official SDKs:
 
 - **Node.js SDK** (`spooled-sdk-nodejs`): Full gRPC support with `@grpc/grpc-js`
-- **Python SDK** (`spooled-sdk-python`): Coming soon
+- **Python SDK** (`spooled-sdk-python`): Full gRPC support with `grpcio`
 - **Go SDK** (`spooled-sdk-go`): Coming soon
 
 ### Node.js SDK Example

@@ -290,9 +290,15 @@ The production docker-compose includes:
 - **Self-signed certificates** in `./certs/` (10-year validity)
 - **Performance Optimized**: HTTP/2 keepalives, TCP_NODELAY, and tuned connection windows
 
-For best performance with **Cloudflare Tunnel**, disable internal TLS (`GRPC_TLS_ENABLED=false`) and use `http://backend:50051` as the service origin. This eliminates the internal TLS handshake overhead.
+**Cloudflare Tunnel Configuration:**
+- Service Type: `HTTPS`
+- URL: `backend:50051`
+- HTTP2 Connection: `ON`
+- No TLS Verify: `ON` (required for self-signed certs)
 
-To disable TLS for local development:
+> **Note**: Cloudflare Tunnel requires HTTPS for HTTP/2 (gRPC). You cannot use plaintext HTTP with gRPC through Cloudflare.
+
+To disable TLS for local development (without Cloudflare):
 ```bash
 GRPC_TLS_ENABLED=false cargo run
 ```

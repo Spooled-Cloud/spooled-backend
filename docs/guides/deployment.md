@@ -318,29 +318,30 @@ helm install redis bitnami/redis \
 
 ### gRPC TLS (Cloudflare Tunnel)
 
-To minimize latency with Cloudflare Tunnel, use HTTP/2 over HTTP (plaintext) between `cloudflared` and the backend, letting Cloudflare handle the public TLS termination.
+Cloudflare Tunnel requires HTTPS for HTTP/2 connections (which gRPC uses). You **cannot** use plaintext HTTP for gRPC through Cloudflare Tunnel.
 
-#### Optimized Configuration (Recommended)
+#### Required Configuration
 
-1. **Docker Compose**: Disable internal TLS to remove handshake overhead (~100ms savings).
+1. **Docker Compose**: Enable TLS (default in `docker-compose.prod.yml`):
    ```yaml
    environment:
-     GRPC_TLS_ENABLED: "false"
+     GRPC_TLS_ENABLED: "true"
    ```
 
 2. **Cloudflare Tunnel Config**:
-   - **Service**: `http://backend:50051` (Note: `http`, not `https`)
+   - **Service Type**: `HTTPS`
+   - **URL**: `backend:50051`
    - **Settings**:
      - [x] HTTP2 Connection
-     - [ ] No TLS Verify (Not needed for HTTP)
+     - [x] No TLS Verify (required for self-signed certs)
 
-#### Legacy/Direct Configuration (with Internal TLS)
+3. **Certificates**: Self-signed certificates are included in `./certs/` directory (10-year validity)
 
-If you need end-to-end encryption within your private network or are exposing the port directly:
+#### Local Development (without Cloudflare)
 
-- [ ] `GRPC_TLS_ENABLED=true` (enabled by default in docker-compose.prod.yml)
-- [ ] Certificate files in `./certs/` directory (included in repo)
-- [ ] Cloudflare Tunnel: Service Type = HTTPS, No TLS Verify = ON, HTTP2 = ON
+For local development without a tunnel, you can disable TLS:
+- `GRPC_TLS_ENABLED=false` 
+- Connect directly to `localhost:50051` with insecure credentials
 
 ### Database
 
