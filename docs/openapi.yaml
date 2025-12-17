@@ -4102,6 +4102,27 @@ components:
           type: boolean
         settings:
           type: object
+        stripe_customer_id:
+          type: string
+          nullable: true
+          description: Stripe customer ID linked to this organization
+        stripe_subscription_id:
+          type: string
+          nullable: true
+          description: Stripe subscription ID for billing
+        stripe_subscription_status:
+          type: string
+          nullable: true
+          description: Stripe subscription status (active, past_due, canceled, etc.)
+        stripe_current_period_end:
+          type: string
+          format: date-time
+          nullable: true
+          description: Current billing period end date
+        stripe_cancel_at_period_end:
+          type: boolean
+          nullable: true
+          description: Whether subscription will cancel at period end
         usage:
           $ref: '#/components/schemas/ResourceUsage'
         resource_counts:
@@ -4128,6 +4149,11 @@ components:
 
     AdminUpdateOrganizationRequest:
       type: object
+      description: |
+        Update organization settings. All fields are optional.
+        
+        When setting `stripe_subscription_id`, the backend will auto-reconcile with Stripe API
+        to fetch the correct plan tier, subscription status, and billing period from Stripe.
       properties:
         name:
           type: string
@@ -4141,6 +4167,25 @@ components:
           format: email
         settings:
           type: object
+        custom_limits:
+          type: object
+          nullable: true
+          description: Custom limit overrides (null or empty object resets to plan defaults)
+        stripe_customer_id:
+          type: string
+          nullable: true
+          description: Link a Stripe customer to this organization
+          example: cus_TcO2bC8PunEANY
+        stripe_subscription_id:
+          type: string
+          nullable: true
+          description: Link a Stripe subscription (triggers auto-reconciliation with Stripe)
+          example: sub_1Sf9GgDtp6Ou1g6CEOL29LqS
+        stripe_subscription_status:
+          type: string
+          nullable: true
+          description: Subscription status (usually auto-filled by reconciliation)
+          enum: [active, past_due, canceled, unpaid, incomplete, trialing]
 
     PlatformStats:
       type: object
