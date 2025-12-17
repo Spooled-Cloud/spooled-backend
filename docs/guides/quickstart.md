@@ -774,5 +774,5 @@ curl -X POST http://localhost:8080/api/v1/jobs/job_xyz/fail \
 ## Need Help?
 
 - GitHub Issues: https://github.com/spooled-cloud/spooled-backend/issues
-- Documentation: https://docs.spooled.cloud
+- Documentation: https://spooled.cloud/docs/
 - Email: support@spooled.cloud
