@@ -3,7 +3,7 @@ info:
   title: Spooled Cloud API
   description: |
     Production-ready webhook queue service API.
-    
+
     Spooled Cloud provides a reliable, multi-tenant job queue system with:
     - Custom webhook ingestion (receive events from any source)
     - Job queue with retry logic and dead-letter queue
@@ -12,47 +12,47 @@ info:
     - Workflow orchestration with job dependencies
     - Cron-based job scheduling
     - Stripe billing integration for subscription management
-    
+
     ## Authentication
-    
+
     All API endpoints (except health checks) require authentication via API key.
     Include your API key in the `Authorization` header:
-    
+
     ```
     Authorization: Bearer sk_live_your_api_key_here
     ```
-    
+
     ## Security
-    
+
     - **Multi-tenant isolation**: All operations are scoped to your organization
     - **API key verification**: Keys verified using bcrypt with caching
     - **Webhook signatures**: HMAC-SHA256 with constant-time comparison
     - **Rate limiting**: Per-key limits with graceful degradation
     - **Input validation**: All inputs sanitized and size-limited
     - **SSRF protection**: Webhook URLs validated in production
-    
+
     ## Rate Limiting
-    
+
     Rate limits are applied per API key based on plan tier:
     - Free tier: 5 requests/second (burst: 10)
     - Starter tier: 25 requests/second (burst: 50)
     - Pro tier: 100 requests/second (burst: 200)
     - Enterprise: 500 requests/second (burst: 1000)
-    
+
     Rate limit headers included in all responses:
     - `X-RateLimit-Limit`: Maximum requests per window
     - `X-RateLimit-Remaining`: Remaining requests in current window
     - `X-RateLimit-Reset`: Unix timestamp when the window resets
-    
+
     ## Plan Limits
-    
+
     Each plan tier has resource limits:
     - Jobs per day: Free (1,000), Starter (10,000), Pro (100,000), Enterprise (unlimited)
     - Active jobs: Free (10), Starter (500), Pro (5,000), Enterprise (unlimited)
     - Queues: Free (2), Starter (10), Pro (50), Enterprise (unlimited)
     - Workers: Free (1), Starter (5), Pro (25), Enterprise (unlimited)
     - Workflows: Free (disabled), Starter (5), Pro (50), Enterprise (unlimited)
-    
+
   version: 1.0.0
   license:
     name: Apache 2.0
@@ -117,7 +117,7 @@ paths:
                 $ref: '#/components/schemas/HealthResponse'
               example:
                 status: healthy
-                version: "1.0.0"
+                version: '1.0.0'
                 database: true
                 cache: true
 
@@ -152,7 +152,7 @@ paths:
       description: |
         Returns comprehensive dashboard data including system info, job statistics,
         queue summaries, worker status, and recent activity.
-        
+
         Requires authentication. Data is scoped to the authenticated organization.
       operationId: dashboardData
       security:
@@ -172,7 +172,7 @@ paths:
       summary: Prometheus metrics
       description: |
         Returns application metrics in Prometheus text format.
-        
+
         Metrics include:
         - `spooled_jobs_enqueued_total`: Total jobs enqueued
         - `spooled_jobs_completed_total`: Total jobs completed
@@ -333,7 +333,8 @@ paths:
       summary: Start email login
       description: |
         Start the email-based login flow. Sends a verification code to the provided email.
-        If the email is not registered, creates a new account.
+        If the email is not associated with an existing organization, verification will
+        return a short-lived signup token to complete registration.
       operationId: startEmailLogin
       security: []
       requestBody:
@@ -371,7 +372,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/EmailLoginResponse'
+                $ref: '#/components/schemas/VerifyEmailResponse'
         '400':
           description: Invalid or expired code
         '404':
@@ -391,7 +392,7 @@ paths:
             schema:
               $ref: '#/components/schemas/CompleteSignupRequest'
       responses:
-        '200':
+        '201':
           description: Signup completed
           content:
             application/json:
@@ -621,8 +622,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/WebhookTokenResponse'
               example:
-                webhook_token: "whk_abc123..."
-                webhook_url: "https://api.spooled.cloud/api/v1/webhooks/org-id/custom"
+                webhook_token: 'whk_abc123...'
+                webhook_url: 'https://api.spooled.cloud/api/v1/webhooks/org-id/custom'
 
   /api/v1/organizations/webhook-token/regenerate:
     post:
@@ -710,6 +711,27 @@ paths:
                 $ref: '#/components/schemas/AdminOrganizationList'
         '401':
           description: Invalid or missing admin key
+
+    post:
+      tags: [Admin]
+      summary: Create organization (admin)
+      description: Create a new organization with specified plan
+      operationId: adminCreateOrganization
+      security:
+        - AdminKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminCreateOrganizationRequest'
+      responses:
+        '201':
+          description: Organization created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminCreateOrganizationResponse'
 
   /api/v1/admin/organizations/{id}:
     parameters:
@@ -809,28 +831,6 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/PlanLimits'
-
-  /api/v1/admin/organizations:
-    post:
-      tags: [Admin]
-      summary: Create organization (admin)
-      description: Create a new organization with specified plan
-      operationId: adminCreateOrganization
-      security:
-        - AdminKeyAuth: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/AdminCreateOrganizationRequest'
-      responses:
-        '201':
-          description: Organization created
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/AdminCreateOrganizationResponse'
 
   /api/v1/admin/organizations/{id}/api-keys:
     parameters:
@@ -932,7 +932,7 @@ paths:
       summary: Create job
       description: |
         Create a new job in the specified queue.
-        
+
         If an `idempotency_key` is provided and a job with the same key exists,
         the existing job ID is returned (idempotent behavior).
       operationId: createJob
@@ -1149,7 +1149,7 @@ paths:
           description: Comma-separated list of job IDs
           schema:
             type: string
-          example: "job-1,job-2,job-3"
+          example: 'job-1,job-2,job-3'
       responses:
         '200':
           description: Job statuses retrieved
@@ -1182,8 +1182,8 @@ paths:
               default_priority: 0
               default_max_retries: 3
               jobs:
-                - payload: {to: "user@example.com", subject: "Hello"}
-                - payload: {to: "user2@example.com", subject: "Welcome"}
+                - payload: { to: 'user@example.com', subject: 'Hello' }
+                - payload: { to: 'user2@example.com', subject: 'Welcome' }
                   priority: 10
       responses:
         '200':
@@ -1336,6 +1336,26 @@ paths:
         '404':
           description: Queue not found
 
+    delete:
+      tags: [Queues]
+      summary: Delete queue
+      description: |
+        Delete a queue and optionally all its jobs.
+        Use with caution - this operation is destructive.
+      operationId: deleteQueue
+      parameters:
+        - name: delete_jobs
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: Also delete all jobs in the queue
+      responses:
+        '204':
+          description: Queue deleted
+        '404':
+          description: Queue not found
+
   /api/v1/queues/{name}/config:
     parameters:
       - name: name
@@ -1426,33 +1446,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ResumeQueueResponse'
-        '404':
-          description: Queue not found
-
-  /api/v1/queues/{name}:
-    parameters:
-      - name: name
-        in: path
-        required: true
-        schema:
-          type: string
-    delete:
-      tags: [Queues]
-      summary: Delete queue
-      description: |
-        Delete a queue and optionally all its jobs.
-        Use with caution - this operation is destructive.
-      operationId: deleteQueue
-      parameters:
-        - name: delete_jobs
-          in: query
-          schema:
-            type: boolean
-            default: false
-          description: Also delete all jobs in the queue
-      responses:
-        '204':
-          description: Queue deleted
         '404':
           description: Queue not found
 
@@ -1649,16 +1642,16 @@ paths:
       summary: Custom webhook
       description: |
         Receive webhook events from any external source and create jobs automatically.
-        
+
         Each organization has a unique webhook URL. Configure your external services
         (payment providers, form handlers, CI/CD pipelines, etc.) to POST events here.
-        
+
         ## Authentication
-        
+
         If your organization has configured a `webhook_token` in settings, you must
         include it in the `X-Webhook-Token` header. Without a configured token, the
         endpoint is open (not recommended for production).
-        
+
         To configure a webhook token:
         ```
         PUT /api/v1/organizations/{org_id}
@@ -1668,9 +1661,9 @@ paths:
           }
         }
         ```
-        
+
         ## Security
-        
+
         - In production, HTTPS is required (HTTP webhooks are rejected)
         - Use idempotency keys to handle retries from external services
         - The payload is stored as-is, validate in your worker
@@ -1860,7 +1853,7 @@ paths:
         Retry all failed jobs in a workflow. This resets failed/deadletter jobs
         back to pending status, clears retry counts and error messages, and
         resumes the workflow.
-        
+
         Only workflows with status 'failed' can be retried.
       operationId: retryWorkflow
       parameters:
@@ -1933,31 +1926,31 @@ paths:
       summary: WebSocket connection
       description: |
         Establish a WebSocket connection for real-time updates.
-        
+
         ## Authentication
         **Required**: Pass your JWT token in the `token` query parameter.
         WebSocket connections cannot use headers for authentication.
-        
+
         ```
         wss://api.spooled.cloud/api/v1/ws?token=eyJ...
         ```
-        
+
         ## Connection
         Connect to this endpoint and upgrade to WebSocket protocol.
-        
+
         ## Events
         The server will send events for:
         - Job status changes
         - Queue statistics updates
         - Worker heartbeats
         - System health updates
-        
+
         ## Filtering
         Use query parameters to filter events:
         - `queue`: Filter by queue name
         - `job_id`: Filter by specific job
         - `events`: Comma-separated event types
-        
+
         ## Client Commands
         Send JSON messages to subscribe/unsubscribe:
         ```json
@@ -2556,7 +2549,8 @@ components:
     # Schedule Schemas
     Schedule:
       type: object
-      required: [id, organization_id, name, cron_expression, timezone, queue_name, is_active, created_at]
+      required:
+        [id, organization_id, name, cron_expression, timezone, queue_name, is_active, created_at]
       properties:
         id:
           type: string
@@ -2569,7 +2563,7 @@ components:
         cron_expression:
           type: string
           description: 6-field cron expression (second minute hour day month weekday)
-          example: "0 */5 * * * *"
+          example: '0 */5 * * * *'
         timezone:
           type: string
           default: UTC
@@ -2804,7 +2798,20 @@ components:
 
     Job:
       type: object
-      required: [id, organization_id, queue_name, status, payload, retry_count, max_retries, timeout_seconds, priority, created_at, updated_at]
+      required:
+        [
+          id,
+          organization_id,
+          queue_name,
+          status,
+          payload,
+          retry_count,
+          max_retries,
+          timeout_seconds,
+          priority,
+          created_at,
+          updated_at,
+        ]
       properties:
         id:
           type: string
@@ -2967,7 +2974,18 @@ components:
 
     QueueConfig:
       type: object
-      required: [id, organization_id, queue_name, max_retries, default_timeout, enabled, settings, created_at, updated_at]
+      required:
+        [
+          id,
+          organization_id,
+          queue_name,
+          max_retries,
+          default_timeout,
+          enabled,
+          settings,
+          created_at,
+          updated_at,
+        ]
       properties:
         id:
           type: string
@@ -3032,7 +3050,15 @@ components:
 
     QueueStats:
       type: object
-      required: [queue_name, pending_jobs, processing_jobs, completed_jobs_24h, failed_jobs_24h, active_workers]
+      required:
+        [
+          queue_name,
+          pending_jobs,
+          processing_jobs,
+          completed_jobs_24h,
+          failed_jobs_24h,
+          active_workers,
+        ]
       properties:
         queue_name:
           type: string
@@ -3053,7 +3079,19 @@ components:
 
     Worker:
       type: object
-      required: [id, organization_id, queue_name, hostname, max_concurrency, current_jobs, status, last_heartbeat, metadata, registered_at]
+      required:
+        [
+          id,
+          organization_id,
+          queue_name,
+          hostname,
+          max_concurrency,
+          current_jobs,
+          status,
+          last_heartbeat,
+          metadata,
+          registered_at,
+        ]
       properties:
         id:
           type: string
@@ -3521,7 +3559,8 @@ components:
 
     WorkflowResponse:
       type: object
-      required: [id, name, status, total_jobs, completed_jobs, failed_jobs, progress_percent, created_at]
+      required:
+        [id, name, status, total_jobs, completed_jobs, failed_jobs, progress_percent, created_at]
       properties:
         id:
           type: string
@@ -3619,7 +3658,7 @@ components:
           items:
             $ref: '#/components/schemas/QueueSummary'
         workers:
-          $ref: '#/components/schemas/WorkerSummary'
+          $ref: '#/components/schemas/WorkerHealthSummary'
         recent_activity:
           $ref: '#/components/schemas/RecentActivity'
 
@@ -3675,7 +3714,7 @@ components:
         paused:
           type: boolean
 
-    WorkerSummary:
+    WorkerHealthSummary:
       type: object
       required: [total, healthy, unhealthy]
       properties:
@@ -3742,7 +3781,8 @@ components:
     # Outgoing Webhook Schemas
     OutgoingWebhook:
       type: object
-      required: [id, organization_id, name, url, events, enabled, failure_count, created_at, updated_at]
+      required:
+        [id, organization_id, name, url, events, enabled, failure_count, created_at, updated_at]
       properties:
         id:
           type: string
@@ -3894,11 +3934,11 @@ components:
           type: string
           nullable: true
           description: The webhook token (null if cleared)
-          example: "whk_abc123def456..."
+          example: 'whk_abc123def456...'
         webhook_url:
           type: string
           description: The webhook URL for this organization
-          example: "https://api.spooled.cloud/api/v1/webhooks/org-id/custom"
+          example: 'https://api.spooled.cloud/api/v1/webhooks/org-id/custom'
 
     # Usage and Admin Schemas
     UsageInfo:
@@ -4226,14 +4266,14 @@ components:
 
     CheckEmailResponse:
       type: object
-      required: [exists, can_login]
+      required: [available, exists]
       properties:
+        available:
+          type: boolean
+          description: Whether the email is available (no account exists)
         exists:
           type: boolean
-        can_login:
-          type: boolean
-        needs_signup:
-          type: boolean
+          description: Whether an account exists with this email
 
     StartEmailLoginRequest:
       type: object
@@ -4245,12 +4285,16 @@ components:
 
     StartEmailLoginResponse:
       type: object
-      required: [sent]
+      required: [message, email_sent_to]
       properties:
-        sent:
-          type: boolean
-        is_new_user:
-          type: boolean
+        message:
+          type: string
+          description: Human-friendly status message
+          example: Login code sent to your email
+        email_sent_to:
+          type: string
+          description: Email address masked for privacy
+          example: j***n@example.com
 
     VerifyEmailRequest:
       type: object
@@ -4264,10 +4308,27 @@ components:
           minLength: 6
           maxLength: 6
 
-    EmailLoginResponse:
+    VerifyEmailResponse:
+      description: |
+        Email verification result. The response is one of:
+        - `type: login` (existing organization) with JWT tokens
+        - `type: signup` (new email) with a short-lived signup token
+      oneOf:
+        - $ref: '#/components/schemas/VerifyEmailLoginResponse'
+        - $ref: '#/components/schemas/VerifyEmailSignupResponse'
+      discriminator:
+        propertyName: type
+        mapping:
+          login: '#/components/schemas/VerifyEmailLoginResponse'
+          signup: '#/components/schemas/VerifyEmailSignupResponse'
+
+    VerifyEmailLoginResponse:
       type: object
-      required: [access_token, refresh_token, token_type, expires_in]
+      required: [type, access_token, refresh_token, token_type, expires_in, refresh_expires_in]
       properties:
+        type:
+          type: string
+          enum: [login]
         access_token:
           type: string
         refresh_token:
@@ -4279,56 +4340,68 @@ components:
           type: integer
         refresh_expires_in:
           type: integer
-        user_id:
+
+    VerifyEmailSignupResponse:
+      type: object
+      required: [type, signup_token, email, expires_in]
+      properties:
+        type:
           type: string
-        email:
-          type: string
-        organizations:
-          type: array
-          items:
-            type: object
-            properties:
-              id:
-                type: string
-              name:
-                type: string
-              role:
-                type: string
-        needs_onboarding:
-          type: boolean
+          enum: [signup]
         signup_token:
           type: string
-          description: Token for completing signup (if needs_onboarding is true)
+          description: Token to complete signup (used with /api/v1/auth/signup/complete)
+        email:
+          type: string
+          format: email
+        expires_in:
+          type: integer
+          description: Token expiration in seconds
+
+    SignupOrganization:
+      type: object
+      required: [id, name, slug, billing_email]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        slug:
+          type: string
+        billing_email:
+          type: string
+          format: email
 
     CompleteSignupRequest:
       type: object
-      required: [signup_token, organization_name, organization_slug]
+      required: [signup_token, name, slug]
       properties:
         signup_token:
           type: string
-        organization_name:
+        name:
           type: string
           minLength: 3
           maxLength: 100
-        organization_slug:
+        slug:
           type: string
           minLength: 3
           maxLength: 50
 
     CompleteSignupResponse:
       type: object
-      required: [access_token, refresh_token, organization]
+      required: [organization, api_key, access_token, refresh_token, token_type, expires_in]
       properties:
+        organization:
+          $ref: '#/components/schemas/SignupOrganization'
         access_token:
           type: string
         refresh_token:
           type: string
         token_type:
           type: string
+          enum: [Bearer]
         expires_in:
           type: integer
-        organization:
-          $ref: '#/components/schemas/Organization'
         api_key:
           type: string
           description: Initial API key (shown only once)
@@ -4444,4 +4517,3 @@ components:
 
 security:
   - bearerAuth: []
-
