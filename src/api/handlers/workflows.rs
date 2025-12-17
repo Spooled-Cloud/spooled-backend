@@ -158,7 +158,7 @@ pub async fn get(
                 scheduled_at: job.scheduled_at,
                 started_at: job.started_at,
                 completed_at: job.completed_at,
-                failed_at: None, // jobs table doesn't track this separately
+                failed_at: None,     // jobs table doesn't track this separately
                 next_retry_at: None, // would need to calculate from retry logic
                 result: job.result,
                 error,
