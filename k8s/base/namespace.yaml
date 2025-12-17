@@ -5,4 +5,3 @@ metadata:
   labels:
     app.kubernetes.io/name: spooled
     app.kubernetes.io/part-of: spooled-cloud
-

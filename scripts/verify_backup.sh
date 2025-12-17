@@ -125,4 +125,3 @@ log "Restore time: ${DURATION}s"
 log "Records verified: jobs=$JOBS_COUNT, orgs=$ORGS_COUNT"
 
 echo "VERIFY_SUCCESS backup=$BACKUP_FILE tables=$TABLES jobs=$JOBS_COUNT"
-

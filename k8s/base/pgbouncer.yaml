@@ -171,4 +171,3 @@ spec:
   selector:
     matchLabels:
       app: pgbouncer
-

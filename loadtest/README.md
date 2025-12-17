@@ -293,4 +293,3 @@ Run both k6 (REST) and ghz (gRPC) tests to compare for your workload.
 - [ghz Documentation](https://ghz.sh/docs/intro)
 - [Performance Testing Guide](https://k6.io/docs/testing-guides/api-load-testing/)
 - [Spooled Architecture](../docs/guides/architecture.md)
-

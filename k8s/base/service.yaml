@@ -39,4 +39,3 @@ spec:
       targetPort: http
   selector:
     app: spooled-backend
-

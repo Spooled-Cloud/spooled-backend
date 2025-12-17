@@ -345,4 +345,3 @@ groups:
         annotations:
           summary: "Jobs accumulating faster than processing"
           description: "Enqueue rate exceeds completion rate by 20%. Queue will grow over time."
-

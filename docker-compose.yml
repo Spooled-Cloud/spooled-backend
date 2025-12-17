@@ -169,4 +169,3 @@ volumes:
 networks:
   default:
     name: spooled-network
-

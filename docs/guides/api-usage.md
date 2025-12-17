@@ -1502,4 +1502,3 @@ Response:
 | Starter | 25 | 50 |
 | Pro | 100 | 200 |
 | Enterprise | 500 | 1,000 |
-

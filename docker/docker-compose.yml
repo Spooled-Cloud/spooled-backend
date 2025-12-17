@@ -255,4 +255,3 @@ volumes:
 networks:
   spooled-network:
     driver: bridge
-

@@ -590,4 +590,3 @@ For high-volume queues, consider partitioning by:
 - [Operations Guide](./operations.md)
 - [API Reference](../openapi.yaml)
 - [Load Testing](../../loadtest/README.md)
-

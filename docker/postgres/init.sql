@@ -19,4 +19,3 @@ DO $$
 BEGIN
     RAISE NOTICE 'Spooled database initialization complete';
 END $$;
-

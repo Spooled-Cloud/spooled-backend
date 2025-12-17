@@ -593,4 +593,3 @@ Add to your monitoring:
   annotations:
     summary: "Database backup has not succeeded in 2 days"
 ```
-

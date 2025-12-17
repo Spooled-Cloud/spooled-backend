@@ -599,4 +599,3 @@ kubectl run redis-test --rm -it --image=redis:7 -- redis-cli -u $REDIS_URL ping
 - GitHub Issues: https://github.com/spooled-cloud/spooled-backend/issues
 - Documentation: https://docs.spooled.cloud
 - Email: support@spooled.cloud
-

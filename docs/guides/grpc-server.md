@@ -381,4 +381,3 @@ const job = await client.queues.enqueue('my-queue', {
 - [Getting Started](./GETTING_STARTED.md) - Quick start guide
 - [Deployment Guide](./DEPLOYMENT.md) - Production deployment
 - [Security Guide](./SECURITY.md) - Security best practices
-

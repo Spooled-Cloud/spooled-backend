@@ -1,6 +1,6 @@
 [package]
 name = "spooled-backend"
-version = "0.1.48"
+version = "0.1.49"
 edition = "2021"
 authors = ["Spooled Cloud Team"]
 description = "Production-ready webhook queue service built with Rust + PostgreSQL"
@@ -126,4 +126,3 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
-

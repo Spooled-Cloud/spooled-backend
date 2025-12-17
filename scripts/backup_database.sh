@@ -93,4 +93,3 @@ log "Backup process completed successfully"
 
 # Output for monitoring (can be parsed by backup monitoring tools)
 echo "BACKUP_SUCCESS timestamp=$TIMESTAMP duration=${DURATION}s size=$BACKUP_SIZE"
-

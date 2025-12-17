@@ -36,4 +36,3 @@ spec:
                 name: spooled-backend
                 port:
                   number: 80
-
