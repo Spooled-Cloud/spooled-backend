@@ -318,6 +318,77 @@ impl From<Workflow> for WorkflowResponse {
     }
 }
 
+/// Workflow detail response with jobs and dependencies (for frontend)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowDetailResponse {
+    pub id: String,
+    pub organization_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub status: String,
+    pub jobs: Vec<WorkflowJobResponse>,
+    pub dependencies: Vec<WorkflowDependencyResponse>,
+    pub progress: WorkflowProgress,
+    pub created_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Job response within a workflow
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowJobResponse {
+    pub id: String,
+    pub organization_id: String,
+    pub queue: String,
+    pub job_type: String,
+    pub payload: serde_json::Value,
+    pub status: String,
+    pub priority: i32,
+    pub attempt: i32,
+    pub max_retries: i32,
+    pub backoff_type: String,
+    pub timeout_ms: Option<i64>,
+    pub created_at: DateTime<Utc>,
+    pub scheduled_at: Option<DateTime<Utc>>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub failed_at: Option<DateTime<Utc>>,
+    pub next_retry_at: Option<DateTime<Utc>>,
+    pub result: Option<serde_json::Value>,
+    pub error: Option<JobErrorResponse>,
+    pub metadata: Option<serde_json::Value>,
+    pub workflow_id: Option<String>,
+    pub parent_job_id: Option<String>,
+}
+
+/// Error info for a job
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobErrorResponse {
+    #[serde(rename = "type")]
+    pub error_type: String,
+    pub message: String,
+    pub stack: Option<String>,
+}
+
+/// Dependency response for workflow
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowDependencyResponse {
+    pub parent_job_id: String,
+    pub child_job_id: String,
+    pub dependency_type: String,
+}
+
+/// Progress info for workflow
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowProgress {
+    pub total: i32,
+    pub completed: i32,
+    pub failed: i32,
+    pub pending: i32,
+    pub processing: i32,
+}
+
 /// Request to add dependencies to an existing job
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
 pub struct AddDependenciesRequest {

@@ -19,8 +19,9 @@ use crate::{
     error::{AppError, AppResult},
     models::{
         AddDependenciesRequest, AddDependenciesResponse, ApiKeyContext, CreateWorkflowRequest,
-        CreateWorkflowResponse, DependencyInfo, JobWithDependencies, Workflow, WorkflowJobMapping,
-        WorkflowResponse,
+        CreateWorkflowResponse, DependencyInfo, Job, JobErrorResponse, JobWithDependencies,
+        Workflow, WorkflowDependencyResponse, WorkflowDetailResponse, WorkflowJobMapping,
+        WorkflowJobResponse, WorkflowProgress, WorkflowResponse,
     },
 };
 
@@ -70,13 +71,14 @@ pub async fn list(
     Ok(Json(workflows.into_iter().map(|w| w.into()).collect()))
 }
 
-/// Get a single workflow
+/// Get a single workflow with jobs and dependencies
 ///
 pub async fn get(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
     Path(workflow_id): Path<String>,
-) -> AppResult<Json<WorkflowResponse>> {
+) -> AppResult<Json<WorkflowDetailResponse>> {
+    // Fetch the workflow
     let workflow: Workflow =
         sqlx::query_as("SELECT * FROM workflows WHERE id = $1 AND organization_id = $2")
             .bind(&workflow_id)
@@ -85,7 +87,139 @@ pub async fn get(
             .await?
             .ok_or_else(|| AppError::NotFound(format!("Workflow {} not found", workflow_id)))?;
 
-    Ok(Json(workflow.into()))
+    // Fetch all jobs belonging to this workflow
+    let jobs: Vec<Job> = sqlx::query_as(
+        r#"
+        SELECT * FROM jobs 
+        WHERE workflow_id = $1 AND organization_id = $2
+        ORDER BY workflow_step ASC, created_at ASC
+        "#,
+    )
+    .bind(&workflow_id)
+    .bind(&ctx.organization_id)
+    .fetch_all(state.db.pool())
+    .await?;
+
+    // Fetch all dependencies for jobs in this workflow
+    let job_ids: Vec<String> = jobs.iter().map(|j| j.id.clone()).collect();
+    let dependencies: Vec<WorkflowDependencyRow> = if !job_ids.is_empty() {
+        sqlx::query_as(
+            r#"
+            SELECT jd.depends_on_job_id as parent_job_id, jd.job_id as child_job_id, jd.dependency_type
+            FROM job_dependencies jd
+            WHERE jd.job_id = ANY($1)
+            "#,
+        )
+        .bind(&job_ids)
+        .fetch_all(state.db.pool())
+        .await?
+    } else {
+        vec![]
+    };
+
+    // Calculate progress
+    let mut pending = 0;
+    let mut processing = 0;
+    let mut completed = 0;
+    let mut failed = 0;
+    for job in &jobs {
+        match job.status.as_str() {
+            "pending" | "scheduled" => pending += 1,
+            "processing" => processing += 1,
+            "completed" => completed += 1,
+            "failed" | "deadletter" | "cancelled" => failed += 1,
+            _ => pending += 1,
+        }
+    }
+
+    // Convert jobs to response format
+    let job_responses: Vec<WorkflowJobResponse> = jobs
+        .into_iter()
+        .map(|job| {
+            let error = job.last_error.as_ref().map(|msg| JobErrorResponse {
+                error_type: "JobError".to_string(),
+                message: msg.clone(),
+                stack: None,
+            });
+
+            WorkflowJobResponse {
+                id: job.id,
+                organization_id: job.organization_id,
+                queue: job.queue_name,
+                job_type: "job".to_string(), // jobs table doesn't have job_type, use default
+                payload: job.payload,
+                status: job.status,
+                priority: job.priority,
+                attempt: job.retry_count,
+                max_retries: job.max_retries,
+                backoff_type: "exponential".to_string(), // default
+                timeout_ms: Some((job.timeout_seconds * 1000) as i64),
+                created_at: job.created_at,
+                scheduled_at: job.scheduled_at,
+                started_at: job.started_at,
+                completed_at: job.completed_at,
+                failed_at: None, // jobs table doesn't track this separately
+                next_retry_at: None, // would need to calculate from retry logic
+                result: job.result,
+                error,
+                metadata: job.tags,
+                workflow_id: job.workflow_id,
+                parent_job_id: job.parent_job_id,
+            }
+        })
+        .collect();
+
+    // Convert dependencies to response format
+    let dependency_responses: Vec<WorkflowDependencyResponse> = dependencies
+        .into_iter()
+        .map(|d| WorkflowDependencyResponse {
+            parent_job_id: d.parent_job_id,
+            child_job_id: d.child_job_id,
+            dependency_type: d.dependency_type,
+        })
+        .collect();
+
+    let response = WorkflowDetailResponse {
+        id: workflow.id,
+        organization_id: workflow.organization_id,
+        name: workflow.name,
+        description: workflow.description,
+        status: workflow.status,
+        jobs: job_responses,
+        dependencies: dependency_responses,
+        progress: WorkflowProgress {
+            total: workflow.total_jobs,
+            completed,
+            failed,
+            pending,
+            processing,
+        },
+        created_at: workflow.created_at,
+        started_at: workflow.started_at,
+        completed_at: workflow.completed_at,
+        metadata: workflow.metadata,
+    };
+
+    Ok(Json(response))
+}
+
+/// Helper struct for fetching dependencies
+#[derive(Debug)]
+struct WorkflowDependencyRow {
+    parent_job_id: String,
+    child_job_id: String,
+    dependency_type: String,
+}
+
+impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for WorkflowDependencyRow {
+    fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
+        use sqlx::Row;
+        Ok(WorkflowDependencyRow {
+            parent_job_id: row.try_get("parent_job_id")?,
+            child_job_id: row.try_get("child_job_id")?,
+            dependency_type: row.try_get("dependency_type")?,
+        })
+    }
 }
 
 /// Create a new workflow
