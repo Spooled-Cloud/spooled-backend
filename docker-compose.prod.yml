@@ -22,7 +22,7 @@
 #   CLOUDFLARE_TUNNEL_TOKEN - Cloudflare tunnel token (for cloudflared)
 #
 # gRPC TLS (for Cloudflare Tunnel HTTPS origin):
-#   Enabled by default with self-signed certs in ./certs/
+#   Enabled by default with self-signed certs embedded in Docker image
 #   Cloudflare Tunnel should have "No TLS Verify" ON to accept self-signed certs
 #
 # Registration Mode (for SaaS vs Self-hosted):
@@ -54,7 +54,7 @@
 #   - grpc.spooled.cloud    -> https://backend:50051 (HTTP2 origin ON, No TLS Verify ON)
 #   - grafana.spooled.cloud -> http://grafana:3000
 #
-# Note: gRPC uses self-signed TLS certs (included in ./certs/). Cloudflare Tunnel
+# Note: gRPC uses self-signed TLS certs (embedded in Docker image). Cloudflare Tunnel
 # must have "No TLS Verify" enabled to accept self-signed certificates.
 
 services:
@@ -144,7 +144,7 @@ services:
       
       # =====================
       # gRPC TLS (for Cloudflare Tunnel)
-      # Self-signed certs included in repo - Cloudflare Tunnel has "No TLS Verify" enabled
+      # Self-signed certs embedded in Docker image - Cloudflare Tunnel has "No TLS Verify" enabled
       # =====================
       GRPC_TLS_ENABLED: "true"
       GRPC_TLS_CERT_PATH: /certs/grpc-cert.pem
@@ -216,9 +216,8 @@ services:
       # =====================
       METRICS_TOKEN: ${METRICS_TOKEN:-}
 
-    volumes:
-      # Mount self-signed TLS certificates for gRPC (included in repo)
-      - ./certs:/certs:ro
+    # Note: TLS certificates are embedded in the Docker image (see Dockerfile)
+    # No volume mount needed - Portainer Git deployments don't preserve bind mount sources
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
       interval: 30s

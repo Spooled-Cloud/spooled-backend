@@ -68,8 +68,12 @@ COPY --from=builder /app/target/release/spooled-backend /app/spooled-backend
 # Copy migrations for SQLx
 COPY --from=builder /app/migrations /app/migrations
 
+# Copy gRPC TLS certificates (self-signed for Cloudflare Tunnel)
+# These are embedded in the image since Portainer Git deployments don't preserve bind mount sources
+COPY certs /certs
+
 # Set ownership
-RUN chown -R spooled:spooled /app
+RUN chown -R spooled:spooled /app /certs
 
 # Switch to non-root user
 USER spooled
