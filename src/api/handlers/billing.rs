@@ -388,14 +388,19 @@ async fn reconcile_org_from_subscription_id(
         .ok_or_else(|| AppError::Internal("Stripe is not configured".to_string()))?;
 
     let client = reqwest::Client::new();
-    let url = format!("https://api.stripe.com/v1/subscriptions/{}", subscription_id);
+    let url = format!(
+        "https://api.stripe.com/v1/subscriptions/{}",
+        subscription_id
+    );
 
     let response = client
         .get(url)
         .header("Authorization", format!("Bearer {}", stripe_secret))
         .send()
         .await
-        .map_err(|e| AppError::Internal(format!("Failed to fetch subscription from Stripe: {}", e)))?;
+        .map_err(|e| {
+            AppError::Internal(format!("Failed to fetch subscription from Stripe: {}", e))
+        })?;
 
     if !response.status().is_success() {
         let error_text = response.text().await.unwrap_or_default();
@@ -405,10 +410,9 @@ async fn reconcile_org_from_subscription_id(
         )));
     }
 
-    let subscription: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to parse Stripe subscription JSON: {}", e)))?;
+    let subscription: serde_json::Value = response.json().await.map_err(|e| {
+        AppError::Internal(format!("Failed to parse Stripe subscription JSON: {}", e))
+    })?;
 
     let customer_id = subscription["customer"].as_str();
     let status = subscription["status"].as_str();
