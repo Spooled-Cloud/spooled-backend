@@ -13,6 +13,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::api::handlers::billing::reconcile_org_from_subscription_id;
 use crate::api::middleware::limits::{
     get_resource_counts, get_usage_info, ResourceCounts, UsageInfo,
 };
@@ -371,6 +372,11 @@ pub struct AdminOrganizationDetail {
     pub billing_email: Option<String>,
     pub settings: serde_json::Value,
     pub custom_limits: Option<serde_json::Value>,
+    pub stripe_customer_id: Option<String>,
+    pub stripe_subscription_id: Option<String>,
+    pub stripe_subscription_status: Option<String>,
+    pub stripe_current_period_end: Option<DateTime<Utc>>,
+    pub stripe_cancel_at_period_end: Option<bool>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub usage_info: UsageInfo,
@@ -415,6 +421,11 @@ pub async fn get_organization(
         billing_email: org.billing_email,
         settings: org.settings,
         custom_limits: org.custom_limits,
+        stripe_customer_id: org.stripe_customer_id,
+        stripe_subscription_id: org.stripe_subscription_id,
+        stripe_subscription_status: org.stripe_subscription_status,
+        stripe_current_period_end: org.stripe_current_period_end,
+        stripe_cancel_at_period_end: org.stripe_cancel_at_period_end,
         created_at: org.created_at,
         updated_at: org.updated_at,
         usage_info,
@@ -438,6 +449,10 @@ pub struct UpdateOrgRequest {
     pub settings: Option<serde_json::Value>,
     /// Custom limit overrides (null = use plan defaults, empty object = reset to defaults)
     pub custom_limits: Option<serde_json::Value>,
+    /// Stripe customer ID (omit to keep current; set to null to clear)
+    pub stripe_customer_id: Option<Option<String>>,
+    /// Stripe subscription ID (omit to keep current; set to null to clear)
+    pub stripe_subscription_id: Option<Option<String>>,
 }
 
 /// Update organization plan or settings
@@ -471,6 +486,12 @@ pub async fn update_organization(
     let plan_tier = request.plan_tier.unwrap_or(existing.plan_tier);
     let billing_email = request.billing_email.or(existing.billing_email);
     let settings = request.settings.unwrap_or(existing.settings);
+    let stripe_customer_id = request
+        .stripe_customer_id
+        .unwrap_or(existing.stripe_customer_id);
+    let stripe_subscription_id = request
+        .stripe_subscription_id
+        .unwrap_or(existing.stripe_subscription_id);
     // For custom_limits: None means keep existing, Some(null) or empty object means reset to defaults
     let custom_limits = match &request.custom_limits {
         Some(limits) if limits.is_null() || limits == &serde_json::json!({}) => None,
@@ -481,8 +502,15 @@ pub async fn update_organization(
     let updated: Organization = sqlx::query_as(
         r#"
         UPDATE organizations
-        SET plan_tier = $1, billing_email = $2, settings = $3, custom_limits = $4, updated_at = NOW()
-        WHERE id = $5
+        SET
+            plan_tier = $1,
+            billing_email = $2,
+            settings = $3,
+            custom_limits = $4,
+            stripe_customer_id = $5,
+            stripe_subscription_id = $6,
+            updated_at = NOW()
+        WHERE id = $7
         RETURNING *
         "#,
     )
@@ -490,9 +518,26 @@ pub async fn update_organization(
     .bind(&billing_email)
     .bind(&settings)
     .bind(&custom_limits)
+    .bind(&stripe_customer_id)
+    .bind(&stripe_subscription_id)
     .bind(&id)
     .fetch_one(state.db.pool())
     .await?;
+
+    // Best-effort: if admin sets a subscription id, reconcile immediately from Stripe so the org
+    // reflects the correct plan_tier/status even if Stripe webhooks were missed (e.g. DB reset).
+    if let Some(ref sub_id) = stripe_subscription_id {
+        if state.stripe.secret_key.as_ref().is_some() {
+            if let Err(e) = reconcile_org_from_subscription_id(&state, &id, sub_id).await {
+                tracing::warn!(
+                    org_id = %id,
+                    subscription_id = %sub_id,
+                    error = %e,
+                    "Failed to reconcile org billing after admin update"
+                );
+            }
+        }
+    }
 
     tracing::info!(
         org_id = %id,
@@ -530,14 +575,9 @@ pub async fn delete_organization(
     if query.hard_delete.unwrap_or(false) {
         // Hard delete - manually delete related data first (some tables lack ON DELETE CASCADE)
         // Order matters due to foreign key constraints
+        // Note: job_dependencies has ON DELETE CASCADE from jobs, so no need to delete explicitly
 
-        // 1. Delete job dependencies (references jobs)
-        sqlx::query("DELETE FROM job_dependencies WHERE organization_id = $1")
-            .bind(&id)
-            .execute(state.db.pool())
-            .await?;
-
-        // 2. Delete jobs (references workflows, queues)
+        // 1. Delete jobs (job_dependencies will cascade automatically)
         sqlx::query("DELETE FROM jobs WHERE organization_id = $1")
             .bind(&id)
             .execute(state.db.pool())

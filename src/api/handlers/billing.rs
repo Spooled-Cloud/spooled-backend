@@ -376,7 +376,7 @@ async fn handle_subscription_updated(state: &AppState, event: &StripeEvent) -> A
 ///
 /// This is used to repair the common webhook ordering issue where subscription events arrive
 /// before checkout.session.completed links stripe_customer_id to the org.
-async fn reconcile_org_from_subscription_id(
+pub(crate) async fn reconcile_org_from_subscription_id(
     state: &AppState,
     org_id: &str,
     subscription_id: &str,
