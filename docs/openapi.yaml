@@ -19,7 +19,7 @@ info:
     Include your API key in the `Authorization` header:
 
     ```
-    Authorization: Bearer sk_live_your_api_key_here
+    Authorization: Bearer sp_live_your_api_key_here
     ```
 
     ## Security

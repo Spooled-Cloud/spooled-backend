@@ -150,7 +150,7 @@ When modifying the gRPC API:
 5. Test with `grpcurl`:
    ```bash
    grpcurl -plaintext localhost:50051 list
-   grpcurl -plaintext -H "x-api-key: sk_test_xxx" \
+   grpcurl -plaintext -H "x-api-key: sp_test_xxx" \
      -d '{"queue_name":"test"}' \
      localhost:50051 spooled.v1.QueueService/Enqueue
    ```

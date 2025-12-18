@@ -16,7 +16,7 @@ async fn test_api_key_bcrypt_verification() {
 
     let org_id = "test-org-bcrypt";
     let api_key_id = uuid::Uuid::new_v4().to_string();
-    let raw_key = "sk_test_verysecretkey123456";
+    let raw_key = "sp_test_verysecretkey123456";
 
     // Create organization first (FK constraint)
     sqlx::query(
@@ -61,7 +61,7 @@ async fn test_api_key_bcrypt_verification() {
     assert!(found_matching, "Should find matching key with bcrypt");
 
     // Verify wrong key fails verification
-    let wrong_key = "sk_test_wrongkey123456";
+    let wrong_key = "sp_test_wrongkey123456";
     for (_id, hash) in &keys {
         assert!(
             !bcrypt::verify(wrong_key, hash).unwrap_or(false),
@@ -829,8 +829,8 @@ async fn test_workflow_org_context() {
 #[test]
 fn test_key_prefix_extraction() {
     let test_keys = [
-        ("sk_live_abcd1234efgh5678", "sk_live_"),
-        ("sk_test_xyz98765abc12345", "sk_test_"),
+        ("sp_live_abcd1234efgh5678", "sp_live_"),
+        ("sp_test_xyz98765abc12345", "sp_test_"),
         ("abcdefgh", "abcdefgh"),
         ("short", "short"),
     ];
@@ -857,7 +857,7 @@ async fn test_prefix_indexed_lookup() {
     .expect("Failed to create org");
 
     // Create API keys with different key formats
-    let raw_keys = ["sk_live_abcd1234", "sk_test_xyz98765", "sk_dev__qwerty12"];
+    let raw_keys = ["sp_live_abcd1234", "sp_test_xyz98765", "sk_dev__qwerty12"];
     let mut created_hashes = Vec::new();
 
     for raw_key in &raw_keys {
@@ -889,7 +889,7 @@ async fn test_prefix_indexed_lookup() {
     assert_eq!(all_keys.len(), 3, "Should have 3 total keys");
 
     // Test bcrypt verification finds the right key
-    let search_key = "sk_live_abcd1234";
+    let search_key = "sp_live_abcd1234";
     let mut found = false;
     for (_id, hash) in &all_keys {
         if bcrypt::verify(search_key, hash).unwrap_or(false) {
@@ -973,10 +973,10 @@ fn test_rate_limit_constants() {
 /// Test login rate limit key format
 #[test]
 fn test_rate_limit_key_format() {
-    let key_prefix = "sk_test_";
+    let key_prefix = "sp_test_";
     let rate_key = format!("login_attempts:{}", key_prefix);
 
-    assert_eq!(rate_key, "login_attempts:sk_test_");
+    assert_eq!(rate_key, "login_attempts:sp_test_");
     assert!(rate_key.starts_with("login_attempts:"));
 }
 
@@ -1336,7 +1336,7 @@ async fn test_40_api_key_org_isolation() {
 
     // Create API key for org-1
     let key_id = uuid::Uuid::new_v4().to_string();
-    let key_hash = bcrypt::hash("sk_test_key123", bcrypt::DEFAULT_COST).unwrap();
+    let key_hash = bcrypt::hash("sp_test_key123", bcrypt::DEFAULT_COST).unwrap();
     sqlx::query(
         "INSERT INTO api_keys (id, organization_id, name, key_hash, queues, is_active, created_at) VALUES ($1, 'key-org-1', 'Test Key', $2, ARRAY['default'], TRUE, NOW())"
     )
@@ -1909,7 +1909,7 @@ async fn test_api_key_list_isolation() {
     for i in 0..3 {
         let key_id = uuid::Uuid::new_v4().to_string();
         let key_hash =
-            bcrypt::hash(format!("sk_test_org1_key{}", i), bcrypt::DEFAULT_COST).unwrap();
+            bcrypt::hash(format!("sp_test_org1_key{}", i), bcrypt::DEFAULT_COST).unwrap();
         sqlx::query(
             "INSERT INTO api_keys (id, organization_id, name, key_hash, queues, is_active, created_at) VALUES ($1, 'list-org-1', $2, $3, ARRAY['default'], TRUE, NOW())"
         )
@@ -1925,7 +1925,7 @@ async fn test_api_key_list_isolation() {
     for i in 0..2 {
         let key_id = uuid::Uuid::new_v4().to_string();
         let key_hash =
-            bcrypt::hash(format!("sk_test_org2_key{}", i), bcrypt::DEFAULT_COST).unwrap();
+            bcrypt::hash(format!("sp_test_org2_key{}", i), bcrypt::DEFAULT_COST).unwrap();
         sqlx::query(
             "INSERT INTO api_keys (id, organization_id, name, key_hash, queues, is_active, created_at) VALUES ($1, 'list-org-2', $2, $3, ARRAY['default'], TRUE, NOW())"
         )
@@ -1988,7 +1988,7 @@ async fn test_complete_workflow_with_fixes() {
     .expect("Failed to create queue config");
 
     // Create API key with bcrypt hash
-    let api_key = "sk_test_workflow_key_12345";
+    let api_key = "sp_test_workflow_key_12345";
     let key_hash = bcrypt::hash(api_key, bcrypt::DEFAULT_COST).unwrap();
     sqlx::query(
         "INSERT INTO api_keys (id, organization_id, name, key_hash, queues, is_active, created_at) VALUES (gen_random_uuid()::TEXT, $1, 'Workflow Key', $2, ARRAY['workflow-queue'], TRUE, NOW())"
@@ -3434,7 +3434,7 @@ async fn test_grpc_auth_validates_properly() {
     .expect("Failed to create org");
 
     // Create an API key with bcrypt hash
-    let raw_key = "sk_test_grpc_auth_key_12345678";
+    let raw_key = "sp_test_grpc_auth_key_12345678";
     let key_hash = bcrypt::hash(raw_key, bcrypt::DEFAULT_COST).unwrap();
     let key_id = uuid::Uuid::new_v4().to_string();
 
@@ -3469,7 +3469,7 @@ async fn test_grpc_auth_validates_properly() {
     );
 
     // Verify wrong key does NOT match
-    let wrong_key = "sk_test_wrong_key_987654321";
+    let wrong_key = "sp_test_wrong_key_987654321";
     let mut wrong_found: Option<String> = None;
     for (_id, org, hash) in &api_keys {
         if bcrypt::verify(wrong_key, hash).unwrap_or(false) {
@@ -5014,7 +5014,7 @@ async fn test_single_bcrypt_verification() {
     // The fix tracks whether verification already happened and skips the second call
 
     // Simulate the optimized flow:
-    let token = "sk_test_example_key_12345";
+    let token = "sp_test_example_key_12345";
     let hash = "$2b$12$abcdefghijklmnopqrstuv"; // Example bcrypt hash
 
     // With the fix:
@@ -5652,8 +5652,8 @@ async fn test_rate_limit_no_collision() {
     // Keys with same prefix would share rate limits
     // Now uses SHA256 hash
 
-    let key1 = "sk_test_aaaaaaaa1111111111111111111111";
-    let key2 = "sk_test_aaaaaaaabbbbbbbbbbbbbbbbbbbb";
+    let key1 = "sp_test_aaaaaaaa1111111111111111111111";
+    let key2 = "sp_test_aaaaaaaabbbbbbbbbbbbbbbbbbbb";
 
     // Old method (old method) - first 8 chars
     let old_id1 = &key1[..8];
@@ -7812,9 +7812,9 @@ fn test_login_rate_limit_secure_key() {
         hex::encode(&hasher.finalize()[..8])
     }
 
-    let key1 = hash_prefix("sk_live_");
-    let key2 = hash_prefix("sk_test_");
-    let key3 = hash_prefix("sk_live_"); // Same prefix
+    let key1 = hash_prefix("sp_live_");
+    let key2 = hash_prefix("sp_test_");
+    let key3 = hash_prefix("sp_live_"); // Same prefix
 
     assert_ne!(key1, key2); // Different prefixes = different hashes
     assert_eq!(key1, key3); // Same prefix = same hash
@@ -7955,10 +7955,10 @@ fn test_grpc_auth_uses_prefix() {
     // Could be slow with many keys and enable timing attacks
     // Now uses key prefix for indexed lookup like REST auth
 
-    let api_key = "sk_live_abc123def456";
+    let api_key = "sp_live_abc123def456";
     let prefix: String = api_key.chars().take(8).collect();
 
-    assert_eq!(prefix, "sk_live_");
+    assert_eq!(prefix, "sp_live_");
     assert_eq!(prefix.len(), 8);
 }
 
@@ -8240,9 +8240,9 @@ fn test_api_key_prefix_field() {
     // Needed for efficient indexed lookup
     // Now includes key_prefix (first 8 chars of raw key)
 
-    let api_key = "sk_live_abc123def456ghi789";
+    let api_key = "sp_live_abc123def456ghi789";
     let prefix: String = api_key.chars().take(8).collect();
-    assert_eq!(prefix, "sk_live_");
+    assert_eq!(prefix, "sp_live_");
     assert_eq!(prefix.len(), 8);
 }
 

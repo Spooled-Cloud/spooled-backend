@@ -226,7 +226,7 @@ mod tests {
             id: "key-1".to_string(),
             organization_id: "org-1".to_string(),
             key_hash: "secret_hash".to_string(),
-            key_prefix: Some("sk_test_".to_string()),
+            key_prefix: Some("sp_test_".to_string()),
             name: "Test Key".to_string(),
             queues: vec!["default".to_string()],
             rate_limit: Some(100),
@@ -342,7 +342,7 @@ mod tests {
     fn test_create_api_key_response_serialization() {
         let response = CreateApiKeyResponse {
             id: "key-123".to_string(),
-            key: "sk_live_abcdefgh12345678".to_string(),
+            key: "sp_live_abcdefgh12345678".to_string(),
             name: "My Key".to_string(),
             created_at: Utc::now(),
             expires_at: None,
@@ -350,7 +350,7 @@ mod tests {
 
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("key-123"));
-        assert!(json.contains("sk_live_abcdefgh12345678"));
+        assert!(json.contains("sp_live_abcdefgh12345678"));
         assert!(json.contains("My Key"));
     }
 

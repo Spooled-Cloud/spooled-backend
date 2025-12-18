@@ -688,7 +688,7 @@ async fn test_api_key_create() {
     .expect("Should create org");
 
     let key_id = uuid::Uuid::new_v4().to_string();
-    let key_hash = bcrypt::hash("sk_test_secretkey123", bcrypt::DEFAULT_COST).unwrap();
+    let key_hash = bcrypt::hash("sp_test_secretkey123", bcrypt::DEFAULT_COST).unwrap();
 
     sqlx::query(
         r#"
@@ -733,7 +733,7 @@ async fn test_api_key_revoke() {
     .expect("Should create org");
 
     let key_id = uuid::Uuid::new_v4().to_string();
-    let key_hash = bcrypt::hash("sk_test_torevoke", bcrypt::DEFAULT_COST).unwrap();
+    let key_hash = bcrypt::hash("sp_test_torevoke", bcrypt::DEFAULT_COST).unwrap();
 
     sqlx::query(
         "INSERT INTO api_keys (id, organization_id, key_hash, name, queues, is_active, created_at) VALUES ($1, $2, $3, 'To Revoke', ARRAY['default'], true, NOW())"

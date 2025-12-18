@@ -213,7 +213,7 @@ For advanced use cases, register your worker to enable monitoring and job routin
 
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/workers/register \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "id": "worker-abc123",
@@ -242,7 +242,7 @@ Response:
 
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/workers/worker-abc123/deregister \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY"
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY"
 ```
 
 ---
@@ -253,7 +253,7 @@ curl -X POST https://api.spooled.cloud/api/v1/workers/worker-abc123/deregister \
 
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/jobs/claim \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "queue_name": "emails",
@@ -266,7 +266,7 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs/claim \
 
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/jobs/job_xxx/complete \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "result": {"message_id": "msg_123", "delivered": true}
@@ -277,7 +277,7 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs/job_xxx/complete \
 
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/jobs/job_xxx/fail \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "reason": "SMTP server unavailable"
@@ -290,7 +290,7 @@ For long-running jobs, renew the lease before it expires:
 
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/jobs/job_xxx/renew-lease \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "extension_seconds": 300
@@ -348,7 +348,7 @@ Registered workers should send heartbeats every 10 seconds:
 
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/workers/worker-abc123/heartbeat \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "status": "healthy",
@@ -372,7 +372,7 @@ curl -X POST https://api.spooled.cloud/api/v1/workers/worker-abc123/heartbeat \
 
 ```bash
 curl https://api.spooled.cloud/api/v1/workers/worker-abc123 \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY"
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY"
 ```
 
 Response:
@@ -465,7 +465,7 @@ request = StreamJobsRequest(
     lease_duration_secs=300
 )
 
-metadata = [('x-api-key', 'sk_live_YOUR_API_KEY')]
+metadata = [('x-api-key', 'sp_live_YOUR_API_KEY')]
 
 for job in stub.StreamJobs(request, metadata=metadata):
     print(f"Received job: {job.id}")

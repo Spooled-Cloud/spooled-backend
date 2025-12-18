@@ -360,9 +360,9 @@ mod tests {
 
     #[test]
     fn test_hash_for_lookup() {
-        let hash1 = hash_for_lookup("sk_test_abc123");
-        let hash2 = hash_for_lookup("sk_test_abc123");
-        let hash3 = hash_for_lookup("sk_test_xyz789");
+        let hash1 = hash_for_lookup("sp_test_abc123");
+        let hash2 = hash_for_lookup("sp_test_abc123");
+        let hash3 = hash_for_lookup("sp_test_xyz789");
 
         assert_eq!(hash1, hash2);
         assert_ne!(hash1, hash3);

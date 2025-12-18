@@ -102,7 +102,7 @@ For high-throughput workloads, use the gRPC API which provides ~28x better perfo
 Include your API key in the `Authorization` header:
 
 ```bash
-Authorization: Bearer sk_live_xxxxxxxxxxxxxxxxxxxx
+Authorization: Bearer sp_live_xxxxxxxxxxxxxxxxxxxx
 ```
 
 ### JWT Authentication
@@ -116,7 +116,7 @@ POST /api/v1/auth/login
 Content-Type: application/json
 
 {
-  "api_key": "sk_live_xxxxxxxxxxxxxxxxxxxx"
+  "api_key": "sp_live_xxxxxxxxxxxxxxxxxxxx"
 }
 ```
 
@@ -789,7 +789,7 @@ You can retrieve it via the API or from the dashboard under Organization Setting
 ```bash
 # Get your current webhook token and URL
 curl https://api.spooled.cloud/api/v1/organizations/webhook-token \
-  -H "Authorization: Bearer sk_live_your_api_key"
+  -H "Authorization: Bearer sp_live_your_api_key"
 ```
 
 Response:
@@ -805,11 +805,11 @@ Response:
 ```bash
 # Regenerate the token (invalidates the old one)
 curl -X POST https://api.spooled.cloud/api/v1/organizations/webhook-token/regenerate \
-  -H "Authorization: Bearer sk_live_your_api_key"
+  -H "Authorization: Bearer sp_live_your_api_key"
 
 # Clear the token (makes endpoint accept unauthenticated requests - NOT RECOMMENDED)
 curl -X POST https://api.spooled.cloud/api/v1/organizations/webhook-token/clear \
-  -H "Authorization: Bearer sk_live_your_api_key" \
+  -H "Authorization: Bearer sp_live_your_api_key" \
   -H "Content-Type: application/json" \
   -d '{"confirm": true}'
 ```
@@ -1167,10 +1167,10 @@ Include your API key in gRPC metadata:
 
 ```bash
 # Using x-api-key header
-grpcurl -H "x-api-key: sk_live_xxxx" ...
+grpcurl -H "x-api-key: sp_live_xxxx" ...
 
 # Using authorization header
-grpcurl -H "authorization: Bearer sk_live_xxxx" ...
+grpcurl -H "authorization: Bearer sp_live_xxxx" ...
 ```
 
 ### QueueService RPCs
@@ -1179,7 +1179,7 @@ grpcurl -H "authorization: Bearer sk_live_xxxx" ...
 
 ```bash
 grpcurl -plaintext \
-  -H "x-api-key: sk_live_xxxx" \
+  -H "x-api-key: sp_live_xxxx" \
   -d '{
     "queue_name": "emails",
     "payload": {"to": "user@example.com", "subject": "Hello"},
@@ -1202,7 +1202,7 @@ Response:
 
 ```bash
 grpcurl -plaintext \
-  -H "x-api-key: sk_live_xxxx" \
+  -H "x-api-key: sp_live_xxxx" \
   -d '{
     "queue_name": "emails",
     "worker_id": "worker-1",
@@ -1216,7 +1216,7 @@ grpcurl -plaintext \
 
 ```bash
 grpcurl -plaintext \
-  -H "x-api-key: sk_live_xxxx" \
+  -H "x-api-key: sp_live_xxxx" \
   -d '{
     "job_id": "job_550e8400e29b41d4",
     "worker_id": "worker-1",
@@ -1229,7 +1229,7 @@ grpcurl -plaintext \
 
 ```bash
 grpcurl -plaintext \
-  -H "x-api-key: sk_live_xxxx" \
+  -H "x-api-key: sp_live_xxxx" \
   -d '{
     "job_id": "job_550e8400e29b41d4",
     "worker_id": "worker-1",
@@ -1243,7 +1243,7 @@ grpcurl -plaintext \
 
 ```bash
 grpcurl -plaintext \
-  -H "x-api-key: sk_live_xxxx" \
+  -H "x-api-key: sp_live_xxxx" \
   -d '{
     "job_id": "job_550e8400e29b41d4",
     "worker_id": "worker-1",
@@ -1256,7 +1256,7 @@ grpcurl -plaintext \
 
 ```bash
 grpcurl -plaintext \
-  -H "x-api-key: sk_live_xxxx" \
+  -H "x-api-key: sp_live_xxxx" \
   -d '{"job_id": "job_550e8400e29b41d4"}' \
   localhost:50051 spooled.v1.QueueService/GetJob
 ```
@@ -1265,7 +1265,7 @@ grpcurl -plaintext \
 
 ```bash
 grpcurl -plaintext \
-  -H "x-api-key: sk_live_xxxx" \
+  -H "x-api-key: sp_live_xxxx" \
   -d '{"queue_name": "emails"}' \
   localhost:50051 spooled.v1.QueueService/GetQueueStats
 ```
@@ -1278,7 +1278,7 @@ Continuously receive jobs as they become available:
 
 ```bash
 grpcurl -plaintext \
-  -H "x-api-key: sk_live_xxxx" \
+  -H "x-api-key: sp_live_xxxx" \
   -d '{
     "queue_name": "emails",
     "worker_id": "worker-1",
@@ -1301,7 +1301,7 @@ Interactive job processing - send commands, receive responses:
 ```bash
 # Interactive mode with grpcurl
 grpcurl -plaintext \
-  -H "x-api-key: sk_live_xxxx" \
+  -H "x-api-key: sp_live_xxxx" \
   localhost:50051 spooled.v1.QueueService/ProcessJobs
 ```
 
@@ -1319,7 +1319,7 @@ Send requests:
 
 ```bash
 grpcurl -plaintext \
-  -H "x-api-key: sk_live_xxxx" \
+  -H "x-api-key: sp_live_xxxx" \
   -d '{
     "queue_name": "emails",
     "hostname": "worker-host-1",
@@ -1343,7 +1343,7 @@ Response:
 
 ```bash
 grpcurl -plaintext \
-  -H "x-api-key: sk_live_xxxx" \
+  -H "x-api-key: sp_live_xxxx" \
   -d '{
     "worker_id": "worker_abc123",
     "current_jobs": 5,
@@ -1356,7 +1356,7 @@ grpcurl -plaintext \
 
 ```bash
 grpcurl -plaintext \
-  -H "x-api-key: sk_live_xxxx" \
+  -H "x-api-key: sp_live_xxxx" \
   -d '{"worker_id": "worker_abc123"}' \
   localhost:50051 spooled.v1.WorkerService/Deregister
 ```

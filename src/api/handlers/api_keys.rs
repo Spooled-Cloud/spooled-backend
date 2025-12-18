@@ -299,13 +299,13 @@ mod tests {
     fn test_create_response_contains_raw_key() {
         let response = CreateApiKeyResponse {
             id: "key-1".to_string(),
-            key: "sk_test_abc123".to_string(),
+            key: "sp_test_abc123".to_string(),
             name: "Test Key".to_string(),
             created_at: Utc::now(),
             expires_at: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("sk_test_abc123"));
+        assert!(json.contains("sp_test_abc123"));
     }
 }

@@ -39,7 +39,7 @@ Get up and running with Spooled Cloud in 5 minutes.
 
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/jobs \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "queue_name": "my-queue",
@@ -57,16 +57,16 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs \
 ```bash
 # Claim up to 5 jobs
 curl -X POST https://api.spooled.cloud/api/v1/jobs/claim \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -d '{"queue_name": "my-queue", "limit": 5}'
 
 # Complete a job
 curl -X POST https://api.spooled.cloud/api/v1/jobs/job_xyz123/complete \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY"
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY"
 
 # Or fail it (will retry)
 curl -X POST https://api.spooled.cloud/api/v1/jobs/job_xyz123/fail \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -d '{"reason": "Connection timeout"}'
 ```
 
@@ -182,7 +182,7 @@ Response:
 ```bash
 curl -X POST http://localhost:8080/api/v1/jobs \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk_live_abc123xyz789..." \
+  -H "Authorization: Bearer sp_live_abc123xyz789..." \
   -d '{
     "queue_name": "emails",
     "payload": {
@@ -374,7 +374,7 @@ worker.run()
 
 ```bash
 #!/bin/bash
-API_KEY="sk_live_..."
+API_KEY="sp_live_..."
 BASE_URL="http://localhost:8080"  # or https://api.spooled.cloud
 
 while true; do
@@ -409,7 +409,7 @@ done
 ```bash
 curl -X POST http://localhost:8080/api/v1/jobs \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk_live_..." \
+  -H "Authorization: Bearer sp_live_..." \
   -d '{
     "queue_name": "reports",
     "payload": {"type": "daily_report"},
@@ -422,7 +422,7 @@ curl -X POST http://localhost:8080/api/v1/jobs \
 ```bash
 curl -X POST http://localhost:8080/api/v1/schedules \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk_live_..." \
+  -H "Authorization: Bearer sp_live_..." \
   -d '{
     "name": "Daily Report",
     "cron_expression": "0 9 * * *",
@@ -437,7 +437,7 @@ curl -X POST http://localhost:8080/api/v1/schedules \
 ```bash
 curl -X POST http://localhost:8080/api/v1/jobs/bulk \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk_live_..." \
+  -H "Authorization: Bearer sp_live_..." \
   -d '{
     "jobs": [
       {"queue_name": "emails", "payload": {"id": 1}},
@@ -451,28 +451,28 @@ curl -X POST http://localhost:8080/api/v1/jobs/bulk \
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/queues/emails/pause \
-  -H "Authorization: Bearer sk_live_..."
+  -H "Authorization: Bearer sp_live_..."
 ```
 
 ### Resume a Queue
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/queues/emails/resume \
-  -H "Authorization: Bearer sk_live_..."
+  -H "Authorization: Bearer sp_live_..."
 ```
 
 ### Retry a Failed Job
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/jobs/job_m1n2o3p4/retry \
-  -H "Authorization: Bearer sk_live_..."
+  -H "Authorization: Bearer sp_live_..."
 ```
 
 ### Cancel a Job
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/jobs/job_m1n2o3p4/cancel \
-  -H "Authorization: Bearer sk_live_..."
+  -H "Authorization: Bearer sp_live_..."
 ```
 
 ### List Jobs with Filtering
@@ -480,22 +480,22 @@ curl -X POST http://localhost:8080/api/v1/jobs/job_m1n2o3p4/cancel \
 ```bash
 # Filter by status
 curl "http://localhost:8080/api/v1/jobs?status=pending" \
-  -H "Authorization: Bearer sk_live_..."
+  -H "Authorization: Bearer sp_live_..."
 
 # Filter by queue
 curl "http://localhost:8080/api/v1/jobs?queue_name=emails" \
-  -H "Authorization: Bearer sk_live_..."
+  -H "Authorization: Bearer sp_live_..."
 
 # Combine filters with pagination
 curl "http://localhost:8080/api/v1/jobs?status=failed&queue_name=emails&limit=50" \
-  -H "Authorization: Bearer sk_live_..."
+  -H "Authorization: Bearer sp_live_..."
 ```
 
 ### Get Queue Statistics
 
 ```bash
 curl http://localhost:8080/api/v1/queues/emails/stats \
-  -H "Authorization: Bearer sk_live_..."
+  -H "Authorization: Bearer sp_live_..."
 ```
 
 Response:
@@ -517,7 +517,7 @@ Response:
 ### WebSocket Connection
 
 ```javascript
-const ws = new WebSocket('ws://localhost:8080/api/v1/ws?token=sk_live_...');
+const ws = new WebSocket('ws://localhost:8080/api/v1/ws?token=sp_live_...');
 
 ws.onopen = () => {
   // Subscribe to queue events
@@ -536,15 +536,15 @@ ws.onmessage = (event) => {
 ```bash
 # Subscribe to all events for your organization
 curl -N http://localhost:8080/api/v1/events \
-  -H "Authorization: Bearer sk_live_..."
+  -H "Authorization: Bearer sp_live_..."
 
 # Subscribe to specific job updates
 curl -N http://localhost:8080/api/v1/events/jobs/job_m1n2o3p4 \
-  -H "Authorization: Bearer sk_live_..."
+  -H "Authorization: Bearer sp_live_..."
 
 # Subscribe to queue events
 curl -N http://localhost:8080/api/v1/events/queues/emails \
-  -H "Authorization: Bearer sk_live_..."
+  -H "Authorization: Bearer sp_live_..."
 ```
 
 ### Event Types
@@ -639,15 +639,15 @@ Jobs that exhaust all retries are moved to the DLQ:
 ```bash
 # List DLQ jobs
 curl "http://localhost:8080/api/v1/jobs/dlq?queue_name=emails&limit=100" \
-  -H "Authorization: Bearer sk_live_..."
+  -H "Authorization: Bearer sp_live_..."
 
 # Retry a DLQ job
 curl -X POST http://localhost:8080/api/v1/jobs/job_xyz/retry \
-  -H "Authorization: Bearer sk_live_..."
+  -H "Authorization: Bearer sp_live_..."
 
 # Bulk retry all DLQ jobs for a queue
 curl -X POST http://localhost:8080/api/v1/jobs/dlq/retry \
-  -H "Authorization: Bearer sk_live_..." \
+  -H "Authorization: Bearer sp_live_..." \
   -H "Content-Type: application/json" \
   -d '{"queue_name":"emails","limit":100}'
 ```
@@ -726,7 +726,7 @@ kill -9 <PID>
 
 ### "Invalid API Key"
 
-- Verify the key starts with `sk_live_` or `sk_test_`
+- Verify the key starts with `sp_live_` or `sp_test_`
 - Check the key hasn't been revoked
 - Ensure you're using the correct organization's key
 - Check key hasn't expired (if expiration was set)
@@ -750,11 +750,11 @@ kill -9 <PID>
 ```bash
 # Check for expired leases (will be auto-recovered)
 curl "http://localhost:8080/api/v1/jobs?status=processing" \
-  -H "Authorization: Bearer sk_live_..."
+  -H "Authorization: Bearer sp_live_..."
 
 # Force-fail a stuck job
 curl -X POST http://localhost:8080/api/v1/jobs/job_xyz/fail \
-  -H "Authorization: Bearer sk_live_..." \
+  -H "Authorization: Bearer sp_live_..." \
   -d '{"reason": "Manual intervention - stuck job"}'
 ```
 

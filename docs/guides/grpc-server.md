@@ -165,7 +165,7 @@ Example:
 
 ```bash
 grpcurl \
-  -H "x-api-key: sk_live_xxxx" \
+  -H "x-api-key: sp_live_xxxx" \
   -d '{"queue_name":"my-queue"}' \
   grpc.spooled.cloud:443 spooled.v1.QueueService/GetQueueStats
 ```
@@ -375,7 +375,7 @@ The gRPC API is supported by the official SDKs:
 
 - **Node.js SDK** (`spooled-sdk-nodejs`): Full gRPC support with `@grpc/grpc-js`
 - **Python SDK** (`spooled-sdk-python`): Full gRPC support with `grpcio`
-- **Go SDK** (`spooled-sdk-go`): Coming soon
+- **Go SDK** (`spooled-sdk-go`): Production ready - [Documentation](https://pkg.go.dev/github.com/spooled-cloud/spooled-sdk-go)
 
 ### Node.js SDK Example
 

@@ -126,7 +126,7 @@ async fn validate_api_key(pool: &PgPool, token: &str) -> Result<GrpcAuthContext,
     let key_prefix: String = token.chars().take(8).collect();
 
     // Fetch candidate keys with matching prefix.
-    // Use a higher LIMIT to handle many keys sharing the same prefix (e.g. sk_test_).
+    // Use a higher LIMIT to handle many keys sharing the same prefix (e.g. sp_test_).
     let records: Vec<ApiKeyRecord> = sqlx::query_as(
         r#"
         SELECT id, organization_id, key_hash, queues, rate_limit
@@ -227,8 +227,8 @@ mod tests {
     #[test]
     fn test_extract_token_formats() {
         // This tests the logic, not actual gRPC requests
-        let token = "sk_test_abc123";
+        let token = "sp_test_abc123";
         let prefix: String = token.chars().take(8).collect();
-        assert_eq!(prefix, "sk_test_");
+        assert_eq!(prefix, "sp_test_");
     }
 }

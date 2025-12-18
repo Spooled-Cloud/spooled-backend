@@ -7,14 +7,14 @@
 #   ./loadtest/simple-load-test.sh [BASE_URL] [API_KEY] [CONCURRENT] [DURATION]
 #
 # Example:
-#   ./loadtest/simple-load-test.sh http://localhost:8080 sk_test_xxx 10 30
+#   ./loadtest/simple-load-test.sh http://localhost:8080 sp_test_xxx 10 30
 #
 
 set -e
 
 # Configuration
 BASE_URL="${1:-http://localhost:8080}"
-API_KEY="${2:-sk_test_default}"
+API_KEY="${2:-sp_test_default}"
 CONCURRENT="${3:-10}"
 DURATION="${4:-30}"
 

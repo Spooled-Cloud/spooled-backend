@@ -187,7 +187,7 @@ pub struct TracingSettings {
 /// Stripe billing configuration
 #[derive(Debug, Clone, Deserialize)]
 pub struct StripeSettings {
-    /// Stripe secret key (sk_live_xxx or sk_test_xxx)
+    /// Stripe secret key (sp_live_xxx or sp_test_xxx)
     pub secret_key: Option<String>,
     /// Stripe webhook signing secret (whsec_xxx)
     pub webhook_secret: Option<String>,

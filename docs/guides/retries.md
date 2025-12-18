@@ -49,7 +49,7 @@ When a job fails, Spooled automatically retries it based on the configuration.
 
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/jobs \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "queue_name": "emails",
@@ -62,7 +62,7 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs \
 
 ```bash
 curl -X PUT https://api.spooled.cloud/api/v1/queues/emails/config \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "max_retries": 3
@@ -75,7 +75,7 @@ When your worker fails a job, it will be retried:
 
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/jobs/job_xxx/fail \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "reason": "Connection timeout to SMTP server"
@@ -88,7 +88,7 @@ For permanent failures, skip retries and send directly to DLQ:
 
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/jobs/job_xxx/fail \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "reason": "Invalid email address format",
@@ -128,7 +128,7 @@ delay = min(base_delay * 2^attempt + random_jitter, max_delay)
 
 ```bash
 curl -X PUT https://api.spooled.cloud/api/v1/queues/emails/config \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "backoff_base_seconds": 5,
@@ -162,7 +162,7 @@ Jobs that fail after exhausting all retries are moved to the Dead Letter Queue (
 
 ```bash
 curl "https://api.spooled.cloud/api/v1/jobs/dlq?limit=50" \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY"
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY"
 ```
 
 Response:
@@ -190,7 +190,7 @@ Response:
 
 ```bash
 curl "https://api.spooled.cloud/api/v1/jobs/dlq?queue_name=emails&limit=50" \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY"
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY"
 ```
 
 ---
@@ -201,7 +201,7 @@ curl "https://api.spooled.cloud/api/v1/jobs/dlq?queue_name=emails&limit=50" \
 
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/jobs/job_xxx/retry \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY"
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY"
 ```
 
 This:
@@ -215,7 +215,7 @@ Retry multiple jobs by ID:
 
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/jobs/dlq/retry \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "job_ids": ["job_xxx", "job_yyy", "job_zzz"]
@@ -226,7 +226,7 @@ Retry all DLQ jobs for a queue:
 
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/jobs/dlq/retry \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "queue_name": "emails",
@@ -240,7 +240,7 @@ Permanently delete DLQ jobs (irreversible):
 
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/jobs/dlq/purge \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "queue_name": "emails",
@@ -253,7 +253,7 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs/dlq/purge \
 
 ```bash
 curl "https://api.spooled.cloud/api/v1/jobs/dlq?limit=100&offset=0" \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -H "Accept: application/json" \
   > dlq_export.json
 ```
@@ -311,7 +311,7 @@ Get notified when jobs fail completely:
 
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/outgoing-webhooks \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "DLQ Alerts",
@@ -348,7 +348,7 @@ except CircuitBreakerError:
 
 ```bash
 curl https://api.spooled.cloud/api/v1/jobs/job_xxx?include=history \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY"
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY"
 ```
 
 Response:

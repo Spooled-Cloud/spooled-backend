@@ -44,48 +44,48 @@ docker pull grafana/k6
 # Smoke test (quick validation)
 k6 run \
   --env BASE_URL=http://localhost:8080 \
-  --env API_KEY=sk_test_your_key \
+  --env API_KEY=sp_test_your_key \
   loadtest/k6-load-test.js
 
 # Load test
 k6 run \
   --env BASE_URL=http://localhost:8080 \
-  --env API_KEY=sk_test_your_key \
+  --env API_KEY=sp_test_your_key \
   --env SCENARIO=load \
   loadtest/k6-load-test.js
 
 # Stress test
 k6 run \
   --env BASE_URL=http://localhost:8080 \
-  --env API_KEY=sk_test_your_key \
+  --env API_KEY=sp_test_your_key \
   --env SCENARIO=stress \
   loadtest/k6-load-test.js
 
 # Spike test
 k6 run \
   --env BASE_URL=http://localhost:8080 \
-  --env API_KEY=sk_test_your_key \
+  --env API_KEY=sp_test_your_key \
   --env SCENARIO=spike \
   loadtest/k6-load-test.js
 
 # Performance baseline (1000 req/sec)
 k6 run \
   --env BASE_URL=http://localhost:8080 \
-  --env API_KEY=sk_test_your_key \
+  --env API_KEY=sp_test_your_key \
   --env SCENARIO=baseline \
   loadtest/k6-load-test.js
 
 # High throughput test (target: 10k req/sec)
 k6 run \
   --env BASE_URL=http://localhost:8080 \
-  --env API_KEY=sk_test_your_key \
+  --env API_KEY=sp_test_your_key \
   --env SCENARIO=throughput \
   loadtest/k6-load-test.js
 
 # With JSON output for analysis
 k6 run \
   --env BASE_URL=http://localhost:8080 \
-  --env API_KEY=sk_test_your_key \
+  --env API_KEY=sp_test_your_key \
   --out json=results.json \
   loadtest/k6-load-test.js
 ```
@@ -99,7 +99,7 @@ For a comprehensive performance baseline with reporting:
 ./loadtest/run-perf-baseline.sh
 
 # Or with environment variables
-BASE_URL=http://api.example.com API_KEY=sk_live_xxx ./loadtest/run-perf-baseline.sh
+BASE_URL=http://api.example.com API_KEY=sp_live_xxx ./loadtest/run-perf-baseline.sh
 ```
 
 #### Docker Usage
@@ -108,7 +108,7 @@ BASE_URL=http://api.example.com API_KEY=sk_live_xxx ./loadtest/run-perf-baseline
 docker run --rm -i \
   -v $(pwd)/loadtest:/scripts \
   -e BASE_URL=http://host.docker.internal:8080 \
-  -e API_KEY=sk_test_your_key \
+  -e API_KEY=sp_test_your_key \
   grafana/k6 run /scripts/k6-load-test.js
 ```
 
@@ -123,10 +123,10 @@ Basic load testing with just curl and bash (no dependencies).
 chmod +x loadtest/simple-load-test.sh
 
 # Run with defaults (10 concurrent, 30 seconds)
-./loadtest/simple-load-test.sh http://localhost:8080 sk_test_your_key
+./loadtest/simple-load-test.sh http://localhost:8080 sp_test_your_key
 
 # Custom settings
-./loadtest/simple-load-test.sh http://localhost:8080 sk_test_your_key 50 60
+./loadtest/simple-load-test.sh http://localhost:8080 sp_test_your_key 50 60
 #                              ^BASE_URL             ^API_KEY         ^CONCURRENT ^DURATION
 ```
 
@@ -254,7 +254,7 @@ docker pull ghz/ghz
 ghz --insecure \
   --proto ../proto/spooled.proto \
   --call spooled.v1.QueueService.Enqueue \
-  --metadata '{"x-api-key":"sk_test_your_key"}' \
+  --metadata '{"x-api-key":"sp_test_your_key"}' \
   -d '{"queue_name":"test","payload":{"test":true},"max_retries":3}' \
   -c 10 -n 1000 \
   localhost:50051
@@ -263,7 +263,7 @@ ghz --insecure \
 ghz --insecure \
   --proto ../proto/spooled.proto \
   --call spooled.v1.QueueService.Dequeue \
-  --metadata '{"x-api-key":"sk_test_your_key"}' \
+  --metadata '{"x-api-key":"sp_test_your_key"}' \
   -d '{"queue_name":"test","worker_id":"loadtest-1","batch_size":10}' \
   -c 10 -n 500 \
   localhost:50051
@@ -272,7 +272,7 @@ ghz --insecure \
 ghz --insecure \
   --proto ../proto/spooled.proto \
   --call spooled.v1.QueueService.Enqueue \
-  --metadata '{"x-api-key":"sk_test_your_key"}' \
+  --metadata '{"x-api-key":"sp_test_your_key"}' \
   -d '{"queue_name":"perf","payload":{"i":"{{.RequestNumber}}"},"max_retries":1}' \
   -c 100 --rps 5000 -z 60s \
   localhost:50051

@@ -1321,13 +1321,13 @@ mod tests {
         let response = AdminApiKeyResponse {
             id: "key-123".to_string(),
             name: "My API Key".to_string(),
-            key: "sk_test_abc123xyz".to_string(),
+            key: "sp_test_abc123xyz".to_string(),
             created_at: Utc::now(),
         };
 
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("key-123"));
-        assert!(json.contains("sk_test_abc123xyz"));
+        assert!(json.contains("sp_test_abc123xyz"));
         assert!(json.contains("My API Key"));
     }
 }

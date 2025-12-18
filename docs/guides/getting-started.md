@@ -66,7 +66,7 @@ When you create an organization (Step 1), you automatically receive an initial A
 
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/api-keys \
-  -H "Authorization: Bearer sk_live_xxxxxxxxxxxxxxxxxxxx" \
+  -H "Authorization: Bearer sp_live_xxxxxxxxxxxxxxxxxxxx" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "Production App",
@@ -79,7 +79,7 @@ curl -X POST https://api.spooled.cloud/api/v1/api-keys \
 {
   "id": "key_xyz789",
   "name": "Production App",
-  "key": "sk_live_xxxxxxxxxxxxxxxxxxxx",
+  "key": "sp_live_xxxxxxxxxxxxxxxxxxxx",
   "queues": ["emails", "notifications"],
   "created_at": "2024-01-15T10:00:00Z"
 }
@@ -95,7 +95,7 @@ Queues are created implicitly when you enqueue your first job. You can optionall
 
 ```bash
 curl -X PUT https://api.spooled.cloud/api/v1/queues/emails/config \
-  -H "Authorization: Bearer sk_live_xxxxxxxxxxxxxxxxxxxx" \
+  -H "Authorization: Bearer sp_live_xxxxxxxxxxxxxxxxxxxx" \
   -H "Content-Type: application/json" \
   -d '{
     "max_retries": 3,
@@ -122,7 +122,7 @@ This is equivalent to Laravel's `dispatch(new SendEmail($user))`:
 
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/jobs \
-  -H "Authorization: Bearer sk_live_xxxxxxxxxxxxxxxxxxxx" \
+  -H "Authorization: Bearer sp_live_xxxxxxxxxxxxxxxxxxxx" \
   -H "Content-Type: application/json" \
   -d '{
     "queue_name": "emails",
@@ -160,7 +160,7 @@ Your worker fetches jobs and processes them:
 ```bash
 # 1. Claim jobs (get the next job(s) to process)
 curl -X POST https://api.spooled.cloud/api/v1/jobs/claim \
-  -H "Authorization: Bearer sk_live_xxxxxxxxxxxxxxxxxxxx" \
+  -H "Authorization: Bearer sp_live_xxxxxxxxxxxxxxxxxxxx" \
   -H "Content-Type: application/json" \
   -d '{
     "queue_name": "emails",
@@ -194,7 +194,7 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs/claim \
 
 # 3. Mark the job as completed
 curl -X POST https://api.spooled.cloud/api/v1/jobs/job_ghi789/complete \
-  -H "Authorization: Bearer sk_live_xxxxxxxxxxxxxxxxxxxx" \
+  -H "Authorization: Bearer sp_live_xxxxxxxxxxxxxxxxxxxx" \
   -H "Content-Type: application/json" \
   -d '{
     "worker_id": "worker-1",
@@ -574,7 +574,7 @@ Send a job that will only be processed after a delay:
 
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/jobs \
-  -H "Authorization: Bearer sk_live_xxx" \
+  -H "Authorization: Bearer sp_live_xxx" \
   -H "Content-Type: application/json" \
   -d '{
     "queue_name": "emails",
@@ -599,17 +599,17 @@ Higher priority jobs are processed first:
 ```bash
 # High priority (processed first)
 curl -X POST https://api.spooled.cloud/api/v1/jobs \
-  -H "Authorization: Bearer sk_live_xxx" \
+  -H "Authorization: Bearer sp_live_xxx" \
   -d '{"queue_name": "emails", "payload": {...}, "priority": 10}'
 
 # Normal priority
 curl -X POST https://api.spooled.cloud/api/v1/jobs \
-  -H "Authorization: Bearer sk_live_xxx" \
+  -H "Authorization: Bearer sp_live_xxx" \
   -d '{"queue_name": "emails", "payload": {...}, "priority": 0}'
 
 # Low priority (processed last)
 curl -X POST https://api.spooled.cloud/api/v1/jobs \
-  -H "Authorization: Bearer sk_live_xxx" \
+  -H "Authorization: Bearer sp_live_xxx" \
   -d '{"queue_name": "emails", "payload": {...}, "priority": -10}'
 ```
 
@@ -621,7 +621,7 @@ Create recurring jobs that run on a schedule:
 
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/schedules \
-  -H "Authorization: Bearer sk_live_xxx" \
+  -H "Authorization: Bearer sp_live_xxx" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "daily-report",
@@ -646,7 +646,7 @@ Run jobs in sequence - job B only runs after job A completes:
 ```bash
 # Create a workflow
 curl -X POST https://api.spooled.cloud/api/v1/workflows \
-  -H "Authorization: Bearer sk_live_xxx" \
+  -H "Authorization: Bearer sp_live_xxx" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "user-onboarding",
@@ -675,28 +675,28 @@ Bus::chain([
 
 ```bash
 curl https://api.spooled.cloud/api/v1/jobs/job_xxx \
-  -H "Authorization: Bearer sk_live_xxx"
+  -H "Authorization: Bearer sp_live_xxx"
 ```
 
 ### List Pending Jobs
 
 ```bash
 curl "https://api.spooled.cloud/api/v1/jobs?queue_name=emails&status=pending" \
-  -H "Authorization: Bearer sk_live_xxx"
+  -H "Authorization: Bearer sp_live_xxx"
 ```
 
 ### View Failed Jobs (Dead Letter Queue)
 
 ```bash
 curl "https://api.spooled.cloud/api/v1/jobs/dlq?queue_name=emails" \
-  -H "Authorization: Bearer sk_live_xxx"
+  -H "Authorization: Bearer sp_live_xxx"
 ```
 
 ### Retry a Failed Job
 
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/jobs/job_xxx/retry \
-  -H "Authorization: Bearer sk_live_xxx"
+  -H "Authorization: Bearer sp_live_xxx"
 ```
 
 ---
@@ -721,7 +721,7 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs/job_xxx/retry \
 1. **Read the [API Reference](../openapi.yaml)** for all endpoints
 2. **Check the [Architecture Guide](./architecture.md)** to understand the system
 3. **Set up Grafana** to monitor your queues (included in docker-compose)
-4. **Use the SDKs** when available (Go, Node.js, Python coming soon)
+4. **Use the SDKs** (Node.js, Python, Go) for the best developer experience
 
 ---
 

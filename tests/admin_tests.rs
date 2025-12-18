@@ -590,7 +590,7 @@ async fn test_admin_create_api_key_for_org() {
     sqlx::query(
         r#"
         INSERT INTO api_keys (id, organization_id, key_hash, key_prefix, name, queues, is_active, created_at)
-        VALUES ($1, $2, $3, 'sk_test_', $4, $5, TRUE, NOW())
+        VALUES ($1, $2, $3, 'sp_test_', $4, $5, TRUE, NOW())
         "#,
     )
     .bind(&key_id)
@@ -645,7 +645,7 @@ async fn test_admin_create_multiple_api_keys() {
         sqlx::query(
             r#"
             INSERT INTO api_keys (id, organization_id, key_hash, key_prefix, name, queues, is_active, created_at)
-            VALUES ($1, $2, $3, 'sk_test_', $4, $5, TRUE, NOW())
+            VALUES ($1, $2, $3, 'sp_test_', $4, $5, TRUE, NOW())
             "#,
         )
         .bind(&key_id)

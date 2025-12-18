@@ -1056,14 +1056,14 @@ mod tests {
     fn test_initial_api_key_serialization() {
         let api_key = InitialApiKey {
             id: "key-789".to_string(),
-            key: "sk_test_abcdef123456".to_string(),
+            key: "sp_test_abcdef123456".to_string(),
             name: "Initial Admin Key".to_string(),
             created_at: Utc::now(),
         };
 
         let json = serde_json::to_string(&api_key).unwrap();
         assert!(json.contains("key-789"));
-        assert!(json.contains("sk_test_abcdef123456"));
+        assert!(json.contains("sp_test_abcdef123456"));
         assert!(json.contains("Initial Admin Key"));
     }
 

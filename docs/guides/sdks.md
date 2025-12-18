@@ -20,9 +20,9 @@ Spooled provides official SDKs for popular languages, plus REST and gRPC APIs fo
 
 | SDK | Status | Package |
 |-----|--------|---------|
-| **Node.js** | ✅ Available | `@spooled/sdk` |
-| **Python** | ✅ Available | `spooled` |
-| **Go** | 🚧 Coming Soon | `github.com/spooled-cloud/spooled-go` |
+| **Node.js** | ✅ Production Ready | `@spooled/sdk` |
+| **Python** | ✅ Production Ready | `spooled` |
+| **Go** | ✅ Production Ready | `github.com/spooled-cloud/spooled-sdk-go` |
 | **REST API** | ✅ Stable | Any HTTP client |
 | **gRPC API** | ✅ Stable | Any gRPC client |
 
@@ -255,10 +255,12 @@ worker.run()
 
 ## Go SDK
 
+The Go SDK provides idiomatic Go with full type safety, gRPC support, worker runtime, and comprehensive test coverage (190+ tests).
+
 ### Installation
 
 ```bash
-go get github.com/spooled-cloud/spooled-go
+go get github.com/spooled-cloud/spooled-sdk-go
 ```
 
 ### Quick Start
@@ -268,57 +270,73 @@ package main
 
 import (
     "context"
-    "log"
+    "fmt"
     "os"
-    
-    spooled "github.com/spooled-cloud/spooled-go"
+
+    "github.com/spooled-cloud/spooled-sdk-go/spooled"
+    "github.com/spooled-cloud/spooled-sdk-go/spooled/resources"
 )
 
 func main() {
-    client := spooled.NewClient(os.Getenv("SPOOLED_API_KEY"))
-    // client.SetBaseURL("http://localhost:8080")  // For self-hosted
-    
-    job, err := client.Jobs.Enqueue(context.Background(), &spooled.EnqueueParams{
-        Queue: "webhook-delivery",
-        Payload: map[string]interface{}{
-            "url":     "https://customer.example.com/webhook",
-            "event":   "order.completed",
-            "payload": orderData,
-        },
-        IdempotencyKey: "order-webhook-" + orderId,
-        MaxRetries:     5,
-    })
-    
+    client, err := spooled.NewClient(
+        spooled.WithAPIKey(os.Getenv("SPOOLED_API_KEY")),
+        // spooled.WithBaseURL("http://localhost:8080"),  // For self-hosted
+    )
     if err != nil {
-        log.Fatal(err)
+        panic(err)
     }
-    
-    log.Printf("Queued job: %s", job.ID)
+    defer client.Close()
+
+    resp, err := client.Jobs().Create(context.Background(), &resources.CreateJobRequest{
+        QueueName: "webhook-delivery",
+        Payload: map[string]interface{}{
+            "url":   "https://customer.example.com/webhook",
+            "event": "order.completed",
+        },
+        IdempotencyKey: stringPtr("order-webhook-123"),
+        MaxRetries:     intPtr(5),
+    })
+    if err != nil {
+        panic(err)
+    }
+
+    fmt.Printf("Queued job: %s\n", resp.ID)
 }
+
+func stringPtr(s string) *string { return &s }
+func intPtr(i int) *int { return &i }
 ```
 
 ### Client API
 
 ```go
+ctx := context.Background()
+
 // Jobs
-job, err := client.Jobs.Enqueue(ctx, params)
-job, err := client.Jobs.Get(ctx, jobID)
-jobs, err := client.Jobs.List(ctx, &spooled.ListParams{Queue: "emails", Status: "pending"})
-err := client.Jobs.Cancel(ctx, jobID)
-err := client.Jobs.Retry(ctx, jobID)
+job, err := client.Jobs().Create(ctx, &resources.CreateJobRequest{...})
+job, err := client.Jobs().Get(ctx, jobID)
+jobs, err := client.Jobs().List(ctx, &resources.ListJobsParams{QueueName: "emails", Status: "pending"})
+err := client.Jobs().Cancel(ctx, jobID)
+err := client.Jobs().Retry(ctx, jobID)
 
 // Bulk operations
-result, err := client.Jobs.BulkEnqueue(ctx, []spooled.EnqueueParams{...})
+result, err := client.Jobs().BulkEnqueue(ctx, &resources.BulkEnqueueRequest{...})
 
 // Queues
-queues, err := client.Queues.List(ctx)
-stats, err := client.Queues.GetStats(ctx, queueName)
-err := client.Queues.Pause(ctx, queueName)
-err := client.Queues.Resume(ctx, queueName)
+queues, err := client.Queues().List(ctx, nil)
+stats, err := client.Queues().Stats(ctx, queueName)
+err := client.Queues().Pause(ctx, queueName)
+err := client.Queues().Resume(ctx, queueName)
 
 // Schedules
-schedule, err := client.Schedules.Create(ctx, &spooled.CreateScheduleParams{...})
-err := client.Schedules.Trigger(ctx, scheduleID)
+schedule, err := client.Schedules().Create(ctx, &resources.CreateScheduleRequest{...})
+err := client.Schedules().Trigger(ctx, scheduleID)
+
+// Workflows
+workflow, err := client.Workflows().Create(ctx, &resources.CreateWorkflowRequest{...})
+
+// gRPC client for high-throughput
+grpcClient, err := client.GRPC()
 ```
 
 ### Worker
@@ -328,35 +346,85 @@ package main
 
 import (
     "context"
-    "log"
     "os"
-    
-    spooled "github.com/spooled-cloud/spooled-go"
+
+    "github.com/spooled-cloud/spooled-sdk-go/spooled"
+    "github.com/spooled-cloud/spooled-sdk-go/spooled/worker"
 )
 
 func main() {
-    worker := spooled.NewWorker(&spooled.WorkerConfig{
-        APIKey:      os.Getenv("SPOOLED_API_KEY"),
-        Queue:       "emails",
+    client, _ := spooled.NewClient(spooled.WithAPIKey(os.Getenv("SPOOLED_API_KEY")))
+
+    w := worker.New(client, worker.Options{
+        QueueName:   "emails",
         Concurrency: 10,
     })
-    
-    worker.HandleFunc(func(ctx context.Context, job *spooled.Job) error {
+
+    w.Process(func(ctx context.Context, job *worker.Job) (map[string]any, error) {
         email := job.Payload["to"].(string)
         subject := job.Payload["subject"].(string)
-        
+
         if err := sendEmail(email, subject); err != nil {
-            return err  // Will retry
+            return nil, err // Will retry
         }
-        
-        return nil  // Success
+
+        return map[string]any{"sent": true}, nil
     })
-    
-    if err := worker.Run(context.Background()); err != nil {
-        log.Fatal(err)
+
+    w.Start(context.Background())
+}
+```
+
+### gRPC Worker (High Throughput)
+
+```go
+package main
+
+import (
+    "context"
+    "os"
+
+    "github.com/spooled-cloud/spooled-sdk-go/spooled"
+    spooledgrpc "github.com/spooled-cloud/spooled-sdk-go/spooled/grpc"
+)
+
+func main() {
+    grpcClient, _ := spooledgrpc.NewClient(spooledgrpc.Options{
+        Address: "grpc.spooled.cloud:443",  // or localhost:50051 for self-hosted
+        APIKey:  os.Getenv("SPOOLED_API_KEY"),
+        UseTLS:  true,
+    })
+    defer grpcClient.Close()
+
+    // Register worker
+    resp, _ := grpcClient.RegisterWorker(context.Background(), &spooledgrpc.RegisterWorkerRequest{
+        QueueName:      "emails",
+        MaxConcurrency: 10,
+    })
+
+    // Dequeue and process jobs
+    jobs, _ := grpcClient.Dequeue(context.Background(), &spooledgrpc.DequeueRequest{
+        QueueName: "emails",
+        WorkerID:  resp.WorkerID,
+        BatchSize: 10,
+    })
+
+    for _, job := range jobs.Jobs {
+        // Process job...
+        grpcClient.Complete(context.Background(), &spooledgrpc.CompleteRequest{
+            JobID:    job.ID,
+            WorkerID: resp.WorkerID,
+            Result:   map[string]interface{}{"success": true},
+        })
     }
 }
 ```
+
+### Documentation
+
+- [GitHub Repository](https://github.com/spooled-cloud/spooled-sdk-go)
+- [pkg.go.dev Documentation](https://pkg.go.dev/github.com/spooled-cloud/spooled-sdk-go)
+- [Code Examples](https://github.com/spooled-cloud/spooled-sdk-go/tree/main/examples)
 
 ---
 
@@ -373,14 +441,14 @@ https://api.spooled.cloud
 ### Authentication
 
 ```bash
-Authorization: Bearer sk_live_YOUR_API_KEY
+Authorization: Bearer sp_live_YOUR_API_KEY
 ```
 
 ### Example: Enqueue Job
 
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/jobs \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "queue_name": "emails",
@@ -393,7 +461,7 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs \
 
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/jobs/claim \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -d '{"queue_name": "emails", "limit": 10}'
 ```
 
@@ -401,7 +469,7 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs/claim \
 
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/jobs/job_xxx/complete \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -d '{"result": {"sent": true}}'
 ```
 
@@ -462,25 +530,25 @@ grpcurl grpc.spooled.cloud:443 list
 
 # Enqueue job
 grpcurl -plaintext \
-  -H "x-api-key: sk_live_xxx" \
+  -H "x-api-key: sp_live_xxx" \
   -d '{"queue_name": "emails", "payload": {"to": "user@example.com"}}' \
   localhost:50051 spooled.v1.QueueService/Enqueue
 
 # (Spooled Cloud) Enqueue job
 grpcurl \
-  -H "x-api-key: sk_live_xxx" \
+  -H "x-api-key: sp_live_xxx" \
   -d '{"queue_name": "emails", "payload": {"to": "user@example.com"}}' \
   grpc.spooled.cloud:443 spooled.v1.QueueService/Enqueue
 
 # Stream jobs
 grpcurl -plaintext \
-  -H "x-api-key: sk_live_xxx" \
+  -H "x-api-key: sp_live_xxx" \
   -d '{"queue_name": "emails", "worker_id": "w1"}' \
   localhost:50051 spooled.v1.QueueService/StreamJobs
 
 # (Spooled Cloud) Stream jobs
 grpcurl \
-  -H "x-api-key: sk_live_xxx" \
+  -H "x-api-key: sp_live_xxx" \
   -d '{"queue_name": "emails", "worker_id": "w1"}' \
   grpc.spooled.cloud:443 spooled.v1.QueueService/StreamJobs
 ```
@@ -521,7 +589,7 @@ Community-maintained SDKs (not officially supported):
 
 ```bash
 # .env
-SPOOLED_API_KEY=sk_live_xxxxx
+SPOOLED_API_KEY=sp_live_xxxxx
 SPOOLED_BASE_URL=https://api.spooled.cloud
 ```
 

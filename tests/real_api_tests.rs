@@ -39,7 +39,7 @@ async fn setup_test_org_and_key(db: &TestDatabase) -> (String, String) {
     sqlx::query(
         r#"
         INSERT INTO api_keys (id, organization_id, name, key_hash, key_prefix, is_active, created_at)
-        VALUES ($1, $2, 'Test API Key', $3, 'sk_test_', TRUE, NOW())
+        VALUES ($1, $2, 'Test API Key', $3, 'sp_test_', TRUE, NOW())
         "#
     )
     .bind(&api_key_id)
@@ -755,7 +755,7 @@ async fn test_api_key_crud_and_revocation() {
     sqlx::query(
         r#"
         INSERT INTO api_keys (id, organization_id, name, key_hash, key_prefix, is_active, queues, rate_limit, created_at)
-        VALUES ($1, $2, 'Production Key', $3, 'sk_live_', TRUE, ARRAY['emails', 'webhooks'], 1000, NOW())
+        VALUES ($1, $2, 'Production Key', $3, 'sp_live_', TRUE, ARRAY['emails', 'webhooks'], 1000, NOW())
         "#
     )
     .bind(&key_id)

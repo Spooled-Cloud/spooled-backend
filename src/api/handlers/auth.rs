@@ -142,7 +142,7 @@ const LOGIN_RATE_LIMIT_WINDOW: i64 = 60;
 /// Previously fetched ANY active API key instead of the provided one.
 /// Now uses key prefix for efficient lookup instead of O(n) scan.
 ///
-/// Key format: sk_live_XXXXX or sk_test_XXXXX
+/// Key format: sp_live_XXXXX or sp_test_XXXXX
 /// Prefix is first 8 chars for indexed lookup
 pub async fn login(
     State(state): State<AppState>,
@@ -715,7 +715,7 @@ mod tests {
     #[test]
     fn test_login_request_validation() {
         let valid_req = LoginRequest {
-            api_key: "sk_test_abc123def456".to_string(),
+            api_key: "sp_test_abc123def456".to_string(),
         };
         assert!(valid_req.validate().is_ok());
 

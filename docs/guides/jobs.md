@@ -70,7 +70,7 @@ Jobs are the fundamental unit of work in Spooled. A job represents an asynchrono
 
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/jobs \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "queue_name": "emails",
@@ -86,7 +86,7 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs \
 
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/jobs \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "queue_name": "emails",
@@ -131,7 +131,7 @@ Create up to 100 jobs in a single request:
 
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/jobs/bulk \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "jobs": [
@@ -152,7 +152,7 @@ Workers claim jobs to process them:
 
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/jobs/claim \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "queue_name": "emails",
@@ -183,7 +183,7 @@ Mark a job as successfully completed:
 
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/jobs/job_xxx/complete \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "result": {"message_id": "msg_123"}
@@ -196,7 +196,7 @@ Mark a job as failed (will retry if retries remaining):
 
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/jobs/job_xxx/fail \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "reason": "SMTP server unavailable"
@@ -209,7 +209,7 @@ Cancel a pending or scheduled job:
 
 ```bash
 curl -X DELETE https://api.spooled.cloud/api/v1/jobs/job_xxx \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY"
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY"
 ```
 
 ### Retry Job
@@ -218,7 +218,7 @@ Manually retry a failed or dead-letter job:
 
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/jobs/job_xxx/retry \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY"
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY"
 ```
 
 ---
@@ -260,7 +260,7 @@ Configure queue-level defaults:
 
 ```bash
 curl -X PUT https://api.spooled.cloud/api/v1/queues/emails/config \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "max_retries": 5,

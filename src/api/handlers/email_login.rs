@@ -1443,7 +1443,7 @@ mod tests {
                 slug: "test-org".to_string(),
                 billing_email: "test@example.com".to_string(),
             },
-            api_key: "sk_test_abc123".to_string(),
+            api_key: "sp_test_abc123".to_string(),
             access_token: "jwt-access-token".to_string(),
             refresh_token: "jwt-refresh-token".to_string(),
             token_type: "Bearer".to_string(),
@@ -1453,7 +1453,7 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("org-123"));
         assert!(json.contains("test-org"));
-        assert!(json.contains("sk_test_abc123"));
+        assert!(json.contains("sp_test_abc123"));
         assert!(json.contains("jwt-access-token"));
         assert!(json.contains("Bearer"));
     }

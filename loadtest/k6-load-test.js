@@ -9,16 +9,16 @@
  * 
  * Usage:
  *   # Smoke test (quick validation)
- *   k6 run --env BASE_URL=http://localhost:8080 --env API_KEY=sk_test_xxx loadtest/k6-load-test.js
+ *   k6 run --env BASE_URL=http://localhost:8080 --env API_KEY=sp_test_xxx loadtest/k6-load-test.js
  * 
  *   # Load test (sustained load)
- *   k6 run --env BASE_URL=http://localhost:8080 --env API_KEY=sk_test_xxx -e SCENARIO=load loadtest/k6-load-test.js
+ *   k6 run --env BASE_URL=http://localhost:8080 --env API_KEY=sp_test_xxx -e SCENARIO=load loadtest/k6-load-test.js
  * 
  *   # Stress test (find breaking point)
- *   k6 run --env BASE_URL=http://localhost:8080 --env API_KEY=sk_test_xxx -e SCENARIO=stress loadtest/k6-load-test.js
+ *   k6 run --env BASE_URL=http://localhost:8080 --env API_KEY=sp_test_xxx -e SCENARIO=stress loadtest/k6-load-test.js
  * 
  *   # Spike test (sudden traffic spike)
- *   k6 run --env BASE_URL=http://localhost:8080 --env API_KEY=sk_test_xxx -e SCENARIO=spike loadtest/k6-load-test.js
+ *   k6 run --env BASE_URL=http://localhost:8080 --env API_KEY=sp_test_xxx -e SCENARIO=spike loadtest/k6-load-test.js
  */
 
 import http from 'k6/http';
@@ -28,7 +28,7 @@ import { randomString, randomIntBetween } from 'https://jslib.k6.io/k6-utils/1.2
 
 // Configuration
 const BASE_URL = __ENV.BASE_URL || 'http://localhost:8080';
-const API_KEY = __ENV.API_KEY || 'sk_test_default';
+const API_KEY = __ENV.API_KEY || 'sp_test_default';
 const SCENARIO = __ENV.SCENARIO || 'smoke';
 
 // Custom metrics

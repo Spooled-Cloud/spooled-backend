@@ -55,7 +55,7 @@ For any external service, use the custom webhook endpoint.
 
 ```bash
 curl https://api.spooled.cloud/api/v1/organizations/webhook-token \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY"
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY"
 ```
 
 Response:
@@ -111,11 +111,11 @@ Response:
 ```bash
 # Regenerate token (invalidates old one)
 curl -X POST https://api.spooled.cloud/api/v1/organizations/webhook-token/regenerate \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY"
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY"
 
 # Clear token (NOT recommended for production)
 curl -X POST https://api.spooled.cloud/api/v1/organizations/webhook-token/clear \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -d '{"confirm": true}'
 ```
 
@@ -143,7 +143,7 @@ Get notified when a specific job completes:
 
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/jobs \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -d '{
     "queue_name": "exports",
     "payload": {"user_id": 123},
@@ -170,7 +170,7 @@ Subscribe to events for all jobs:
 
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/outgoing-webhooks \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -d '{
     "name": "Job Notifications",
     "url": "https://api.example.com/webhooks/spooled",
@@ -184,11 +184,11 @@ You can inspect deliveries and retry individual delivery attempts:
 ```bash
 # List delivery history
 curl https://api.spooled.cloud/api/v1/outgoing-webhooks/{id}/deliveries \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY"
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY"
 
 # Retry a specific delivery
 curl -X POST https://api.spooled.cloud/api/v1/outgoing-webhooks/{id}/retry/{delivery_id} \
-  -H "Authorization: Bearer sk_live_YOUR_API_KEY"
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY"
 ```
 
 ### Event Types

@@ -351,7 +351,7 @@ grpcurl -plaintext localhost:50051 list
 
 # Enqueue a job
 grpcurl -plaintext \
-  -H "x-api-key: sk_live_your_key" \
+  -H "x-api-key: sp_live_your_key" \
   -d '{
     "queue_name": "emails",
     "payload": {"to": "user@example.com"},
@@ -362,13 +362,13 @@ grpcurl -plaintext \
 
 # Dequeue jobs
 grpcurl -plaintext \
-  -H "x-api-key: sk_live_your_key" \
+  -H "x-api-key: sp_live_your_key" \
   -d '{"queue_name": "emails", "worker_id": "worker-1", "batch_size": 10}' \
   localhost:50051 spooled.v1.QueueService/Dequeue
 
 # Stream jobs (server streaming)
 grpcurl -plaintext \
-  -H "x-api-key: sk_live_your_key" \
+  -H "x-api-key: sp_live_your_key" \
   -d '{"queue_name": "emails", "worker_id": "worker-1", "lease_duration_secs": 300}' \
   localhost:50051 spooled.v1.QueueService/StreamJobs
 ```
