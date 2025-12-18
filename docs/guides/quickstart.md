@@ -213,7 +213,7 @@ Response:
 
 ## SDK Examples
 
-> **Note**: SDKs are under active development. For production use today, use the cURL/HTTP API examples above.
+> **All SDKs are production-ready!** Node.js, Python, Go, and PHP SDKs are fully featured with comprehensive test coverage.
 
 ### Node.js
 
@@ -288,22 +288,24 @@ import (
     "log"
     "os"
     
-    "github.com/spooled-cloud/spooled-go"
+    "github.com/spooled-cloud/spooled-sdk-go/spooled"
+    "github.com/spooled-cloud/spooled-sdk-go/spooled/resources"
 )
 
 func main() {
-    client := spooled.NewClient(os.Getenv("SPOOLED_API_KEY"))
-    // For self-hosted: client.SetBaseURL("http://localhost:8080")
+    client, _ := spooled.NewClient(spooled.WithAPIKey(os.Getenv("SPOOLED_API_KEY")))
+    // For self-hosted: spooled.WithBaseURL("http://localhost:8080")
+    defer client.Close()
     
-    job, err := client.Jobs.Enqueue(context.Background(), &spooled.EnqueueParams{
-        Queue: "webhook-delivery",
+    job, err := client.Jobs().Create(context.Background(), &resources.CreateJobRequest{
+        QueueName: "webhook-delivery",
         Payload: map[string]interface{}{
             "url":     "https://customer.example.com/webhook",
             "event":   "order.completed",
             "payload": orderData,
         },
-        IdempotencyKey: "order-webhook-" + orderId,
-        MaxRetries:     5,
+        IdempotencyKey: stringPtr("order-webhook-" + orderId),
+        MaxRetries:     intPtr(5),
     })
     
     if err != nil {
@@ -312,6 +314,38 @@ func main() {
     
     log.Printf("Queued job: %s", job.ID)
 }
+```
+
+### PHP
+
+```bash
+composer require spooled-cloud/spooled
+```
+
+```php
+<?php
+
+use Spooled\SpooledClient;
+use Spooled\Config\ClientOptions;
+
+$client = new SpooledClient(new ClientOptions(
+    apiKey: getenv('SPOOLED_API_KEY'),
+    // For self-hosted: baseUrl: 'http://localhost:8080'
+));
+
+// Create a job
+$job = $client->jobs->create([
+    'queue' => 'email-notifications',
+    'payload' => [
+        'to' => 'user@example.com',
+        'subject' => 'Welcome!',
+        'template' => 'welcome',
+    ],
+    'idempotencyKey' => "welcome-{$userId}",
+    'maxRetries' => 5,
+]);
+
+echo "Queued job: {$job->id}\n";
 ```
 
 ---
@@ -368,6 +402,43 @@ async def process_image(job):
     await job.complete(result={"output_url": result.url})
     
 worker.run()
+```
+
+### PHP Worker
+
+```php
+<?php
+
+use Spooled\SpooledClient;
+use Spooled\Config\ClientOptions;
+use Spooled\Worker\SpooledWorker;
+use Spooled\Worker\WorkerConfig;
+use Spooled\Worker\JobContext;
+
+$client = new SpooledClient(new ClientOptions(
+    apiKey: getenv('SPOOLED_API_KEY'),
+));
+
+$worker = new SpooledWorker($client, new WorkerConfig(
+    queueName: 'image-processing',
+    concurrency: 10,
+));
+
+$worker->process(function (JobContext $ctx): array {
+    $imageUrl = $ctx->get('image_url');
+    $operations = $ctx->get('operations');
+    
+    // Process the image
+    $result = runImagePipeline($imageUrl, $operations);
+    
+    return ['output_url' => $result->url];
+});
+
+// Graceful shutdown
+pcntl_signal(SIGTERM, fn() => $worker->stop());
+pcntl_signal(SIGINT, fn() => $worker->stop());
+
+$worker->start();
 ```
 
 ### Simple Polling Worker (cURL/Bash)

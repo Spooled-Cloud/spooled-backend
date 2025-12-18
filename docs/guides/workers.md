@@ -203,6 +203,51 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 main();
 ```
 
+### PHP Worker
+
+```php
+<?php
+
+use Spooled\SpooledClient;
+use Spooled\Config\ClientOptions;
+use Spooled\Worker\SpooledWorker;
+use Spooled\Worker\WorkerConfig;
+use Spooled\Worker\JobContext;
+
+$client = new SpooledClient(new ClientOptions(
+    apiKey: getenv('SPOOLED_API_KEY'),
+));
+
+$worker = new SpooledWorker($client, new WorkerConfig(
+    queueName: 'emails',
+    concurrency: 10,
+    pollIntervalMs: 1000,
+));
+
+$worker->process(function (JobContext $ctx): array {
+    echo "Processing {$ctx->job->id}\n";
+    
+    $result = doWork($ctx->payload);
+    
+    echo "✓ Completed {$ctx->job->id}\n";
+    return $result;
+});
+
+$worker->on('error', function (\Throwable $e, ?JobContext $ctx): void {
+    if ($ctx) {
+        echo "✗ Failed {$ctx->job->id}: {$e->getMessage()}\n";
+    } else {
+        echo "Worker error: {$e->getMessage()}\n";
+    }
+});
+
+// Graceful shutdown
+pcntl_signal(SIGTERM, fn() => $worker->stop());
+pcntl_signal(SIGINT, fn() => $worker->stop());
+
+$worker->start();
+```
+
 ---
 
 ## Worker Registration
@@ -627,3 +672,4 @@ def process_job(job):
 - [Retries Guide](./retries.md) — Retry configuration
 - [gRPC Guide](./grpc-server.md) — High-performance gRPC API
 - [API Reference](./api-usage.md) — Complete API documentation
+

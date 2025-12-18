@@ -563,7 +563,7 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317 ./target/release/spooled-backend
 ### Reference
 - [API Usage Guide](docs/guides/api-usage.md) — Complete REST API reference
 - [gRPC Server Guide](docs/guides/grpc-server.md) — High-performance gRPC API
-- [SDKs](docs/guides/sdks.md) — Node.js, Python, Go SDKs
+- [SDKs](docs/guides/sdks.md) — Node.js, Python, Go, PHP SDKs
 - [OpenAPI Spec](docs/openapi.yaml) — OpenAPI 3.1 specification
 
 ### Operations

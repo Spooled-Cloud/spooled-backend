@@ -373,9 +373,10 @@ For continuous job processing, prefer:
 
 The gRPC API is supported by the official SDKs:
 
-- **Node.js SDK** (`spooled-sdk-nodejs`): Full gRPC support with `@grpc/grpc-js`
-- **Python SDK** (`spooled-sdk-python`): Full gRPC support with `grpcio`
+- **Node.js SDK** (`@spooled/sdk`): Full gRPC support with `@grpc/grpc-js`
+- **Python SDK** (`spooled`): Full gRPC support with `grpcio`
 - **Go SDK** (`spooled-sdk-go`): Production ready - [Documentation](https://pkg.go.dev/github.com/spooled-cloud/spooled-sdk-go)
+- **PHP SDK** (`spooled-cloud/spooled`): Full gRPC support with `ext-grpc`
 
 ### Node.js SDK Example
 

@@ -8,9 +8,10 @@ Official SDKs for integrating with Spooled Cloud.
 2. [Node.js SDK](#nodejs-sdk)
 3. [Python SDK](#python-sdk)
 4. [Go SDK](#go-sdk)
-5. [REST API](#rest-api)
-6. [gRPC API](#grpc-api)
-7. [Community SDKs](#community-sdks)
+5. [PHP SDK](#php-sdk)
+6. [REST API](#rest-api)
+7. [gRPC API](#grpc-api)
+8. [Community SDKs](#community-sdks)
 
 ---
 
@@ -23,6 +24,7 @@ Spooled provides official SDKs for popular languages, plus REST and gRPC APIs fo
 | **Node.js** | ✅ Production Ready | `@spooled/sdk` |
 | **Python** | ✅ Production Ready | `spooled` |
 | **Go** | ✅ Production Ready | `github.com/spooled-cloud/spooled-sdk-go` |
+| **PHP** | ✅ Production Ready | `spooled-cloud/spooled` |
 | **REST API** | ✅ Stable | Any HTTP client |
 | **gRPC API** | ✅ Stable | Any gRPC client |
 
@@ -428,6 +430,201 @@ func main() {
 
 ---
 
+## PHP SDK
+
+The PHP SDK provides a fully-featured client with PHP 8.2+ support, readonly DTOs, worker runtime, optional gRPC, and comprehensive error handling.
+
+### Installation
+
+```bash
+composer require spooled-cloud/spooled
+
+# With gRPC support (optional)
+pecl install grpc protobuf
+composer require grpc/grpc google/protobuf
+```
+
+### Quick Start
+
+```php
+<?php
+
+use Spooled\SpooledClient;
+use Spooled\Config\ClientOptions;
+
+// Initialize client
+$client = new SpooledClient(new ClientOptions(
+    apiKey: getenv('SPOOLED_API_KEY'),
+    // baseUrl: 'http://localhost:8080'  // For self-hosted
+));
+
+// Create a job
+$job = $client->jobs->create([
+    'queue' => 'emails',
+    'payload' => [
+        'to' => 'user@example.com',
+        'subject' => 'Welcome!',
+        'template' => 'welcome',
+    ],
+    'idempotencyKey' => "welcome-{$userId}",
+    'maxRetries' => 5,
+]);
+
+echo "Queued job: {$job->id}\n";
+```
+
+### Client API
+
+```php
+<?php
+
+// Jobs
+$job = $client->jobs->create(['queue' => $queueName, 'payload' => $payload]);
+$job = $client->jobs->get($jobId);
+$jobs = $client->jobs->list(['queue' => $queueName, 'status' => 'pending', 'limit' => 50]);
+$client->jobs->cancel($jobId);
+$client->jobs->retry($jobId);
+
+// Bulk operations
+$result = $client->jobs->bulkEnqueue([
+    'queue' => 'emails',
+    'jobs' => [
+        ['payload' => ['id' => 1]],
+        ['payload' => ['id' => 2]],
+    ],
+]);
+
+// Queues
+$queues = $client->queues->list();
+$stats = $client->queues->getStats($queueName);
+$client->queues->pause($queueName);
+$client->queues->resume($queueName);
+
+// Schedules
+$schedule = $client->schedules->create([
+    'name' => 'Daily Report',
+    'cronExpression' => '0 9 * * *',
+    'timezone' => 'America/New_York',
+    'queue' => 'reports',
+    'payloadTemplate' => ['type' => 'daily'],
+]);
+$client->schedules->trigger($scheduleId);
+
+// Workflows
+$workflow = $client->workflows->create([
+    'name' => 'user-onboarding',
+    'jobs' => [
+        ['key' => 'create-account', 'queue' => 'users', 'payload' => ['email' => 'user@example.com']],
+        ['key' => 'send-email', 'queue' => 'emails', 'dependsOn' => ['create-account'], 'payload' => ['template' => 'welcome']],
+    ],
+]);
+```
+
+### Worker
+
+```php
+<?php
+
+use Spooled\SpooledClient;
+use Spooled\Config\ClientOptions;
+use Spooled\Worker\SpooledWorker;
+use Spooled\Worker\WorkerConfig;
+use Spooled\Worker\JobContext;
+
+$client = new SpooledClient(new ClientOptions(
+    apiKey: getenv('SPOOLED_API_KEY'),
+));
+
+$worker = new SpooledWorker($client, new WorkerConfig(
+    queueName: 'emails',
+    concurrency: 10,
+));
+
+$worker->process(function (JobContext $ctx): array {
+    $to = $ctx->get('to');
+    $subject = $ctx->get('subject');
+    
+    try {
+        sendEmail($to, $subject);
+        return ['sent' => true];
+    } catch (\Exception $e) {
+        throw $e; // Will retry
+    }
+});
+
+// Handle graceful shutdown
+pcntl_signal(SIGTERM, fn() => $worker->stop());
+pcntl_signal(SIGINT, fn() => $worker->stop());
+
+$worker->start();
+```
+
+### gRPC Client (High Throughput)
+
+```php
+<?php
+
+use Spooled\SpooledClient;
+use Spooled\Config\ClientOptions;
+
+$client = new SpooledClient(new ClientOptions(
+    apiKey: getenv('SPOOLED_API_KEY'),
+    grpcAddress: 'grpc.spooled.cloud:443', // or 'localhost:50051' for self-hosted
+));
+
+// Get gRPC client
+$grpc = $client->grpc();
+
+// Enqueue via gRPC
+$job = $grpc->queue->enqueue([
+    'queueName' => 'emails',
+    'payload' => ['to' => 'user@example.com'],
+]);
+
+// Register worker
+$worker = $grpc->workers->register([
+    'queueName' => 'emails',
+    'hostname' => gethostname(),
+    'maxConcurrency' => 10,
+]);
+
+// Dequeue and process
+$result = $grpc->queue->dequeue([
+    'queueName' => 'emails',
+    'workerId' => $worker['workerId'],
+    'batchSize' => 10,
+]);
+
+foreach ($result['jobs'] ?? [] as $job) {
+    // Process job...
+    $grpc->queue->complete([
+        'jobId' => $job['id'],
+        'workerId' => $worker['workerId'],
+        'result' => ['success' => true],
+    ]);
+}
+```
+
+### Features
+
+- **PHP 8.2+** - Modern PHP with readonly properties and type hints
+- **PSR-Compliant** - Works with any PSR-compatible HTTP client and logger
+- **Worker Runtime** - Built-in job processing with concurrency control and graceful shutdown
+- **gRPC Support** - Optional high-performance gRPC client (requires ext-grpc)
+- **Real-time Events** - WebSocket and SSE support
+- **Resilience** - Retry logic with exponential backoff and circuit breaker
+- **Framework Agnostic** - Works with Laravel, Symfony, or vanilla PHP
+- **Webhook Ingestion** - Validate GitHub, Stripe, and custom webhooks
+
+### Documentation
+
+- [GitHub Repository](https://github.com/spooled-cloud/spooled-sdk-php)
+- [Packagist Package](https://packagist.org/packages/spooled-cloud/spooled)
+- [Full Documentation](https://github.com/spooled-cloud/spooled-sdk-php/tree/main/docs)
+- [Code Examples](https://github.com/spooled-cloud/spooled-sdk-php/tree/main/examples)
+
+---
+
 ## REST API
 
 For languages without an official SDK, use the REST API directly.
@@ -564,22 +761,24 @@ Community-maintained SDKs (not officially supported):
 | Language | Package | Maintainer |
 |----------|---------|------------|
 | Ruby | `spooled-ruby` | Community |
-| PHP | `spooled-php` | Community |
 | Java | `spooled-java` | Community |
 | Rust | `spooled-rs` | Community |
+| .NET | `Spooled.NET` | Community |
 
 ---
 
 ## SDK Features Comparison
 
-| Feature | Node.js | Python | Go | REST | gRPC |
-|---------|---------|--------|-----|------|------|
-| Enqueue jobs | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Bulk enqueue | ✅ | ✅ | ✅ | ✅ | ❌ |
-| Worker class | ✅ | ✅ | ✅ | DIY | DIY |
-| gRPC streaming | ✅ | ✅ | ✅ | ❌ | ✅ |
-| Auto retry | ✅ | ✅ | ✅ | DIY | DIY |
-| Type safety | ✅ | ✅ | ✅ | ❌ | ✅ |
+| Feature | Node.js | Python | Go | PHP | REST | gRPC |
+|---------|---------|--------|-----|-----|------|------|
+| Enqueue jobs | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Bulk enqueue | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Worker class | ✅ | ✅ | ✅ | ✅ | DIY | DIY |
+| gRPC streaming | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
+| Auto retry | ✅ | ✅ | ✅ | ✅ | DIY | DIY |
+| Type safety | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
+| Circuit breaker | ✅ | ✅ | ✅ | ✅ | DIY | DIY |
+| Realtime (WS/SSE) | ✅ | ✅ | ✅ | ✅ | DIY | DIY |
 
 ---
 

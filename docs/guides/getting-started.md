@@ -721,7 +721,7 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs/job_xxx/retry \
 1. **Read the [API Reference](../openapi.yaml)** for all endpoints
 2. **Check the [Architecture Guide](./architecture.md)** to understand the system
 3. **Set up Grafana** to monitor your queues (included in docker-compose)
-4. **Use the SDKs** (Node.js, Python, Go) for the best developer experience
+4. **Use the SDKs** (Node.js, Python, Go, PHP) for the best developer experience
 
 ---
 

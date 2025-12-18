@@ -470,7 +470,7 @@ async fn process_job(
 /// **IMPORTANT**: This built-in worker is primarily for development and testing.
 /// In production deployments, jobs should be processed by external workers that:
 /// 1. Connect via the gRPC API (`RegisterWorker`, `DequeueJobs`, `CompleteJob`)
-/// 2. Use one of the official SDKs (Node.js, Python, Go)
+/// 2. Use one of the official SDKs (Node.js, Python, Go, PHP)
 /// 3. Implement their own business logic for each job type
 ///
 /// The Spooled backend is a **job queue**, not a job executor. It manages:
