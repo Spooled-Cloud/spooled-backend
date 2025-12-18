@@ -37,7 +37,7 @@ The easiest way to get started is with the managed service at [spooled.cloud](ht
 - ✓ Automatic scaling and updates
 - ✓ Built-in monitoring and alerting
 - ✓ 99.9% SLA (Pro and Enterprise plans)
-- ✓ SOC 2 Type II compliance
+- ✓ Security-focused architecture and operational monitoring
 
 **Getting Started:**
 1. Sign up at https://spooled.cloud/signup
