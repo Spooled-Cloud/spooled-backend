@@ -219,7 +219,7 @@ curl -X POST http://localhost:8080/api/v1/schedules \
   -H "Content-Type: application/json" \
   -d '{
     "name": "daily-sales-report",
-    "cron_expression": "0 9 * * *",
+    "cron_expression": "0 0 9 * * *",
     "timezone": "America/New_York",
     "queue_name": "reports",
     "payload_template": {"report_type": "daily_sales"}
@@ -553,6 +553,7 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317 ./target/release/spooled-backend
 ### Getting Started
 - [Quick Start Guide](docs/guides/quickstart.md) — Get running in 5 minutes
 - [Getting Started (Laravel users)](docs/guides/getting-started.md) — Familiar concepts for Laravel developers
+- [Real-world examples](docs/guides/real-world-examples.md) — 5 beginner-friendly examples you can copy/paste
 
 ### Core Concepts
 - [Jobs & Queues](docs/guides/jobs.md) — Job lifecycle, creation, and processing
