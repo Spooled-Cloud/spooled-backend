@@ -335,4 +335,3 @@ COMMENT ON TABLE jobs IS 'Core queue table with aggressive autovacuum tuning for
 INSERT INTO organizations (id, name, slug, plan_tier)
 VALUES ('default-org', 'Default Organization', 'default', 'free')
 ON CONFLICT (id) DO NOTHING;
-

@@ -203,4 +203,3 @@ $$;
 
 COMMENT ON FUNCTION archive_completed_jobs IS 'Archive completed jobs older than N days to archive table';
 COMMENT ON PROCEDURE cleanup_expired_jobs IS 'Delete pending/scheduled jobs past their expiration';
-

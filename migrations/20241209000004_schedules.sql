@@ -148,4 +148,3 @@ CREATE TRIGGER update_schedules_updated_at
 COMMENT ON TABLE schedules IS 'Cron-based recurring job schedules';
 COMMENT ON TABLE schedule_runs IS 'History of schedule executions';
 COMMENT ON FUNCTION process_due_schedules() IS 'Process all schedules that are due for execution';
-

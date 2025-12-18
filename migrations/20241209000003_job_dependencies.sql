@@ -178,4 +178,3 @@ CREATE TRIGGER trigger_update_workflow_progress
 COMMENT ON TABLE job_dependencies IS 'Stores job dependency relationships for workflow support';
 COMMENT ON TABLE workflows IS 'Stores workflow definitions and progress tracking';
 COMMENT ON FUNCTION check_job_dependencies_met IS 'Checks if all/any dependencies are met for a job';
-

@@ -579,4 +579,3 @@ const client = new SpooledClient({
 - [Jobs Guide](./jobs.md) — Job creation and processing
 - [Workers Guide](./workers.md) — Building production workers
 - [API Reference](./api-usage.md) — Complete API documentation
-
