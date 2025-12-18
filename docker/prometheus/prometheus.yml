@@ -13,11 +13,11 @@ global:
 rule_files:
   - 'spooled-rules.yml'
 
-# Alertmanager configuration (uncomment for production)
-# alerting:
-#   alertmanagers:
-#     - static_configs:
-#         - targets: ['alertmanager:9093']
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
 
 scrape_configs:
   # Spooled Backend metrics

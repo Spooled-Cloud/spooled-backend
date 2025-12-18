@@ -1,0 +1,123 @@
+# Spooled Backend - Alertmanager Configuration
+#
+# Configure notification channels for alerts.
+# Replace placeholder values with your actual credentials.
+
+global:
+  # How long to wait before sending a notification again if it has already
+  # been sent successfully for an alert.
+  resolve_timeout: 5m
+
+  # SMTP settings for email notifications (uncomment and configure)
+  # smtp_smarthost: 'smtp.gmail.com:587'
+  # smtp_from: 'alerts@yourdomain.com'
+  # smtp_auth_username: 'alerts@yourdomain.com'
+  # smtp_auth_password: 'your-app-password'
+
+  # Slack settings (uncomment and configure)
+  # slack_api_url: 'https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK'
+
+# Route tree - defines how alerts are routed to receivers
+route:
+  # Default receiver
+  receiver: 'default-receiver'
+  
+  # How long to initially wait to send a notification for a group of alerts
+  group_wait: 30s
+  
+  # How long to wait before sending notifications about new alerts
+  # that are added to a group of alerts for which an initial notification
+  # has already been sent
+  group_interval: 5m
+  
+  # How long to wait before sending a notification again if it has already
+  # been sent successfully for an alert
+  repeat_interval: 4h
+  
+  # Group alerts by these labels
+  group_by: ['alertname', 'severity']
+
+  # Child routes for different severities
+  routes:
+    # Critical alerts - notify immediately
+    - match:
+        severity: critical
+      receiver: 'critical-alerts'
+      group_wait: 10s
+      repeat_interval: 1h
+
+    # Warning alerts - batch notifications
+    - match:
+        severity: warning
+      receiver: 'warning-alerts'
+      group_wait: 1m
+      repeat_interval: 4h
+
+# Inhibition rules - suppress less severe alerts when more severe ones exist
+inhibit_rules:
+  # If a critical alert is firing, suppress related warnings
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['alertname']
+
+# Receivers define notification channels
+receivers:
+  # Default receiver - logs to console (for development)
+  - name: 'default-receiver'
+    webhook_configs:
+      - url: 'http://localhost:9999/webhook'  # Placeholder - configure a real receiver (this will error until you do)
+        send_resolved: true
+
+  # Critical alerts - configure for your notification system
+  - name: 'critical-alerts'
+    # Email notifications (uncomment and configure)
+    # email_configs:
+    #   - to: 'oncall@yourdomain.com'
+    #     send_resolved: true
+    #     headers:
+    #       Subject: '[CRITICAL] {{ .GroupLabels.alertname }}'
+
+    # Slack notifications (uncomment and configure)
+    # slack_configs:
+    #   - channel: '#alerts-critical'
+    #     send_resolved: true
+    #     title: '{{ if eq .Status "firing" }}🚨{{ else }}✅{{ end }} {{ .GroupLabels.alertname }}'
+    #     text: >-
+    #       {{ range .Alerts }}
+    #       *Alert:* {{ .Annotations.summary }}
+    #       *Description:* {{ .Annotations.description }}
+    #       *Severity:* {{ .Labels.severity }}
+    #       {{ end }}
+
+    # PagerDuty (uncomment and configure)
+    # pagerduty_configs:
+    #   - service_key: 'your-pagerduty-service-key'
+    #     send_resolved: true
+
+    # Webhook (generic HTTP endpoint)
+    webhook_configs:
+      - url: 'http://localhost:9999/critical'  # Placeholder - configure a real receiver (this will error until you do)
+        send_resolved: true
+
+  # Warning alerts - lower urgency notifications
+  - name: 'warning-alerts'
+    # Slack notifications (uncomment and configure)
+    # slack_configs:
+    #   - channel: '#alerts-warning'
+    #     send_resolved: true
+    #     title: '{{ if eq .Status "firing" }}⚠️{{ else }}✅{{ end }} {{ .GroupLabels.alertname }}'
+    #     text: >-
+    #       {{ range .Alerts }}
+    #       *Alert:* {{ .Annotations.summary }}
+    #       *Description:* {{ .Annotations.description }}
+    #       {{ end }}
+
+    webhook_configs:
+      - url: 'http://localhost:9999/warning'  # Placeholder - configure a real receiver (this will error until you do)
+        send_resolved: true
+
+# Templates for notification formatting
+templates: []
+

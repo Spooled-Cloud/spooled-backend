@@ -245,6 +245,70 @@ Panels include:
 - Database connections
 - Error rates
 
+### Alertmanager Configuration
+
+Alertmanager handles alert routing and notifications. Configuration: `docker/alertmanager/alertmanager.yml`
+
+#### Alert Severity Levels
+
+| Severity | Response Time | Notification Channel | Repeat Interval |
+|----------|---------------|---------------------|-----------------|
+| Critical | Immediate (10s group wait) | PagerDuty/SMS/Phone | 1 hour |
+| Warning | 30 seconds | Slack/Email | 4 hours |
+
+#### Critical Alerts (Page-Worthy)
+
+These alerts require immediate attention:
+
+| Alert | Condition | Action |
+|-------|-----------|--------|
+| `NoHealthyWorkers` | No workers reporting healthy | Check worker processes, network, deployments |
+| `DatabaseConnectionsCritical` | > 95 connections in use | Scale pool, investigate connection leaks |
+| `CriticalJobFailureRate` | > 25% job failure rate | Check job handlers, payloads, downstream services |
+| `JobQueueBacklogCritical` | Oldest job > 15 min | Scale workers, check processing bottlenecks |
+| `CriticalAPILatency` | p99 > 5 seconds | Check database, reduce load, scale |
+| `RedisUnavailable` | No Redis ops for 2 min | Check Redis connectivity (workers fallback to polling) |
+| `AllWorkersDegraded` | Workers active but unhealthy | Check network, heartbeat issues |
+
+#### Warning Alerts (Non-Urgent)
+
+These alerts indicate issues that need attention but aren't emergencies:
+
+| Alert | Condition | Action |
+|-------|-----------|--------|
+| `JobQueueBacklog` | Oldest job > 5 min | Monitor, consider scaling |
+| `HighJobFailureRate` | > 10% job failure rate | Investigate failing jobs |
+| `JobsDeadlettered` | > 5 DLQ jobs in 15 min | Check DLQ, investigate patterns |
+| `HighAPILatency` | p99 > 1 second | Monitor, optimize queries |
+| `WorkerCountDrop` | > 50% workers lost | Check deployments, scaling events |
+| `JobAccumulationRate` | Enqueue > completion rate | Plan capacity increase |
+
+#### Setting Up Notifications
+
+1. **Email**: Uncomment `email_configs` and configure SMTP in `alertmanager.yml`
+2. **Slack**: Add Slack webhook URL to `slack_api_url` and configure `slack_configs`
+3. **PagerDuty**: Add service key to `pagerduty_configs` for critical alerts
+
+Example Slack configuration:
+
+```yaml
+receivers:
+  - name: 'critical-alerts'
+    slack_configs:
+      - channel: '#alerts-critical'
+        api_url: 'https://hooks.slack.com/services/YOUR/WEBHOOK/URL'
+        send_resolved: true
+        title: '{{ if eq .Status "firing" }}🚨{{ else }}✅{{ end }} {{ .GroupLabels.alertname }}'
+```
+
+#### Testing Alerts
+
+Run the alert testing script to verify alerts fire correctly:
+
+```bash
+./loadtest/test-alerts.sh
+```
+
 ---
 
 ## Security Configuration
