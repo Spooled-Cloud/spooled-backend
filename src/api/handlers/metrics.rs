@@ -4,7 +4,7 @@
 
 use axum::{
     extract::State,
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
 };
 use prometheus::{Encoder, TextEncoder};
@@ -14,15 +14,67 @@ use crate::api::AppState;
 /// Maximum metrics response size (to prevent memory issues)
 const MAX_METRICS_SIZE: usize = 10 * 1024 * 1024; // 10MB
 
+/// Constant-time string comparison to prevent timing attacks
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    use subtle::ConstantTimeEq;
+
+    // If lengths differ, pad to prevent length-based timing leaks
+    let max_len = a.len().max(b.len());
+    let a_bytes: Vec<u8> = a
+        .bytes()
+        .chain(std::iter::repeat(0u8))
+        .take(max_len)
+        .collect();
+    let b_bytes: Vec<u8> = b
+        .bytes()
+        .chain(std::iter::repeat(0u8))
+        .take(max_len)
+        .collect();
+
+    // Constant-time comparison
+    let bytes_eq: bool = a_bytes.ct_eq(&b_bytes).into();
+
+    // Length must also match
+    a.len() == b.len() && bytes_eq
+}
+
 /// Prometheus metrics endpoint
 ///
 /// Returns metrics in Prometheus text format for scraping.
 ///
-/// This endpoint is protected by the main API rate limiter
-/// when accessed through /api/v1/metrics. The dedicated metrics server
-/// on the metrics port has its own rate limiter (see observability/mod.rs).
+/// This endpoint requires authentication via METRICS_TOKEN if set.
+/// The dedicated metrics server on the metrics port has its own rate limiter
+/// (see observability/mod.rs).
 ///
-pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn prometheus_metrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    // Validate metrics access token if configured
+    if let Some(ref expected_token) = state.settings.server.metrics_token {
+        let auth_header = headers.get("Authorization").and_then(|v| v.to_str().ok());
+
+        match auth_header {
+            Some(auth) if auth.starts_with("Bearer ") => {
+                let provided_token = &auth[7..];
+                // Use constant-time comparison to prevent timing attacks
+                if !constant_time_eq(provided_token, expected_token) {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        "Invalid metrics token".to_string(),
+                    )
+                        .into_response();
+                }
+            }
+            _ => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    "Metrics endpoint requires Authorization: Bearer <token>".to_string(),
+                )
+                    .into_response();
+            }
+        }
+    }
     let encoder = TextEncoder::new();
     let metric_families = state.metrics.gather();
 

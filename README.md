@@ -577,7 +577,7 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317 ./target/release/spooled-backend
 ┌─────────────────────────────────────────────────────────────┐
 │                     SPOOLED BACKEND                         │
 ├─────────────────────────────────────────────────────────────┤
-│  REST API (Axum)  │  gRPC (Tonic)  │  WebSocket/SSE        │
+│  REST API (Axum)  │  gRPC (Tonic)  │  WebSocket/SSE         │
 ├─────────────────────────────────────────────────────────────┤
 │              Queue Manager (FOR UPDATE SKIP LOCKED)         │
 │              Worker Coordination & Heartbeat                │

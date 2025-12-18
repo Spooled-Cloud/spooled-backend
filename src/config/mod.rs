@@ -78,6 +78,9 @@ pub struct ServerSettings {
     pub environment: Environment,
     /// External URL for this server (used in webhook URLs, etc.)
     pub external_url: Option<String>,
+    /// Optional token for metrics endpoint authentication
+    /// When set, /metrics endpoint requires Authorization: Bearer <token>
+    pub metrics_token: Option<String>,
 }
 
 /// Environment type
@@ -256,6 +259,7 @@ impl Settings {
                     .parse()
                     .context("Invalid GRPC_PORT")?,
                 external_url: env::var("EXTERNAL_URL").ok(),
+                metrics_token: env::var("METRICS_TOKEN").ok(),
                 environment: match env::var("RUST_ENV")
                     .unwrap_or_else(|_| "development".to_string())
                     .as_str()
@@ -536,6 +540,7 @@ impl Settings {
                 grpc_port: 50051,
                 environment: Environment::Development,
                 external_url: None,
+                metrics_token: None,
             },
             database: DatabaseSettings {
                 url: "postgres://test:test@localhost:5432/test".to_string(),
