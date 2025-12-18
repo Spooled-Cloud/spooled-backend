@@ -93,7 +93,7 @@ async fn main() -> Result<()> {
     // Start metrics server on separate port
     // Pass optional metrics token for authentication
     let metrics_addr = SocketAddr::new(settings.server.host.parse()?, settings.server.metrics_port);
-    let metrics_token = std::env::var("METRICS_TOKEN").ok();
+    let metrics_token = settings.server.metrics_token.clone();
     let metrics_server = observability::start_metrics_server(
         metrics_addr,
         state.metrics.clone(),
