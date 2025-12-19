@@ -315,7 +315,7 @@ If you see `launchd` using the port, use `GRPC_PORT=50052` instead.
 **Symptom**: `Unauthenticated: Missing x-api-key or authorization header`
 
 **Solutions**:
-1. Include the API key header: `-H "x-api-key: sk_live_..."`
+1. Include the API key header: `-H "x-api-key: sp_live_..."` (or legacy `sk_live_...`)
 2. Or use JWT token: `-H "Authorization: Bearer <token>"`
 3. Verify the API key is valid and not expired
 4. Check the organization has the correct permissions

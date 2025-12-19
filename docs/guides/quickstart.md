@@ -797,7 +797,7 @@ kill -9 <PID>
 
 ### "Invalid API Key"
 
-- Verify the key starts with `sk_live_` or `sk_test_` (production keys)
+- Verify the key starts with `sp_live_` or `sp_test_` (new keys) or `sk_live_`/`sk_test_` (legacy keys)
 - Check the key hasn't been revoked
 - Ensure you're using the correct organization's key
 - Check key hasn't expired (if expiration was set)
