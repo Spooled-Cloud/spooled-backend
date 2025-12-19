@@ -464,6 +464,7 @@ impl Scheduler {
     /// during parent completion (e.g., race conditions, server restarts)
     async fn update_job_dependencies(&self) -> Result<()> {
         // Find jobs with dependencies_met = FALSE whose parent jobs are completed
+        // SECURITY: Include organization_id filter to ensure cross-tenant isolation
         let result = sqlx::query(
             r#"
             UPDATE jobs child
@@ -477,6 +478,7 @@ impl Scheduler {
                 AND EXISTS (
                     SELECT 1 FROM jobs parent
                     WHERE parent.id = child.parent_job_id
+                      AND parent.organization_id = child.organization_id
                       AND parent.status = 'completed'
                 )
             "#,
@@ -494,6 +496,7 @@ impl Scheduler {
 
         // Also handle jobs where parent failed/deadlettered - these should be cancelled
         // or marked as blocked (policy decision - here we cancel them)
+        // SECURITY: Include organization_id filter to ensure cross-tenant isolation
         let failed_parent_result = sqlx::query(
             r#"
             UPDATE jobs child
@@ -508,6 +511,7 @@ impl Scheduler {
                 AND EXISTS (
                     SELECT 1 FROM jobs parent
                     WHERE parent.id = child.parent_job_id
+                      AND parent.organization_id = child.organization_id
                       AND parent.status IN ('failed', 'deadletter', 'cancelled')
                 )
             "#,

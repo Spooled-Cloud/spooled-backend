@@ -489,8 +489,10 @@ impl QueueManager {
                   AND NOT EXISTS (
                       -- Check if there are any other incomplete parent jobs
                       -- For now, we only support single-parent dependencies via parent_job_id
+                      -- SECURITY: Include organization_id in subquery for cross-tenant isolation
                       SELECT 1 FROM jobs parent
                       WHERE parent.id = jobs.parent_job_id
+                        AND parent.organization_id = $2
                         AND parent.status NOT IN ('completed')
                   )
                 "#,
@@ -501,6 +503,7 @@ impl QueueManager {
             .await?
         } else {
             // Fallback for internal calls without org context (backward compat)
+            // Uses self-join on organization_id for cross-tenant isolation
             sqlx::query(
                 r#"
                 UPDATE jobs
@@ -513,6 +516,7 @@ impl QueueManager {
                   AND NOT EXISTS (
                       SELECT 1 FROM jobs parent
                       WHERE parent.id = jobs.parent_job_id
+                        AND parent.organization_id = jobs.organization_id
                         AND parent.status NOT IN ('completed')
                   )
                 "#,
