@@ -2412,11 +2412,18 @@ paths:
     post:
       tags: [Outgoing Webhooks]
       summary: Retry webhook delivery
-      description: Trigger a retry for a specific outgoing webhook delivery attempt
+      description: |
+        Trigger a retry for a specific outgoing webhook delivery attempt.
+        
+        **Limitations:**
+        - Cannot retry successful deliveries (returns 400)
+        - Maximum 10 manual retry attempts per delivery (returns 400 when exceeded)
       operationId: retryOutgoingWebhookDelivery
       responses:
         '200':
           description: Retry initiated
+        '400':
+          description: Bad request (delivery already successful or max retries exceeded)
           content:
             application/json:
               schema:

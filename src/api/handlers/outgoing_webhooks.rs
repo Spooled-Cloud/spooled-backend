@@ -466,9 +466,16 @@ pub struct RetryDeliveryResponse {
     pub message: String,
 }
 
+/// Maximum manual retry attempts allowed per delivery
+const MAX_MANUAL_RETRY_ATTEMPTS: i32 = 10;
+
 /// Retry a specific webhook delivery
 ///
 /// POST /api/v1/outgoing-webhooks/{id}/retry/{delivery_id}
+///
+/// SECURITY: Now enforces:
+/// - Cannot retry successful deliveries
+/// - Maximum 10 manual retry attempts per delivery
 pub async fn retry_delivery(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
@@ -501,8 +508,24 @@ pub async fn retry_delivery(
     .fetch_optional(state.db.pool())
     .await?;
 
-    if delivery.is_none() {
-        return Err(AppError::NotFound("Delivery not found".to_string()));
+    let delivery = match delivery {
+        Some(d) => d,
+        None => return Err(AppError::NotFound("Delivery not found".to_string())),
+    };
+
+    // SECURITY: Cannot retry successful deliveries
+    if delivery.status == "success" {
+        return Err(AppError::BadRequest(
+            "Cannot retry a successful delivery".to_string(),
+        ));
+    }
+
+    // SECURITY: Enforce maximum manual retry attempts
+    if delivery.attempts >= MAX_MANUAL_RETRY_ATTEMPTS {
+        return Err(AppError::BadRequest(format!(
+            "Maximum retry attempts ({}) exceeded for this delivery",
+            MAX_MANUAL_RETRY_ATTEMPTS
+        )));
     }
 
     // Reset the delivery status to pending for retry

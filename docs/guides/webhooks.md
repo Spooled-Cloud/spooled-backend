@@ -180,10 +180,12 @@ You can inspect deliveries and retry individual delivery attempts:
 curl https://api.spooled.cloud/api/v1/outgoing-webhooks/{id}/deliveries \
   -H "Authorization: Bearer sp_live_YOUR_API_KEY"
 
-# Retry a specific delivery
+# Retry a specific delivery (max 10 manual retries per delivery)
 curl -X POST https://api.spooled.cloud/api/v1/outgoing-webhooks/{id}/retry/{delivery_id} \
   -H "Authorization: Bearer sp_live_YOUR_API_KEY"
 ```
+
+> **Note:** You cannot retry successful deliveries, and each delivery has a maximum of 10 manual retry attempts.
 
 ### Event Types
 
