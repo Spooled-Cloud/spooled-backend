@@ -104,17 +104,10 @@ pub async fn custom(
         )));
     };
 
-    // If org has configured a webhook token, validate it
-    if let Some(ref expected_token) = configured_token {
-        match webhook_token {
-            Some(provided) if constant_time_compare(provided, expected_token) => {}
-            _ => {
-                return Err(AppError::Authentication(
-                    "Invalid or missing X-Webhook-Token".to_string(),
-                ));
-            }
-        }
-    }
+    // SECURITY: Always require a token.
+    // Historically, the token was optional which made the ingestion endpoint effectively public
+    // for orgs without a token configured. That is unsafe for multi-tenant environments.
+    require_webhook_token(configured_token.as_deref(), webhook_token)?;
 
     let job_id = Uuid::new_v4().to_string();
     let now = Utc::now();
@@ -204,6 +197,31 @@ fn constant_time_compare(a: &str, b: &str) -> bool {
     len_eq && bytes_eq
 }
 
+/// Require an incoming webhook token.
+///
+/// Returns Authentication error if:
+/// - No token is configured for the org (misconfiguration)
+/// - Token header is missing
+/// - Token does not match
+fn require_webhook_token(
+    configured_token: Option<&str>,
+    provided_token: Option<&str>,
+) -> AppResult<()> {
+    let Some(expected) = configured_token else {
+        // Do not allow public ingestion; force token configuration via dashboard/API.
+        return Err(AppError::Authentication(
+            "Webhook token is not configured for this organization".to_string(),
+        ));
+    };
+
+    match provided_token {
+        Some(provided) if constant_time_compare(provided, expected) => Ok(()),
+        _ => Err(AppError::Authentication(
+            "Invalid or missing X-Webhook-Token".to_string(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,5 +231,31 @@ mod tests {
         assert!(constant_time_compare("abc", "abc"));
         assert!(!constant_time_compare("abc", "abd"));
         assert!(!constant_time_compare("abc", "abcd"));
+    }
+
+    #[test]
+    fn test_require_webhook_token_requires_configured_token() {
+        let err = require_webhook_token(None, Some("whk_x")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.to_lowercase().contains("not configured"));
+    }
+
+    #[test]
+    fn test_require_webhook_token_requires_header() {
+        let err = require_webhook_token(Some("whk_expected"), None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.to_lowercase().contains("missing"));
+    }
+
+    #[test]
+    fn test_require_webhook_token_rejects_wrong_token() {
+        let err = require_webhook_token(Some("whk_expected"), Some("whk_wrong")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.to_lowercase().contains("invalid"));
+    }
+
+    #[test]
+    fn test_require_webhook_token_accepts_correct_token() {
+        require_webhook_token(Some("whk_expected"), Some("whk_expected")).unwrap();
     }
 }

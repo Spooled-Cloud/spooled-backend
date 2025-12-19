@@ -66,12 +66,10 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/redirect"))
-            .respond_with(
-                ResponseTemplate::new(302).insert_header(
-                    "Location",
-                    "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
-                ),
-            )
+            .respond_with(ResponseTemplate::new(302).insert_header(
+                "Location",
+                "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+            ))
             .expect(1)
             .mount(&server)
             .await;
@@ -95,5 +93,3 @@ mod tests {
         assert_eq!(res.status().as_u16(), 302);
     }
 }
-
-

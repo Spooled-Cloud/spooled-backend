@@ -419,12 +419,16 @@ pub async fn create(
 
     let org_id = Uuid::new_v4().to_string();
     let now = Utc::now();
+    // SECURITY: Generate a webhook token for the org so incoming webhook ingestion is never public by default.
+    let org_settings = serde_json::json!({
+        "webhook_token": generate_webhook_token(),
+    });
 
     // Create organization
     let org = sqlx::query_as::<_, Organization>(
         r#"
         INSERT INTO organizations (id, name, slug, plan_tier, billing_email, settings, created_at, updated_at)
-        VALUES ($1, $2, $3, 'free', $4, '{}', $5, $5)
+        VALUES ($1, $2, $3, 'free', $4, $5, $6, $6)
         RETURNING *
         "#,
     )
@@ -432,6 +436,7 @@ pub async fn create(
     .bind(&request.name)
     .bind(&request.slug)
     .bind(&request.billing_email)
+    .bind(&org_settings)
     .bind(now)
     .fetch_one(state.db.pool())
     .await
@@ -834,63 +839,26 @@ pub async fn regenerate_webhook_token(
     }))
 }
 
-/// Request to clear the webhook token (make webhook accept requests without token)
+/// Request to clear the webhook token
 #[derive(Debug, Deserialize)]
 pub struct ClearWebhookTokenRequest {
     /// Must be true to confirm clearing the token
     pub confirm: bool,
 }
 
-/// Clear the webhook token (disable webhook authentication)
+/// Clear the webhook token
 pub async fn clear_webhook_token(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
     Json(request): Json<ClearWebhookTokenRequest>,
 ) -> AppResult<Json<WebhookTokenResponse>> {
-    if !request.confirm {
-        return Err(AppError::Validation(
-            "You must set confirm: true to clear the webhook token".to_string(),
-        ));
-    }
-
-    // Get current settings and remove webhook_token
-    let org: Organization = sqlx::query_as("SELECT * FROM organizations WHERE id = $1")
-        .bind(&ctx.organization_id)
-        .fetch_one(state.db.pool())
-        .await
-        .map_err(|_| AppError::NotFound("Organization not found".to_string()))?;
-
-    let mut settings = org.settings.clone();
-    if let Some(obj) = settings.as_object_mut() {
-        obj.remove("webhook_token");
-    }
-
-    sqlx::query("UPDATE organizations SET settings = $1, updated_at = $2 WHERE id = $3")
-        .bind(&settings)
-        .bind(Utc::now())
-        .bind(&ctx.organization_id)
-        .execute(state.db.pool())
-        .await?;
-
-    let base_url = state
-        .settings
-        .server
-        .external_url
-        .clone()
-        .unwrap_or_else(|| "https://api.spooled.cloud".to_string());
-
-    tracing::warn!(
-        org_id = %ctx.organization_id,
-        "Webhook token cleared - webhook now accepts unauthenticated requests"
-    );
-
-    Ok(Json(WebhookTokenResponse {
-        webhook_token: None,
-        webhook_url: format!(
-            "{}/api/v1/webhooks/{}/custom",
-            base_url, ctx.organization_id
-        ),
-    }))
+    // SECURITY: Disallow disabling webhook authentication.
+    // A public ingestion endpoint is a critical risk for multi-tenant systems.
+    let _ = (state, ctx, request);
+    Err(AppError::Validation(
+        "Clearing the webhook token is not allowed. Use /organizations/webhook-token/regenerate to rotate it."
+            .to_string(),
+    ))
 }
 
 /// Generate a secure webhook token for incoming webhooks
