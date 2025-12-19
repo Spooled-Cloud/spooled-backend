@@ -277,6 +277,34 @@ pub async fn generate_slug(
     Ok(Json(GenerateSlugResponse { slug: final_slug }))
 }
 
+/// Constant-time string comparison to prevent timing attacks
+fn constant_time_compare(a: &str, b: &str) -> bool {
+    use subtle::ConstantTimeEq;
+
+    // If lengths differ, the signatures are definitely different
+    // But we still do constant-time work to not leak the length difference
+    let len_eq = a.len() == b.len();
+
+    // Pad shorter string to match longer one (constant time padding)
+    let max_len = a.len().max(b.len());
+    let a_bytes: Vec<u8> = a
+        .bytes()
+        .chain(std::iter::repeat(0u8))
+        .take(max_len)
+        .collect();
+    let b_bytes: Vec<u8> = b
+        .bytes()
+        .chain(std::iter::repeat(0u8))
+        .take(max_len)
+        .collect();
+
+    // Constant-time byte comparison
+    let bytes_eq = a_bytes.ct_eq(&b_bytes).into();
+
+    // Both length and content must match
+    len_eq && bytes_eq
+}
+
 /// Extract client IP from headers for rate limiting
 fn extract_client_ip(headers: &axum::http::HeaderMap) -> String {
     // Check CF-Connecting-IP (Cloudflare)
@@ -375,8 +403,8 @@ pub async fn create(
             let admin_key = headers.get("X-Admin-Key").and_then(|v| v.to_str().ok());
 
             match (&state.settings.registration.admin_api_key, admin_key) {
-                (Some(expected), Some(provided)) if expected == provided => {
-                    // Valid admin key
+                (Some(expected), Some(provided)) if constant_time_compare(expected, provided) => {
+                    // Valid admin key (constant-time comparison prevents timing attacks)
                 }
                 (Some(_), _) => {
                     return Err(AppError::Authorization(
@@ -714,6 +742,13 @@ pub async fn delete(
         )));
     }
 
+    // CRITICAL: Get API key hashes BEFORE deleting, for cache invalidation
+    let api_key_hashes: Vec<(String,)> =
+        sqlx::query_as("SELECT key_hash FROM api_keys WHERE organization_id = $1")
+            .bind(&id)
+            .fetch_all(state.db.pool())
+            .await?;
+
     let result = sqlx::query("DELETE FROM organizations WHERE id = $1")
         .bind(&id)
         .execute(state.db.pool())
@@ -721,6 +756,24 @@ pub async fn delete(
 
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound(format!("Organization {} not found", id)));
+    }
+
+    // CRITICAL: Invalidate all cached API keys for this org
+    // Without this, deleted org's API keys remain valid in cache for up to 1 hour!
+    if let Some(ref cache) = state.cache {
+        for (key_hash,) in api_key_hashes {
+            let hash_prefix = if key_hash.len() >= 16 {
+                &key_hash[..16]
+            } else {
+                &key_hash
+            };
+            let reverse_key = format!("api_key_reverse:{}", hash_prefix);
+            if let Ok(Some(lookup_hash)) = cache.get(&reverse_key).await {
+                let cache_key = format!("api_key:{}", lookup_hash);
+                let _ = cache.delete(&cache_key).await;
+                let _ = cache.delete(&reverse_key).await;
+            }
+        }
     }
 
     Ok(StatusCode::NO_CONTENT)

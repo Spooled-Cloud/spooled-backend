@@ -529,6 +529,7 @@ pub async fn retry_delivery(
     }
 
     // Reset the delivery status to pending for retry
+    // SECURITY: Include webhook_id in WHERE clause as defense-in-depth
     sqlx::query(
         r#"
         UPDATE outgoing_webhook_deliveries 
@@ -537,10 +538,11 @@ pub async fn retry_delivery(
             error = NULL,
             status_code = NULL,
             response_body = NULL
-        WHERE id = $1
+        WHERE id = $1 AND webhook_id = $2
         "#,
     )
     .bind(delivery_uuid)
+    .bind(webhook_uuid)
     .execute(state.db.pool())
     .await?;
 
