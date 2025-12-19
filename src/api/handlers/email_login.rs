@@ -637,8 +637,9 @@ pub async fn complete_signup(
 
     // Create API key
     let api_key_id = Uuid::new_v4().to_string();
+    // Uses sp_ prefix (new standard); sk_ is legacy and only accepted for backward compatibility
     let raw_key = format!(
-        "sk_{}_{}",
+        "sp_{}_{}",
         if state.settings.server.environment == crate::config::Environment::Production {
             "live"
         } else {
@@ -1099,7 +1100,8 @@ async fn get_or_create_email_api_key(
     let now = Utc::now();
 
     // Generate a random key (we won't expose it, just for internal use)
-    let raw_key = format!("sk_email_{}", Uuid::new_v4().to_string().replace('-', ""));
+    // Uses sp_ prefix (new standard)
+    let raw_key = format!("sp_email_{}", Uuid::new_v4().to_string().replace('-', ""));
     let key_hash = bcrypt::hash(&raw_key, 10)
         .map_err(|e| AppError::Internal(format!("Failed to hash key: {}", e)))?;
     let key_prefix = raw_key.chars().take(8).collect::<String>();

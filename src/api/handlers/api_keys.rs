@@ -73,8 +73,9 @@ pub async fn create(
     let now = Utc::now();
 
     // Generate a secure random API key
+    // Uses sp_ prefix (new standard); sk_ is legacy and only accepted for backward compatibility
     let raw_key = format!(
-        "sk_{}_{}",
+        "sp_{}_{}",
         if state.settings.server.environment == crate::config::Environment::Production {
             "live"
         } else {

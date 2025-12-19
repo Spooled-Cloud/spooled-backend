@@ -914,9 +914,10 @@ pub async fn create_organization(
     })?;
 
     // Create initial API key
+    // Uses sp_ prefix (new standard); sk_ is legacy and only accepted for backward compatibility
     let api_key_id = Uuid::new_v4().to_string();
     let raw_key = format!(
-        "sk_{}_{}",
+        "sp_{}_{}",
         if state.settings.server.environment == crate::config::Environment::Production {
             "live"
         } else {
@@ -1010,9 +1011,10 @@ pub async fn create_api_key(
     }
 
     let now = Utc::now();
+    // Uses sp_ prefix (new standard); sk_ is legacy and only accepted for backward compatibility
     let api_key_id = Uuid::new_v4().to_string();
     let raw_key = format!(
-        "sk_{}_{}",
+        "sp_{}_{}",
         if state.settings.server.environment == crate::config::Environment::Production {
             "live"
         } else {

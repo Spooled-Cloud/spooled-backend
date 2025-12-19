@@ -4,7 +4,8 @@
 //! - API key authentication with bcrypt verification (for programmatic access)
 //! - JWT token authentication (for dashboard/browser access)
 //!
-//! JWT tokens start with "eyJ" (base64 encoded header), API keys start with "sk_"
+//! JWT tokens start with "eyJ" (base64 encoded header).
+//! API keys use "sp_" prefix (new standard) or "sk_" prefix (legacy, for backward compatibility).
 
 use axum::{
     extract::{Extension, Request, State},
@@ -40,7 +41,7 @@ struct ApiKeyRecord {
 /// Authenticate API key or JWT token middleware
 ///
 /// This middleware accepts both:
-/// - API keys (start with "sk_") - for programmatic access
+/// - API keys (sp_ or legacy sk_ prefix) - for programmatic access
 /// - JWT tokens (start with "eyJ") - for dashboard/browser access
 ///
 /// For API keys:
@@ -98,7 +99,7 @@ pub async fn authenticate_api_key(
         // JWT token authentication
         authenticate_jwt_token(&state, &token).await?
     } else {
-        // API key authentication (starts with "sk_")
+        // API key authentication (sp_ or legacy sk_ prefix)
         authenticate_api_key_token(&state, &token).await?
     };
 

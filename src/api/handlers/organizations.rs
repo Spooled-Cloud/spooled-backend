@@ -450,8 +450,9 @@ pub async fn create(
 
     // Create initial API key for the organization
     let api_key_id = Uuid::new_v4().to_string();
+    // Uses sp_ prefix (new standard); sk_ is legacy and only accepted for backward compatibility
     let raw_key = format!(
-        "sk_{}_{}",
+        "sp_{}_{}",
         if state.settings.server.environment == crate::config::Environment::Production {
             "live"
         } else {
