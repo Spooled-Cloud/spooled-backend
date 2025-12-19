@@ -370,8 +370,9 @@ pub async fn verify(
         .execute(state.db.pool())
         .await?;
 
-    // Verify code
-    if code != stored_code {
+    // SECURITY: Use constant-time comparison to prevent timing attacks
+    // An attacker could otherwise determine the correct code digit-by-digit
+    if !constant_time_compare(&code, &stored_code) {
         warn!(email = %mask_email(&email), attempts = attempts + 1, "Invalid login code");
         return Err(AppError::Authentication("Invalid code".to_string()));
     }
@@ -1127,6 +1128,34 @@ async fn get_or_create_email_api_key(
     );
 
     Ok(key_id)
+}
+
+/// Constant-time string comparison to prevent timing attacks
+fn constant_time_compare(a: &str, b: &str) -> bool {
+    use subtle::ConstantTimeEq;
+
+    // If lengths differ, the values are definitely different
+    // But we still do constant-time work to not leak the length difference
+    let len_eq = a.len() == b.len();
+
+    // Pad shorter string to match longer one (constant time padding)
+    let max_len = a.len().max(b.len());
+    let a_bytes: Vec<u8> = a
+        .bytes()
+        .chain(std::iter::repeat(0u8))
+        .take(max_len)
+        .collect();
+    let b_bytes: Vec<u8> = b
+        .bytes()
+        .chain(std::iter::repeat(0u8))
+        .take(max_len)
+        .collect();
+
+    // Constant-time byte comparison
+    let bytes_eq = a_bytes.ct_eq(&b_bytes).into();
+
+    // Both length and content must match
+    len_eq && bytes_eq
 }
 
 /// Mask email for privacy in logs and responses
