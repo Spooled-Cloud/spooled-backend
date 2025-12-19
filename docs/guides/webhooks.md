@@ -39,11 +39,10 @@ Spooled currently supports **one** incoming webhook endpoint per organization:
 
 | Type | Endpoint | Authentication |
 |------|----------|----------------|
-| Custom | `/api/v1/webhooks/{org_id}/custom` | `X-Webhook-Token` (optional, recommended) |
+| Custom | `/api/v1/webhooks/{org_id}/custom` | `X-Webhook-Token` (required) |
 
-If a webhook token is configured for the organization, the request must include the
-`X-Webhook-Token` header. If no token is configured, the endpoint is open (not
-recommended for production).
+Incoming custom webhooks **always require** the `X-Webhook-Token` header.
+Tokens are generated automatically when your organization is created.
 
 ---
 
@@ -112,11 +111,6 @@ Response:
 # Regenerate token (invalidates old one)
 curl -X POST https://api.spooled.cloud/api/v1/organizations/webhook-token/regenerate \
   -H "Authorization: Bearer sp_live_YOUR_API_KEY"
-
-# Clear token (NOT recommended for production)
-curl -X POST https://api.spooled.cloud/api/v1/organizations/webhook-token/clear \
-  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
-  -d '{"confirm": true}'
 ```
 
 ---

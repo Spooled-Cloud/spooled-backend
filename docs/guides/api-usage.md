@@ -806,18 +806,12 @@ Response:
 # Regenerate the token (invalidates the old one)
 curl -X POST https://api.spooled.cloud/api/v1/organizations/webhook-token/regenerate \
   -H "Authorization: Bearer sp_live_your_api_key"
-
-# Clear the token (makes endpoint accept unauthenticated requests - NOT RECOMMENDED)
-curl -X POST https://api.spooled.cloud/api/v1/organizations/webhook-token/clear \
-  -H "Authorization: Bearer sp_live_your_api_key" \
-  -H "Content-Type: application/json" \
-  -d '{"confirm": true}'
 ```
 
 **Important:** 
 - Store your webhook token securely - you'll configure it in your external service
 - Regenerating the token invalidates the old one; update all external services
-- If no token is configured, the webhook endpoint is open (not recommended for production)
+- The `X-Webhook-Token` header is required for incoming webhooks
 
 ### Step 2: Send Webhooks to Spooled
 

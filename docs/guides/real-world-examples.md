@@ -36,12 +36,12 @@ Spooled is the “middle” that makes your automation reliable:
 > Your real key usually starts with `sk_live_...` or `sk_test_...`.
 > In docs we may show `sp_live_...` / `sp_test_...` to avoid GitHub false positives — **both formats are accepted** by the SDKs.
 
-### 2) Get your “incoming webhook” URL + token (optional but recommended)
+### 2) Get your “incoming webhook” URL + token (required)
 
 Spooled gives each organization a unique incoming webhook URL:
 
 - `POST /api/v1/webhooks/{org_id}/custom`
-- optional header: `X-Webhook-Token: ...`
+- required header: `X-Webhook-Token: ...`
 
 Get your token + URL:
 

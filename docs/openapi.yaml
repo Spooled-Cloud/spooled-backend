@@ -644,11 +644,14 @@ paths:
   /api/v1/organizations/webhook-token/clear:
     post:
       tags: [Organizations]
-      summary: Clear webhook token
+      summary: Clear webhook token (disabled)
       description: |
-        Remove the webhook token, making the endpoint accept unauthenticated requests.
-        **Warning:** This is not recommended for production use.
+        This endpoint is **disabled**.
+
+        Spooled Cloud no longer supports unauthenticated incoming webhook ingestion.
+        Use `/api/v1/organizations/webhook-token/regenerate` to rotate the token instead.
       operationId: clearWebhookToken
+      deprecated: true
       requestBody:
         required: true
         content:
@@ -663,12 +666,15 @@ paths:
             example:
               confirm: true
       responses:
-        '200':
-          description: Token cleared
+        '400':
+          description: Not allowed
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/WebhookTokenResponse'
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: validation_error
+                message: Clearing the webhook token is not allowed. Use /organizations/webhook-token/regenerate to rotate it.
 
   # Admin Endpoints
   /api/v1/admin/organizations:
@@ -1651,18 +1657,12 @@ paths:
 
         ## Authentication
 
-        If your organization has configured a `webhook_token` in settings, you must
-        include it in the `X-Webhook-Token` header. Without a configured token, the
-        endpoint is open (not recommended for production).
+        You must include the organization’s webhook token in the `X-Webhook-Token` header.
 
         To configure a webhook token:
         ```
-        PUT /api/v1/organizations/{org_id}
-        {
-          "settings": {
-            "webhook_token": "your-secret-token-min-16-chars"
-          }
-        }
+        GET /api/v1/organizations/webhook-token
+        POST /api/v1/organizations/webhook-token/regenerate
         ```
 
         ## Security
@@ -1675,11 +1675,11 @@ paths:
       parameters:
         - name: X-Webhook-Token
           in: header
+          required: true
           schema:
             type: string
           description: |
-            Webhook authentication token. Required if the organization has configured
-            a `webhook_token` in their settings.
+            Webhook authentication token (required).
           example: your-secret-webhook-token
       requestBody:
         required: true

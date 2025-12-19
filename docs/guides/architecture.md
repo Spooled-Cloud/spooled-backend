@@ -471,7 +471,7 @@ CREATE POLICY org_isolation ON jobs
 
 - GitHub: HMAC-SHA256 signature verification
 - Stripe: Signature + timestamp validation (5 min max age)
-- Custom: Optional X-Webhook-Token header
+- Custom: Required X-Webhook-Token header
 - Outbound: HTTPS required in production (SSRF protection)
 
 ---
