@@ -407,6 +407,15 @@ pub struct ListJobsQuery {
     pub queue_name: Option<String>,
     /// Filter by status
     pub status: Option<String>,
+    /// Filter by a single tag.
+    ///
+    /// Matches Postgres `jsonb ? tag` semantics, which works for:
+    /// - JSON arrays of strings: `["urgent", "billing"]`
+    /// - JSON objects with tag keys: `{ "urgent": true }`
+    ///
+    /// Note: This is intentionally a simple primitive filter. For complex tag queries,
+    /// use multiple requests or build a higher-level index in your app.
+    pub tag: Option<String>,
     /// Maximum number of results (default: 50)
     pub limit: Option<i64>,
     /// Offset for pagination

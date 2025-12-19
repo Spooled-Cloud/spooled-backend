@@ -9,6 +9,7 @@ use chrono::Utc;
 use std::sync::Arc;
 use tracing::info;
 use uuid::Uuid;
+use sqlx::{Postgres, QueryBuilder};
 
 use crate::api::middleware::limits::{check_job_limits, check_payload_size, increment_daily_jobs};
 use crate::api::middleware::ValidatedJson;
@@ -47,6 +48,30 @@ fn validate_queue_name_filter(name: &str) -> bool {
             .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
+/// Validate a single tag filter value (simple, predictable syntax).
+fn validate_tag_filter(tag: &str) -> bool {
+    !tag.is_empty()
+        && tag.len() <= 64
+        && tag
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+/// Publish a realtime event to the organization-scoped events channel (best-effort).
+///
+/// The WebSocket handler subscribes to `org:{org_id}:events` and expects JSON in the
+/// `RealtimeEvent` enum shape: `{ "type": "...", "data": { ... } }`.
+async fn publish_realtime_event(
+    cache: &crate::cache::RedisCache,
+    org_id: &str,
+    event: serde_json::Value,
+) {
+    let channel = format!("org:{}:events", org_id);
+    if let Ok(payload) = serde_json::to_string(&event) {
+        let _ = cache.publish(&channel, &payload).await;
+    }
+}
+
 /// List jobs with optional filtering
 ///
 /// Reduced max limit from 1000 to 100
@@ -78,57 +103,45 @@ pub async fn list(
             None
         }
     });
+
+    // Validate tag filter (optional)
+    let validated_tag = query.tag.as_ref().and_then(|t| {
+        if validate_tag_filter(t) {
+            Some(t.clone())
+        } else {
+            tracing::warn!(tag = %t, "Invalid tag filter ignored");
+            None
+        }
+    });
     let org_id = &ctx.organization_id;
 
-    // All queries now include organization_id filter
-    // Use validated_status instead of raw query.status
-    // Use validated_queue instead of raw query.queue_name
-    let jobs = match (&validated_queue, &validated_status) {
-        (Some(queue), Some(status)) => {
-            sqlx::query_as::<_, Job>(
-                "SELECT * FROM jobs WHERE organization_id = $1 AND queue_name = $2 AND status = $3 ORDER BY created_at DESC LIMIT $4 OFFSET $5",
-            )
-            .bind(org_id)
-            .bind(queue)
-            .bind(status)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(state.db.pool())
-            .await?
-        }
-        (Some(queue), None) => {
-            sqlx::query_as::<_, Job>(
-                "SELECT * FROM jobs WHERE organization_id = $1 AND queue_name = $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4",
-            )
-            .bind(org_id)
-            .bind(queue)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(state.db.pool())
-            .await?
-        }
-        (None, Some(status)) => {
-            sqlx::query_as::<_, Job>(
-                "SELECT * FROM jobs WHERE organization_id = $1 AND status = $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4",
-            )
-            .bind(org_id)
-            .bind(status)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(state.db.pool())
-            .await?
-        }
-        (None, None) => {
-            sqlx::query_as::<_, Job>(
-                "SELECT * FROM jobs WHERE organization_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
-            )
-            .bind(org_id)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(state.db.pool())
-            .await?
-        }
-    };
+    // Build query dynamically to support optional filters without a combinatorial explosion.
+    // All filters are parameterized (no string interpolation of user input).
+    let mut qb: QueryBuilder<Postgres> =
+        QueryBuilder::new("SELECT * FROM jobs WHERE organization_id = ");
+    qb.push_bind(org_id);
+
+    if let Some(queue) = &validated_queue {
+        qb.push(" AND queue_name = ");
+        qb.push_bind(queue);
+    }
+
+    if let Some(status) = &validated_status {
+        qb.push(" AND status = ");
+        qb.push_bind(status);
+    }
+
+    if let Some(tag) = &validated_tag {
+        qb.push(" AND tags ? ");
+        qb.push_bind(tag);
+    }
+
+    qb.push(" ORDER BY created_at DESC LIMIT ");
+    qb.push_bind(limit);
+    qb.push(" OFFSET ");
+    qb.push_bind(offset);
+
+    let jobs: Vec<Job> = qb.build_query_as().fetch_all(state.db.pool()).await?;
 
     let summaries: Vec<JobSummary> = jobs.into_iter().map(Into::into).collect();
     Ok(Json(summaries))
@@ -241,6 +254,25 @@ pub async fn create(
                 &returned_id,
             )
             .await;
+
+        // Also publish a structured realtime event for WebSocket consumers.
+        // Only publish for newly created jobs, not idempotent duplicates.
+        if created {
+            publish_realtime_event(
+                cache,
+                &org_id,
+                serde_json::json!({
+                    "type": "JobCreated",
+                    "data": {
+                        "job_id": returned_id,
+                        "queue_name": request.queue_name,
+                        "priority": priority,
+                        "timestamp": Utc::now().to_rfc3339()
+                    }
+                }),
+            )
+            .await;
+        }
     }
 
     Ok((
@@ -330,6 +362,34 @@ pub async fn complete(
     state.metrics.jobs_processing.dec();
     state.metrics.jobs_completed.inc();
 
+    // Best-effort realtime publish (queue_name fetched after completion)
+    if let Some(ref cache) = state.cache {
+        let queue_name: Option<(String,)> = sqlx::query_as(
+            "SELECT queue_name FROM jobs WHERE id = $1 AND organization_id = $2",
+        )
+        .bind(&id)
+        .bind(&ctx.organization_id)
+        .fetch_optional(state.db.pool())
+        .await
+        .unwrap_or(None);
+
+        publish_realtime_event(
+            cache,
+            &ctx.organization_id,
+            serde_json::json!({
+                "type": "JobStatusChange",
+                "data": {
+                    "job_id": id,
+                    "queue_name": queue_name.map(|(q,)| q).unwrap_or_else(|| "unknown".to_string()),
+                    "old_status": "processing",
+                    "new_status": "completed",
+                    "timestamp": Utc::now().to_rfc3339()
+                }
+            }),
+        )
+        .await;
+    }
+
     Ok((StatusCode::OK, Json(serde_json::json!({ "success": true }))))
 }
 
@@ -373,6 +433,36 @@ pub async fn fail(
     // Metrics: processing -> pending (retry) OR processing -> deadletter.
     // We don't know which without re-fetching; keep counters conservative.
     state.metrics.jobs_processing.dec();
+
+    // Best-effort realtime publish (status after fail may be pending (retry), failed, or deadletter)
+    if let Some(ref cache) = state.cache {
+        let updated: Option<(String, String)> = sqlx::query_as(
+            "SELECT status, queue_name FROM jobs WHERE id = $1 AND organization_id = $2",
+        )
+        .bind(&id)
+        .bind(&ctx.organization_id)
+        .fetch_optional(state.db.pool())
+        .await
+        .unwrap_or(None);
+
+        if let Some((new_status, queue_name)) = updated {
+            publish_realtime_event(
+                cache,
+                &ctx.organization_id,
+                serde_json::json!({
+                    "type": "JobStatusChange",
+                    "data": {
+                        "job_id": id,
+                        "queue_name": queue_name,
+                        "old_status": "processing",
+                        "new_status": new_status,
+                        "timestamp": Utc::now().to_rfc3339()
+                    }
+                }),
+            )
+            .await;
+        }
+    }
 
     Ok((StatusCode::OK, Json(serde_json::json!({ "success": true }))))
 }
@@ -437,6 +527,17 @@ pub async fn cancel(
     Extension(ctx): Extension<ApiKeyContext>,
     Path(id): Path<String>,
 ) -> AppResult<StatusCode> {
+    // Capture current status/queue for accurate realtime event (best-effort).
+    // This is safe because it is scoped to the authenticated org.
+    let before: Option<(String, String)> = sqlx::query_as(
+        "SELECT status, queue_name FROM jobs WHERE id = $1 AND organization_id = $2",
+    )
+    .bind(&id)
+    .bind(&ctx.organization_id)
+    .fetch_optional(state.db.pool())
+    .await
+    .unwrap_or(None);
+
     let result = sqlx::query(
         r#"
         UPDATE jobs 
@@ -481,6 +582,23 @@ pub async fn cancel(
                 "cancelled",
             )
             .await;
+
+        let (old_status, queue_name) = before.unwrap_or_else(|| ("pending".to_string(), "unknown".to_string()));
+        publish_realtime_event(
+            cache,
+            &ctx.organization_id,
+            serde_json::json!({
+                "type": "JobStatusChange",
+                "data": {
+                    "job_id": id,
+                    "queue_name": queue_name,
+                    "old_status": old_status,
+                    "new_status": "cancelled",
+                    "timestamp": Utc::now().to_rfc3339()
+                }
+            }),
+        )
+        .await;
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -493,6 +611,16 @@ pub async fn retry(
     Extension(ctx): Extension<ApiKeyContext>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Job>> {
+    // Capture previous status for realtime event (failed vs deadletter)
+    let before_status: Option<(String,)> = sqlx::query_as(
+        "SELECT status FROM jobs WHERE id = $1 AND organization_id = $2",
+    )
+    .bind(&id)
+    .bind(&ctx.organization_id)
+    .fetch_optional(state.db.pool())
+    .await
+    .unwrap_or(None);
+
     let job = sqlx::query_as::<_, Job>(
         r#"
         UPDATE jobs 
@@ -526,6 +654,23 @@ pub async fn retry(
                 &job.id,
             )
             .await;
+
+        // Best-effort realtime publish
+        publish_realtime_event(
+            cache,
+            &ctx.organization_id,
+            serde_json::json!({
+                "type": "JobStatusChange",
+                "data": {
+                    "job_id": job.id,
+                    "queue_name": job.queue_name,
+                    "old_status": before_status.map(|(s,)| s).unwrap_or_else(|| "failed".to_string()),
+                    "new_status": "pending",
+                    "timestamp": Utc::now().to_rfc3339()
+                }
+            }),
+        )
+        .await;
     }
 
     Ok(Json(job))
@@ -758,6 +903,31 @@ pub async fn bulk_enqueue(
                     "bulk_enqueue",
                 )
                 .await;
+
+            // Also publish realtime job.created events for newly-created jobs (best-effort).
+            // This allows WebSocket consumers to show new jobs immediately.
+            for item in &succeeded {
+                if item.created {
+                    let priority = priorities
+                        .get(item.index)
+                        .copied()
+                        .unwrap_or(default_priority);
+                    publish_realtime_event(
+                        cache,
+                        &org_id,
+                        serde_json::json!({
+                            "type": "JobCreated",
+                            "data": {
+                                "job_id": item.job_id,
+                                "queue_name": request.queue_name,
+                                "priority": priority,
+                                "timestamp": Utc::now().to_rfc3339()
+                            }
+                        }),
+                    )
+                    .await;
+                }
+            }
         }
     }
 
@@ -851,29 +1021,36 @@ pub async fn list_dlq(
         }
     });
 
-    let jobs = match &validated_queue {
-        Some(queue) => {
-            sqlx::query_as::<_, Job>(
-                "SELECT * FROM jobs WHERE status = 'deadletter' AND organization_id = $1 AND queue_name = $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4",
-            )
-            .bind(&ctx.organization_id)
-            .bind(queue)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(state.db.pool())
-            .await?
+    let validated_tag = query.tag.as_ref().and_then(|t| {
+        if validate_tag_filter(t) {
+            Some(t.clone())
+        } else {
+            tracing::warn!(tag = %t, "Invalid tag filter ignored in list_dlq");
+            None
         }
-        None => {
-            sqlx::query_as::<_, Job>(
-                "SELECT * FROM jobs WHERE status = 'deadletter' AND organization_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
-            )
-            .bind(&ctx.organization_id)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(state.db.pool())
-            .await?
-        }
-    };
+    });
+
+    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
+        "SELECT * FROM jobs WHERE status = 'deadletter' AND organization_id = ",
+    );
+    qb.push_bind(&ctx.organization_id);
+
+    if let Some(queue) = &validated_queue {
+        qb.push(" AND queue_name = ");
+        qb.push_bind(queue);
+    }
+
+    if let Some(tag) = &validated_tag {
+        qb.push(" AND tags ? ");
+        qb.push_bind(tag);
+    }
+
+    qb.push(" ORDER BY created_at DESC LIMIT ");
+    qb.push_bind(limit);
+    qb.push(" OFFSET ");
+    qb.push_bind(offset);
+
+    let jobs: Vec<Job> = qb.build_query_as().fetch_all(state.db.pool()).await?;
 
     let summaries: Vec<JobSummary> = jobs.into_iter().map(Into::into).collect();
     Ok(Json(summaries))
@@ -1269,6 +1446,7 @@ mod tests {
         let query = ListJobsQuery {
             queue_name: None,
             status: None,
+            tag: None,
             limit: None,
             offset: None,
             order_by: None,
@@ -1289,6 +1467,7 @@ mod tests {
         let query_large = ListJobsQuery {
             queue_name: None,
             status: None,
+            tag: None,
             limit: Some(5000), // Over max
             offset: None,
             order_by: None,
@@ -1301,6 +1480,7 @@ mod tests {
         let query_small = ListJobsQuery {
             queue_name: None,
             status: None,
+            tag: None,
             limit: Some(10),
             offset: None,
             order_by: None,
