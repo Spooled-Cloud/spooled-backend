@@ -8,7 +8,9 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 
 use crate::models::OutgoingWebhook;
-use crate::security::{validate_webhook_url as validate_url_ssrf, UrlValidationOptions};
+use crate::security::{
+    build_outbound_http_client, validate_webhook_url as validate_url_ssrf, UrlValidationOptions,
+};
 
 #[derive(Clone)]
 pub struct OutgoingWebhookService {
@@ -22,10 +24,13 @@ impl OutgoingWebhookService {
     pub fn new(pool: Pool<Postgres>, signing_secret: String, max_attempts: i32) -> Self {
         Self {
             pool,
-            client: Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .unwrap_or_default(),
+            // SECURITY: Never fall back to a default client. A default client may have no timeouts
+            // and will follow redirects, increasing SSRF/DoS risk.
+            client: build_outbound_http_client(
+                Duration::from_secs(10),
+                Duration::from_secs(5),
+                "Spooled-OutgoingWebhook/1.0",
+            ),
             signing_secret,
             max_attempts,
         }

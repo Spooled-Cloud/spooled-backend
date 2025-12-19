@@ -27,7 +27,7 @@ use crate::models::{
     OutgoingWebhookSummary, TestWebhookResponse, UpdateOutgoingWebhookRequest,
     VALID_WEBHOOK_EVENTS,
 };
-use crate::security::{validate_webhook_url, UrlValidationOptions};
+use crate::security::{build_outbound_http_client, validate_webhook_url, UrlValidationOptions};
 
 /// Validate that all event types are valid
 fn validate_events(events: &[String]) -> AppResult<()> {
@@ -336,10 +336,12 @@ pub async fn test(
     });
 
     // Send test request
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| AppError::Internal(format!("Failed to create HTTP client: {}", e)))?;
+    // SECURITY: Use hardened outbound client to prevent SSRF via redirects.
+    let client = build_outbound_http_client(
+        std::time::Duration::from_secs(10),
+        std::time::Duration::from_secs(5),
+        "Spooled-WebhookTest/1.0",
+    );
 
     let start = std::time::Instant::now();
 

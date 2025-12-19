@@ -1,3 +1,4 @@
+#![cfg(feature = "docker-tests")]
 //! Security and Validation Tests
 //!
 //! These tests verify security controls and input validation.

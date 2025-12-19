@@ -1,3 +1,4 @@
+#![cfg(feature = "docker-tests")]
 //! Production-Ready Integration Tests
 //!
 //! These tests verify critical production scenarios:

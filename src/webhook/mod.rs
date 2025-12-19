@@ -19,7 +19,7 @@ use sqlx::PgPool;
 use tracing::{error, info, warn};
 
 use crate::models::Job;
-use crate::security::{validate_webhook_url, UrlValidationOptions};
+use crate::security::{build_outbound_http_client, validate_webhook_url, UrlValidationOptions};
 
 /// Minimum signing secret length for security
 const MIN_SIGNING_SECRET_LENGTH: usize = 32;
@@ -95,12 +95,11 @@ impl WebhookService {
             );
         }
 
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .connect_timeout(Duration::from_secs(10))
-            .user_agent("Spooled-Webhook/1.0")
-            .build()
-            .expect("Failed to create HTTP client");
+        let client = build_outbound_http_client(
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+            "Spooled-Webhook/1.0",
+        );
 
         // Clamp max_attempts to reasonable range
         let safe_max_attempts = max_attempts.clamp(1, 10);

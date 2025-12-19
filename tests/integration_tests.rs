@@ -1,3 +1,4 @@
+#![cfg(feature = "docker-tests")]
 //! Integration tests for Spooled Backend
 //!
 //! These tests use testcontainers to spin up PostgreSQL and Redis

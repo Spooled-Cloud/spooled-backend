@@ -104,6 +104,9 @@ tonic-prost-build = "0.14"
 default = []
 # Enable OpenTelemetry/Jaeger distributed tracing
 otel = ["tracing-opentelemetry", "opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp"]
+# Enable Docker/testcontainers-based integration tests.
+# These require a working Docker daemon and are disabled by default.
+docker-tests = []
 
 [dev-dependencies]
 # Testing

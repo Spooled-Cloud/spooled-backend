@@ -1,3 +1,4 @@
+#![cfg(feature = "docker-tests")]
 //! Comprehensive endpoint integration tests
 //!
 //! These tests verify that all API endpoints return correct responses

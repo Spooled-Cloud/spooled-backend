@@ -1,3 +1,4 @@
+#![cfg(feature = "docker-tests")]
 //! Real API Integration Tests
 //!
 //! These tests spin up actual Docker containers and test all API endpoints

@@ -450,9 +450,11 @@ fn test_plan_display_names() {
 // Admin Create Organization Tests (Integration)
 // ============================================================================
 
+#[cfg(feature = "docker-tests")]
 use common::TestDatabase;
 
 /// Test admin organization creation with default plan
+#[cfg(feature = "docker-tests")]
 #[tokio::test]
 async fn test_admin_create_organization_default_plan() {
     let db = TestDatabase::new().await;
@@ -488,6 +490,7 @@ async fn test_admin_create_organization_default_plan() {
 }
 
 /// Test admin organization creation with specified plan tier
+#[cfg(feature = "docker-tests")]
 #[tokio::test]
 async fn test_admin_create_organization_custom_plan() {
     let db = TestDatabase::new().await;
@@ -523,6 +526,7 @@ async fn test_admin_create_organization_custom_plan() {
 }
 
 /// Test admin organization creation fails for duplicate slug
+#[cfg(feature = "docker-tests")]
 #[tokio::test]
 async fn test_admin_create_organization_duplicate_slug_fails() {
     let db = TestDatabase::new().await;
@@ -563,6 +567,7 @@ async fn test_admin_create_organization_duplicate_slug_fails() {
 // ============================================================================
 
 /// Test admin can create API key for organization
+#[cfg(feature = "docker-tests")]
 #[tokio::test]
 async fn test_admin_create_api_key_for_org() {
     let db = TestDatabase::new().await;
@@ -618,6 +623,7 @@ async fn test_admin_create_api_key_for_org() {
 }
 
 /// Test multiple API keys can be created for same organization
+#[cfg(feature = "docker-tests")]
 #[tokio::test]
 async fn test_admin_create_multiple_api_keys() {
     let db = TestDatabase::new().await;
@@ -673,6 +679,7 @@ async fn test_admin_create_multiple_api_keys() {
 // ============================================================================
 
 /// Test admin can reset organization usage counters
+#[cfg(feature = "docker-tests")]
 #[tokio::test]
 async fn test_admin_reset_usage_counters() {
     let db = TestDatabase::new().await;
@@ -742,6 +749,7 @@ async fn test_admin_reset_usage_counters() {
 }
 
 /// Test usage reset preserves total_jobs_created
+#[cfg(feature = "docker-tests")]
 #[tokio::test]
 async fn test_admin_reset_usage_preserves_total() {
     let db = TestDatabase::new().await;
