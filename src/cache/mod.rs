@@ -237,12 +237,18 @@ impl RedisCache {
     }
 
     /// Decrement a counter (minimum 0)
+    ///
+    /// If value goes to 0 or negative, deletes the key to prevent memory leaks.
+    /// Previous implementation used SET without TTL which removed expiration,
+    /// causing keys to become permanent.
     pub async fn decr(&self, key: &str) -> Result<i64> {
         let mut conn = self.get_connection().await?;
         let value: i64 = conn.decr(key, 1).await?;
-        // Ensure value doesn't go negative
-        if value < 0 {
-            let _: () = conn.set(key, 0i64).await?;
+        // If value is 0 or negative, delete the key entirely
+        // This prevents memory leaks from orphaned keys with no TTL
+        // and is semantically correct (0 connections = no entry needed)
+        if value <= 0 {
+            let _: () = conn.del(key).await?;
             return Ok(0);
         }
         Ok(value)
