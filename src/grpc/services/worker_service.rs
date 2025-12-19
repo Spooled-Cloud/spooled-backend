@@ -312,6 +312,9 @@ impl WorkerService for WorkerServiceImpl {
     }
 
     /// Deregister a worker
+    ///
+    /// SECURITY: Now releases any jobs assigned to this worker before marking offline.
+    /// Previously, jobs would be stuck in 'processing' until background cleanup ran.
     async fn deregister(
         &self,
         request: Request<DeregisterRequest>,
@@ -323,6 +326,38 @@ impl WorkerService for WorkerServiceImpl {
             return Err(Status::invalid_argument("Worker ID is required"));
         }
 
+        // First, release any jobs assigned to this worker (with org isolation)
+        // This prevents jobs from being stuck in 'processing' state
+        let released = sqlx::query(
+            r#"
+            UPDATE jobs 
+            SET 
+                status = 'pending',
+                assigned_worker_id = NULL,
+                lease_id = NULL,
+                lease_expires_at = NULL,
+                updated_at = NOW()
+            WHERE assigned_worker_id = $1 AND status = 'processing' AND organization_id = $2
+            "#,
+        )
+        .bind(&req.worker_id)
+        .bind(&auth.organization_id)
+        .execute(self.pool.as_ref())
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to release worker jobs");
+            Status::internal("Failed to release worker jobs")
+        })?;
+
+        if released.rows_affected() > 0 {
+            info!(
+                worker_id = %req.worker_id,
+                released_jobs = released.rows_affected(),
+                "Released jobs from deregistering worker"
+            );
+        }
+
+        // Then mark worker as offline
         let result = sqlx::query(
             "UPDATE workers SET status = 'offline', updated_at = NOW() WHERE id = $1 AND organization_id = $2",
         )
