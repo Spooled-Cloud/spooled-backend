@@ -20,6 +20,7 @@ use serde::Serialize;
 use uuid::Uuid;
 use validator::Validate;
 
+use crate::api::middleware::limits::check_resource_limit;
 use crate::api::AppState;
 use crate::error::{AppError, AppResult};
 use crate::models::{
@@ -74,11 +75,19 @@ pub async fn list(
 /// # Security
 /// The URL is validated against SSRF attacks. Private IPs, internal hostnames,
 /// and cloud metadata endpoints are blocked. HTTPS is required in production.
+/// Plan limits are enforced before creating webhooks.
 pub async fn create(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
     Json(request): Json<CreateOutgoingWebhookRequest>,
 ) -> AppResult<(StatusCode, Json<OutgoingWebhook>)> {
+    // Check webhook limit before creating
+    if let Err(response) =
+        check_resource_limit(state.db.pool(), &ctx.organization_id, "webhooks", 1).await
+    {
+        return Err(AppError::LimitExceeded(Box::new(response)));
+    }
+
     // Validate request
     request
         .validate()

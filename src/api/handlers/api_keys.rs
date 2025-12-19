@@ -8,6 +8,7 @@ use axum::{
 use chrono::Utc;
 use uuid::Uuid;
 
+use crate::api::middleware::limits::check_resource_limit;
 use crate::api::middleware::ValidatedJson;
 use crate::api::AppState;
 use crate::error::{AppError, AppResult};
@@ -54,12 +55,20 @@ pub async fn list(
 
 /// Create a new API key
 ///
-/// Now requires organization context from authenticated user
+/// Now requires organization context from authenticated user.
+/// SECURITY: Enforces plan limits before creating API keys.
 pub async fn create(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
     ValidatedJson(request): ValidatedJson<CreateApiKeyRequest>,
 ) -> AppResult<(StatusCode, Json<CreateApiKeyResponse>)> {
+    // Check API key limit before creating
+    if let Err(response) =
+        check_resource_limit(state.db.pool(), &ctx.organization_id, "api_keys", 1).await
+    {
+        return Err(AppError::LimitExceeded(Box::new(response)));
+    }
+
     let key_id = Uuid::new_v4().to_string();
     let now = Utc::now();
 

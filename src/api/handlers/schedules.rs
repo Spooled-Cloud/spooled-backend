@@ -12,7 +12,7 @@ use serde::Deserialize;
 use tracing::{error, info};
 
 use crate::api::middleware::limits::{
-    check_job_limits_generic, increment_daily_jobs, LimitCheckError,
+    check_job_limits_generic, check_resource_limit, increment_daily_jobs, LimitCheckError,
 };
 use crate::api::middleware::validation::ValidatedJson;
 use crate::api::AppState;
@@ -94,13 +94,25 @@ pub async fn get(
 ///
 /// POST /api/v1/schedules
 ///
-/// Now uses authenticated org context
+/// Now uses authenticated org context.
+/// SECURITY: Enforces plan limits before creating schedules.
 pub async fn create(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
     ValidatedJson(req): ValidatedJson<CreateScheduleRequest>,
 ) -> Result<(StatusCode, Json<CreateScheduleResponse>), (StatusCode, String)> {
     let org_id = &ctx.organization_id;
+
+    // Check schedule limit before creating
+    if check_resource_limit(state.db.pool(), org_id, "schedules", 1)
+        .await
+        .is_err()
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Schedule limit exceeded for your plan".to_string(),
+        ));
+    }
 
     // Validate cron expression
     let cron = CronSchedule::parse(&req.cron_expression).map_err(|e| {

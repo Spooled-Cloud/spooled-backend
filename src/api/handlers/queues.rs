@@ -7,6 +7,7 @@ use axum::{
 };
 use chrono::Utc;
 
+use crate::api::middleware::limits::check_resource_limit;
 use crate::api::AppState;
 use crate::error::{AppError, AppResult};
 use crate::models::{
@@ -87,14 +88,33 @@ pub async fn get(
 
 /// Update or create queue configuration
 ///
-/// Now uses authenticated organization context
-/// Now validates rate_limit bounds
+/// Now uses authenticated organization context.
+/// Now validates rate_limit bounds.
+/// SECURITY: Enforces plan limits before creating NEW queues.
 pub async fn update_config(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
     Path(name): Path<String>,
     Json(request): Json<UpsertQueueConfigRequest>,
 ) -> AppResult<Json<QueueConfig>> {
+    // Check if queue already exists (to distinguish create vs update)
+    let existing: Option<(String,)> = sqlx::query_as(
+        "SELECT id FROM queue_config WHERE queue_name = $1 AND organization_id = $2",
+    )
+    .bind(&name)
+    .bind(&ctx.organization_id)
+    .fetch_optional(state.db.pool())
+    .await?;
+
+    // Only check limit when creating a NEW queue
+    if existing.is_none() {
+        if let Err(response) =
+            check_resource_limit(state.db.pool(), &ctx.organization_id, "queues", 1).await
+        {
+            return Err(AppError::LimitExceeded(Box::new(response)));
+        }
+    }
+
     let max_retries = request
         .max_retries
         .unwrap_or(state.settings.queue.default_max_retries);
