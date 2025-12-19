@@ -1180,16 +1180,19 @@ pub async fn retry_dlq(
     // Reset child jobs that were blocked due to parent failure
     // When a parent job is retried from DLQ, its child jobs (with dependencies_met = false)
     // should have their dependencies recalculated
+    // SECURITY: Must include organization_id to prevent cross-tenant modification
     if !retried_job_ids.is_empty() {
         let reset_children = sqlx::query(
             r#"
             UPDATE jobs
             SET dependencies_met = FALSE, updated_at = NOW()
             WHERE parent_job_id = ANY($1)
+              AND organization_id = $2
               AND status IN ('pending', 'scheduled')
             "#,
         )
         .bind(&retried_job_ids)
+        .bind(&ctx.organization_id)
         .execute(state.db.pool())
         .await;
 

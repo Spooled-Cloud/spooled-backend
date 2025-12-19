@@ -474,27 +474,53 @@ impl QueueManager {
         // Update dependencies_met for child jobs that depend on this job
         // A child job's dependencies are met when ALL its parent jobs are completed
         // This runs in the same transaction to ensure atomicity
-        let update_result = sqlx::query(
-            r#"
-            UPDATE jobs
-            SET 
-                dependencies_met = TRUE,
-                updated_at = NOW()
-            WHERE parent_job_id = $1
-              AND status IN ('pending', 'scheduled')
-              AND dependencies_met = FALSE
-              AND NOT EXISTS (
-                  -- Check if there are any other incomplete parent jobs
-                  -- For now, we only support single-parent dependencies via parent_job_id
-                  SELECT 1 FROM jobs parent
-                  WHERE parent.id = jobs.parent_job_id
-                    AND parent.status NOT IN ('completed')
-              )
-            "#,
-        )
-        .bind(job_id)
-        .execute(&mut *tx)
-        .await?;
+        // SECURITY: Include organization_id when available for defense-in-depth
+        let update_result = if let Some(oid) = org_id {
+            sqlx::query(
+                r#"
+                UPDATE jobs
+                SET 
+                    dependencies_met = TRUE,
+                    updated_at = NOW()
+                WHERE parent_job_id = $1
+                  AND organization_id = $2
+                  AND status IN ('pending', 'scheduled')
+                  AND dependencies_met = FALSE
+                  AND NOT EXISTS (
+                      -- Check if there are any other incomplete parent jobs
+                      -- For now, we only support single-parent dependencies via parent_job_id
+                      SELECT 1 FROM jobs parent
+                      WHERE parent.id = jobs.parent_job_id
+                        AND parent.status NOT IN ('completed')
+                  )
+                "#,
+            )
+            .bind(job_id)
+            .bind(oid)
+            .execute(&mut *tx)
+            .await?
+        } else {
+            // Fallback for internal calls without org context (backward compat)
+            sqlx::query(
+                r#"
+                UPDATE jobs
+                SET 
+                    dependencies_met = TRUE,
+                    updated_at = NOW()
+                WHERE parent_job_id = $1
+                  AND status IN ('pending', 'scheduled')
+                  AND dependencies_met = FALSE
+                  AND NOT EXISTS (
+                      SELECT 1 FROM jobs parent
+                      WHERE parent.id = jobs.parent_job_id
+                        AND parent.status NOT IN ('completed')
+                  )
+                "#,
+            )
+            .bind(job_id)
+            .execute(&mut *tx)
+            .await?
+        };
 
         // Commit the transaction
         tx.commit().await?;

@@ -577,6 +577,13 @@ pub async fn delete_organization(
         // Order matters due to foreign key constraints
         // Note: job_dependencies has ON DELETE CASCADE from jobs, so no need to delete explicitly
 
+        // CRITICAL: Get API key hashes BEFORE deleting, for cache invalidation
+        let api_key_hashes: Vec<(String,)> =
+            sqlx::query_as("SELECT key_hash FROM api_keys WHERE organization_id = $1")
+                .bind(&id)
+                .fetch_all(state.db.pool())
+                .await?;
+
         // 1. Delete jobs (job_dependencies will cascade automatically)
         sqlx::query("DELETE FROM jobs WHERE organization_id = $1")
             .bind(&id)
@@ -604,6 +611,24 @@ pub async fn delete_organization(
             .bind(&id)
             .execute(state.db.pool())
             .await?;
+
+        // CRITICAL: Invalidate all cached API keys for this org
+        // Without this, deleted org's API keys remain valid in cache for up to 1 hour!
+        if let Some(ref cache) = state.cache {
+            for (key_hash,) in api_key_hashes {
+                let hash_prefix = if key_hash.len() >= 16 {
+                    &key_hash[..16]
+                } else {
+                    &key_hash
+                };
+                let reverse_key = format!("api_key_reverse:{}", hash_prefix);
+                if let Ok(Some(lookup_hash)) = cache.get(&reverse_key).await {
+                    let cache_key = format!("api_key:{}", lookup_hash);
+                    let _ = cache.delete(&cache_key).await;
+                    let _ = cache.delete(&reverse_key).await;
+                }
+            }
+        }
 
         sqlx::query("DELETE FROM outgoing_webhooks WHERE organization_id = $1")
             .bind(&id)

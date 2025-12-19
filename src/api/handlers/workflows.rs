@@ -706,9 +706,11 @@ pub async fn add_dependencies(
     }
 
     // Update dependency mode
-    sqlx::query("UPDATE jobs SET dependency_mode = $1, dependencies_met = FALSE WHERE id = $2")
+    // SECURITY: Include organization_id for defense-in-depth
+    sqlx::query("UPDATE jobs SET dependency_mode = $1, dependencies_met = FALSE WHERE id = $2 AND organization_id = $3")
         .bind(request.dependency_mode.to_string())
         .bind(&job_id)
+        .bind(&ctx.organization_id)
         .execute(state.db.pool())
         .await?;
 
@@ -755,9 +757,11 @@ pub async fn add_dependencies(
         .unwrap_or(true);
 
     // Update job's dependencies_met flag
-    sqlx::query("UPDATE jobs SET dependencies_met = $1 WHERE id = $2")
+    // SECURITY: Include organization_id for defense-in-depth
+    sqlx::query("UPDATE jobs SET dependencies_met = $1 WHERE id = $2 AND organization_id = $3")
         .bind(dependencies_met)
         .bind(&job_id)
+        .bind(&ctx.organization_id)
         .execute(state.db.pool())
         .await?;
 

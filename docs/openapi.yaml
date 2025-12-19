@@ -914,12 +914,18 @@ paths:
             type: string
             enum: [pending, scheduled, processing, completed, failed, deadletter, cancelled]
           description: Filter by status
+        - name: tag
+          in: query
+          schema:
+            type: string
+            maxLength: 64
+          description: Filter jobs by a single tag (matches Postgres `tags ? tag` semantics)
         - name: limit
           in: query
           schema:
             type: integer
             default: 50
-            maximum: 1000
+            maximum: 100
           description: Maximum number of results
         - name: offset
           in: query
@@ -1242,12 +1248,18 @@ paths:
           schema:
             type: string
           description: Filter by queue name
+        - name: tag
+          in: query
+          schema:
+            type: string
+            maxLength: 64
+          description: Filter jobs by a single tag (matches Postgres `tags ? tag` semantics)
         - name: limit
           in: query
           schema:
             type: integer
             default: 50
-            maximum: 1000
+            maximum: 100
         - name: offset
           in: query
           schema:
@@ -3774,17 +3786,18 @@ components:
         type:
           type: string
           enum:
-            - job.status
-            - job.created
-            - job.completed
-            - job.failed
-            - queue.stats
-            - worker.heartbeat
-            - worker.registered
-            - worker.deregistered
-            - system.health
-            - ping
-            - error
+            # JSON payload "type" values (matches backend `RealtimeEvent` enum variants)
+            - JobStatusChange
+            - JobCreated
+            - JobCompleted
+            - JobFailed
+            - QueueStats
+            - WorkerHeartbeat
+            - WorkerRegistered
+            - WorkerDeregistered
+            - SystemHealth
+            - Ping
+            - Error
         data:
           type: object
 

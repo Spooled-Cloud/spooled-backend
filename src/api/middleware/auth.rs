@@ -291,8 +291,20 @@ async fn fetch_and_cache_api_key(
 
     // Cache for 1 hour
     if let Some(ref cache) = state.cache {
-        let cache_key = format!("api_key:{}", hash_for_lookup(token));
+        let lookup_hash = hash_for_lookup(token);
+        let cache_key = format!("api_key:{}", lookup_hash);
         let _ = cache.set_json(&cache_key, &record, 3600).await;
+
+        // CRITICAL: Also set reverse mapping (bcrypt hash prefix -> lookup hash)
+        // This allows cache invalidation when the API key is revoked.
+        // Without this, revoked keys remain valid in cache for up to 1 hour!
+        let hash_prefix = if record.key_hash.len() >= 16 {
+            &record.key_hash[..16]
+        } else {
+            &record.key_hash
+        };
+        let reverse_key = format!("api_key_reverse:{}", hash_prefix);
+        let _ = cache.set(&reverse_key, &lookup_hash, 3600).await;
     }
 
     Ok(record)
