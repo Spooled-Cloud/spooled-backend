@@ -376,4 +376,3 @@ Common cron expressions and their meanings:
 
 - [Schedules Guide](../../../spooled-frontend/src/pages/docs/jobs.astro) (scheduled jobs section)
 - [Operations Guide](../operations.md)
-

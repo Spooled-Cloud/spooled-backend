@@ -296,4 +296,3 @@ Redis data is automatically rebuilt as the system operates.
 - [Operations Guide](operations.md) - General operational procedures
 - [Backup Script](../../scripts/backup_database.sh) - Automated backup
 - [Verify Script](../../scripts/verify_backup.sh) - Automated verification
-

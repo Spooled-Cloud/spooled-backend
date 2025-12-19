@@ -495,5 +495,3 @@ Start a worker for queue `signups` (for example `worker-print.mjs`) and you’re
 - Keep your `X-Webhook-Token` secret. Don’t put it in public repos.
 - Start simple: first print jobs, then add real actions.
 - You don’t need to pre-create queues. Pick a queue name and send jobs to it.
-
-

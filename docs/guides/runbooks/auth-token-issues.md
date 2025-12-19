@@ -310,4 +310,3 @@ HAVING COUNT(*) > 10;
 - [Authentication Guide](../../../spooled-frontend/src/pages/docs/authentication.astro)
 - [API Keys Management](../api-usage.md)
 - [Operations Guide - JWT Security](../operations.md#jwt-security)
-

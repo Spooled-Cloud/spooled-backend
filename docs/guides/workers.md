@@ -672,4 +672,3 @@ def process_job(job):
 - [Retries Guide](./retries.md) — Retry configuration
 - [gRPC Guide](./grpc-server.md) — High-performance gRPC API
 - [API Reference](./api-usage.md) — Complete API documentation
-

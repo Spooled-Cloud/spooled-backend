@@ -238,4 +238,3 @@ When Redis reconnects:
 
 - [Operations Guide - Redis Configuration](../operations.md#redis-configuration)
 - [Redis Documentation](https://redis.io/docs/)
-

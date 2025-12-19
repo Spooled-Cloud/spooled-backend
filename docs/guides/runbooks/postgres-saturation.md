@@ -211,4 +211,3 @@ Add to your monitoring checklist:
 
 - [Operations Guide - Connection Pooling](../operations.md#connection-pooling-pgbouncer)
 - [PgBouncer Documentation](https://www.pgbouncer.org/config.html)
-
