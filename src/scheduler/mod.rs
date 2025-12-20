@@ -865,6 +865,33 @@ impl Scheduler {
             total_cleaned += webhooks_cleaned;
         }
 
+        // Cleanup jobs that have passed their expires_at timestamp
+        // These are jobs created with explicit expiration (e.g., demo/temporary jobs)
+        // They remain pending/scheduled but are never claimed, so delete them
+        let result = sqlx::query(
+            r#"
+            DELETE FROM jobs
+            WHERE id IN (
+                SELECT id FROM jobs
+                WHERE expires_at IS NOT NULL
+                  AND expires_at < NOW()
+                  AND status IN ('pending', 'scheduled', 'failed', 'deadletter')
+                LIMIT 10000
+            )
+            "#,
+        )
+        .execute(&*self.db)
+        .await?;
+
+        let expired_cleaned = result.rows_affected();
+        if expired_cleaned > 0 {
+            debug!(
+                count = expired_cleaned,
+                "Cleaned up expired jobs (expires_at passed)"
+            );
+            total_cleaned += expired_cleaned;
+        }
+
         Ok(total_cleaned)
     }
 }
