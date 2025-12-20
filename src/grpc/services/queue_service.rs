@@ -845,19 +845,38 @@ impl QueueService for QueueServiceImpl {
         // Extract metadata before consuming request (Streaming is not Sync)
         let metadata = request.metadata().clone();
         let auth = authenticate_from_metadata(self.pool.as_ref(), &metadata).await?;
-        self.enforce_rate_limits(&auth.organization_id, &auth.api_key_id, auth.rate_limit)
-            .await?;
         let mut stream = request.into_inner();
 
         let pool = self.pool.clone();
         let metrics = self.metrics.clone();
         let org_id = auth.organization_id.clone();
+        let api_key_id = auth.api_key_id.clone();
+        let api_key_rate_limit = auth.rate_limit;
+        let this = self.clone();
 
         let (tx, rx) = mpsc::channel(16);
 
         // Spawn background task to handle incoming requests
         tokio::spawn(async move {
             while let Ok(Some(req)) = stream.message().await {
+                // IMPORTANT: enforce rate limits per message, otherwise the stream can bypass limits.
+                if let Err(status) =
+                    this.enforce_rate_limits(&org_id, &api_key_id, api_key_rate_limit).await
+                {
+                    let response = ProcessResponse {
+                        response: Some(crate::grpc::proto::process_response::Response::Error(
+                            crate::grpc::proto::ErrorResponse {
+                                code: "RATE_LIMIT_EXCEEDED".to_string(),
+                                message: status.to_string(),
+                            },
+                        )),
+                    };
+                    if tx.send(Ok(response)).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+
                 let response = match req.request {
                     Some(crate::grpc::proto::process_request::Request::Dequeue(dequeue_req)) => {
                         handle_process_dequeue(&pool, &metrics, &org_id, dequeue_req).await

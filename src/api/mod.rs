@@ -160,7 +160,12 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
         // Organization creation is public (for onboarding)
         .route("/organizations", post(handlers::organizations::create))
         // Auth/me uses JWT validation internally (not API key middleware)
-        .route("/auth/me", get(handlers::auth::me));
+        .route("/auth/me", get(handlers::auth::me))
+        // Global rate limiting for public endpoints (protects auth/webhooks/signup).
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::plan_rate_limit::plan_rate_limit_middleware,
+        ));
 
     // Protected routes (require API key authentication)
     // Auth middleware is applied via route_layer which runs AFTER state extraction

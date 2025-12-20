@@ -73,7 +73,9 @@ fn extract_client_id(request: &Request<Body>) -> String {
         return format!("ua:{}", hash);
     }
 
-    format!("req:{}", uuid::Uuid::new_v4())
+    // Worst-case fallback: group unknown clients together (don't generate a random key,
+    // otherwise callers can bypass rate limiting by omitting identifying headers).
+    "unknown".to_string()
 }
 
 async fn get_org_rate_limits(state: &AppState, org_id: &str) -> Result<OrgRateLimits, ()> {
