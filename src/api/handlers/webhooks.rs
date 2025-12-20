@@ -3,12 +3,13 @@
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
-    Json,
 };
 use chrono::Utc;
 use uuid::Uuid;
 
 use crate::api::AppState;
+use crate::api::middleware::limits::{check_job_limits, check_payload_size, increment_daily_jobs};
+use crate::api::middleware::ValidatedJson;
 use crate::config::Environment;
 use crate::error::{AppError, AppResult};
 use crate::models::CustomWebhookRequest;
@@ -83,7 +84,7 @@ pub async fn custom(
     State(state): State<AppState>,
     Path(org_id): Path<String>,
     headers: HeaderMap,
-    Json(request): Json<CustomWebhookRequest>,
+    ValidatedJson(request): ValidatedJson<CustomWebhookRequest>,
 ) -> AppResult<StatusCode> {
     // In production, require HTTPS for webhooks
     validate_https_in_production(&state, &headers)?;
@@ -113,7 +114,28 @@ pub async fn custom(
     let now = Utc::now();
     let priority = request.priority.unwrap_or(0);
 
-    sqlx::query(
+    // Enforce plan limits for webhook-ingested jobs too (same as /jobs).
+    let payload_json = serde_json::to_string(&request.payload).unwrap_or_default();
+
+    // Hard safety cap for webhook payloads (separate from plan payload limit).
+    if payload_json.len() > MAX_WEBHOOK_PAYLOAD_SIZE {
+        return Err(AppError::BadRequest(format!(
+            "Webhook payload too large ({} bytes, max {} bytes)",
+            payload_json.len(),
+            MAX_WEBHOOK_PAYLOAD_SIZE
+        )));
+    }
+
+    if let Err(response) = check_payload_size(state.db.pool(), &org_id, payload_json.len()).await {
+        return Err(AppError::LimitExceeded(Box::new(response)));
+    }
+
+    if let Err(response) = check_job_limits(state.db.pool(), &org_id, 1).await {
+        return Err(AppError::LimitExceeded(Box::new(response)));
+    }
+
+    // Insert job with idempotency support and return ID to detect new vs duplicate.
+    let (returned_id,): (String,) = sqlx::query_as(
         r#"
         INSERT INTO jobs (
             id, organization_id, queue_name, status, payload, priority,
@@ -122,17 +144,20 @@ pub async fn custom(
         VALUES ($1, $2, $3, 'pending', $4::JSONB, $5, 3, 300, $6, $6, $7)
         ON CONFLICT (organization_id, idempotency_key) WHERE idempotency_key IS NOT NULL
         DO UPDATE SET updated_at = NOW()
+        RETURNING id
         "#,
     )
     .bind(&job_id)
     .bind(&org_id) // Use org_id from path
     .bind(&request.queue_name)
-    .bind(serde_json::to_string(&request.payload).unwrap_or_default())
+    .bind(&payload_json)
     .bind(priority)
     .bind(now)
     .bind(&request.idempotency_key)
-    .execute(state.db.pool())
+    .fetch_one(state.db.pool())
     .await?;
+
+    let created = returned_id == job_id;
 
     // Record webhook delivery
     let event_type = request.event_type.unwrap_or_else(|| "custom".to_string());
@@ -151,14 +176,20 @@ pub async fn custom(
     .execute(state.db.pool())
     .await?;
 
-    state.metrics.jobs_enqueued.inc();
+    if created {
+        state.metrics.jobs_enqueued.inc();
+        // Increment daily job counter for plan limit tracking
+        if let Err(e) = increment_daily_jobs(state.db.pool(), &org_id, 1).await {
+            tracing::warn!(error = %e, org_id = %org_id, "Failed to increment daily job counter");
+        }
+    }
 
     // Publish to Redis with org context to prevent cross-tenant leakage
     if let Some(ref cache) = state.cache {
         let _ = cache
             .publish(
                 &format!("org:{}:queue:{}", org_id, request.queue_name),
-                &job_id,
+                &returned_id,
             )
             .await;
     }

@@ -17,6 +17,9 @@ use tokio::sync::watch;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
+use crate::api::middleware::limits::{
+    check_job_limits_generic, check_payload_size_generic, increment_daily_jobs,
+};
 use crate::cache::RedisCache;
 use crate::models::CronSchedule;
 use crate::observability::Metrics;
@@ -344,6 +347,82 @@ impl Scheduler {
                 .ok()
                 .and_then(|c| c.next_run_after(now));
 
+            // Enforce plan limits BEFORE inserting cron jobs.
+            // Important: cron-triggered jobs must count toward daily quota + payload limits.
+            if let Err(e) = check_job_limits_generic(&*self.db, &schedule.organization_id, 1).await {
+                tx.rollback().await?;
+
+                warn!(
+                    schedule_id = %schedule.id,
+                    org_id = %schedule.organization_id,
+                    error = %e,
+                    "Cron schedule blocked by plan job limits"
+                );
+
+                let run_id = uuid::Uuid::new_v4().to_string();
+                let _ = sqlx::query(
+                    r#"
+                    INSERT INTO schedule_runs (id, schedule_id, status, error_message, started_at, completed_at)
+                    VALUES ($1, $2, 'failed', $3, $4, $4)
+                    "#,
+                )
+                .bind(&run_id)
+                .bind(&schedule.id)
+                .bind(e.to_string())
+                .bind(now)
+                .execute(&*self.db)
+                .await;
+
+                let _ = sqlx::query(
+                    "UPDATE schedules SET next_run_at = $2, updated_at = NOW() WHERE id = $1",
+                )
+                .bind(&schedule.id)
+                .bind(next_run)
+                .execute(&*self.db)
+                .await;
+
+                continue;
+            }
+
+            let payload_json = serde_json::to_string(&schedule.payload_template).unwrap_or_default();
+            if let Err(e) =
+                check_payload_size_generic(&*self.db, &schedule.organization_id, payload_json.len())
+                    .await
+            {
+                tx.rollback().await?;
+
+                warn!(
+                    schedule_id = %schedule.id,
+                    org_id = %schedule.organization_id,
+                    error = %e,
+                    "Cron schedule blocked by payload size limits"
+                );
+
+                let run_id = uuid::Uuid::new_v4().to_string();
+                let _ = sqlx::query(
+                    r#"
+                    INSERT INTO schedule_runs (id, schedule_id, status, error_message, started_at, completed_at)
+                    VALUES ($1, $2, 'failed', $3, $4, $4)
+                    "#,
+                )
+                .bind(&run_id)
+                .bind(&schedule.id)
+                .bind(e.to_string())
+                .bind(now)
+                .execute(&*self.db)
+                .await;
+
+                let _ = sqlx::query(
+                    "UPDATE schedules SET next_run_at = $2, updated_at = NOW() WHERE id = $1",
+                )
+                .bind(&schedule.id)
+                .bind(next_run)
+                .execute(&*self.db)
+                .await;
+
+                continue;
+            }
+
             // Transaction already started with lock - create job from schedule
             let job_id = uuid::Uuid::new_v4().to_string();
             let run_id = uuid::Uuid::new_v4().to_string();
@@ -405,6 +484,15 @@ impl Scheduler {
 
                     processed += 1;
                     self.metrics.jobs_enqueued.inc();
+
+                    // Increment daily job counter for plan limit tracking (best-effort).
+                    if let Err(e) = increment_daily_jobs(&*self.db, &schedule.organization_id, 1).await {
+                        warn!(
+                            error = %e,
+                            org_id = %schedule.organization_id,
+                            "Failed to increment daily job counter for cron schedule job"
+                        );
+                    }
 
                     // Notify queue with org context (outside transaction)
                     if let Some(ref cache) = self.cache {

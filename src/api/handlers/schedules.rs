@@ -12,7 +12,8 @@ use serde::Deserialize;
 use tracing::{error, info};
 
 use crate::api::middleware::limits::{
-    check_job_limits_generic, check_resource_limit, increment_daily_jobs, LimitCheckError,
+    check_job_limits_generic, check_payload_size_generic, check_resource_limit, increment_daily_jobs,
+    LimitCheckError,
 };
 use crate::api::middleware::validation::ValidatedJson;
 use crate::api::AppState;
@@ -420,6 +421,22 @@ pub async fn trigger(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Limit check error".to_string(),
             ),
+        })?;
+
+    // Also enforce plan payload size for the schedule's payload template.
+    let payload_json = serde_json::to_string(&schedule.payload_template).unwrap_or_default();
+    check_payload_size_generic(state.db.pool(), &ctx.organization_id, payload_json.len())
+        .await
+        .map_err(|e| match e {
+            LimitCheckError::Database(msg) => {
+                error!(error = %msg, "Failed to check payload size for schedule trigger");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to check limits".to_string(),
+                )
+            }
+            LimitCheckError::PayloadTooLarge { .. } => (StatusCode::FORBIDDEN, e.to_string()),
+            LimitCheckError::LimitExceeded(err) => (StatusCode::FORBIDDEN, err.to_string()),
         })?;
 
     // Create job immediately

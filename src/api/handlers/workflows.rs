@@ -13,7 +13,10 @@ use tracing::{info, warn};
 
 use crate::{
     api::{
-        middleware::{limits::check_job_limits, ValidatedJson},
+        middleware::{
+            limits::{check_job_limits, check_payload_size},
+            ValidatedJson,
+        },
         AppState,
     },
     error::{AppError, AppResult},
@@ -237,6 +240,18 @@ pub async fn create(
     // Check job limits (daily + active) before creating workflow jobs
     let job_count = request.jobs.len() as u64;
     if let Err(response) = check_job_limits(state.db.pool(), &ctx.organization_id, job_count).await
+    {
+        return Err(AppError::LimitExceeded(Box::new(response)));
+    }
+
+    // Enforce plan payload size for workflow jobs too (plan overrides + custom_limits).
+    let mut max_payload_size: usize = 0;
+    for job_def in &request.jobs {
+        let payload_json = serde_json::to_string(&job_def.payload).unwrap_or_default();
+        max_payload_size = max_payload_size.max(payload_json.len());
+    }
+    if let Err(response) =
+        check_payload_size(state.db.pool(), &ctx.organization_id, max_payload_size).await
     {
         return Err(AppError::LimitExceeded(Box::new(response)));
     }
