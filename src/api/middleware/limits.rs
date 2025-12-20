@@ -182,6 +182,13 @@ pub enum LimitCheckError {
     Database(String),
     /// Job limit exceeded
     LimitExceeded(crate::config::LimitError),
+    /// Payload too large for current plan
+    PayloadTooLarge {
+        current: u64,
+        limit: u64,
+        plan: String,
+        upgrade_to: Option<String>,
+    },
 }
 
 impl std::fmt::Display for LimitCheckError {
@@ -189,6 +196,22 @@ impl std::fmt::Display for LimitCheckError {
         match self {
             LimitCheckError::Database(msg) => write!(f, "Database error: {}", msg),
             LimitCheckError::LimitExceeded(err) => write!(f, "{}", err),
+            LimitCheckError::PayloadTooLarge {
+                current,
+                limit,
+                plan,
+                upgrade_to,
+            } => {
+                write!(
+                    f,
+                    "payload size limit reached ({}/{}) on plan {}",
+                    current, limit, plan
+                )?;
+                if let Some(upgrade) = upgrade_to {
+                    write!(f, ". Upgrade to {} for higher limits.", upgrade)?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -224,6 +247,37 @@ pub async fn check_job_limits_generic(
     Ok(())
 }
 
+/// Check payload size against plan limits - generic version (usable by HTTP, gRPC, etc.)
+pub async fn check_payload_size_generic(
+    pool: &PgPool,
+    org_id: &str,
+    payload_size: usize,
+) -> Result<(), LimitCheckError> {
+    let (plan_tier, custom_limits) = get_org_plan_and_limits(pool, org_id)
+        .await
+        .map_err(|e| LimitCheckError::Database(e.to_string()))?;
+
+    let limits = PlanLimits::for_tier_with_overrides(&plan_tier, custom_limits.as_ref());
+
+    if payload_size > limits.max_payload_size_bytes {
+        let upgrade_to = match limits.tier.as_str() {
+            "free" => Some("starter".to_string()),
+            "starter" => Some("pro".to_string()),
+            "pro" => Some("enterprise".to_string()),
+            _ => None,
+        };
+
+        return Err(LimitCheckError::PayloadTooLarge {
+            current: payload_size as u64,
+            limit: limits.max_payload_size_bytes as u64,
+            plan: limits.tier,
+            upgrade_to,
+        });
+    }
+
+    Ok(())
+}
+
 /// Check job creation limits (both daily and active) - HTTP version
 pub async fn check_job_limits(pool: &PgPool, org_id: &str, job_count: u64) -> Result<(), Response> {
     check_job_limits_generic(pool, org_id, job_count)
@@ -234,6 +288,10 @@ pub async fn check_job_limits(pool: &PgPool, org_id: &str, job_count: u64) -> Re
                 (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
             }
             LimitCheckError::LimitExceeded(err) => LimitExceededResponse::from(err).into_response(),
+            LimitCheckError::PayloadTooLarge { .. } => {
+                // Not expected for job count checks; treat as internal mapping error
+                (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
+            }
         })
 }
 
@@ -243,29 +301,35 @@ pub async fn check_payload_size(
     org_id: &str,
     payload_size: usize,
 ) -> Result<(), Response> {
-    let (plan_tier, custom_limits) = get_org_plan_and_limits(pool, org_id).await.map_err(|e| {
-        tracing::error!(error = %e, "Failed to get org plan tier");
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
-    })?;
-
-    let limits = PlanLimits::for_tier_with_overrides(&plan_tier, custom_limits.as_ref());
-
-    if payload_size > limits.max_payload_size_bytes {
-        return Err(Json(serde_json::json!({
-            "error": "payload_too_large",
-            "message": format!(
-                "Payload size ({} bytes) exceeds plan limit ({} bytes). Upgrade for larger payloads.",
-                payload_size, limits.max_payload_size_bytes
-            ),
-            "current": payload_size,
-            "limit": limits.max_payload_size_bytes,
-            "plan": limits.tier,
-            "upgrade_to": limits.tier != "enterprise"
-        }))
-        .into_response());
-    }
-
-    Ok(())
+    check_payload_size_generic(pool, org_id, payload_size)
+        .await
+        .map_err(|e| match e {
+            LimitCheckError::Database(msg) => {
+                tracing::error!(error = %msg, "Failed to get org plan tier");
+                (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
+            }
+            LimitCheckError::LimitExceeded(_) => {
+                // Not expected for payload checks; treat as internal mapping error
+                (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
+            }
+            LimitCheckError::PayloadTooLarge {
+                current,
+                limit,
+                plan,
+                upgrade_to,
+            } => Json(serde_json::json!({
+                "error": "payload_too_large",
+                "message": format!(
+                    "Payload size ({} bytes) exceeds plan limit ({} bytes). Upgrade for larger payloads.",
+                    current, limit
+                ),
+                "current": current,
+                "limit": limit,
+                "plan": plan,
+                "upgrade_to": upgrade_to.is_some()
+            }))
+            .into_response(),
+        })
 }
 
 /// Increment daily job counter

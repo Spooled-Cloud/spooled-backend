@@ -416,6 +416,10 @@ pub async fn trigger(
                 )
             }
             LimitCheckError::LimitExceeded(err) => (StatusCode::FORBIDDEN, err.to_string()),
+            LimitCheckError::PayloadTooLarge { .. } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Limit check error".to_string(),
+            ),
         })?;
 
     // Create job immediately

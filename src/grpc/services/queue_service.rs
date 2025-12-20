@@ -19,7 +19,7 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info};
 
 use crate::api::middleware::limits::{
-    check_job_limits_generic, increment_daily_jobs, LimitCheckError,
+    check_job_limits_generic, check_payload_size_generic, increment_daily_jobs, LimitCheckError,
 };
 use crate::grpc::auth::{authenticate_from_metadata, authenticate_request};
 use crate::grpc::convert::{
@@ -180,6 +180,19 @@ impl QueueService for QueueServiceImpl {
             )));
         }
 
+        // Enforce plan-specific payload limits (e.g. Free: 64KB, Starter: 256KB)
+        check_payload_size_generic(self.pool.as_ref(), &auth.organization_id, payload_str.len())
+            .await
+            .map_err(|e| match e {
+                LimitCheckError::Database(msg) => {
+                    error!(error = %msg, "Failed to check payload size");
+                    Status::internal("Failed to check payload size")
+                }
+                LimitCheckError::PayloadTooLarge { .. } => Status::resource_exhausted(e.to_string()),
+                // Not expected for payload checks, but map defensively
+                LimitCheckError::LimitExceeded(err) => Status::resource_exhausted(err.to_string()),
+            })?;
+
         // Check job limits (daily + active) before creating
         check_job_limits_generic(self.pool.as_ref(), &auth.organization_id, 1)
             .await
@@ -189,6 +202,10 @@ impl QueueService for QueueServiceImpl {
                     Status::internal("Failed to check job limits")
                 }
                 LimitCheckError::LimitExceeded(err) => Status::resource_exhausted(err.to_string()),
+                LimitCheckError::PayloadTooLarge { .. } => {
+                    // Not expected for job count checks
+                    Status::internal("Limit check error")
+                }
             })?;
 
         let job_id = uuid::Uuid::new_v4().to_string();

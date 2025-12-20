@@ -747,6 +747,7 @@ pub async fn bulk_enqueue(
         Vec::with_capacity(request.jobs.len());
     let mut idempotency_keys: Vec<Option<String>> = Vec::with_capacity(request.jobs.len());
     let mut indexes: Vec<i32> = Vec::with_capacity(request.jobs.len());
+    let mut max_payload_size: usize = 0;
 
     for (index, job_item) in request.jobs.iter().enumerate() {
         let job_id = Uuid::new_v4().to_string();
@@ -760,11 +761,19 @@ pub async fn bulk_enqueue(
 
         job_ids.push(job_id);
         statuses.push(initial_status.to_string());
-        payloads.push(serde_json::to_string(&job_item.payload).unwrap_or_default());
+        let payload_json = serde_json::to_string(&job_item.payload).unwrap_or_default();
+        max_payload_size = max_payload_size.max(payload_json.len());
+        payloads.push(payload_json);
         priorities.push(priority);
         scheduled_ats.push(job_item.scheduled_at);
         idempotency_keys.push(job_item.idempotency_key.clone());
         indexes.push(index as i32);
+    }
+
+    // SECURITY: Enforce per-plan payload size limit for bulk enqueue too.
+    // Previously, /jobs created enforced plan payload limits, but /jobs/bulk only validated 1MB.
+    if let Err(response) = check_payload_size(state.db.pool(), &org_id, max_payload_size).await {
+        return Err(AppError::LimitExceeded(Box::new(response)));
     }
 
     // Batch INSERT using UNNEST - single database round-trip
