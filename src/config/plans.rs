@@ -5,6 +5,11 @@
 //! restrictive to encourage upgrades.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::env;
+
+use lazy_static::lazy_static;
+use tracing::warn;
 
 /// Resource limits for a plan tier
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +54,326 @@ pub struct PlanLimits {
     pub job_retention_days: u32,
     /// Job history retention in days
     pub history_retention_days: u32,
+}
+
+/// Per-tier environment overrides, loaded once at process start.
+#[derive(Debug, Clone, Default)]
+struct TierEnvOverrides {
+    /// JSON overrides (same schema as organizations.custom_limits)
+    json: Option<Value>,
+
+    /// Individual field overrides (take precedence over JSON overrides)
+    max_jobs_per_day: Option<Option<u64>>,
+    max_active_jobs: Option<Option<u64>>,
+    max_queues: Option<Option<u32>>,
+    max_workers: Option<Option<u32>>,
+    max_api_keys: Option<Option<u32>>,
+    max_schedules: Option<Option<u32>>,
+    max_workflows: Option<Option<u32>>,
+    max_webhooks: Option<Option<u32>>,
+
+    max_payload_size_bytes: Option<usize>,
+
+    rate_limit_requests_per_second: Option<u32>,
+    rate_limit_burst: Option<u32>,
+
+    job_retention_days: Option<u32>,
+    history_retention_days: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct EnvPlanOverrides {
+    /// Global JSON override mapping tier -> overrides
+    ///
+    /// Env: `SPOOLED_PLAN_LIMITS_JSON`
+    global_json: Option<Value>,
+
+    free: TierEnvOverrides,
+    starter: TierEnvOverrides,
+    pro: TierEnvOverrides,
+    enterprise: TierEnvOverrides,
+}
+
+fn env_get(key: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn parse_env_json(key: &str) -> Option<Value> {
+    let raw = env_get(key)?;
+    match serde_json::from_str::<Value>(&raw) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            warn!(env = %key, error = %e, "Failed to parse plan limits JSON from env; ignoring");
+            None
+        }
+    }
+}
+
+fn parse_optional_u64_env(key: &str) -> Option<Option<u64>> {
+    let raw = env_get(key)?;
+    let lower = raw.to_lowercase();
+    if lower == "unlimited" || lower == "none" || lower == "null" || lower == "-1" {
+        return Some(None);
+    }
+    match raw.parse::<u64>() {
+        Ok(v) => Some(Some(v)),
+        Err(e) => {
+            warn!(env = %key, value = %raw, error = %e, "Invalid u64 env var; ignoring");
+            None
+        }
+    }
+}
+
+fn parse_optional_u32_env(key: &str) -> Option<Option<u32>> {
+    let opt = parse_optional_u64_env(key)?;
+    match opt {
+        None => Some(None),
+        Some(v) => {
+            if v > u32::MAX as u64 {
+                warn!(env = %key, value = v, "Env var too large for u32; ignoring");
+                None
+            } else {
+                Some(Some(v as u32))
+            }
+        }
+    }
+}
+
+fn parse_u32_env(key: &str) -> Option<u32> {
+    let raw = env_get(key)?;
+    match raw.parse::<u32>() {
+        Ok(v) => Some(v),
+        Err(e) => {
+            warn!(env = %key, value = %raw, error = %e, "Invalid u32 env var; ignoring");
+            None
+        }
+    }
+}
+
+fn parse_usize_env(key: &str) -> Option<usize> {
+    let raw = env_get(key)?;
+    match raw.parse::<usize>() {
+        Ok(v) => Some(v),
+        Err(e) => {
+            warn!(env = %key, value = %raw, error = %e, "Invalid usize env var; ignoring");
+            None
+        }
+    }
+}
+
+fn load_tier_fields(tier_upper: &str, out: &mut TierEnvOverrides) {
+    // Option limits (support "unlimited"/"none"/"null"/-1)
+    out.max_jobs_per_day =
+        parse_optional_u64_env(&format!("SPOOLED_PLAN_{}_MAX_JOBS_PER_DAY", tier_upper));
+    out.max_active_jobs =
+        parse_optional_u64_env(&format!("SPOOLED_PLAN_{}_MAX_ACTIVE_JOBS", tier_upper));
+    out.max_queues = parse_optional_u32_env(&format!("SPOOLED_PLAN_{}_MAX_QUEUES", tier_upper));
+    out.max_workers = parse_optional_u32_env(&format!("SPOOLED_PLAN_{}_MAX_WORKERS", tier_upper));
+    out.max_api_keys = parse_optional_u32_env(&format!("SPOOLED_PLAN_{}_MAX_API_KEYS", tier_upper));
+    out.max_schedules =
+        parse_optional_u32_env(&format!("SPOOLED_PLAN_{}_MAX_SCHEDULES", tier_upper));
+    out.max_workflows =
+        parse_optional_u32_env(&format!("SPOOLED_PLAN_{}_MAX_WORKFLOWS", tier_upper));
+    out.max_webhooks =
+        parse_optional_u32_env(&format!("SPOOLED_PLAN_{}_MAX_WEBHOOKS", tier_upper));
+
+    // Non-option limits
+    out.max_payload_size_bytes =
+        parse_usize_env(&format!("SPOOLED_PLAN_{}_MAX_PAYLOAD_SIZE_BYTES", tier_upper));
+    out.rate_limit_requests_per_second =
+        parse_u32_env(&format!("SPOOLED_PLAN_{}_RATE_LIMIT_RPS", tier_upper));
+    out.rate_limit_burst = parse_u32_env(&format!("SPOOLED_PLAN_{}_RATE_LIMIT_BURST", tier_upper));
+    out.job_retention_days =
+        parse_u32_env(&format!("SPOOLED_PLAN_{}_JOB_RETENTION_DAYS", tier_upper));
+    out.history_retention_days =
+        parse_u32_env(&format!("SPOOLED_PLAN_{}_HISTORY_RETENTION_DAYS", tier_upper));
+}
+
+impl EnvPlanOverrides {
+    fn from_env() -> Self {
+        let mut out = Self::default();
+
+        // Global JSON mapping: { "free": { ... }, "starter": { ... } }
+        out.global_json = parse_env_json("SPOOLED_PLAN_LIMITS_JSON");
+
+        // Per-tier JSON: SPOOLED_PLAN_<TIER>_LIMITS_JSON
+        out.free.json = parse_env_json("SPOOLED_PLAN_FREE_LIMITS_JSON");
+        out.starter.json = parse_env_json("SPOOLED_PLAN_STARTER_LIMITS_JSON");
+        out.pro.json = parse_env_json("SPOOLED_PLAN_PRO_LIMITS_JSON");
+        out.enterprise.json = parse_env_json("SPOOLED_PLAN_ENTERPRISE_LIMITS_JSON");
+
+        // Per-tier individual fields (override JSON)
+        load_tier_fields("FREE", &mut out.free);
+        load_tier_fields("STARTER", &mut out.starter);
+        load_tier_fields("PRO", &mut out.pro);
+        load_tier_fields("ENTERPRISE", &mut out.enterprise);
+
+        out
+    }
+
+    fn tier(&self, tier: &str) -> Option<&TierEnvOverrides> {
+        match tier.to_lowercase().as_str() {
+            "free" => Some(&self.free),
+            "starter" => Some(&self.starter),
+            "pro" => Some(&self.pro),
+            "enterprise" => Some(&self.enterprise),
+            _ => None,
+        }
+    }
+}
+
+lazy_static! {
+    static ref ENV_PLAN_OVERRIDES: EnvPlanOverrides = EnvPlanOverrides::from_env();
+}
+
+fn apply_overrides_from_object(limits: &mut PlanLimits, obj: &serde_json::Map<String, Value>) {
+    // Option<u64>
+    if let Some(v) = obj.get("max_jobs_per_day") {
+        limits.max_jobs_per_day = if v.is_null() { None } else { v.as_u64() };
+    }
+    if let Some(v) = obj.get("max_active_jobs") {
+        limits.max_active_jobs = if v.is_null() { None } else { v.as_u64() };
+    }
+
+    // Option<u32>
+    if let Some(v) = obj.get("max_queues") {
+        limits.max_queues = if v.is_null() {
+            None
+        } else {
+            v.as_u64().map(|n| n as u32)
+        };
+    }
+    if let Some(v) = obj.get("max_workers") {
+        limits.max_workers = if v.is_null() {
+            None
+        } else {
+            v.as_u64().map(|n| n as u32)
+        };
+    }
+    if let Some(v) = obj.get("max_api_keys") {
+        limits.max_api_keys = if v.is_null() {
+            None
+        } else {
+            v.as_u64().map(|n| n as u32)
+        };
+    }
+    if let Some(v) = obj.get("max_schedules") {
+        limits.max_schedules = if v.is_null() {
+            None
+        } else {
+            v.as_u64().map(|n| n as u32)
+        };
+    }
+    if let Some(v) = obj.get("max_workflows") {
+        limits.max_workflows = if v.is_null() {
+            None
+        } else {
+            v.as_u64().map(|n| n as u32)
+        };
+    }
+    if let Some(v) = obj.get("max_webhooks") {
+        limits.max_webhooks = if v.is_null() {
+            None
+        } else {
+            v.as_u64().map(|n| n as u32)
+        };
+    }
+
+    // Non-option limits
+    if let Some(v) = obj.get("max_payload_size_bytes") {
+        if let Some(n) = v.as_u64() {
+            limits.max_payload_size_bytes = n as usize;
+        }
+    }
+    if let Some(v) = obj.get("rate_limit_requests_per_second") {
+        if let Some(n) = v.as_u64() {
+            limits.rate_limit_requests_per_second = n as u32;
+        }
+    }
+    if let Some(v) = obj.get("rate_limit_burst") {
+        if let Some(n) = v.as_u64() {
+            limits.rate_limit_burst = n as u32;
+        }
+    }
+    if let Some(v) = obj.get("job_retention_days") {
+        if let Some(n) = v.as_u64() {
+            limits.job_retention_days = n as u32;
+        }
+    }
+    if let Some(v) = obj.get("history_retention_days") {
+        if let Some(n) = v.as_u64() {
+            limits.history_retention_days = n as u32;
+        }
+    }
+}
+
+fn apply_overrides_from_json(limits: &mut PlanLimits, overrides: &Value) {
+    if let Some(obj) = overrides.as_object() {
+        apply_overrides_from_object(limits, obj);
+    }
+}
+
+fn apply_env_overrides(limits: &mut PlanLimits) {
+    let tier = limits.tier.to_lowercase();
+
+    // Global mapping: { "free": { ... } }
+    if let Some(Value::Object(map)) = ENV_PLAN_OVERRIDES.global_json.as_ref() {
+        if let Some(tier_overrides) = map.get(&tier) {
+            apply_overrides_from_json(limits, tier_overrides);
+        }
+    }
+
+    // Per-tier JSON + individual fields
+    if let Some(t) = ENV_PLAN_OVERRIDES.tier(&tier) {
+        if let Some(ref v) = t.json {
+            apply_overrides_from_json(limits, v);
+        }
+
+        if let Some(v) = t.max_jobs_per_day {
+            limits.max_jobs_per_day = v;
+        }
+        if let Some(v) = t.max_active_jobs {
+            limits.max_active_jobs = v;
+        }
+        if let Some(v) = t.max_queues {
+            limits.max_queues = v;
+        }
+        if let Some(v) = t.max_workers {
+            limits.max_workers = v;
+        }
+        if let Some(v) = t.max_api_keys {
+            limits.max_api_keys = v;
+        }
+        if let Some(v) = t.max_schedules {
+            limits.max_schedules = v;
+        }
+        if let Some(v) = t.max_workflows {
+            limits.max_workflows = v;
+        }
+        if let Some(v) = t.max_webhooks {
+            limits.max_webhooks = v;
+        }
+
+        if let Some(v) = t.max_payload_size_bytes {
+            limits.max_payload_size_bytes = v;
+        }
+
+        if let Some(v) = t.rate_limit_requests_per_second {
+            limits.rate_limit_requests_per_second = v;
+        }
+        if let Some(v) = t.rate_limit_burst {
+            limits.rate_limit_burst = v;
+        }
+        if let Some(v) = t.job_retention_days {
+            limits.job_retention_days = v;
+        }
+        if let Some(v) = t.history_retention_days {
+            limits.history_retention_days = v;
+        }
+    }
 }
 
 impl PlanLimits {
@@ -184,59 +509,13 @@ impl PlanLimits {
     pub fn for_tier_with_overrides(tier: &str, custom_limits: Option<&serde_json::Value>) -> Self {
         let mut limits = Self::for_tier(tier);
 
+        // Apply env-configured plan overrides first (global + per-tier).
+        // Org-level custom limits take precedence and are applied last.
+        apply_env_overrides(&mut limits);
+
         if let Some(overrides) = custom_limits {
-            if let Some(obj) = overrides.as_object() {
-                // Override each limit if specified
-                if let Some(v) = obj.get("max_jobs_per_day") {
-                    limits.max_jobs_per_day = v.as_u64();
-                }
-                if let Some(v) = obj.get("max_active_jobs") {
-                    limits.max_active_jobs = v.as_u64();
-                }
-                if let Some(v) = obj.get("max_queues") {
-                    limits.max_queues = v.as_u64().map(|n| n as u32);
-                }
-                if let Some(v) = obj.get("max_workers") {
-                    limits.max_workers = v.as_u64().map(|n| n as u32);
-                }
-                if let Some(v) = obj.get("max_api_keys") {
-                    limits.max_api_keys = v.as_u64().map(|n| n as u32);
-                }
-                if let Some(v) = obj.get("max_schedules") {
-                    limits.max_schedules = v.as_u64().map(|n| n as u32);
-                }
-                if let Some(v) = obj.get("max_workflows") {
-                    limits.max_workflows = v.as_u64().map(|n| n as u32);
-                }
-                if let Some(v) = obj.get("max_webhooks") {
-                    limits.max_webhooks = v.as_u64().map(|n| n as u32);
-                }
-                if let Some(v) = obj.get("max_payload_size_bytes") {
-                    if let Some(n) = v.as_u64() {
-                        limits.max_payload_size_bytes = n as usize;
-                    }
-                }
-                if let Some(v) = obj.get("rate_limit_requests_per_second") {
-                    if let Some(n) = v.as_u64() {
-                        limits.rate_limit_requests_per_second = n as u32;
-                    }
-                }
-                if let Some(v) = obj.get("rate_limit_burst") {
-                    if let Some(n) = v.as_u64() {
-                        limits.rate_limit_burst = n as u32;
-                    }
-                }
-                if let Some(v) = obj.get("job_retention_days") {
-                    if let Some(n) = v.as_u64() {
-                        limits.job_retention_days = n as u32;
-                    }
-                }
-                if let Some(v) = obj.get("history_retention_days") {
-                    if let Some(n) = v.as_u64() {
-                        limits.history_retention_days = n as u32;
-                    }
-                }
-            }
+            // Apply org-level overrides (jsonb) with support for null -> unlimited for Option fields
+            apply_overrides_from_json(&mut limits, overrides);
         }
 
         limits
@@ -245,10 +524,10 @@ impl PlanLimits {
     /// Get all available plan tiers
     pub fn all_tiers() -> Vec<Self> {
         vec![
-            Self::free(),
-            Self::starter(),
-            Self::pro(),
-            Self::enterprise(),
+            Self::for_tier_with_overrides("free", None),
+            Self::for_tier_with_overrides("starter", None),
+            Self::for_tier_with_overrides("pro", None),
+            Self::for_tier_with_overrides("enterprise", None),
         ]
     }
 

@@ -70,6 +70,58 @@ curl http://localhost:8080/health
 | `METRICS_PORT` | ❌ | `9090` | Prometheus metrics port |
 | `METRICS_TOKEN` | ❌ | - | If set, requires `Authorization: Bearer <token>` for `/metrics` |
 
+### Plan Limits via Environment Variables (Self-Hosted)
+
+Spooled ships with sensible built-in plan defaults (Free/Starter/Pro/Enterprise), but **you can override every plan limit via env vars**.
+
+Limits resolution order (lowest → highest precedence):
+
+- Built-in defaults
+- `SPOOLED_PLAN_LIMITS_JSON` (global per-tier JSON map)
+- `SPOOLED_PLAN_<TIER>_LIMITS_JSON` (tier-specific JSON)
+- `SPOOLED_PLAN_<TIER>_<FIELD>` (tier-specific individual fields)
+- Organization `custom_limits` (DB, per-org override)
+
+#### JSON overrides
+
+- **`SPOOLED_PLAN_LIMITS_JSON`**: JSON object mapping tier → overrides (same keys as `organizations.custom_limits`)
+- **`SPOOLED_PLAN_FREE_LIMITS_JSON`**, **`SPOOLED_PLAN_STARTER_LIMITS_JSON`**, **`SPOOLED_PLAN_PRO_LIMITS_JSON`**, **`SPOOLED_PLAN_ENTERPRISE_LIMITS_JSON`**
+
+Example:
+
+```json
+{
+  "free": { "max_jobs_per_day": 5000, "max_payload_size_bytes": 131072 },
+  "starter": { "max_active_jobs": 2000 },
+  "enterprise": { "max_jobs_per_day": null }
+}
+```
+
+Notes:
+- For **optional** limits (like `max_jobs_per_day`), `null` means **unlimited**.
+
+#### Per-field overrides
+
+You can override individual fields per tier with env vars:
+
+- **Limits (support `unlimited` / `none` / `null` / `-1`)**:
+  - `SPOOLED_PLAN_<TIER>_MAX_JOBS_PER_DAY`
+  - `SPOOLED_PLAN_<TIER>_MAX_ACTIVE_JOBS`
+  - `SPOOLED_PLAN_<TIER>_MAX_QUEUES`
+  - `SPOOLED_PLAN_<TIER>_MAX_WORKERS`
+  - `SPOOLED_PLAN_<TIER>_MAX_API_KEYS`
+  - `SPOOLED_PLAN_<TIER>_MAX_SCHEDULES`
+  - `SPOOLED_PLAN_<TIER>_MAX_WORKFLOWS`
+  - `SPOOLED_PLAN_<TIER>_MAX_WEBHOOKS`
+- **Sizes / rates / retention**:
+  - `SPOOLED_PLAN_<TIER>_MAX_PAYLOAD_SIZE_BYTES`
+  - `SPOOLED_PLAN_<TIER>_RATE_LIMIT_RPS`
+  - `SPOOLED_PLAN_<TIER>_RATE_LIMIT_BURST`
+  - `SPOOLED_PLAN_<TIER>_JOB_RETENTION_DAYS`
+  - `SPOOLED_PLAN_<TIER>_HISTORY_RETENTION_DAYS`
+
+Where `<TIER>` is one of: `FREE`, `STARTER`, `PRO`, `ENTERPRISE`.
+
 ## 🔧 Local Development
 
 ### Prerequisites
