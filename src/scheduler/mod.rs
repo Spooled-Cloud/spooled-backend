@@ -892,6 +892,43 @@ impl Scheduler {
             total_cleaned += expired_cleaned;
         }
 
+        // Cleanup old completed/failed/cancelled workflows based on plan tier
+        // Workflows accumulate over time (e.g., demo apps create one per request)
+        let result = sqlx::query(
+            r#"
+            DELETE FROM workflows
+            WHERE id IN (
+                SELECT w.id
+                FROM workflows w
+                JOIN organizations o ON w.organization_id = o.id
+                WHERE w.status IN ('completed', 'failed', 'cancelled')
+                  AND w.completed_at < NOW() - (
+                    COALESCE(
+                        (o.custom_limits->>'job_retention_days')::INT,
+                        CASE o.plan_tier
+                            WHEN 'enterprise' THEN 90
+                            WHEN 'pro' THEN 30
+                            WHEN 'starter' THEN 14
+                            ELSE 3  -- free tier default
+                        END
+                    ) || ' days'
+                  )::INTERVAL
+                LIMIT 5000
+            )
+            "#,
+        )
+        .execute(&*self.db)
+        .await?;
+
+        let workflows_cleaned = result.rows_affected();
+        if workflows_cleaned > 0 {
+            debug!(
+                count = workflows_cleaned,
+                "Cleaned up old workflows (tier-based retention)"
+            );
+            total_cleaned += workflows_cleaned;
+        }
+
         Ok(total_cleaned)
     }
 }
