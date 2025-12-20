@@ -65,6 +65,9 @@ pub enum RealtimeEvent {
         queue_name: String,
         duration_ms: i64,
         timestamp: chrono::DateTime<chrono::Utc>,
+        /// Optional job result (included if available at completion time)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        result: Option<serde_json::Value>,
     },
     /// Job failed
     JobFailed {
@@ -848,6 +851,7 @@ mod tests {
             queue_name: "queue".to_string(),
             duration_ms: 100,
             timestamp: chrono::Utc::now(),
+            result: None,
         };
         assert_eq!(event.event_type(), "job.completed");
 
@@ -944,6 +948,7 @@ mod tests {
                 queue_name: "q".to_string(),
                 duration_ms: 100,
                 timestamp: chrono::Utc::now(),
+                result: None,
             },
             RealtimeEvent::JobFailed {
                 job_id: "1".to_string(),

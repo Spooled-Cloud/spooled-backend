@@ -362,10 +362,10 @@ pub async fn complete(
     state.metrics.jobs_processing.dec();
     state.metrics.jobs_completed.inc();
 
-    // Best-effort realtime publish (queue_name fetched after completion)
+    // Best-effort realtime publish (queue_name + result fetched after completion)
     if let Some(ref cache) = state.cache {
-        let queue_name: Option<(String,)> = sqlx::query_as(
-            "SELECT queue_name FROM jobs WHERE id = $1 AND organization_id = $2",
+        let job_data: Option<(String, Option<serde_json::Value>)> = sqlx::query_as(
+            "SELECT queue_name, result FROM jobs WHERE id = $1 AND organization_id = $2",
         )
         .bind(&id)
         .bind(&ctx.organization_id)
@@ -373,16 +373,20 @@ pub async fn complete(
         .await
         .unwrap_or(None);
 
+        let (queue_name, result) = job_data.unwrap_or_else(|| ("unknown".to_string(), None));
+
+        // Publish JobCompleted event with result for realtime consumers (e.g. SpriteForge demo)
+        // Use PascalCase type and snake_case fields to match RealtimeEvent enum
         publish_realtime_event(
             cache,
             &ctx.organization_id,
             serde_json::json!({
-                "type": "JobStatusChange",
+                "type": "JobCompleted",
                 "data": {
                     "job_id": id,
-                    "queue_name": queue_name.map(|(q,)| q).unwrap_or_else(|| "unknown".to_string()),
-                    "old_status": "processing",
-                    "new_status": "completed",
+                    "queue_name": queue_name,
+                    "duration_ms": 0,
+                    "result": result,
                     "timestamp": Utc::now().to_rfc3339()
                 }
             }),

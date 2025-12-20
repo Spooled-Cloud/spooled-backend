@@ -119,9 +119,16 @@ pub const MAX_WORKFLOW_JOB_PAYLOAD_SIZE: usize = 1024 * 1024; // 1MB
 
 /// Validate workflow name for safe characters
 fn validate_workflow_name(name: &str) -> Result<(), validator::ValidationError> {
-    // Allow alphanumeric, spaces, hyphens, underscores, and common punctuation
+    // Allow alphanumeric, spaces, hyphens, underscores, colons, and common punctuation
     if !name.chars().all(|c| {
-        c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' || c == '.' || c == '(' || c == ')'
+        c.is_alphanumeric()
+            || c == ' '
+            || c == '-'
+            || c == '_'
+            || c == '.'
+            || c == ':'
+            || c == '('
+            || c == ')'
     }) {
         let mut err = validator::ValidationError::new("invalid_workflow_name");
         err.message = Some(std::borrow::Cow::Borrowed(
