@@ -81,9 +81,11 @@ pub async fn create(
     Extension(ctx): Extension<ApiKeyContext>,
     Json(request): Json<CreateOutgoingWebhookRequest>,
 ) -> AppResult<(StatusCode, Json<OutgoingWebhook>)> {
-    // Check webhook limit before creating
+    // Check webhook limit before creating.
+    // Note: resource counts track ENABLED webhooks, so only count towards limit when enabled=true.
+    let adding = if request.enabled { 1 } else { 0 };
     if let Err(response) =
-        check_resource_limit(state.db.pool(), &ctx.organization_id, "webhooks", 1).await
+        check_resource_limit(state.db.pool(), &ctx.organization_id, "webhooks", adding).await
     {
         return Err(AppError::LimitExceeded(Box::new(response)));
     }

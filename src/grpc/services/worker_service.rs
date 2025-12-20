@@ -12,15 +12,13 @@ use sqlx::PgPool;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
+use crate::config::PlanLimits;
 use crate::grpc::auth::authenticate_request;
 use crate::grpc::proto::{
     worker_service_server::WorkerService, DeregisterRequest, DeregisterResponse, HeartbeatRequest,
     HeartbeatResponse, RegisterWorkerRequest, RegisterWorkerResponse,
 };
 use crate::observability::Metrics;
-
-/// Maximum workers per organization
-const MAX_WORKERS_PER_ORG: i64 = 100;
 
 /// Maximum concurrent jobs a worker can handle
 const MAX_CONCURRENT_JOBS: i32 = 1000;
@@ -135,29 +133,40 @@ impl WorkerService for WorkerServiceImpl {
             safe_max_concurrent
         };
 
-        // Check worker count limit per organization
-        let (worker_count,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM workers WHERE organization_id = $1 AND status != 'offline'",
+        // Enforce plan-based worker limits (supports env overrides + org custom_limits).
+        let (plan_tier, custom_limits): (String, Option<serde_json::Value>) = sqlx::query_as(
+            "SELECT plan_tier, custom_limits FROM organizations WHERE id = $1",
         )
         .bind(&auth.organization_id)
         .fetch_one(self.pool.as_ref())
         .await
         .map_err(|e| {
-            tracing::error!(error = %e, "Database error during worker registration");
+            tracing::error!(error = %e, "Failed to fetch org plan limits");
             Status::internal("Registration failed")
         })?;
 
-        if worker_count >= MAX_WORKERS_PER_ORG {
+        let limits = PlanLimits::for_tier_with_overrides(&plan_tier, custom_limits.as_ref());
+
+        // Read current worker count using the same source as HTTP limit checks.
+        let counts: (i64, i64, i64, i64, i64, i64, i64, i64) =
+            sqlx::query_as("SELECT * FROM get_org_resource_counts($1)")
+                .bind(&auth.organization_id)
+                .fetch_one(self.pool.as_ref())
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, "Failed to fetch org resource counts");
+                    Status::internal("Registration failed")
+                })?;
+
+        let current_workers = counts.2.max(0) as u64;
+        if let Err(err) = limits.check_limit("workers", current_workers, 1) {
             warn!(
                 org_id = %auth.organization_id,
-                worker_count = worker_count,
-                max_workers = MAX_WORKERS_PER_ORG,
-                "Organization exceeded max worker limit"
+                current = current_workers,
+                limit = err.limit,
+                "Organization exceeded worker limit"
             );
-            return Err(Status::resource_exhausted(format!(
-                "Organization has reached maximum worker limit ({})",
-                MAX_WORKERS_PER_ORG
-            )));
+            return Err(Status::resource_exhausted(err.to_string()));
         }
 
         let now = Utc::now();

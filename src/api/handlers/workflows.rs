@@ -14,7 +14,7 @@ use tracing::{info, warn};
 use crate::{
     api::{
         middleware::{
-            limits::{check_job_limits, check_payload_size},
+            limits::{check_job_limits, check_payload_size, check_resource_limit},
             ValidatedJson,
         },
         AppState,
@@ -236,6 +236,13 @@ pub async fn create(
 ) -> AppResult<Json<CreateWorkflowResponse>> {
     let workflow_id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now();
+
+    // Enforce workflow count / feature availability (e.g. Free disables workflows)
+    if let Err(response) =
+        check_resource_limit(state.db.pool(), &ctx.organization_id, "workflows", 1).await
+    {
+        return Err(AppError::LimitExceeded(Box::new(response)));
+    }
 
     // Check job limits (daily + active) before creating workflow jobs
     let job_count = request.jobs.len() as u64;

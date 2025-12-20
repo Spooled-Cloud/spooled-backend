@@ -8,6 +8,7 @@ use axum::{
 use chrono::Utc;
 use uuid::Uuid;
 
+use crate::api::middleware::limits::check_resource_limit;
 use crate::api::middleware::ValidatedJson;
 use crate::api::AppState;
 use crate::error::{AppError, AppResult};
@@ -49,6 +50,12 @@ pub async fn register(
     Extension(ctx): Extension<ApiKeyContext>,
     ValidatedJson(request): ValidatedJson<RegisterWorkerRequest>,
 ) -> AppResult<(StatusCode, Json<RegisterWorkerResponse>)> {
+    // Enforce worker limit before creating a new worker record
+    if let Err(response) = check_resource_limit(state.db.pool(), &ctx.organization_id, "workers", 1).await
+    {
+        return Err(AppError::LimitExceeded(Box::new(response)));
+    }
+
     // Validate queue name characters
     if !request
         .queue_name

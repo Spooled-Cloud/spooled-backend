@@ -115,6 +115,22 @@ pub async fn create(
         ));
     }
 
+    // Enforce plan payload size for schedule payload_template at creation time too.
+    let payload_json = serde_json::to_string(&req.payload_template).unwrap_or_default();
+    check_payload_size_generic(state.db.pool(), org_id, payload_json.len())
+        .await
+        .map_err(|e| match e {
+            LimitCheckError::Database(msg) => {
+                error!(error = %msg, "Failed to check payload size for schedule creation");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to check limits".to_string(),
+                )
+            }
+            // Return 403 to match other plan-limit errors in this handler module.
+            _ => (StatusCode::FORBIDDEN, e.to_string()),
+        })?;
+
     // Validate cron expression
     let cron = CronSchedule::parse(&req.cron_expression).map_err(|e| {
         (
