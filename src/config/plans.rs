@@ -232,80 +232,138 @@ lazy_static! {
 fn apply_overrides_from_object(limits: &mut PlanLimits, obj: &serde_json::Map<String, Value>) {
     // Option<u64>
     if let Some(v) = obj.get("max_jobs_per_day") {
-        limits.max_jobs_per_day = if v.is_null() { None } else { v.as_u64() };
+        if v.is_null() {
+            limits.max_jobs_per_day = None;
+        } else if let Some(n) = v.as_u64() {
+            limits.max_jobs_per_day = Some(n);
+        } else {
+            warn!(key = "max_jobs_per_day", value = %v, "Invalid override type; ignoring");
+        }
     }
     if let Some(v) = obj.get("max_active_jobs") {
-        limits.max_active_jobs = if v.is_null() { None } else { v.as_u64() };
+        if v.is_null() {
+            limits.max_active_jobs = None;
+        } else if let Some(n) = v.as_u64() {
+            limits.max_active_jobs = Some(n);
+        } else {
+            warn!(key = "max_active_jobs", value = %v, "Invalid override type; ignoring");
+        }
     }
 
     // Option<u32>
     if let Some(v) = obj.get("max_queues") {
-        limits.max_queues = if v.is_null() {
-            None
+        if v.is_null() {
+            limits.max_queues = None;
+        } else if let Some(n) = v.as_u64() {
+            if n > u32::MAX as u64 {
+                warn!(key = "max_queues", value = n, "Override too large for u32; ignoring");
+            } else {
+                limits.max_queues = Some(n as u32);
+            }
         } else {
-            v.as_u64().map(|n| n as u32)
-        };
+            warn!(key = "max_queues", value = %v, "Invalid override type; ignoring");
+        }
     }
     if let Some(v) = obj.get("max_workers") {
-        limits.max_workers = if v.is_null() {
-            None
+        if v.is_null() {
+            limits.max_workers = None;
+        } else if let Some(n) = v.as_u64() {
+            if n > u32::MAX as u64 {
+                warn!(key = "max_workers", value = n, "Override too large for u32; ignoring");
+            } else {
+                limits.max_workers = Some(n as u32);
+            }
         } else {
-            v.as_u64().map(|n| n as u32)
-        };
+            warn!(key = "max_workers", value = %v, "Invalid override type; ignoring");
+        }
     }
     if let Some(v) = obj.get("max_api_keys") {
-        limits.max_api_keys = if v.is_null() {
-            None
+        if v.is_null() {
+            limits.max_api_keys = None;
+        } else if let Some(n) = v.as_u64() {
+            if n > u32::MAX as u64 {
+                warn!(key = "max_api_keys", value = n, "Override too large for u32; ignoring");
+            } else {
+                limits.max_api_keys = Some(n as u32);
+            }
         } else {
-            v.as_u64().map(|n| n as u32)
-        };
+            warn!(key = "max_api_keys", value = %v, "Invalid override type; ignoring");
+        }
     }
     if let Some(v) = obj.get("max_schedules") {
-        limits.max_schedules = if v.is_null() {
-            None
+        if v.is_null() {
+            limits.max_schedules = None;
+        } else if let Some(n) = v.as_u64() {
+            if n > u32::MAX as u64 {
+                warn!(key = "max_schedules", value = n, "Override too large for u32; ignoring");
+            } else {
+                limits.max_schedules = Some(n as u32);
+            }
         } else {
-            v.as_u64().map(|n| n as u32)
-        };
+            warn!(key = "max_schedules", value = %v, "Invalid override type; ignoring");
+        }
     }
     if let Some(v) = obj.get("max_workflows") {
-        limits.max_workflows = if v.is_null() {
-            None
+        if v.is_null() {
+            limits.max_workflows = None;
+        } else if let Some(n) = v.as_u64() {
+            if n > u32::MAX as u64 {
+                warn!(key = "max_workflows", value = n, "Override too large for u32; ignoring");
+            } else {
+                limits.max_workflows = Some(n as u32);
+            }
         } else {
-            v.as_u64().map(|n| n as u32)
-        };
+            warn!(key = "max_workflows", value = %v, "Invalid override type; ignoring");
+        }
     }
     if let Some(v) = obj.get("max_webhooks") {
-        limits.max_webhooks = if v.is_null() {
-            None
+        if v.is_null() {
+            limits.max_webhooks = None;
+        } else if let Some(n) = v.as_u64() {
+            if n > u32::MAX as u64 {
+                warn!(key = "max_webhooks", value = n, "Override too large for u32; ignoring");
+            } else {
+                limits.max_webhooks = Some(n as u32);
+            }
         } else {
-            v.as_u64().map(|n| n as u32)
-        };
+            warn!(key = "max_webhooks", value = %v, "Invalid override type; ignoring");
+        }
     }
 
     // Non-option limits
     if let Some(v) = obj.get("max_payload_size_bytes") {
         if let Some(n) = v.as_u64() {
             limits.max_payload_size_bytes = n as usize;
+        } else {
+            warn!(key = "max_payload_size_bytes", value = %v, "Invalid override type; ignoring");
         }
     }
     if let Some(v) = obj.get("rate_limit_requests_per_second") {
         if let Some(n) = v.as_u64() {
             limits.rate_limit_requests_per_second = n as u32;
+        } else {
+            warn!(key = "rate_limit_requests_per_second", value = %v, "Invalid override type; ignoring");
         }
     }
     if let Some(v) = obj.get("rate_limit_burst") {
         if let Some(n) = v.as_u64() {
             limits.rate_limit_burst = n as u32;
+        } else {
+            warn!(key = "rate_limit_burst", value = %v, "Invalid override type; ignoring");
         }
     }
     if let Some(v) = obj.get("job_retention_days") {
         if let Some(n) = v.as_u64() {
             limits.job_retention_days = n as u32;
+        } else {
+            warn!(key = "job_retention_days", value = %v, "Invalid override type; ignoring");
         }
     }
     if let Some(v) = obj.get("history_retention_days") {
         if let Some(n) = v.as_u64() {
             limits.history_retention_days = n as u32;
+        } else {
+            warn!(key = "history_retention_days", value = %v, "Invalid override type; ignoring");
         }
     }
 }
