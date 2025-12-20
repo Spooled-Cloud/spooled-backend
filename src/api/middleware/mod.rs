@@ -3,6 +3,7 @@
 pub mod admin_auth;
 pub mod auth;
 pub mod limits;
+pub mod plan_rate_limit;
 pub mod rate_limit;
 pub mod security;
 pub mod validation;
@@ -17,6 +18,8 @@ pub use limits::{
 };
 #[allow(unused_imports)]
 pub use rate_limit::{rate_limit_middleware, RateLimitConfig, RateLimitState};
+#[allow(unused_imports)]
+pub use plan_rate_limit::plan_rate_limit_middleware;
 #[allow(unused_imports)]
 pub use security::{
     is_valid_job_id, is_valid_queue_name, sanitize_string, security_headers_middleware,

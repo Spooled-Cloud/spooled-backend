@@ -324,6 +324,13 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
         .route("/billing/portal", post(handlers::billing::create_portal))
         // Apply authentication middleware to all protected routes
         // route_layer runs the middleware for matched routes only
+        // IMPORTANT: auth must run BEFORE plan-based rate limiting so the limiter can use ApiKeyContext.
+        // In tower layering, the LAST route_layer is the OUTERMOST layer.
+        // So we attach rate limiting first, then auth.
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::plan_rate_limit::plan_rate_limit_middleware,
+        ))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             middleware::auth::authenticate_api_key,

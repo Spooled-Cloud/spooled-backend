@@ -99,6 +99,7 @@ pub async fn start_grpc_server(
     addr: SocketAddr,
     db: Arc<crate::db::Database>,
     metrics: Arc<Metrics>,
+    cache: Option<crate::cache::RedisCache>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let pool = db.pool_arc();
 
@@ -109,8 +110,8 @@ pub async fn start_grpc_server(
         .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
 
     // Create service implementations
-    let queue_service = QueueServiceImpl::new(pool.clone(), metrics.clone());
-    let worker_service = WorkerServiceImpl::new(pool.clone(), metrics.clone());
+    let queue_service = QueueServiceImpl::new(pool.clone(), metrics.clone(), cache.clone());
+    let worker_service = WorkerServiceImpl::new(pool.clone(), metrics.clone(), cache.clone());
 
     // Setup health service
     let (health_reporter, health_service) = health_reporter();

@@ -21,6 +21,8 @@ use tracing::{debug, error, info};
 use crate::api::middleware::limits::{
     check_job_limits_generic, check_payload_size_generic, increment_daily_jobs, LimitCheckError,
 };
+use crate::cache::RedisCache;
+use crate::config::PlanLimits;
 use crate::grpc::auth::{authenticate_from_metadata, authenticate_request};
 use crate::grpc::convert::{
     datetime_to_timestamp, job_to_proto, jobs_to_proto, struct_to_json_opt,
@@ -64,11 +66,92 @@ const STREAM_POLL_INTERVAL_MS: u64 = 1000;
 pub struct QueueServiceImpl {
     pool: Arc<PgPool>,
     metrics: Arc<Metrics>,
+    cache: Option<RedisCache>,
 }
 
 impl QueueServiceImpl {
-    pub fn new(pool: Arc<PgPool>, metrics: Arc<Metrics>) -> Self {
-        Self { pool, metrics }
+    pub fn new(pool: Arc<PgPool>, metrics: Arc<Metrics>, cache: Option<RedisCache>) -> Self {
+        Self { pool, metrics, cache }
+    }
+
+    async fn enforce_rate_limits(
+        &self,
+        org_id: &str,
+        api_key_id: &str,
+        api_key_per_minute: Option<i32>,
+    ) -> Result<(), Status> {
+        let Some(ref cache) = self.cache else {
+            // Redis is optional; if absent we can't reliably enforce distributed rate limits.
+            return Ok(());
+        };
+
+        #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+        struct OrgRateLimits {
+            rps: u32,
+            burst: u32,
+        }
+
+        let cache_key = format!("org_rate_limits:{}", org_id);
+        let org_limits: OrgRateLimits = match cache.get_json(&cache_key).await {
+            Ok(Some(v)) => v,
+            _ => {
+                let (plan_tier, custom_limits): (String, Option<serde_json::Value>) = sqlx::query_as(
+                    "SELECT plan_tier, custom_limits FROM organizations WHERE id = $1",
+                )
+                .bind(org_id)
+                .fetch_one(self.pool.as_ref())
+                .await
+                .map_err(|e| {
+                    error!(
+                        error = %e,
+                        org_id = %org_id,
+                        "Failed to fetch org plan for gRPC rate limiting"
+                    );
+                    Status::internal("Rate limiting unavailable")
+                })?;
+
+                let limits = PlanLimits::for_tier_with_overrides(&plan_tier, custom_limits.as_ref());
+                let v = OrgRateLimits {
+                    rps: limits.rate_limit_requests_per_second.max(1),
+                    burst: limits.rate_limit_burst.max(1),
+                };
+                let _ = cache.set_json(&cache_key, &v, 60).await;
+                v
+            }
+        };
+
+        // Org token bucket (plan rps/burst)
+        let bucket_key = format!("rate_limit:grpc:org:{}", org_id);
+        let result = cache
+            .check_token_bucket(&bucket_key, org_limits.rps, org_limits.burst)
+            .await
+            .map_err(|e| {
+                error!(error = %e, org_id = %org_id, "Redis error during gRPC org rate limit");
+                Status::internal("Rate limiting unavailable")
+            })?;
+
+        if !result.allowed {
+            return Err(Status::resource_exhausted("Rate limit exceeded"));
+        }
+
+        // Optional per-key override (requests per minute)
+        if let Some(per_min) = api_key_per_minute {
+            let per_min = per_min.max(1) as u32;
+            let key = format!("rate_limit:grpc:api_key:{}", api_key_id);
+            let rl = cache.check_rate_limit(&key, per_min, 60).await.map_err(|e| {
+                error!(
+                    error = %e,
+                    api_key_id = %api_key_id,
+                    "Redis error during gRPC api-key rate limit"
+                );
+                Status::internal("Rate limiting unavailable")
+            })?;
+            if !rl.allowed {
+                return Err(Status::resource_exhausted("Rate limit exceeded"));
+            }
+        }
+
+        Ok(())
     }
 
     /// Validate queue name format
@@ -164,6 +247,9 @@ impl QueueService for QueueServiceImpl {
     ) -> Result<Response<EnqueueResponse>, Status> {
         // Authenticate
         let auth = authenticate_request(self.pool.as_ref(), &request).await?;
+        // Enforce plan-based rate limits (org + optional per-key override)
+        self.enforce_rate_limits(&auth.organization_id, &auth.api_key_id, auth.rate_limit)
+            .await?;
         let req = request.into_inner();
 
         // Validate queue name
@@ -297,6 +383,8 @@ impl QueueService for QueueServiceImpl {
         request: Request<DequeueRequest>,
     ) -> Result<Response<DequeueResponse>, Status> {
         let auth = authenticate_request(self.pool.as_ref(), &request).await?;
+        self.enforce_rate_limits(&auth.organization_id, &auth.api_key_id, auth.rate_limit)
+            .await?;
         let req = request.into_inner();
 
         Self::validate_queue_name(&req.queue_name)?;
@@ -347,6 +435,8 @@ impl QueueService for QueueServiceImpl {
         request: Request<CompleteRequest>,
     ) -> Result<Response<CompleteResponse>, Status> {
         let auth = authenticate_request(self.pool.as_ref(), &request).await?;
+        self.enforce_rate_limits(&auth.organization_id, &auth.api_key_id, auth.rate_limit)
+            .await?;
         let req = request.into_inner();
 
         if req.job_id.is_empty() {
@@ -407,6 +497,8 @@ impl QueueService for QueueServiceImpl {
     /// Fail a job (triggers retry or DLQ)
     async fn fail(&self, request: Request<FailRequest>) -> Result<Response<FailResponse>, Status> {
         let auth = authenticate_request(self.pool.as_ref(), &request).await?;
+        self.enforce_rate_limits(&auth.organization_id, &auth.api_key_id, auth.rate_limit)
+            .await?;
         let req = request.into_inner();
 
         if req.job_id.is_empty() {
@@ -508,6 +600,8 @@ impl QueueService for QueueServiceImpl {
         request: Request<RenewLeaseRequest>,
     ) -> Result<Response<RenewLeaseResponse>, Status> {
         let auth = authenticate_request(self.pool.as_ref(), &request).await?;
+        self.enforce_rate_limits(&auth.organization_id, &auth.api_key_id, auth.rate_limit)
+            .await?;
         let req = request.into_inner();
 
         if req.job_id.is_empty() {
@@ -565,6 +659,8 @@ impl QueueService for QueueServiceImpl {
         request: Request<GetJobRequest>,
     ) -> Result<Response<GetJobResponse>, Status> {
         let auth = authenticate_request(self.pool.as_ref(), &request).await?;
+        self.enforce_rate_limits(&auth.organization_id, &auth.api_key_id, auth.rate_limit)
+            .await?;
         let req = request.into_inner();
 
         if req.job_id.is_empty() {
@@ -593,6 +689,8 @@ impl QueueService for QueueServiceImpl {
         request: Request<GetQueueStatsRequest>,
     ) -> Result<Response<GetQueueStatsResponse>, Status> {
         let auth = authenticate_request(self.pool.as_ref(), &request).await?;
+        self.enforce_rate_limits(&auth.organization_id, &auth.api_key_id, auth.rate_limit)
+            .await?;
         let req = request.into_inner();
 
         Self::validate_queue_name(&req.queue_name)?;
@@ -642,6 +740,8 @@ impl QueueService for QueueServiceImpl {
         request: Request<StreamJobsRequest>,
     ) -> Result<Response<Self::StreamJobsStream>, Status> {
         let auth = authenticate_request(self.pool.as_ref(), &request).await?;
+        self.enforce_rate_limits(&auth.organization_id, &auth.api_key_id, auth.rate_limit)
+            .await?;
         let req = request.into_inner();
 
         Self::validate_queue_name(&req.queue_name)?;
@@ -745,6 +845,8 @@ impl QueueService for QueueServiceImpl {
         // Extract metadata before consuming request (Streaming is not Sync)
         let metadata = request.metadata().clone();
         let auth = authenticate_from_metadata(self.pool.as_ref(), &metadata).await?;
+        self.enforce_rate_limits(&auth.organization_id, &auth.api_key_id, auth.rate_limit)
+            .await?;
         let mut stream = request.into_inner();
 
         let pool = self.pool.clone();

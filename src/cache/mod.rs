@@ -401,6 +401,90 @@ impl RedisCache {
             reset_at: chrono::Utc::now() + chrono::Duration::seconds(ttl),
         })
     }
+
+    /// Token bucket rate limiting: check if request is allowed
+    ///
+    /// Enforces an average refill rate (tokens/sec) with a burst capacity.
+    /// Uses a Redis Lua script to ensure atomic update of (tokens, last_ts).
+    ///
+    /// - `key`: Redis key (hash) used to store bucket state
+    /// - `refill_rate_per_sec`: tokens refilled per second (RPS)
+    /// - `capacity`: maximum tokens (burst)
+    pub async fn check_token_bucket(
+        &self,
+        key: &str,
+        refill_rate_per_sec: u32,
+        capacity: u32,
+    ) -> Result<TokenBucketResult> {
+        // Avoid division by zero; treat 0 as "blocked"
+        let refill_rate_per_sec = refill_rate_per_sec.max(1);
+        let capacity = capacity.max(1);
+
+        let now_ms = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()) as i64;
+
+        // TTL: keep bucket state around for a bit (at least 60s),
+        // or ~2x the time needed to refill from 0 to full.
+        let refill_time_secs = (capacity as f64 / refill_rate_per_sec as f64).ceil() as i64;
+        let ttl_ms = (std::cmp::max(60, (refill_time_secs * 2).max(1)) * 1000) as i64;
+
+        let mut conn = self.get_connection().await?;
+
+        let script = redis::Script::new(
+            r#"
+            local key = KEYS[1]
+            local now_ms = tonumber(ARGV[1])
+            local rate = tonumber(ARGV[2]) -- tokens per second
+            local capacity = tonumber(ARGV[3])
+            local ttl_ms = tonumber(ARGV[4])
+
+            local data = redis.call('HMGET', key, 'tokens', 'ts')
+            local tokens = tonumber(data[1])
+            local ts = tonumber(data[2])
+
+            if tokens == nil then tokens = capacity end
+            if ts == nil then ts = now_ms end
+
+            local delta = now_ms - ts
+            if delta < 0 then delta = 0 end
+
+            local refill = (delta / 1000.0) * rate
+            tokens = math.min(capacity, tokens + refill)
+
+            local allowed = 0
+            local retry_ms = 0
+            if tokens >= 1.0 then
+              allowed = 1
+              tokens = tokens - 1.0
+            else
+              allowed = 0
+              retry_ms = math.ceil((1.0 - tokens) * 1000.0 / rate)
+            end
+
+            redis.call('HMSET', key, 'tokens', tokens, 'ts', now_ms)
+            redis.call('PEXPIRE', key, ttl_ms)
+
+            return {allowed, math.floor(tokens), retry_ms}
+            "#,
+        );
+
+        let (allowed, remaining, retry_ms): (i64, i64, i64) = script
+            .key(key)
+            .arg(now_ms)
+            .arg(refill_rate_per_sec as i64)
+            .arg(capacity as i64)
+            .arg(ttl_ms)
+            .invoke_async(&mut conn)
+            .await?;
+
+        Ok(TokenBucketResult {
+            allowed: allowed == 1,
+            remaining: remaining.max(0) as u32,
+            retry_after_ms: retry_ms.max(0) as u64,
+        })
+    }
 }
 
 /// Rate limit check result
@@ -412,6 +496,17 @@ pub struct RateLimitResult {
     pub remaining: u32,
     /// When the rate limit resets
     pub reset_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Token bucket rate limit check result
+#[derive(Debug, Clone)]
+pub struct TokenBucketResult {
+    /// Whether the request is allowed
+    pub allowed: bool,
+    /// Remaining tokens (approximate integer)
+    pub remaining: u32,
+    /// Suggested retry-after in milliseconds (0 if allowed)
+    pub retry_after_ms: u64,
 }
 
 #[cfg(test)]
