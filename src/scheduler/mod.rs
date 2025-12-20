@@ -349,7 +349,7 @@ impl Scheduler {
 
             // Enforce plan limits BEFORE inserting cron jobs.
             // Important: cron-triggered jobs must count toward daily quota + payload limits.
-            if let Err(e) = check_job_limits_generic(&*self.db, &schedule.organization_id, 1).await {
+            if let Err(e) = check_job_limits_generic(&self.db, &schedule.organization_id, 1).await {
                 tx.rollback().await?;
 
                 warn!(
@@ -384,9 +384,10 @@ impl Scheduler {
                 continue;
             }
 
-            let payload_json = serde_json::to_string(&schedule.payload_template).unwrap_or_default();
+            let payload_json =
+                serde_json::to_string(&schedule.payload_template).unwrap_or_default();
             if let Err(e) =
-                check_payload_size_generic(&*self.db, &schedule.organization_id, payload_json.len())
+                check_payload_size_generic(&self.db, &schedule.organization_id, payload_json.len())
                     .await
             {
                 tx.rollback().await?;
@@ -486,7 +487,9 @@ impl Scheduler {
                     self.metrics.jobs_enqueued.inc();
 
                     // Increment daily job counter for plan limit tracking (best-effort).
-                    if let Err(e) = increment_daily_jobs(&*self.db, &schedule.organization_id, 1).await {
+                    if let Err(e) =
+                        increment_daily_jobs(&self.db, &schedule.organization_id, 1).await
+                    {
                         warn!(
                             error = %e,
                             org_id = %schedule.organization_id,

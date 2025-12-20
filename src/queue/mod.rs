@@ -577,8 +577,9 @@ impl QueueManager {
             // to match our documentation/examples.
             let base_backoff_seconds = 2_i64.pow(job.retry_count as u32).min(60);
             let jitter_ms: i64 = (rand::random::<u16>() % 500) as i64;
-            let next_run =
-                Utc::now() + Duration::seconds(base_backoff_seconds) + Duration::milliseconds(jitter_ms);
+            let next_run = Utc::now()
+                + Duration::seconds(base_backoff_seconds)
+                + Duration::milliseconds(jitter_ms);
 
             sqlx::query(
                 r#"
@@ -836,11 +837,7 @@ mod tests {
         // Test backoff calculation
         for retry in 0..5 {
             let backoff_seconds = 2_i64.pow(retry).min(60);
-            println!(
-                "Retry {}: {} seconds",
-                retry,
-                backoff_seconds
-            );
+            println!("Retry {}: {} seconds", retry, backoff_seconds);
         }
 
         assert_eq!(2_i64.pow(0), 1); // 1 second

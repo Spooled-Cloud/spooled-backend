@@ -428,7 +428,7 @@ impl RedisCache {
         // TTL: keep bucket state around for a bit (at least 60s),
         // or ~2x the time needed to refill from 0 to full.
         let refill_time_secs = (capacity as f64 / refill_rate_per_sec as f64).ceil() as i64;
-        let ttl_ms = (std::cmp::max(60, (refill_time_secs * 2).max(1)) * 1000) as i64;
+        let ttl_ms = std::cmp::max(60, (refill_time_secs * 2).max(1)) * 1000;
 
         let mut conn = self.get_connection().await?;
 

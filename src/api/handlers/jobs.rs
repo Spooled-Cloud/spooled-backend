@@ -6,10 +6,10 @@ use axum::{
     Json,
 };
 use chrono::Utc;
+use sqlx::{Postgres, QueryBuilder};
 use std::sync::Arc;
 use tracing::info;
 use uuid::Uuid;
-use sqlx::{Postgres, QueryBuilder};
 
 use crate::api::middleware::limits::{check_job_limits, check_payload_size, increment_daily_jobs};
 use crate::api::middleware::ValidatedJson;
@@ -587,7 +587,8 @@ pub async fn cancel(
             )
             .await;
 
-        let (old_status, queue_name) = before.unwrap_or_else(|| ("pending".to_string(), "unknown".to_string()));
+        let (old_status, queue_name) =
+            before.unwrap_or_else(|| ("pending".to_string(), "unknown".to_string()));
         publish_realtime_event(
             cache,
             &ctx.organization_id,
@@ -616,14 +617,13 @@ pub async fn retry(
     Path(id): Path<String>,
 ) -> AppResult<Json<Job>> {
     // Capture previous status for realtime event (failed vs deadletter)
-    let before_status: Option<(String,)> = sqlx::query_as(
-        "SELECT status FROM jobs WHERE id = $1 AND organization_id = $2",
-    )
-    .bind(&id)
-    .bind(&ctx.organization_id)
-    .fetch_optional(state.db.pool())
-    .await
-    .unwrap_or(None);
+    let before_status: Option<(String,)> =
+        sqlx::query_as("SELECT status FROM jobs WHERE id = $1 AND organization_id = $2")
+            .bind(&id)
+            .bind(&ctx.organization_id)
+            .fetch_optional(state.db.pool())
+            .await
+            .unwrap_or(None);
 
     let job = sqlx::query_as::<_, Job>(
         r#"
@@ -1043,9 +1043,8 @@ pub async fn list_dlq(
         }
     });
 
-    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
-        "SELECT * FROM jobs WHERE status = 'deadletter' AND organization_id = ",
-    );
+    let mut qb: QueryBuilder<Postgres> =
+        QueryBuilder::new("SELECT * FROM jobs WHERE status = 'deadletter' AND organization_id = ");
     qb.push_bind(&ctx.organization_id);
 
     if let Some(queue) = &validated_queue {

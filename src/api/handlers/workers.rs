@@ -51,7 +51,8 @@ pub async fn register(
     ValidatedJson(request): ValidatedJson<RegisterWorkerRequest>,
 ) -> AppResult<(StatusCode, Json<RegisterWorkerResponse>)> {
     // Enforce worker limit before creating a new worker record
-    if let Err(response) = check_resource_limit(state.db.pool(), &ctx.organization_id, "workers", 1).await
+    if let Err(response) =
+        check_resource_limit(state.db.pool(), &ctx.organization_id, "workers", 1).await
     {
         return Err(AppError::LimitExceeded(Box::new(response)));
     }

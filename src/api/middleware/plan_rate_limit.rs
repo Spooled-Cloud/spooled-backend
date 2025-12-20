@@ -96,7 +96,6 @@ async fn get_org_rate_limits(state: &AppState, org_id: &str) -> Result<OrgRateLi
     .await
     .map_err(|e| {
         warn!(error = %e, org_id = %org_id, "Failed to fetch org plan limits for rate limiting");
-        ()
     })?;
 
     let limits = PlanLimits::for_tier_with_overrides(&row.0, row.1.as_ref());
@@ -144,7 +143,7 @@ pub async fn plan_rate_limit_middleware(
         {
             Ok(result) => {
                 if !result.allowed {
-                    let retry_after_secs = (result.retry_after_ms + 999) / 1000;
+                    let retry_after_secs = result.retry_after_ms.div_ceil(1000);
                     let reset_at = current_timestamp() + retry_after_secs;
                     let body = RateLimitExceededResponse {
                         error: "Rate limit exceeded".to_string(),
@@ -173,9 +172,8 @@ pub async fn plan_rate_limit_middleware(
             match cache.check_rate_limit(&key, key_limit, 60).await {
                 Ok(result) => {
                     if !result.allowed {
-                        let retry_after_secs = (result.reset_at - chrono::Utc::now())
-                            .num_seconds()
-                            .max(1) as u64;
+                        let retry_after_secs =
+                            (result.reset_at - chrono::Utc::now()).num_seconds().max(1) as u64;
                         let reset_at = current_timestamp() + retry_after_secs;
                         let body = RateLimitExceededResponse {
                             error: "Rate limit exceeded".to_string(),
@@ -215,7 +213,7 @@ pub async fn plan_rate_limit_middleware(
     match cache.check_token_bucket(&key, rps, burst).await {
         Ok(result) => {
             if !result.allowed {
-                let retry_after_secs = (result.retry_after_ms + 999) / 1000;
+                let retry_after_secs = result.retry_after_ms.div_ceil(1000);
                 let reset_at = current_timestamp() + retry_after_secs;
                 let body = RateLimitExceededResponse {
                     error: "Rate limit exceeded".to_string(),

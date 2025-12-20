@@ -177,27 +177,32 @@ fn load_tier_fields(tier_upper: &str, out: &mut TierEnvOverrides) {
         parse_optional_u32_env(&format!("SPOOLED_PLAN_{}_MAX_SCHEDULES", tier_upper));
     out.max_workflows =
         parse_optional_u32_env(&format!("SPOOLED_PLAN_{}_MAX_WORKFLOWS", tier_upper));
-    out.max_webhooks =
-        parse_optional_u32_env(&format!("SPOOLED_PLAN_{}_MAX_WEBHOOKS", tier_upper));
+    out.max_webhooks = parse_optional_u32_env(&format!("SPOOLED_PLAN_{}_MAX_WEBHOOKS", tier_upper));
 
     // Non-option limits
-    out.max_payload_size_bytes =
-        parse_usize_env(&format!("SPOOLED_PLAN_{}_MAX_PAYLOAD_SIZE_BYTES", tier_upper));
+    out.max_payload_size_bytes = parse_usize_env(&format!(
+        "SPOOLED_PLAN_{}_MAX_PAYLOAD_SIZE_BYTES",
+        tier_upper
+    ));
     out.rate_limit_requests_per_second =
         parse_u32_env(&format!("SPOOLED_PLAN_{}_RATE_LIMIT_RPS", tier_upper));
     out.rate_limit_burst = parse_u32_env(&format!("SPOOLED_PLAN_{}_RATE_LIMIT_BURST", tier_upper));
     out.job_retention_days =
         parse_u32_env(&format!("SPOOLED_PLAN_{}_JOB_RETENTION_DAYS", tier_upper));
-    out.history_retention_days =
-        parse_u32_env(&format!("SPOOLED_PLAN_{}_HISTORY_RETENTION_DAYS", tier_upper));
+    out.history_retention_days = parse_u32_env(&format!(
+        "SPOOLED_PLAN_{}_HISTORY_RETENTION_DAYS",
+        tier_upper
+    ));
 }
 
 impl EnvPlanOverrides {
     fn from_env() -> Self {
-        let mut out = Self::default();
-
-        // Global JSON mapping: { "free": { ... }, "starter": { ... } }
-        out.global_json = parse_env_json("SPOOLED_PLAN_LIMITS_JSON");
+        // Build from Default, but set env-derived JSON fields in the initializer
+        // to satisfy clippy::field_reassign_with_default.
+        let mut out = Self {
+            global_json: parse_env_json("SPOOLED_PLAN_LIMITS_JSON"),
+            ..Self::default()
+        };
 
         // Per-tier JSON: SPOOLED_PLAN_<TIER>_LIMITS_JSON
         out.free.json = parse_env_json("SPOOLED_PLAN_FREE_LIMITS_JSON");
@@ -256,7 +261,11 @@ fn apply_overrides_from_object(limits: &mut PlanLimits, obj: &serde_json::Map<St
             limits.max_queues = None;
         } else if let Some(n) = v.as_u64() {
             if n > u32::MAX as u64 {
-                warn!(key = "max_queues", value = n, "Override too large for u32; ignoring");
+                warn!(
+                    key = "max_queues",
+                    value = n,
+                    "Override too large for u32; ignoring"
+                );
             } else {
                 limits.max_queues = Some(n as u32);
             }
@@ -269,7 +278,11 @@ fn apply_overrides_from_object(limits: &mut PlanLimits, obj: &serde_json::Map<St
             limits.max_workers = None;
         } else if let Some(n) = v.as_u64() {
             if n > u32::MAX as u64 {
-                warn!(key = "max_workers", value = n, "Override too large for u32; ignoring");
+                warn!(
+                    key = "max_workers",
+                    value = n,
+                    "Override too large for u32; ignoring"
+                );
             } else {
                 limits.max_workers = Some(n as u32);
             }
@@ -282,7 +295,11 @@ fn apply_overrides_from_object(limits: &mut PlanLimits, obj: &serde_json::Map<St
             limits.max_api_keys = None;
         } else if let Some(n) = v.as_u64() {
             if n > u32::MAX as u64 {
-                warn!(key = "max_api_keys", value = n, "Override too large for u32; ignoring");
+                warn!(
+                    key = "max_api_keys",
+                    value = n,
+                    "Override too large for u32; ignoring"
+                );
             } else {
                 limits.max_api_keys = Some(n as u32);
             }
@@ -295,7 +312,11 @@ fn apply_overrides_from_object(limits: &mut PlanLimits, obj: &serde_json::Map<St
             limits.max_schedules = None;
         } else if let Some(n) = v.as_u64() {
             if n > u32::MAX as u64 {
-                warn!(key = "max_schedules", value = n, "Override too large for u32; ignoring");
+                warn!(
+                    key = "max_schedules",
+                    value = n,
+                    "Override too large for u32; ignoring"
+                );
             } else {
                 limits.max_schedules = Some(n as u32);
             }
@@ -308,7 +329,11 @@ fn apply_overrides_from_object(limits: &mut PlanLimits, obj: &serde_json::Map<St
             limits.max_workflows = None;
         } else if let Some(n) = v.as_u64() {
             if n > u32::MAX as u64 {
-                warn!(key = "max_workflows", value = n, "Override too large for u32; ignoring");
+                warn!(
+                    key = "max_workflows",
+                    value = n,
+                    "Override too large for u32; ignoring"
+                );
             } else {
                 limits.max_workflows = Some(n as u32);
             }
@@ -321,7 +346,11 @@ fn apply_overrides_from_object(limits: &mut PlanLimits, obj: &serde_json::Map<St
             limits.max_webhooks = None;
         } else if let Some(n) = v.as_u64() {
             if n > u32::MAX as u64 {
-                warn!(key = "max_webhooks", value = n, "Override too large for u32; ignoring");
+                warn!(
+                    key = "max_webhooks",
+                    value = n,
+                    "Override too large for u32; ignoring"
+                );
             } else {
                 limits.max_webhooks = Some(n as u32);
             }
