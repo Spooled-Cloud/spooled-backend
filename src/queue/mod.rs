@@ -570,9 +570,15 @@ impl QueueManager {
         };
 
         if job.retry_count < job.max_retries {
-            // Exponential backoff: 2^retry_count minutes (capped at 1 hour)
-            let backoff_seconds = 2_i64.pow(job.retry_count as u32).min(60) * 60;
-            let next_run = Utc::now() + Duration::seconds(backoff_seconds);
+            // Exponential backoff (seconds) with small jitter:
+            // 1s, 2s, 4s, 8s, 16s, 32s, 60s (cap) ...
+            //
+            // NOTE: This is intentionally seconds (not minutes) to keep retries responsive and
+            // to match our documentation/examples.
+            let base_backoff_seconds = 2_i64.pow(job.retry_count as u32).min(60);
+            let jitter_ms: i64 = (rand::random::<u16>() % 500) as i64;
+            let next_run =
+                Utc::now() + Duration::seconds(base_backoff_seconds) + Duration::milliseconds(jitter_ms);
 
             sqlx::query(
                 r#"
@@ -829,32 +835,31 @@ mod tests {
     fn test_exponential_backoff() {
         // Test backoff calculation
         for retry in 0..5 {
-            let backoff_seconds = 2_i64.pow(retry).min(60) * 60;
+            let backoff_seconds = 2_i64.pow(retry).min(60);
             println!(
-                "Retry {}: {} seconds = {} minutes",
+                "Retry {}: {} seconds",
                 retry,
-                backoff_seconds,
-                backoff_seconds / 60
+                backoff_seconds
             );
         }
 
-        assert_eq!(2_i64.pow(0) * 60, 60); // 1 minute
-        assert_eq!(2_i64.pow(1) * 60, 120); // 2 minutes
-        assert_eq!(2_i64.pow(2) * 60, 240); // 4 minutes
-        assert_eq!(2_i64.pow(3) * 60, 480); // 8 minutes
-        assert_eq!(60_i64.min(2_i64.pow(10)) * 60, 3600); // Capped at 60 minutes
+        assert_eq!(2_i64.pow(0), 1); // 1 second
+        assert_eq!(2_i64.pow(1), 2); // 2 seconds
+        assert_eq!(2_i64.pow(2), 4); // 4 seconds
+        assert_eq!(2_i64.pow(3), 8); // 8 seconds
+        assert_eq!(60_i64.min(2_i64.pow(10)), 60); // Capped at 60 seconds
     }
 
     #[test]
     fn test_backoff_sequence() {
         // Verify the full backoff sequence
-        let expected_minutes = vec![1, 2, 4, 8, 16, 32, 60, 60, 60, 60];
+        let expected_seconds = vec![1, 2, 4, 8, 16, 32, 60, 60, 60, 60];
 
-        for (retry, expected) in expected_minutes.iter().enumerate() {
-            let backoff_minutes = 2_i64.pow(retry as u32).min(60);
+        for (retry, expected) in expected_seconds.iter().enumerate() {
+            let backoff_seconds = 2_i64.pow(retry as u32).min(60);
             assert_eq!(
-                backoff_minutes, *expected,
-                "Retry {} should wait {} minutes",
+                backoff_seconds, *expected,
+                "Retry {} should wait {} seconds",
                 retry, expected
             );
         }
