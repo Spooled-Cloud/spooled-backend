@@ -6,6 +6,8 @@
 
 **Job queue + worker coordination service built with Rust**
 
+[**Live Demo (SpriteForge)**](https://example.spooled.cloud) • [Documentation](https://spooled.cloud/docs) • [Website](https://spooled.cloud)
+
 Spooled is a high-performance, multi-tenant job queue system designed for reliability, observability, and horizontal scalability.
 
 ## ✨ Features
