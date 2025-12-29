@@ -12,10 +12,10 @@ If you can copy/paste and change a few values, you can do this.
 
 ## What Spooled is (in 60 seconds)
 
-- **Webhook**: an external service sends you an HTTP `POST` when something happens (payment completed, new signup, GitHub issue opened).
 - **Job**: some work you want to do *reliably* (send email, update database, generate invoice).
 - **Queue**: a named “line” of jobs (example: `stripe-payments`, `github-events`, `maintenance`, `csv-import`).
 - **Worker**: a small program you run that **pulls jobs** from a queue and does the work.
+- **Webhook (optional)**: an external service sends you an HTTP `POST` when something happens (payment completed, new signup, GitHub issue opened). You can ingest that event into a job.
 
 Spooled is the “middle” that makes your automation reliable:
 
@@ -36,53 +36,30 @@ Spooled is the “middle” that makes your automation reliable:
 > Your real key usually starts with `sk_live_...` or `sk_test_...`.
 > In docs we may show `sp_live_...` / `sp_test_...` to avoid GitHub false positives — **both formats are accepted** by the SDKs.
 
-### 2) Get your “incoming webhook” URL + token (required)
-
-Spooled gives each organization a unique incoming webhook URL:
-
-- `POST /api/v1/webhooks/{org_id}/custom`
-- required header: `X-Webhook-Token: ...`
-
-Get your token + URL:
+Export your API key for the examples below:
 
 ```bash
-curl -sS https://api.spooled.cloud/api/v1/organizations/webhook-token \
-  -H "Authorization: Bearer sp_test_YOUR_API_KEY"
+export SPOOLED_API_KEY="sp_test_YOUR_API_KEY"
 ```
 
-You’ll get something like:
+### 2) Send a test job (sanity check)
 
-```json
-{
-  "webhook_token": "whk_abc123...",
-  "webhook_url": "https://api.spooled.cloud/api/v1/webhooks/org_abc123/custom"
-}
-```
-
-Save:
-- `SPOOLED_WEBHOOK_URL`
-- `SPOOLED_WEBHOOK_TOKEN`
-
-### 3) Send a test job (sanity check)
+This uses the core queue API (jobs). No webhooks involved.
 
 ```bash
-export SPOOLED_WEBHOOK_URL="https://api.spooled.cloud/api/v1/webhooks/org_abc123/custom"
-export SPOOLED_WEBHOOK_TOKEN="whk_abc123..."
-
-curl -sS -X POST "$SPOOLED_WEBHOOK_URL" \
+curl -sS -X POST https://api.spooled.cloud/api/v1/jobs \
+  -H "Authorization: Bearer $SPOOLED_API_KEY" \
   -H "Content-Type: application/json" \
-  -H "X-Webhook-Token: $SPOOLED_WEBHOOK_TOKEN" \
   -d '{
     "queue_name": "test",
-    "event_type": "hello.world",
-    "idempotency_key": "hello-1",
-    "payload": { "message": "Hello from curl!" }
+    "payload": { "message": "Hello from curl!" },
+    "idempotency_key": "hello-1"
   }'
 ```
 
 Open the dashboard and look for a new job in the **`test`** queue.
 
-### 4) Start a “super simple” worker (prints jobs to your terminal)
+### 3) Start a “super simple” worker (prints jobs to your terminal)
 
 This worker listens to **one queue**, prints each job, and marks it as done.
 No Slack, no email provider, no extra services.
@@ -118,21 +95,46 @@ const worker = new SpooledWorker({
   },
 });
 
-await worker.start();
+worker.start();
 console.log(`✅ Worker started for queue: ${queueName}`);
 ```
 
-#### C) Run it
+#### C) Run the worker
 
 ```bash
-export SPOOLED_API_KEY="sp_test_YOUR_API_KEY"
-export SPOOLED_QUEUE="test"
 node worker-print.mjs
 ```
 
-#### D) Test it
+You should see the job you created in step 2 printed in your terminal.
 
-Re-run the “Send a test job” curl from step 3. You should see the job printed in your terminal.
+### 4) Optional: Get your “incoming webhook” URL + token (for external services)
+
+If you want to ingest webhooks from Stripe/GitHub/etc via Spooled’s webhook endpoint, you’ll need a webhook token + URL.
+
+Spooled gives each organization a unique incoming webhook URL:
+
+- `POST /api/v1/webhooks/{org_id}/custom`
+- required header: `X-Webhook-Token: ...`
+
+Get your token + URL:
+
+```bash
+curl -sS https://api.spooled.cloud/api/v1/organizations/webhook-token \
+  -H "Authorization: Bearer $SPOOLED_API_KEY"
+```
+
+You’ll get something like:
+
+```json
+{
+  "webhook_token": "whk_abc123...",
+  "webhook_url": "https://api.spooled.cloud/api/v1/webhooks/org_abc123/custom"
+}
+```
+
+Save:
+- `SPOOLED_WEBHOOK_URL`
+- `SPOOLED_WEBHOOK_TOKEN`
 
 ---
 

@@ -2,6 +2,8 @@
 
 Complete guide to using the Spooled Cloud REST API.
 
+Spooled is a Postgres-backed job queue: you enqueue jobs, workers lease and process them, and you get retries, DLQ, schedules, and workflows. Webhooks are supported as an optional ingestion mechanism.
+
 ## Table of Contents
 
 1. [Plan Limits](#plan-limits)

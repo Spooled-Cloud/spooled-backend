@@ -22,8 +22,8 @@ This document provides a comprehensive overview of the Spooled Cloud backend arc
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                          │
 │  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐                  │
-│  │   Clients   │    │  Webhooks   │    │   Workers   │                  │
-│  │  (REST/WS)  │    │(GitHub/etc) │    │  (gRPC/REST)│                  │
+│  │ Producers   │    │  Ingestion  │    │   Workers   │                  │
+│  │ (REST/SDK)  │    │ (webhooks*) │    │  (gRPC/REST)│                  │
 │  └──────┬──────┘    └──────┬──────┘    └──────┬──────┘                  │
 │         │                  │                  │                          │
 │         ▼                  ▼                  ▼                          │
@@ -55,6 +55,8 @@ This document provides a comprehensive overview of the Spooled Cloud backend arc
 │                                                                          │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
+
+`*` Webhook ingestion is optional — jobs can always be enqueued directly via the REST/gRPC APIs.
 
 ---
 
