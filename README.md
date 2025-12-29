@@ -12,21 +12,21 @@ Spooled is a high-performance, multi-tenant job queue system designed for reliab
 
 ## ✨ Features
 
-- 🚀 **High Performance**: Built on Rust + Tokio + PostgreSQL with Redis caching (~28x faster auth)
-- ⚡ **Optimized gRPC**: HTTP/2 keepalive, TCP optimizations, and connection pooling for ~3x faster throughput
-- 🔒 **Multi-Tenant**: PostgreSQL Row-Level Security (RLS) for data isolation
-- 📊 **Observable**: Prometheus metrics, Grafana dashboards, optional OpenTelemetry export (`--features otel`)
-- 🔄 **Reliable**: At-least-once processing with leases + retries (use idempotency keys for exactly-once effects)
-- ⚡ **Real-Time**: WebSocket + SSE for live job/queue updates
-- 🔐 **Secure**: Bcrypt API keys with Redis caching, JWT auth, HMAC webhook verification
-- 📈 **Scalable**: Stateless API nodes (Kubernetes-friendly) + DB-backed locking (`FOR UPDATE SKIP LOCKED`)
-- 🗓️ **Scheduling**: Cron-based recurring jobs with timezone support
-- 🔗 **Workflows**: Job dependencies with DAG execution
-- 🔌 **Dual Protocol**: REST API (`:8080`) + real gRPC (`GRPC_PORT`, default `:50051`) with streaming support
-- 💎 **Tier-Based Limits**: Automatic enforcement across all endpoints (HTTP, gRPC, workflows, schedules)
-- 💀 **Dead Letter Queue**: Automatic retry and purge operations for failed jobs
-- 🔔 **Webhooks**: Outgoing webhook delivery with automatic retries and status tracking
-- 💳 **Billing**: Stripe integration for subscriptions and usage tracking
+- **High Performance**: Built on Rust + Tokio + PostgreSQL with Redis caching (~28x faster auth)
+- **Optimized gRPC**: HTTP/2 keepalive, TCP optimizations, and connection pooling for ~3x faster throughput
+- **Multi-Tenant**: PostgreSQL Row-Level Security (RLS) for data isolation
+- **Observable**: Prometheus metrics, Grafana dashboards, optional OpenTelemetry export (`--features otel`)
+- **Reliable**: At-least-once processing with leases + retries (use idempotency keys for exactly-once effects)
+- **Real-Time**: WebSocket + SSE for live job/queue updates
+- **Secure**: Bcrypt API keys with Redis caching, JWT auth, HMAC webhook verification
+- **Scalable**: Stateless API nodes (Kubernetes-friendly) + DB-backed locking (`FOR UPDATE SKIP LOCKED`)
+- **Scheduling**: Cron-based recurring jobs with timezone support
+- **Workflows**: Job dependencies with DAG execution
+- **Dual Protocol**: REST API (`:8080`) + real gRPC (`GRPC_PORT`, default `:50051`) with streaming support
+- **Tier-Based Limits**: Automatic enforcement across all endpoints (HTTP, gRPC, workflows, schedules)
+- **Dead Letter Queue**: Automatic retry and purge operations for failed jobs
+- **Webhooks**: Outgoing webhook delivery with automatic retries and status tracking
+- **Billing**: Stripe integration for subscriptions and usage tracking
 
 ## 🐳 Quick Start with Docker
 
