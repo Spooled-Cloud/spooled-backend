@@ -530,7 +530,7 @@ pub async fn create(
 
 /// Generate a secure random API key
 fn generate_api_key() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let mut rng = rand::rng();
     let mut bytes = [0u8; 32];
     rng.fill(&mut bytes);
@@ -917,7 +917,7 @@ pub async fn clear_webhook_token(
 
 /// Generate a secure webhook token for incoming webhooks
 fn generate_webhook_token() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let mut rng = rand::rng();
     let mut bytes = [0u8; 24]; // 24 bytes = 32 base64 chars
     rng.fill(&mut bytes);

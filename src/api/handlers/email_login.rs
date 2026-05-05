@@ -7,7 +7,7 @@
 use axum::{extract::State, Json};
 use chrono::{Duration, Utc};
 use jsonwebtoken::{encode, EncodingKey, Header};
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -737,7 +737,7 @@ pub async fn complete_signup(
 
 /// Generate a secure random API key string
 fn generate_api_key_string() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let mut rng = rand::rng();
     let mut bytes = [0u8; 32];
     rng.fill(&mut bytes);
@@ -746,7 +746,7 @@ fn generate_api_key_string() -> String {
 
 /// Generate a secure webhook token for incoming webhooks
 fn generate_webhook_token() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let mut rng = rand::rng();
     let mut bytes = [0u8; 24]; // 24 bytes = 32 base64 chars
     rng.fill(&mut bytes);

@@ -189,6 +189,21 @@ impl WorkerServiceImpl {
             "healthy"
         }
     }
+
+    /// Preserve an admin/server drain request while accepting normal worker heartbeats.
+    #[cfg(test)]
+    fn resolve_heartbeat_status<'a>(current_status: &'a str, requested_status: &'a str) -> &'a str {
+        if current_status == "draining" || requested_status == "draining" {
+            "draining"
+        } else {
+            requested_status
+        }
+    }
+
+    /// Convert the returned worker status into the gRPC drain hint.
+    fn should_drain_from_status(status: Option<&str>) -> bool {
+        matches!(status, Some("draining"))
+    }
 }
 
 #[tonic::async_trait]
@@ -370,20 +385,20 @@ impl WorkerService for WorkerServiceImpl {
             .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
             .collect();
 
-        // Check if we should tell the worker to drain
-        // This could be based on configuration or admin action
-        let should_drain = false; // TODO: Implement drain logic if needed
-
-        let result = sqlx::query(
+        let result = sqlx::query_as::<_, (String,)>(
             r#"
             UPDATE workers
             SET 
                 last_heartbeat = NOW(),
-                status = $1,
+                status = CASE
+                    WHEN status = 'draining' OR $1 = 'draining' THEN 'draining'
+                    ELSE $1
+                END,
                 current_job_count = $2,
                 metadata = COALESCE($3::JSONB, metadata),
                 updated_at = NOW()
             WHERE id = $4 AND organization_id = $5
+            RETURNING status
             "#,
         )
         .bind(safe_status)
@@ -391,14 +406,16 @@ impl WorkerService for WorkerServiceImpl {
         .bind(&metadata_json)
         .bind(&req.worker_id)
         .bind(&auth.organization_id)
-        .execute(self.pool.as_ref())
+        .fetch_optional(self.pool.as_ref())
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "Failed to process heartbeat");
             Status::internal("Heartbeat failed")
         })?;
 
-        let acknowledged = result.rows_affected() > 0;
+        let acknowledged = result.is_some();
+        let should_drain =
+            Self::should_drain_from_status(result.as_ref().map(|(status,)| status.as_str()));
 
         if !acknowledged {
             warn!(
@@ -522,5 +539,44 @@ mod tests {
         assert_eq!(WorkerServiceImpl::validate_status("draining"), "draining");
         assert_eq!(WorkerServiceImpl::validate_status("offline"), "offline");
         assert_eq!(WorkerServiceImpl::validate_status("invalid"), "healthy");
+    }
+
+    #[test]
+    fn test_resolve_heartbeat_status_preserves_existing_draining() {
+        assert_eq!(
+            WorkerServiceImpl::resolve_heartbeat_status("draining", "healthy"),
+            "draining"
+        );
+    }
+
+    #[test]
+    fn test_resolve_heartbeat_status_accepts_requested_draining() {
+        assert_eq!(
+            WorkerServiceImpl::resolve_heartbeat_status("healthy", "draining"),
+            "draining"
+        );
+    }
+
+    #[test]
+    fn test_resolve_heartbeat_status_keeps_normal_statuses() {
+        assert_eq!(
+            WorkerServiceImpl::resolve_heartbeat_status("healthy", "healthy"),
+            "healthy"
+        );
+        assert_eq!(
+            WorkerServiceImpl::resolve_heartbeat_status("healthy", "degraded"),
+            "degraded"
+        );
+    }
+
+    #[test]
+    fn test_should_drain_from_status_handles_unknown_worker() {
+        assert!(!WorkerServiceImpl::should_drain_from_status(None));
+        assert!(!WorkerServiceImpl::should_drain_from_status(Some(
+            "healthy"
+        )));
+        assert!(WorkerServiceImpl::should_drain_from_status(Some(
+            "draining"
+        )));
     }
 }

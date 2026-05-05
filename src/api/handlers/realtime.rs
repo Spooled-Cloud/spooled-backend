@@ -453,10 +453,10 @@ async fn handle_websocket(
                             }
                         }
                     }
-                    Some(Ok(Message::Ping(data))) => {
-                        if sender.send(Message::Pong(data)).await.is_err() {
-                            break;
-                        }
+                    Some(Ok(Message::Ping(data)))
+                        if sender.send(Message::Pong(data.clone())).await.is_err() =>
+                    {
+                        break;
                     }
                     Some(Ok(Message::Close(_))) => {
                         info!("Client closed WebSocket connection");

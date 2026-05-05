@@ -283,7 +283,7 @@ async fn invalidate_api_key_cache(cache: &crate::cache::RedisCache, key_hash: &s
 /// Now uses cryptographically secure random number generator.
 /// Previously used thread_rng() which may not be cryptographically secure.
 fn generate_api_key() -> String {
-    use rand::Rng;
+    use rand::RngExt;
 
     // Use thread_rng which uses OsRng internally and is cryptographically secure
     let mut rng = rand::rng();
