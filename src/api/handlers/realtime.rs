@@ -549,8 +549,16 @@ pub async fn sse_job_handler(
     // Track connection start time to close idle connections
     let start_time = std::time::Instant::now();
 
+    // Emit an SSE comment immediately so the response headers + first body
+    // chunk flush right away. Without this, proxies (Cloudflare in particular)
+    // buffer the response until the first poll cycle (2s), which makes the
+    // connection look dead to clients with short timeouts.
+    let initial = stream::once(async {
+        Ok::<_, std::convert::Infallible>(Event::default().comment("connected"))
+    });
+
     // Create a stream that polls for job status changes (filtered by org)
-    let stream = stream::unfold(
+    let body = stream::unfold(
         (
             job_id.clone(),
             org_id.clone(),
@@ -641,7 +649,7 @@ pub async fn sse_job_handler(
         },
     );
 
-    Sse::new(stream).keep_alive(
+    Sse::new(initial.chain(body)).keep_alive(
         axum::response::sse::KeepAlive::new()
             .interval(std::time::Duration::from_secs(15))
             .text("ping"),
@@ -663,8 +671,14 @@ pub async fn sse_queue_handler(
     // Track connection start time for timeout
     let start_time = std::time::Instant::now();
 
+    // Flush an initial SSE comment so headers/first chunk make it past
+    // proxies before the first 5s poll cycle. See sse_job_handler for context.
+    let initial = stream::once(async {
+        Ok::<_, std::convert::Infallible>(Event::default().comment("connected"))
+    });
+
     // Create a stream that polls for queue stats (filtered by org)
-    let stream = stream::unfold(
+    let body = stream::unfold(
         (
             queue_name.clone(),
             org_id.clone(),
@@ -742,7 +756,7 @@ pub async fn sse_queue_handler(
         },
     );
 
-    Sse::new(stream).keep_alive(
+    Sse::new(initial.chain(body)).keep_alive(
         axum::response::sse::KeepAlive::new()
             .interval(std::time::Duration::from_secs(15))
             .text("ping"),
@@ -768,8 +782,14 @@ pub async fn sse_events_handler(
     // Track connection start time for timeout
     let start_time = std::time::Instant::now();
 
+    // Flush an initial SSE comment so headers/first chunk make it past
+    // proxies before the first 10s poll cycle. See sse_job_handler for context.
+    let initial = stream::once(async {
+        Ok::<_, std::convert::Infallible>(Event::default().comment("connected"))
+    });
+
     // Create a stream that emits periodic health checks and simulated events
-    let stream = stream::unfold(
+    let body = stream::unfold(
         (
             state.clone(),
             event_filter,
@@ -825,7 +845,7 @@ pub async fn sse_events_handler(
         },
     );
 
-    Sse::new(stream).keep_alive(
+    Sse::new(initial.chain(body)).keep_alive(
         axum::response::sse::KeepAlive::new()
             .interval(std::time::Duration::from_secs(15))
             .text("ping"),
