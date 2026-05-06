@@ -11,7 +11,8 @@ use axum::{
     extract::{Extension, Request, State},
     http::StatusCode,
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
+    Json,
 };
 use chrono::Utc;
 use jsonwebtoken::{decode, DecodingKey, Validation};
@@ -19,7 +20,27 @@ use sqlx::FromRow;
 
 use crate::api::handlers::auth::Claims;
 use crate::api::AppState;
+use crate::error::ErrorResponse;
 use crate::models::ApiKeyContext;
+
+/// Map an `(StatusCode, String)` auth failure into a JSON error response so
+/// SDKs and the dashboard get the same `{code, message}` shape they get for
+/// every other API error. Without this, 401s leaked back as `text/plain`,
+/// which forced every client to special-case auth failures.
+fn auth_error_response(status: StatusCode, message: String) -> Response {
+    let code = match status {
+        StatusCode::UNAUTHORIZED => "UNAUTHORIZED",
+        StatusCode::FORBIDDEN => "ACCESS_DENIED",
+        StatusCode::INTERNAL_SERVER_ERROR => "INTERNAL_ERROR",
+        _ => "ERROR",
+    };
+    let body = Json(ErrorResponse {
+        code: code.to_string(),
+        message,
+        details: None,
+    });
+    (status, body).into_response()
+}
 
 /// Type alias for organization context extractor
 /// Use `Option<Extension<ApiKeyContext>>` in handlers to get the org context
@@ -58,7 +79,7 @@ pub async fn authenticate_api_key(
     State(state): State<AppState>,
     mut request: Request,
     next: Next,
-) -> Result<Response, (StatusCode, String)> {
+) -> Result<Response, Response> {
     // Check Authorization header first
     let token_from_header = request
         .headers()
@@ -85,7 +106,7 @@ pub async fn authenticate_api_key(
         match found_token {
             Some(t) => t,
             None => {
-                return Err((
+                return Err(auth_error_response(
                     StatusCode::UNAUTHORIZED,
                     "Missing or invalid Authorization header or token/api_key query parameter"
                         .to_string(),
@@ -96,11 +117,13 @@ pub async fn authenticate_api_key(
 
     // Detect token type: JWT tokens start with "eyJ" (base64 encoded JSON header)
     let context = if token.starts_with("eyJ") {
-        // JWT token authentication
-        authenticate_jwt_token(&state, &token).await?
+        authenticate_jwt_token(&state, &token)
+            .await
+            .map_err(|(s, m)| auth_error_response(s, m))?
     } else {
-        // API key authentication (sp_ or legacy sk_ prefix)
-        authenticate_api_key_token(&state, &token).await?
+        authenticate_api_key_token(&state, &token)
+            .await
+            .map_err(|(s, m)| auth_error_response(s, m))?
     };
 
     // Store context for downstream handlers

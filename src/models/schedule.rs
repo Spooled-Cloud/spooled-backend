@@ -309,7 +309,7 @@ impl CronSchedule {
 
         if parts.len() != 6 {
             return Err(format!(
-                "Invalid cron expression: expected 6 fields, got {}",
+                "expected 6 fields (sec min hour dom mon dow), got {}",
                 parts.len()
             ));
         }

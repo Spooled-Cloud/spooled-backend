@@ -21,15 +21,17 @@ const MAX_QUEUES_PER_PAGE: i64 = 100;
 /// Maximum allowed rate limit value
 const MAX_RATE_LIMIT: i32 = 100000;
 
-/// List all queues with their configurations
+/// List all queues with their configurations.
 ///
-/// Now filters by authenticated organization
-/// Now uses configurable limit constant
+/// Returns the union of:
+/// 1. Explicitly configured queues from `queue_config` (authoritative settings).
+/// 2. "Implicit" queues that have jobs but no `queue_config` row (e.g. created on
+///    the fly by webhook ingestion or `POST /jobs`). Implicit queues are reported
+///    with the org's default config so they aren't invisible to operators.
 pub async fn list(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
 ) -> AppResult<Json<Vec<QueueConfigSummary>>> {
-    // Use constant instead of hardcoded value
     let configs = sqlx::query_as::<_, QueueConfig>(
         "SELECT * FROM queue_config WHERE organization_id = $1 ORDER BY queue_name ASC LIMIT $2",
     )
@@ -38,7 +40,43 @@ pub async fn list(
     .fetch_all(state.db.pool())
     .await?;
 
-    let summaries: Vec<QueueConfigSummary> = configs.into_iter().map(Into::into).collect();
+    let mut seen: std::collections::HashSet<String> =
+        configs.iter().map(|c| c.queue_name.clone()).collect();
+    let mut summaries: Vec<QueueConfigSummary> = configs.into_iter().map(Into::into).collect();
+
+    // Backfill implicit queues (jobs exist but no queue_config row).
+    let implicit: Vec<(String,)> = sqlx::query_as(
+        r#"
+        SELECT DISTINCT queue_name
+        FROM jobs
+        WHERE organization_id = $1
+          AND queue_name NOT IN (
+              SELECT queue_name FROM queue_config WHERE organization_id = $1
+          )
+        ORDER BY queue_name ASC
+        LIMIT $2
+        "#,
+    )
+    .bind(&ctx.organization_id)
+    .bind(MAX_QUEUES_PER_PAGE)
+    .fetch_all(state.db.pool())
+    .await?;
+
+    for (name,) in implicit {
+        if seen.insert(name.clone()) {
+            summaries.push(QueueConfigSummary {
+                queue_name: name,
+                max_retries: state.settings.queue.default_max_retries,
+                default_timeout: state.settings.queue.default_timeout_secs,
+                rate_limit: None,
+                enabled: true,
+            });
+        }
+    }
+
+    summaries.sort_by(|a, b| a.queue_name.cmp(&b.queue_name));
+    summaries.truncate(MAX_QUEUES_PER_PAGE as usize);
+
     Ok(Json(summaries))
 }
 
@@ -60,30 +98,56 @@ fn validate_queue_name_param(name: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Get queue configuration by name
+/// Get queue configuration by name.
 ///
-/// Now checks organization isolation
-/// Now returns generic "Queue not found" without exposing name
-/// Now validates queue name parameter
+/// Falls back to a synthesized default config if the queue exists implicitly
+/// (jobs are present but no `queue_config` row has been written yet). This
+/// keeps `GET /queues/{name}` consistent with `GET /queues/{name}/stats` and
+/// the dashboard view, both of which already see implicit queues.
 pub async fn get(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
     Path(name): Path<String>,
 ) -> AppResult<Json<QueueConfig>> {
-    // Validate queue name
     validate_queue_name_param(&name)?;
 
-    let config = sqlx::query_as::<_, QueueConfig>(
+    if let Some(config) = sqlx::query_as::<_, QueueConfig>(
         "SELECT * FROM queue_config WHERE queue_name = $1 AND organization_id = $2",
     )
     .bind(&name)
     .bind(&ctx.organization_id)
     .fetch_optional(state.db.pool())
     .await?
-    // Don't expose queue name in error
-    .ok_or_else(|| AppError::NotFound("Queue not found".to_string()))?;
+    {
+        return Ok(Json(config));
+    }
 
-    Ok(Json(config))
+    // No explicit config row: check whether this queue exists implicitly via jobs.
+    let (exists,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS(SELECT 1 FROM jobs WHERE organization_id = $1 AND queue_name = $2)",
+    )
+    .bind(&ctx.organization_id)
+    .bind(&name)
+    .fetch_one(state.db.pool())
+    .await?;
+
+    if !exists {
+        return Err(AppError::NotFound("Queue not found".to_string()));
+    }
+
+    let now = Utc::now();
+    Ok(Json(QueueConfig {
+        id: format!("implicit:{}", name),
+        organization_id: ctx.organization_id.clone(),
+        queue_name: name,
+        max_retries: state.settings.queue.default_max_retries,
+        default_timeout: state.settings.queue.default_timeout_secs,
+        rate_limit: None,
+        enabled: true,
+        settings: serde_json::json!({"implicit": true}),
+        created_at: now,
+        updated_at: now,
+    }))
 }
 
 /// Update or create queue configuration
