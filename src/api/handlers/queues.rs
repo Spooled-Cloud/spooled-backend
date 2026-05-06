@@ -249,7 +249,7 @@ pub async fn stats(
             COUNT(*) FILTER (WHERE status = 'processing') as processing_jobs,
             COUNT(*) FILTER (WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '24 hours') as completed_24h,
             COUNT(*) FILTER (WHERE status = 'failed' AND completed_at > NOW() - INTERVAL '24 hours') as failed_24h,
-            AVG(EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000) FILTER (WHERE status = 'completed' AND completed_at IS NOT NULL AND started_at IS NOT NULL) as avg_processing_time_ms,
+            AVG(EXTRACT(EPOCH FROM (completed_at - started_at))::FLOAT8 * 1000) FILTER (WHERE status = 'completed' AND completed_at IS NOT NULL AND started_at IS NOT NULL) as avg_processing_time_ms,
             EXTRACT(EPOCH FROM (NOW() - MIN(created_at) FILTER (WHERE status IN ('pending', 'scheduled'))))::BIGINT as max_job_age_seconds,
             (SELECT COUNT(*) FROM workers WHERE (queue_name = $1 OR $1 = ANY(queue_names)) AND organization_id = $2 AND status = 'healthy') as active_workers
         FROM jobs
