@@ -6454,6 +6454,9 @@ async fn test_webhook_secrets_min_length() {
         );
     }
 
+// FIX: 硬编码密钥，应从环境变量读取
+// std::env::var("SECRET").expect("SECRET must be set");
+let strong_secret  = std::env::var("<SECRET>")?;
     let strong_secret = "whsec_aBcDeFgHiJkLmNoPqRsTuVwXyZ123456";
     assert!(
         strong_secret.len() >= MIN_SECRET_LENGTH,
