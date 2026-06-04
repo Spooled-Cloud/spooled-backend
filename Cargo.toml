@@ -26,10 +26,10 @@ tower = { version = "0.5", features = ["timeout", "limit"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "request-id", "compression-gzip", "timeout"] }
 
 # Async runtime
-tokio = { version = "1.50", features = ["full", "tracing"] }
+tokio = { version = "1.52", features = ["full", "tracing"] }
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -42,10 +42,10 @@ dotenvy = "0.15"
 # Logging and tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-tracing-opentelemetry = { version = "0.32", optional = true }
-opentelemetry = { version = "0.31", optional = true }
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"], optional = true }
-opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"], optional = true }
+tracing-opentelemetry = { version = "0.33", optional = true }
+opentelemetry = { version = "0.32", optional = true }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"], optional = true }
 
 # Error handling
 thiserror = "2.0"
@@ -53,8 +53,8 @@ anyhow = "1.0"
 
 # Security
 bcrypt = "0.19"
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
 hex = "0.4"
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 subtle = "2.5"  # Constant-time comparison for crypto
@@ -63,12 +63,12 @@ subtle = "2.5"  # Constant-time comparison for crypto
 chrono = { version = "0.4", features = ["serde"] }
 
 # Utilities
-uuid = { version = "1.22", features = ["v4", "serde"] }
+uuid = { version = "1.23", features = ["v4", "serde"] }
 rand = "0.10"
 base64 = "0.22"
 
 # Redis
-redis = { version = "1.0", features = ["tokio-comp", "connection-manager"] }
+redis = { version = "1.2", features = ["tokio-comp", "connection-manager"] }
 
 # Metrics
 prometheus = "0.14"
@@ -85,7 +85,7 @@ regex = "1.12"
 hostname = "0.4"
 futures = "0.3"
 url = "2.5"  # URL parsing for SSRF protection
-lettre = { version = "0.11.19", features = ["smtp-transport", "tokio1-native-tls", "builder"] }
+lettre = { version = "0.11.22", features = ["smtp-transport", "tokio1-native-tls", "builder"] }
 
 # gRPC
 tonic = { version = "0.14", features = ["gzip", "tls-ring"] }
@@ -116,7 +116,7 @@ testcontainers-modules = { version = "0.12", features = ["postgres", "redis"] }
 pretty_assertions = "1.4"
 fake = { version = "5.1", features = ["derive", "chrono", "uuid"] }
 wiremock = "0.6"
-serial_test = "3.4"
+serial_test = "3.5"
 
 [profile.release]
 lto = true
