@@ -7,6 +7,18 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.78] - 2026-06-15
+
+### Fixed
+- **Signup slug validation always shows "Invalid"** — `/organizations/check-slug`
+  and `/organizations/generate-slug` were placed behind the API-key auth
+  middleware, so the signup page (which has no account yet) always received a
+  401 response. The frontend interpreted the `{"code":"UNAUTHORIZED"}` JSON as
+  `{valid: undefined}` and displayed "❌ Invalid" for every auto-generated slug.
+  Both endpoints moved to public routes; they are rate-limited independently.
+
+---
+
 ## [0.1.77] - 2026-05-06
 
 ### Fixed

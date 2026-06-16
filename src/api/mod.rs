@@ -159,6 +159,15 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
         .route("/billing/webhook", post(handlers::billing::webhook))
         // Organization creation is public (for onboarding)
         .route("/organizations", post(handlers::organizations::create))
+        // Slug helpers are public — used during signup before an account exists
+        .route(
+            "/organizations/check-slug",
+            get(handlers::organizations::check_slug),
+        )
+        .route(
+            "/organizations/generate-slug",
+            post(handlers::organizations::generate_slug),
+        )
         // Auth/me uses JWT validation internally (not API key middleware)
         .route("/auth/me", get(handlers::auth::me))
         // Global rate limiting for public endpoints (protects auth/webhooks/signup).
@@ -174,17 +183,9 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
         .route("/auth/logout", post(handlers::auth::logout))
         // Dashboard
         .route("/dashboard", get(handlers::health::dashboard_data))
-        // Organizations (except create which is public)
+        // Organizations (except create/check-slug/generate-slug which are public)
         .route("/organizations", get(handlers::organizations::list))
         .route("/organizations/usage", get(handlers::organizations::usage))
-        .route(
-            "/organizations/check-slug",
-            get(handlers::organizations::check_slug),
-        )
-        .route(
-            "/organizations/generate-slug",
-            post(handlers::organizations::generate_slug),
-        )
         .route("/organizations/{id}", get(handlers::organizations::get))
         .route("/organizations/{id}", put(handlers::organizations::update))
         .route(
