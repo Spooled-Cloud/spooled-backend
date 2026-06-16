@@ -25,6 +25,15 @@ pub struct GrpcAuthContext {
     pub rate_limit: Option<i32>,
 }
 
+impl GrpcAuthContext {
+    /// Whether this key is allowed to operate on the given queue.
+    /// Mirrors `ApiKeyContext::can_access_queue`: empty list or a `*`
+    /// wildcard means all queues are allowed.
+    pub fn can_access_queue(&self, queue_name: &str) -> bool {
+        self.queues.is_empty() || self.queues.iter().any(|q| q == "*" || q == queue_name)
+    }
+}
+
 /// Extract authentication context from gRPC request metadata
 pub async fn authenticate_request<T>(
     pool: &PgPool,

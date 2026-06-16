@@ -221,6 +221,14 @@ impl WorkerService for WorkerServiceImpl {
         // Validate queue name
         Self::validate_queue_name(&req.queue_name)?;
 
+        // Enforce API key queue scope (empty/`*` = all queues allowed)
+        if !auth.can_access_queue(&req.queue_name) {
+            return Err(Status::permission_denied(format!(
+                "API key does not have permission for queue '{}'",
+                req.queue_name
+            )));
+        }
+
         // Validate hostname
         Self::validate_hostname(&req.hostname)?;
 

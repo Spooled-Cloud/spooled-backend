@@ -156,6 +156,14 @@ pub async fn create(
     Extension(ctx): Extension<ApiKeyContext>,
     ValidatedJson(request): ValidatedJson<CreateJobRequest>,
 ) -> AppResult<(StatusCode, Json<CreateJobResponse>)> {
+    // Enforce API key queue scope (empty/`*` = all queues allowed)
+    if !ctx.can_access_queue(&request.queue_name) {
+        return Err(AppError::Authorization(format!(
+            "API key does not have permission for queue '{}'",
+            request.queue_name
+        )));
+    }
+
     let org_id = ctx.organization_id;
 
     // Check payload size against plan limits
@@ -299,6 +307,14 @@ pub async fn claim(
     Extension(ctx): Extension<ApiKeyContext>,
     ValidatedJson(request): ValidatedJson<ClaimJobsRequest>,
 ) -> AppResult<Json<ClaimJobsResponse>> {
+    // Enforce API key queue scope (empty/`*` = all queues allowed)
+    if !ctx.can_access_queue(&request.queue_name) {
+        return Err(AppError::Authorization(format!(
+            "API key does not have permission for queue '{}'",
+            request.queue_name
+        )));
+    }
+
     // Defaults and safety bounds
     let limit = request
         .limit
@@ -725,6 +741,14 @@ pub async fn bulk_enqueue(
     Extension(ctx): Extension<ApiKeyContext>,
     ValidatedJson(request): ValidatedJson<crate::models::BulkEnqueueRequest>,
 ) -> AppResult<Json<crate::models::BulkEnqueueResponse>> {
+    // Enforce API key queue scope (empty/`*` = all queues allowed)
+    if !ctx.can_access_queue(&request.queue_name) {
+        return Err(AppError::Authorization(format!(
+            "API key does not have permission for queue '{}'",
+            request.queue_name
+        )));
+    }
+
     let org_id = ctx.organization_id;
     let job_count = request.jobs.len() as u64;
 

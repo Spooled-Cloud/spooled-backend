@@ -120,6 +120,7 @@ pub async fn create(
             id: key_id,
             key: raw_key, // This is the ONLY time the raw key is returned!
             name: request.name,
+            queues,
             created_at: now,
             expires_at: request.expires_at,
         }),
@@ -311,6 +312,7 @@ mod tests {
             id: "key-1".to_string(),
             key: "sp_test_abc123".to_string(),
             name: "Test Key".to_string(),
+            queues: vec![],
             created_at: Utc::now(),
             expires_at: None,
         };

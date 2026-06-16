@@ -264,6 +264,14 @@ impl QueueService for QueueServiceImpl {
         // Validate queue name
         Self::validate_queue_name(&req.queue_name)?;
 
+        // Enforce API key queue scope (empty/`*` = all queues allowed)
+        if !auth.can_access_queue(&req.queue_name) {
+            return Err(Status::permission_denied(format!(
+                "API key does not have permission for queue '{}'",
+                req.queue_name
+            )));
+        }
+
         // Validate payload size
         let payload = struct_to_json_opt(req.payload.as_ref());
         let payload_str = serde_json::to_string(&payload).unwrap_or_default();
@@ -399,6 +407,14 @@ impl QueueService for QueueServiceImpl {
         let req = request.into_inner();
 
         Self::validate_queue_name(&req.queue_name)?;
+
+        // Enforce API key queue scope (empty/`*` = all queues allowed)
+        if !auth.can_access_queue(&req.queue_name) {
+            return Err(Status::permission_denied(format!(
+                "API key does not have permission for queue '{}'",
+                req.queue_name
+            )));
+        }
 
         if req.worker_id.is_empty() {
             return Err(Status::invalid_argument("Worker ID is required"));

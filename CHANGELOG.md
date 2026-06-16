@@ -7,6 +7,32 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.79] - 2026-06-16
+
+### Security
+- **API key queue scoping now enforced on job operations** — A key created with
+  a restricted `queues` list (e.g. `["billing"]`) could still enqueue, bulk
+  enqueue, and claim jobs on *any* queue via both REST and gRPC; the scope was
+  only checked on worker registration. Scope is now enforced consistently on
+  `POST /jobs`, `POST /jobs/bulk`, `POST /jobs/claim`, and the gRPC
+  `QueueService.Enqueue` / `QueueService.Dequeue` / `WorkerService.Register`
+  RPCs. An empty list or a `*` entry still means "all queues". Violations
+  return `403`/`PERMISSION_DENIED`. Added shared `can_access_queue` helpers to
+  `ApiKeyContext` and `GrpcAuthContext`.
+
+### Fixed
+- **`POST /workers/{id}/heartbeat` returned a raw deserialize error** instead of
+  the structured `VALIDATION_ERROR` shape used elsewhere. Switched the handler
+  to the validated JSON extractor so missing/invalid fields (e.g. `current_jobs`)
+  produce consistent `{"code":"VALIDATION_ERROR","details":[...]}` responses.
+
+### Changed
+- **`POST /api-keys` response now echoes the `queues` field** so callers can
+  confirm the scope a freshly created key was granted (the value was always
+  stored, just not returned).
+
+---
+
 ## [0.1.78] - 2026-06-15
 
 ### Fixed

@@ -138,6 +138,8 @@ pub struct CreateApiKeyResponse {
     pub key: String,
     /// Human-readable name
     pub name: String,
+    /// Allowed queues (empty = all queues)
+    pub queues: Vec<String>,
     /// Creation timestamp
     pub created_at: DateTime<Utc>,
     /// Expiration timestamp
@@ -183,6 +185,18 @@ pub struct ApiKeyContext {
     pub queues: Vec<String>,
     /// Rate limit for this key
     pub rate_limit: Option<i32>,
+}
+
+impl ApiKeyContext {
+    /// Whether this key is allowed to operate on the given queue.
+    ///
+    /// A key with an empty `queues` list (or one containing the `*` wildcard)
+    /// may access every queue. Otherwise the queue must be explicitly listed.
+    /// Used to enforce queue scoping consistently across enqueue, claim,
+    /// bulk enqueue, worker registration, and the gRPC equivalents.
+    pub fn can_access_queue(&self, queue_name: &str) -> bool {
+        self.queues.is_empty() || self.queues.iter().any(|q| q == "*" || q == queue_name)
+    }
 }
 
 /// Validate optional API key name
@@ -344,6 +358,7 @@ mod tests {
             id: "key-123".to_string(),
             key: "sp_live_abcdefgh12345678".to_string(),
             name: "My Key".to_string(),
+            queues: vec!["billing".to_string()],
             created_at: Utc::now(),
             expires_at: None,
         };
@@ -352,6 +367,28 @@ mod tests {
         assert!(json.contains("key-123"));
         assert!(json.contains("sp_live_abcdefgh12345678"));
         assert!(json.contains("My Key"));
+        assert!(json.contains("billing"));
+    }
+
+    #[test]
+    fn test_can_access_queue_scoping() {
+        let ctx = |queues: Vec<&str>| ApiKeyContext {
+            api_key_id: "k".to_string(),
+            organization_id: "o".to_string(),
+            queues: queues.into_iter().map(String::from).collect(),
+            rate_limit: None,
+        };
+
+        // Empty list = all queues allowed
+        assert!(ctx(vec![]).can_access_queue("anything"));
+        // Wildcard = all queues allowed
+        assert!(ctx(vec!["*"]).can_access_queue("anything"));
+        // Scoped key: only listed queues
+        let scoped = ctx(vec!["billing", "emails"]);
+        assert!(scoped.can_access_queue("billing"));
+        assert!(scoped.can_access_queue("emails"));
+        assert!(!scoped.can_access_queue("default"));
+        assert!(!scoped.can_access_queue("Billing")); // case-sensitive
     }
 
     #[test]

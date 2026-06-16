@@ -70,10 +70,7 @@ pub async fn register(
 
     // Check if API key has permission for this queue
     // Empty queues list means all queues allowed, otherwise must be in list
-    if !ctx.queues.is_empty()
-        && !ctx.queues.contains(&request.queue_name)
-        && !ctx.queues.contains(&"*".to_string())
-    {
+    if !ctx.can_access_queue(&request.queue_name) {
         return Err(AppError::Authorization(format!(
             "API key does not have permission for queue '{}'",
             request.queue_name
@@ -183,7 +180,7 @@ pub async fn heartbeat(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
     Path(id): Path<String>,
-    Json(request): Json<WorkerHeartbeatRequest>,
+    ValidatedJson(request): ValidatedJson<WorkerHeartbeatRequest>,
 ) -> AppResult<StatusCode> {
     // Validate and sanitize status
     let status = request.status.as_deref().unwrap_or("healthy");
