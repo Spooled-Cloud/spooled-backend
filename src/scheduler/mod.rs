@@ -620,6 +620,122 @@ impl Scheduler {
             );
         }
 
+        // Workflow jobs express dependencies via job_dependencies (not
+        // parent_job_id), and the DB trigger only flips dependencies_met on
+        // parent *completion* — so a failed/deadlettered/cancelled dependency
+        // used to strand dependents in pending forever. Cancel jobs whose
+        // dependencies can no longer be met, honoring dependency_mode:
+        //   'all' — any dependency in a terminal-failure state is fatal;
+        //   'any' — fatal only when no dependency can still complete.
+        // Looped so multi-level chains cascade within one sweep.
+        let mut workflow_cancelled = 0u64;
+        for _ in 0..10 {
+            let result = sqlx::query(
+                r#"
+                UPDATE jobs child
+                SET
+                    status = 'cancelled',
+                    last_error = 'Dependency job failed or was deadlettered',
+                    updated_at = NOW()
+                WHERE
+                    child.status IN ('pending', 'scheduled')
+                    AND (child.dependencies_met = FALSE OR child.dependencies_met IS NULL)
+                    AND EXISTS (
+                        SELECT 1 FROM job_dependencies jd WHERE jd.job_id = child.id
+                    )
+                    AND (
+                        (
+                            COALESCE(child.dependency_mode, 'all') != 'any'
+                            AND EXISTS (
+                                SELECT 1
+                                FROM job_dependencies jd
+                                JOIN jobs dep ON dep.id = jd.depends_on_job_id
+                                WHERE jd.job_id = child.id
+                                  AND dep.organization_id = child.organization_id
+                                  AND dep.status IN ('failed', 'deadletter', 'cancelled')
+                            )
+                        )
+                        OR
+                        (
+                            COALESCE(child.dependency_mode, 'all') = 'any'
+                            AND NOT EXISTS (
+                                SELECT 1
+                                FROM job_dependencies jd
+                                JOIN jobs dep ON dep.id = jd.depends_on_job_id
+                                WHERE jd.job_id = child.id
+                                  AND dep.organization_id = child.organization_id
+                                  AND dep.status NOT IN ('failed', 'deadletter', 'cancelled')
+                            )
+                        )
+                    )
+                "#,
+            )
+            .execute(&*self.db)
+            .await?;
+
+            let batch = result.rows_affected();
+            workflow_cancelled += batch;
+            if batch == 0 {
+                break;
+            }
+        }
+
+        if workflow_cancelled > 0 {
+            warn!(
+                count = workflow_cancelled,
+                "Cancelled workflow jobs whose dependencies can no longer be met"
+            );
+        }
+
+        // Terminate workflows stuck non-terminal: the progress trigger only fires
+        // on transitions to completed/failed, so cancellations (above or manual)
+        // never close the workflow. A workflow with jobs but nothing left to run
+        // is 'failed' if anything failed/deadlettered, else 'cancelled'.
+        let terminated = sqlx::query(
+            r#"
+            UPDATE workflows w
+            SET
+                status = CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM jobs j
+                        WHERE j.workflow_id = w.id AND j.status IN ('failed', 'deadletter')
+                    ) THEN 'failed'
+                    ELSE 'cancelled'
+                END,
+                completed_jobs = (
+                    SELECT COUNT(*) FROM jobs j
+                    WHERE j.workflow_id = w.id AND j.status = 'completed'
+                ),
+                failed_jobs = (
+                    SELECT COUNT(*) FROM jobs j
+                    WHERE j.workflow_id = w.id AND j.status IN ('failed', 'deadletter')
+                ),
+                completed_at = COALESCE(w.completed_at, NOW())
+            WHERE
+                w.status IN ('pending', 'running')
+                AND EXISTS (SELECT 1 FROM jobs j WHERE j.workflow_id = w.id)
+                AND NOT EXISTS (
+                    SELECT 1 FROM jobs j
+                    WHERE j.workflow_id = w.id
+                      AND j.status IN ('pending', 'scheduled', 'processing')
+                )
+                AND EXISTS (
+                    SELECT 1 FROM jobs j
+                    WHERE j.workflow_id = w.id
+                      AND j.status IN ('failed', 'deadletter', 'cancelled')
+                )
+            "#,
+        )
+        .execute(&*self.db)
+        .await?;
+
+        if terminated.rows_affected() > 0 {
+            warn!(
+                count = terminated.rows_affected(),
+                "Terminated workflows with no runnable jobs remaining"
+            );
+        }
+
         Ok(())
     }
 
