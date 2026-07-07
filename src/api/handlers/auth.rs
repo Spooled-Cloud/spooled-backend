@@ -152,12 +152,15 @@ pub async fn login(
     // This avoids O(n) bcrypt comparisons which are very expensive
     let key_prefix = req.api_key.chars().take(8).collect::<String>();
 
-    // Rate limit login attempts to prevent brute force
-    // Use hash of prefix to prevent rate limit bypass via similar prefixes
+    // Rate limit login attempts to prevent brute force.
+    // Bucket on a hash of the FULL submitted key: bucketing on the 8-char
+    // prefix put every "sp_live_" key in one shared bucket, so 5 failed
+    // attempts by anyone locked out logins for every customer (and gave
+    // attackers a trivial login DoS).
     let rate_limit_id = {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
-        hasher.update(key_prefix.as_bytes());
+        hasher.update(req.api_key.as_bytes());
         hex::encode(&hasher.finalize()[..8])
     };
 
@@ -459,6 +462,15 @@ pub async fn refresh_token(
     }))
 }
 
+/// Logout request body (optional)
+#[derive(Debug, Deserialize)]
+pub struct LogoutRequest {
+    /// Refresh token to invalidate together with the access token. Without it
+    /// the refresh token stays usable until it expires — clients should always
+    /// send it.
+    pub refresh_token: Option<String>,
+}
+
 /// Logout handler - invalidate tokens
 ///
 /// POST /api/v1/auth/logout
@@ -466,6 +478,7 @@ pub async fn logout(
     State(state): State<AppState>,
     Extension(context): Extension<ApiKeyContext>,
     headers: axum::http::HeaderMap,
+    body: Option<Json<LogoutRequest>>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     // Extract token from Authorization header
     let auth_header = headers
@@ -494,11 +507,53 @@ pub async fn logout(
         )
     })?;
 
-    // Add token to blacklist
-    if let Some(ref cache) = state.cache {
-        let blacklist_key = format!("token_blacklist:{}", token_data.claims.jti);
-        let ttl = (token_data.claims.exp - Utc::now().timestamp()).max(1) as u64;
-        let _ = cache.set(&blacklist_key, "1", ttl).await;
+    // Logout without a working blacklist is a lie to the client: the tokens
+    // would remain fully usable. Fail loudly instead of pretending.
+    let Some(ref cache) = state.cache else {
+        error!(org_id = %context.organization_id, "Logout requested but Redis is unavailable; tokens cannot be invalidated");
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse::internal()),
+        ));
+    };
+
+    // Blacklist the access token
+    let blacklist_key = format!("token_blacklist:{}", token_data.claims.jti);
+    let ttl = (token_data.claims.exp - Utc::now().timestamp()).max(1) as u64;
+    cache.set(&blacklist_key, "1", ttl).await.map_err(|e| {
+        error!(error = %e, "Failed to blacklist access token on logout");
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse::internal()),
+        )
+    })?;
+
+    // Blacklist the refresh token as well when the client supplies it —
+    // otherwise the session survives logout via /auth/refresh.
+    if let Some(Json(LogoutRequest {
+        refresh_token: Some(refresh_token),
+    })) = body
+    {
+        match decode::<Claims>(
+            &refresh_token,
+            &DecodingKey::from_secret(state.settings.jwt.secret.as_bytes()),
+            &Validation::default(),
+        ) {
+            Ok(refresh_data) if refresh_data.claims.token_type == "refresh" => {
+                let key = format!("token_blacklist:{}", refresh_data.claims.jti);
+                let ttl = (refresh_data.claims.exp - Utc::now().timestamp()).max(1) as u64;
+                cache.set(&key, "1", ttl).await.map_err(|e| {
+                    error!(error = %e, "Failed to blacklist refresh token on logout");
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(ErrorResponse::internal()),
+                    )
+                })?;
+            }
+            _ => {
+                warn!(org_id = %context.organization_id, "Ignoring invalid refresh token supplied to logout");
+            }
+        }
     }
 
     info!(org_id = %context.organization_id, "User logged out");
