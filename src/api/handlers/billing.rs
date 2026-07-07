@@ -273,11 +273,21 @@ async fn handle_checkout_completed(state: &AppState, event: &StripeEvent) -> App
     let client_reference_id = session["client_reference_id"].as_str(); // org_id
 
     if let (Some(customer_id), Some(org_id)) = (customer_id, client_reference_id) {
+        // Capture the current linkage before overwriting it: a Payment Link checkout for an
+        // already-subscribed org creates a brand-new customer + second subscription, and the
+        // old subscription would keep billing while becoming unreachable from the portal.
+        let previous: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT stripe_customer_id, stripe_subscription_id FROM organizations WHERE id = $1",
+        )
+        .bind(org_id)
+        .fetch_optional(state.db.pool())
+        .await?;
+
         // Update organization with Stripe customer ID
         sqlx::query(
             r#"
-            UPDATE organizations 
-            SET stripe_customer_id = $1, 
+            UPDATE organizations
+            SET stripe_customer_id = $1,
                 stripe_subscription_id = $2,
                 updated_at = NOW()
             WHERE id = $3
@@ -288,6 +298,32 @@ async fn handle_checkout_completed(state: &AppState, event: &StripeEvent) -> App
         .bind(org_id)
         .execute(state.db.pool())
         .await?;
+
+        // Backstop against double billing: cancel the superseded subscription, if any.
+        if let Some((prev_customer_id, Some(prev_subscription_id))) = previous {
+            let is_superseded =
+                subscription_id.is_some() && subscription_id != Some(prev_subscription_id.as_str());
+            if is_superseded {
+                error!(
+                    org_id = %org_id,
+                    prev_customer_id = ?prev_customer_id,
+                    prev_subscription_id = %prev_subscription_id,
+                    new_customer_id = %customer_id,
+                    new_subscription_id = ?subscription_id,
+                    "Checkout completed for an org that already had a subscription; canceling the superseded subscription"
+                );
+                if let Err(e) =
+                    cancel_stripe_subscription(state, &prev_subscription_id).await
+                {
+                    error!(
+                        org_id = %org_id,
+                        prev_subscription_id = %prev_subscription_id,
+                        error = %e,
+                        "Failed to cancel superseded subscription — manual cleanup required to stop double billing"
+                    );
+                }
+            }
+        }
 
         info!(org_id = %org_id, customer_id = %customer_id, "Linked Stripe customer to organization");
 
@@ -457,31 +493,73 @@ pub(crate) async fn reconcile_org_from_subscription_id(
     Ok(())
 }
 
+/// Cancel a Stripe subscription immediately.
+///
+/// Used as the double-billing backstop: when a checkout supersedes an existing
+/// subscription, the old one must not keep charging the customer.
+async fn cancel_stripe_subscription(state: &AppState, subscription_id: &str) -> AppResult<()> {
+    let stripe_secret = state
+        .stripe
+        .secret_key
+        .as_ref()
+        .ok_or_else(|| AppError::Internal("Stripe is not configured".to_string()))?;
+
+    let client = reqwest::Client::new();
+    let url = format!(
+        "https://api.stripe.com/v1/subscriptions/{}",
+        subscription_id
+    );
+
+    let response = client
+        .delete(url)
+        .header("Authorization", format!("Bearer {}", stripe_secret))
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to cancel subscription: {}", e)))?;
+
+    if !response.status().is_success() {
+        let error_text = response.text().await.unwrap_or_default();
+        return Err(AppError::Internal(format!(
+            "Stripe subscription cancel failed: {}",
+            error_text
+        )));
+    }
+
+    info!(subscription_id = %subscription_id, "Canceled superseded Stripe subscription");
+    Ok(())
+}
+
 /// Handle subscription deleted event
 async fn handle_subscription_deleted(state: &AppState, event: &StripeEvent) -> AppResult<()> {
     let subscription = &event.data.object;
 
     let customer_id = subscription["customer"].as_str();
+    let subscription_id = subscription["id"].as_str();
 
     if let Some(customer_id) = customer_id {
-        // Downgrade to free tier
+        // Downgrade to free tier. Scoped to the org's *current* subscription id so a
+        // deletion event for a superseded subscription (e.g. one we auto-canceled after a
+        // duplicate checkout) can never downgrade an org that already moved to a newer
+        // subscription. NULL id is matched for legacy rows linked by customer only.
         sqlx::query(
             r#"
-            UPDATE organizations 
-            SET 
+            UPDATE organizations
+            SET
                 stripe_subscription_id = NULL,
                 stripe_subscription_status = 'canceled',
                 stripe_cancel_at_period_end = FALSE,
                 plan_tier = 'free',
                 updated_at = NOW()
             WHERE stripe_customer_id = $1
+              AND (stripe_subscription_id IS NULL OR stripe_subscription_id = $2)
             "#,
         )
         .bind(customer_id)
+        .bind(subscription_id)
         .execute(state.db.pool())
         .await?;
 
-        info!(customer_id = %customer_id, "Subscription canceled, downgraded to free tier");
+        info!(customer_id = %customer_id, subscription_id = ?subscription_id, "Subscription canceled, downgraded to free tier");
     }
 
     Ok(())
