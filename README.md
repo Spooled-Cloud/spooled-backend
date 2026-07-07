@@ -14,7 +14,7 @@ Spooled is a high-performance, multi-tenant job queue system designed for reliab
 
 - **High Performance**: Built on Rust + Tokio + PostgreSQL with Redis caching (~28x faster auth)
 - **Optimized gRPC**: HTTP/2 keepalive, TCP optimizations, and connection pooling for ~3x faster throughput
-- **Multi-Tenant**: PostgreSQL Row-Level Security (RLS) for data isolation
+- **Multi-Tenant**: explicit per-organization scoping on every query
 - **Observable**: Prometheus metrics, Grafana dashboards, optional OpenTelemetry export (`--features otel`)
 - **Reliable**: At-least-once processing with leases + retries (use idempotency keys for exactly-once effects)
 - **Real-Time**: WebSocket + SSE for live job/queue updates
@@ -596,7 +596,7 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317 ./target/release/spooled-backend
 ## 🔒 Security
 
 - **Authentication**: API keys (bcrypt hashed) or JWT tokens
-- **Multi-tenancy**: PostgreSQL Row-Level Security (RLS)
+- **Multi-tenancy**: explicit per-organization scoping on every query
 - **Rate Limiting**: Per-key limits with Redis (fails closed when configured)
 - **Webhooks**: HMAC-SHA256 signature verification
 - **Input Validation**: All inputs sanitized and size-limited

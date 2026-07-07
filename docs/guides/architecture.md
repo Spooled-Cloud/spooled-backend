@@ -325,18 +325,27 @@ Jobs can have parent-child dependencies. Child jobs are blocked until their pare
 | `workflows` | DAG orchestration | status |
 | `schedules` | Cron definitions | next_run_at, is_active |
 
-### Row-Level Security
+### Tenant Isolation
 
-All tables use PostgreSQL RLS for tenant isolation:
+Tenant isolation is enforced at the application layer: every query explicitly
+filters by the authenticated `organization_id`. RLS policies exist in the
+migrations, but they are **not active as a runtime backstop** today — the
+application connects as the table owner without `FORCE ROW LEVEL SECURITY`,
+and the `app.current_org_id` setting is never bound per request. Do not rely
+on them; keep the explicit `WHERE organization_id` predicate on every query.
 
 ```sql
--- Every table has this pattern
+-- Declared in migrations, currently inert at runtime (see above):
 ALTER TABLE jobs ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY jobs_org_isolation ON jobs
     FOR ALL
     USING (organization_id = current_setting('app.current_org_id', true));
 ```
+
+Making RLS a real backstop requires a non-owner application role,
+`FORCE ROW LEVEL SECURITY` on every tenant table, and a transaction-local
+`set_config('app.current_org_id', $org, true)` at the start of each request.
 
 ---
 
@@ -444,15 +453,13 @@ Response includes next cursor:
 
 ### Multi-Tenant Isolation
 
-All operations are scoped to the authenticated organization via PostgreSQL Row-Level Security:
-
-```sql
-CREATE POLICY org_isolation ON jobs
-    FOR ALL USING (organization_id = current_setting('app.current_org_id'));
-```
+All operations are scoped to the authenticated organization by explicit
+`WHERE organization_id` predicates in every query. (RLS policies are declared
+in migrations but are not an active runtime control — see Tenant Isolation
+above.)
 
 **Isolation enforced at:**
-- Database level (RLS policies on all tables)
+- Query level (explicit organization_id filter in every statement)
 - API handlers (org context required)
 - Cache keys (org-prefixed namespaces)
 - Redis pub/sub (org-scoped channels)
