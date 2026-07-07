@@ -597,6 +597,17 @@ pub async fn me(
         )
     })?;
 
+    // Only access tokens may call /auth/me — same token-type separation the
+    // auth middleware enforces everywhere else; refresh tokens are for
+    // /auth/refresh only.
+    if token_data.claims.token_type != "access" {
+        warn!(jti = %token_data.claims.jti, "Non-access token used on /auth/me");
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse::unauthorized()),
+        ));
+    }
+
     // Check if token is blacklisted (logged out)
     if let Some(ref cache) = state.cache {
         let blacklist_key = format!("token_blacklist:{}", token_data.claims.jti);

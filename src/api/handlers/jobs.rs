@@ -8,7 +8,7 @@ use axum::{
 use chrono::Utc;
 use sqlx::{Postgres, QueryBuilder};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::api::middleware::limits::{check_job_limits, check_payload_size, increment_daily_jobs};
@@ -1213,6 +1213,21 @@ pub async fn retry_dlq(
     let retried_job_ids: Vec<String> = retried_jobs.into_iter().map(|(id,)| id).collect();
     let retried_count = retried_job_ids.len() as i64;
 
+    // Remove the corresponding dead_letter_queue audit rows — the job is live
+    // again, and nothing else ever deletes them (no FK), so they would dangle.
+    if !retried_job_ids.is_empty() {
+        if let Err(e) = sqlx::query(
+            "DELETE FROM dead_letter_queue WHERE job_id = ANY($1) AND organization_id = $2",
+        )
+        .bind(&retried_job_ids)
+        .bind(&ctx.organization_id)
+        .execute(state.db.pool())
+        .await
+        {
+            warn!(error = %e, "Failed to clean dead_letter_queue rows after DLQ retry");
+        }
+    }
+
     // Reset child jobs that were blocked due to parent failure
     // When a parent job is retried from DLQ, its child jobs (with dependencies_met = false)
     // should have their dependencies recalculated
@@ -1332,6 +1347,22 @@ pub async fn purge_dlq(
                 .await?
         }
     };
+
+    // Clean up dead_letter_queue rows whose jobs no longer exist (this purge
+    // and any earlier ones — there is no FK, so they accumulate forever).
+    if let Err(e) = sqlx::query(
+        r#"
+        DELETE FROM dead_letter_queue dlq
+        WHERE dlq.organization_id = $1
+          AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.id = dlq.job_id)
+        "#,
+    )
+    .bind(&ctx.organization_id)
+    .execute(state.db.pool())
+    .await
+    {
+        warn!(error = %e, "Failed to clean orphaned dead_letter_queue rows after purge");
+    }
 
     Ok(Json(crate::models::PurgeDlqResponse {
         purged_count: result.rows_affected() as i64,

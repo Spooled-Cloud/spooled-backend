@@ -186,21 +186,42 @@ impl Scheduler {
             self.metrics.jobs_retried.inc_by(recovered);
         }
 
-        // Move jobs that have exceeded max_retries to deadletter
+        // Move jobs that have exceeded max_retries to deadletter. Also insert a
+        // dead_letter_queue row, matching the explicit-fail path in queue/mod.rs —
+        // otherwise jobs that die via worker timeout are missing from the DLQ
+        // audit table.
         let result = sqlx::query(
             r#"
-            UPDATE jobs
-            SET 
-                status = 'deadletter',
-                assigned_worker_id = NULL,
-                lease_id = NULL,
-                lease_expires_at = NULL,
-                last_error = 'Max retries exceeded after lease expiration',
-                updated_at = NOW()
-            WHERE 
-                status = 'processing'
-                AND lease_expires_at < NOW()
-                AND retry_count >= max_retries
+            WITH deadlettered AS (
+                UPDATE jobs
+                SET
+                    status = 'deadletter',
+                    assigned_worker_id = NULL,
+                    lease_id = NULL,
+                    lease_expires_at = NULL,
+                    last_error = 'Max retries exceeded after lease expiration',
+                    updated_at = NOW()
+                WHERE
+                    status = 'processing'
+                    AND lease_expires_at < NOW()
+                    AND retry_count >= max_retries
+                RETURNING id, organization_id, queue_name, payload, retry_count
+            )
+            INSERT INTO dead_letter_queue
+                (id, job_id, organization_id, queue_name, reason, original_payload, error_details, created_at)
+            SELECT
+                gen_random_uuid()::TEXT,
+                id,
+                organization_id,
+                queue_name,
+                'Max retries exceeded after lease expiration',
+                payload,
+                jsonb_build_object(
+                    'final_error', 'Max retries exceeded after lease expiration',
+                    'total_retries', retry_count
+                ),
+                NOW()
+            FROM deadlettered
             "#,
         )
         .execute(&*self.db)
