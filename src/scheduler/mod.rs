@@ -283,6 +283,7 @@ impl Scheduler {
             id: String,
             organization_id: String,
             cron_expression: String,
+            timezone: String,
             queue_name: String,
             payload_template: serde_json::Value,
             priority: i32,
@@ -313,7 +314,7 @@ impl Scheduler {
 
             let schedule: Option<ScheduleRecord> = sqlx::query_as(
                 r#"
-                SELECT id, organization_id, cron_expression, queue_name, 
+                SELECT id, organization_id, cron_expression, timezone, queue_name,
                        payload_template, priority, max_retries, timeout_seconds, tags
                 FROM schedules
                 WHERE id = $1
@@ -342,10 +343,11 @@ impl Scheduler {
         let now = Utc::now();
 
         for (schedule, mut tx) in schedules {
-            // Calculate next run time FIRST (before any DB operations)
+            // Calculate next run time FIRST (before any DB operations), in the
+            // schedule's own timezone (DST-aware); stored value is UTC.
             let next_run = CronSchedule::parse(&schedule.cron_expression)
                 .ok()
-                .and_then(|c| c.next_run_after(now));
+                .and_then(|c| c.next_run_after_in_timezone(now, &schedule.timezone));
 
             // Enforce plan limits BEFORE inserting cron jobs.
             // Important: cron-triggered jobs must count toward daily quota + payload limits.

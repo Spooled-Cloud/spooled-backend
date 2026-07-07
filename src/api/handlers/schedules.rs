@@ -139,8 +139,9 @@ pub async fn create(
         )
     })?;
 
-    // Calculate next run time
-    let next_run = cron.next_run_after(Utc::now());
+    // Calculate next run time in the schedule's timezone (stored as UTC)
+    let next_run =
+        cron.next_run_after_in_timezone(Utc::now(), req.timezone.as_deref().unwrap_or("UTC"));
 
     let id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now();
@@ -206,15 +207,38 @@ pub async fn update(
 ) -> Result<Json<Schedule>, (StatusCode, String)> {
     let org_id = &ctx.organization_id;
 
-    // Validate cron expression if provided
-    let next_run = if let Some(ref cron_expr) = req.cron_expression {
+    // Recompute next_run_at when the cron expression OR the timezone changes —
+    // both alter the next fire time. The effective values are the incoming ones
+    // falling back to what is currently stored.
+    let next_run = if req.cron_expression.is_some() || req.timezone.is_some() {
+        let current: Option<Schedule> =
+            sqlx::query_as("SELECT * FROM schedules WHERE id = $1 AND organization_id = $2")
+                .bind(&id)
+                .bind(org_id)
+                .fetch_optional(state.db.pool())
+                .await
+                .map_err(|e| {
+                    error!(error = %e, "Failed to load schedule for update");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to update schedule".to_string(),
+                    )
+                })?;
+        let current = current.ok_or((StatusCode::NOT_FOUND, "Schedule not found".to_string()))?;
+
+        let cron_expr = req
+            .cron_expression
+            .as_deref()
+            .unwrap_or(&current.cron_expression);
+        let timezone = req.timezone.as_deref().unwrap_or(&current.timezone);
+
         let cron = CronSchedule::parse(cron_expr).map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
                 format!("Invalid cron expression: {}", e),
             )
         })?;
-        Some(cron.next_run_after(Utc::now()))
+        Some(cron.next_run_after_in_timezone(Utc::now(), timezone))
     } else {
         None
     };
@@ -365,7 +389,7 @@ pub async fn resume(
 
     let next_run = CronSchedule::parse(&current.cron_expression)
         .ok()
-        .and_then(|c| c.next_run_after(Utc::now()));
+        .and_then(|c| c.next_run_after_in_timezone(Utc::now(), &current.timezone));
 
     let schedule: Option<Schedule> = sqlx::query_as(
         r#"

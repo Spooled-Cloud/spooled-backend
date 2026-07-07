@@ -61,6 +61,7 @@ subtle = "2.5"  # Constant-time comparison for crypto
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"  # IANA timezone support for cron schedules
 
 # Utilities
 uuid = { version = "1.22", features = ["v4", "serde"] }
