@@ -843,7 +843,7 @@ Content-Type: application/json
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `queue_name` | string | Yes | Target queue for the job (1-255 chars) |
-| `payload` | object | Yes | Job data (max 5MB) |
+| `payload` | object | Yes | Job data (max 1MB) |
 | `event_type` | string | No | Event type label (for logging/tracking) |
 | `priority` | integer | No | -100 to 100 (default: 0) |
 | `idempotency_key` | string | No | Prevent duplicate jobs (max 255 chars) |
@@ -1485,7 +1485,7 @@ Response:
 | Schedules | 1 | 25 | 100 | Unlimited |
 | Workflows | ❌ | 5 | 50 | Unlimited |
 | Webhooks | 1 | 10 | 50 | Unlimited |
-| Payload size | 64KB | 256KB | 1MB | 5MB |
+| Payload size | 64KB | 256KB | 1MB | 1MB |
 | Job retention | 3 days | 14 days | 30 days | 90 days |
 
 ---

@@ -567,7 +567,11 @@ impl PlanLimits {
             max_workflows: None,
             max_webhooks: None,
 
-            max_payload_size_bytes: 5 * 1024 * 1024, // 5 MB
+            // Must never exceed the hard ingest caps (models::job::MAX_JOB_PAYLOAD_SIZE,
+            // grpc MAX_PAYLOAD_SIZE, models::workflow::MAX_WORKFLOW_JOB_PAYLOAD_SIZE = 1 MiB):
+            // those validators run before the per-plan check, so a larger value here is
+            // unenforceable and would overstate the product.
+            max_payload_size_bytes: 1024 * 1024, // 1 MB
 
             rate_limit_requests_per_second: 500,
             rate_limit_burst: 1000,
