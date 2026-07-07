@@ -411,12 +411,18 @@ async fn handle_checkout_completed(state: &AppState, event: &StripeEvent) -> App
         if let Some(subscription_id) = subscription_id {
             if let Err(e) = reconcile_org_from_subscription_id(state, org_id, subscription_id).await
             {
+                // Propagate as 5xx so Stripe retries the event: the customer has paid,
+                // and swallowing this error could leave them on the free tier. The event
+                // is only marked processed after success, so the retry is applied
+                // (re-linking is idempotent and the cancel backstop only fires when the
+                // subscription id actually changes).
                 warn!(
                     org_id = %org_id,
                     subscription_id = %subscription_id,
                     error = %e,
-                    "Failed to reconcile org plan tier from subscription after checkout"
+                    "Failed to reconcile org plan tier from subscription after checkout; requesting Stripe retry"
                 );
+                return Err(e);
             }
         }
     }
@@ -471,15 +477,35 @@ async fn handle_subscription_updated(state: &AppState, event: &StripeEvent) -> A
         .await?;
 
         if result.rows_affected() == 0 {
-            // Either no org is linked to this customer yet (event arrived before
-            // checkout.session.completed) or a newer billing event was already applied.
-            warn!(
+            // No org linked to this customer yet (event arrived before
+            // checkout.session.completed): return 5xx so Stripe retries until the
+            // linkage exists. Without the retry this event is dropped forever and a
+            // paying customer can be stuck on the free tier. Orphaned customers
+            // (superseded > 24h ago) are ACKed to stop pointless retries.
+            if !org_linked_to_customer(state, customer_id).await?
+                && should_request_retry_for_unlinked(event_time)
+            {
+                warn!(
+                    customer_id = %customer_id,
+                    subscription_id = ?subscription_id,
+                    event_id = %event.id,
+                    "Subscription event received before org linkage; requesting Stripe retry"
+                );
+                return Err(AppError::Internal(format!(
+                    "subscription event received before org was linked to customer {}; requesting Stripe retry",
+                    customer_id
+                )));
+            }
+
+            // Org exists but the ordering guard rejected the event (stale re-delivery),
+            // or the customer is orphaned: ACK.
+            info!(
                 customer_id = %customer_id,
                 subscription_id = ?subscription_id,
                 status = %status,
                 plan_tier = ?plan_tier,
                 event_id = %event.id,
-                "Subscription update not applied: org not linked yet or event is stale"
+                "Ignoring stale subscription event"
             );
         } else {
             info!(
@@ -656,18 +682,49 @@ async fn handle_subscription_deleted(state: &AppState, event: &StripeEvent) -> A
     Ok(())
 }
 
+/// Extract the subscription id from an invoice object.
+///
+/// Stripe API "Basil" (2025-03-31+) moved the top-level `invoice.subscription`
+/// field to `parent.subscription_details.subscription`; older API versions
+/// still send the top-level field. Accept both so the recovery handler is not
+/// a silent no-op on current API versions.
+fn invoice_subscription_id(invoice: &serde_json::Value) -> Option<&str> {
+    invoice["subscription"]
+        .as_str()
+        .or_else(|| invoice["parent"]["subscription_details"]["subscription"].as_str())
+}
+
+/// Whether any organization is linked to this Stripe customer.
+async fn org_linked_to_customer(state: &AppState, customer_id: &str) -> AppResult<bool> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM organizations WHERE stripe_customer_id = $1 LIMIT 1")
+            .bind(customer_id)
+            .fetch_optional(state.db.pool())
+            .await?;
+    Ok(row.is_some())
+}
+
+/// Whether an event for a not-yet-linked customer should be answered with 5xx so
+/// Stripe retries it. Linkage races (subscription/invoice events arriving before
+/// checkout.session.completed) resolve within minutes; after 24h the customer is
+/// almost certainly orphaned (e.g. superseded by a newer checkout), and retrying
+/// forever would only pollute webhook health.
+fn should_request_retry_for_unlinked(event_time: DateTime<Utc>) -> bool {
+    Utc::now() - event_time < chrono::Duration::hours(24)
+}
+
 /// Handle invoice.paid event
 async fn handle_invoice_paid(state: &AppState, event: &StripeEvent) -> AppResult<()> {
     let invoice = &event.data.object;
 
     let customer_id = invoice["customer"].as_str();
-    let subscription_id = invoice["subscription"].as_str();
+    let subscription_id = invoice_subscription_id(invoice);
 
     if let (Some(customer_id), Some(_sub_id)) = (customer_id, subscription_id) {
         // Ensure subscription is active. Stale re-deliveries are ignored via the
         // stripe_last_event_at guard.
         let event_time = event_created_at(event);
-        sqlx::query(
+        let result = sqlx::query(
             r#"
             UPDATE organizations
             SET
@@ -683,6 +740,23 @@ async fn handle_invoice_paid(state: &AppState, event: &StripeEvent) -> AppResult
         .execute(state.db.pool())
         .await?;
 
+        if result.rows_affected() == 0 {
+            // No org linked yet (event raced ahead of checkout linkage): return 5xx so
+            // Stripe retries — a paying customer must not get stuck on the free tier
+            // because a one-shot event was dropped. A stale event (org linked but the
+            // ordering guard rejected it) or an orphaned-customer event is ACKed instead.
+            if !org_linked_to_customer(state, customer_id).await?
+                && should_request_retry_for_unlinked(event_time)
+            {
+                return Err(AppError::Internal(format!(
+                    "invoice.paid received before org was linked to customer {}; requesting Stripe retry",
+                    customer_id
+                )));
+            }
+            info!(customer_id = %customer_id, event_id = %event.id, "Ignoring stale or unlinked invoice.paid event");
+            return Ok(());
+        }
+
         info!(customer_id = %customer_id, "Invoice paid, subscription active");
     }
 
@@ -695,11 +769,19 @@ async fn handle_payment_failed(state: &AppState, event: &StripeEvent) -> AppResu
 
     let customer_id = invoice["customer"].as_str();
 
+    // Only subscription-backed invoices may flip the org to past_due; a failed
+    // one-off invoice must not degrade the subscription status (this also makes
+    // the handler symmetric with invoice.paid).
+    if invoice_subscription_id(invoice).is_none() {
+        info!(event_id = %event.id, "Ignoring invoice.payment_failed for non-subscription invoice");
+        return Ok(());
+    }
+
     if let Some(customer_id) = customer_id {
         // Mark as past_due. Stale re-deliveries are ignored via the
         // stripe_last_event_at guard.
         let event_time = event_created_at(event);
-        sqlx::query(
+        let result = sqlx::query(
             r#"
             UPDATE organizations
             SET
@@ -714,6 +796,21 @@ async fn handle_payment_failed(state: &AppState, event: &StripeEvent) -> AppResu
         .bind(event_time)
         .execute(state.db.pool())
         .await?;
+
+        if result.rows_affected() == 0 {
+            // Same retry semantics as invoice.paid: not-linked-yet → 5xx for retry,
+            // stale/orphaned → ACK.
+            if !org_linked_to_customer(state, customer_id).await?
+                && should_request_retry_for_unlinked(event_time)
+            {
+                return Err(AppError::Internal(format!(
+                    "invoice.payment_failed received before org was linked to customer {}; requesting Stripe retry",
+                    customer_id
+                )));
+            }
+            info!(customer_id = %customer_id, event_id = %event.id, "Ignoring stale or unlinked invoice.payment_failed event");
+            return Ok(());
+        }
 
         warn!(customer_id = %customer_id, "Payment failed, subscription past_due");
     }
@@ -911,6 +1008,23 @@ mod tests {
 
         let created = event_created_at(&event);
         assert_eq!(created.timestamp(), 1700000000);
+    }
+
+    #[test]
+    fn test_invoice_subscription_id_legacy_and_basil() {
+        // Pre-Basil API versions: top-level subscription field.
+        let legacy = serde_json::json!({ "subscription": "sub_legacy" });
+        assert_eq!(invoice_subscription_id(&legacy), Some("sub_legacy"));
+
+        // Basil (2025-03-31+): parent.subscription_details.subscription.
+        let basil = serde_json::json!({
+            "parent": { "subscription_details": { "subscription": "sub_basil" } }
+        });
+        assert_eq!(invoice_subscription_id(&basil), Some("sub_basil"));
+
+        // One-off invoice: no subscription anywhere.
+        let one_off = serde_json::json!({ "customer": "cus_1" });
+        assert_eq!(invoice_subscription_id(&one_off), None);
     }
 
     #[test]
