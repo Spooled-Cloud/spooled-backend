@@ -231,8 +231,14 @@ mod tests {
         );
     }
 
+    // Both TLS tests mutate the same process-global env vars; tests run in
+    // parallel, so they must serialize against each other or they flake.
+    static TLS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_tls_config_disabled_by_default() {
+        let _guard = TLS_ENV_LOCK.lock().unwrap();
+
         // Clear env vars for test
         std::env::remove_var("GRPC_TLS_ENABLED");
         std::env::remove_var("GRPC_TLS_CERT_PATH");
@@ -245,6 +251,8 @@ mod tests {
 
     #[test]
     fn test_tls_config_requires_paths_when_enabled() {
+        let _guard = TLS_ENV_LOCK.lock().unwrap();
+
         std::env::set_var("GRPC_TLS_ENABLED", "true");
         std::env::remove_var("GRPC_TLS_CERT_PATH");
         std::env::remove_var("GRPC_TLS_KEY_PATH");
