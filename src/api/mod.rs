@@ -129,7 +129,13 @@ pub fn router(state: AppState) -> Router {
         .layer(TraceLayer::new_for_http())
         .layer(CompressionLayer::new())
         .layer(timeout_layer)
-        .layer(cors);
+        .layer(cors)
+        // Security headers (X-Frame-Options, nosniff, Referrer-Policy, CSP,
+        // Permissions-Policy, HSTS when ENABLE_HSTS=true). The middleware
+        // existed but was never mounted, so the API served none of them.
+        .layer(axum::middleware::from_fn(
+            middleware::security_headers_middleware,
+        ));
 
     Router::new()
         // Health endpoints (public - no auth required)
