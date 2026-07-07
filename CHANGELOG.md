@@ -7,6 +7,72 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.80] - 2026-07-07
+
+### Security
+- **CORS no longer reflects the request origin.** Production previously used
+  `AllowOrigin::mirror_request()`, which echoes back any `Origin` and is
+  equivalent to allowing every site. Origins now come from a configured
+  allow-list (`CORS_ALLOWED_ORIGINS`, defaulting to the spooled.cloud apps).
+- **Security-headers middleware is now actually mounted.** The middleware
+  (`X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`,
+  `Content-Security-Policy`, `Permissions-Policy`, and HSTS when
+  `ENABLE_HSTS=true`) existed but was never added to the router, so the API
+  served none of them.
+- **Login rate limit no longer buckets on the key prefix.** Brute-force
+  throttling hashed the 8-character key prefix, so every `sp_live_` key shared
+  one bucket — five failed attempts locked out login for *all* customers (a
+  trivial login DoS). It now buckets on a hash of the full submitted key.
+- **Logout fails loud and revokes the refresh token.** When Redis is
+  unavailable, logout now returns `503` instead of silently leaving the tokens
+  usable, and it blacklists the refresh token supplied by the client so a
+  session can no longer survive logout via `/auth/refresh`.
+- **`/auth/me` rejects non-access tokens**, matching the token-type separation
+  enforced elsewhere.
+
+### Fixed
+- **Stripe webhooks are now idempotent and order-safe.** Applied event ids are
+  recorded in `processed_stripe_events` (only *after* successful processing, so
+  a failed handler still returns 5xx and the retry is applied), and a
+  `stripe_last_event_at` ordering guard rejects stale re-deliveries that could
+  restore paid state on a cancelled organization.
+- **Stripe "Basil" API compatibility.** `current_period_end` and the invoice
+  subscription id moved to new locations in the 2025-03-31+ API; both are now
+  read from the new and legacy locations, so subscription-period storage and
+  invoice recovery stop being silent no-ops on current API versions.
+- **Webhook signature verification accepts multiple `v1` signatures**, so
+  webhooks are not lost during a Stripe signing-secret rotation.
+- **Duplicate-checkout double billing is backstopped.** When a checkout
+  supersedes an existing subscription, the previous subscription is cancelled
+  instead of continuing to bill.
+- **Unmapped Stripe price ids are now alerted** (error-logged) instead of
+  silently keeping the current plan tier and hiding entitlement drift.
+- **Schedules honor their timezone.** Cron expressions are evaluated against
+  the schedule's timezone (IANA name or `±HH:MM` offset) with DST-correct
+  next-run computation; they previously always ran in UTC.
+- **Explicit cron catch-up policy.** Fires missed while the scheduler was down
+  are skipped (the schedule runs once now and advances to the next future
+  occurrence) and logged, rather than burst-enqueueing an unbounded backlog.
+- **Lease-expiration dead-lettering writes the `dead_letter_queue` audit row**,
+  matching the explicit-fail path — jobs that died via worker timeout were
+  previously missing from the audit table.
+- **Stranded workflow dependents are cancelled** and workflows left in a
+  non-terminal state are terminated, so a failed or dead-lettered dependency no
+  longer strands its dependents in `pending` forever.
+- **DLQ audit rows are cleaned up on retry and purge** — there is no foreign
+  key, so they previously accumulated indefinitely.
+
+### Changed
+- **Enterprise max payload aligned to the enforced 1 MiB ingest cap** (it was
+  advertised as 5 MB, which the ingest validators made unenforceable).
+- **`bcrypt` bumped to 0.19.2** for an auth-path panic fix.
+- **Kubernetes manifests wire the Stripe billing env the backend actually
+  reads** (`STRIPE_SECRET_KEY`, `STRIPE_BILLING_WEBHOOK_SECRET`, price ids).
+- **Docs describe tenant isolation accurately** — row-level security is not a
+  runtime control in this deployment.
+
+---
+
 ## [0.1.79] - 2026-06-16
 
 ### Security

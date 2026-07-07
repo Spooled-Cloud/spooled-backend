@@ -376,8 +376,8 @@ fn test_plan_payload_size_limits() {
     assert_eq!(PlanLimits::free().max_payload_size_bytes, 64 * 1024); // 64KB
     assert_eq!(PlanLimits::starter().max_payload_size_bytes, 256 * 1024); // 256KB
     assert_eq!(PlanLimits::pro().max_payload_size_bytes, 1024 * 1024); // 1MB
-    // Enterprise matches the platform-wide 1 MiB hard ingest cap; a larger plan
-    // limit is unenforceable (validators reject >1 MiB before the plan check).
+                                                                       // Enterprise matches the platform-wide 1 MiB hard ingest cap; a larger plan
+                                                                       // limit is unenforceable (validators reject >1 MiB before the plan check).
     assert_eq!(PlanLimits::enterprise().max_payload_size_bytes, 1024 * 1024); // 1MB
 }
 

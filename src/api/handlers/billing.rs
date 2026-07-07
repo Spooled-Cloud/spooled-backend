@@ -389,9 +389,7 @@ async fn handle_checkout_completed(state: &AppState, event: &StripeEvent) -> App
                     new_subscription_id = ?subscription_id,
                     "Checkout completed for an org that already had a subscription; canceling the superseded subscription"
                 );
-                if let Err(e) =
-                    cancel_stripe_subscription(state, &prev_subscription_id).await
-                {
+                if let Err(e) = cancel_stripe_subscription(state, &prev_subscription_id).await {
                     error!(
                         org_id = %org_id,
                         prev_subscription_id = %prev_subscription_id,
@@ -880,9 +878,7 @@ fn verify_stripe_signature(secret: &str, body: &[u8], signature: &str) -> AppRes
     let timestamp_str = timestamp
         .ok_or_else(|| AppError::Authentication("Missing timestamp in signature".to_string()))?;
     if v1_signatures.is_empty() {
-        return Err(AppError::Authentication(
-            "Missing v1 signature".to_string(),
-        ));
+        return Err(AppError::Authentication("Missing v1 signature".to_string()));
     }
 
     // Validate timestamp

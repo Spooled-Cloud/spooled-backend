@@ -237,7 +237,10 @@ mod tests {
 
     #[test]
     fn test_tls_config_disabled_by_default() {
-        let _guard = TLS_ENV_LOCK.lock().unwrap();
+        // Recover a poisoned lock rather than cascading the panic: if the other
+        // TLS test panicked mid-section, the env-var invariant is re-established
+        // below, so the poison is not meaningful here.
+        let _guard = TLS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         // Clear env vars for test
         std::env::remove_var("GRPC_TLS_ENABLED");
@@ -251,7 +254,7 @@ mod tests {
 
     #[test]
     fn test_tls_config_requires_paths_when_enabled() {
-        let _guard = TLS_ENV_LOCK.lock().unwrap();
+        let _guard = TLS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         std::env::set_var("GRPC_TLS_ENABLED", "true");
         std::env::remove_var("GRPC_TLS_CERT_PATH");
