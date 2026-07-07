@@ -153,11 +153,36 @@ spec:
                   name: spooled-secrets
                   key: github-webhook-secret
                   optional: true
-            - name: STRIPE_WEBHOOK_SECRET
+            # Stripe billing (all optional; required together for paid plans to work)
+            - name: STRIPE_SECRET_KEY
               valueFrom:
                 secretKeyRef:
                   name: spooled-secrets
-                  key: stripe-webhook-secret
+                  key: stripe-secret-key
+                  optional: true
+            - name: STRIPE_BILLING_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: spooled-secrets
+                  key: stripe-billing-webhook-secret
+                  optional: true
+            - name: STRIPE_STARTER_PRICE_ID
+              valueFrom:
+                secretKeyRef:
+                  name: spooled-secrets
+                  key: stripe-starter-price-id
+                  optional: true
+            - name: STRIPE_PRO_PRICE_ID
+              valueFrom:
+                secretKeyRef:
+                  name: spooled-secrets
+                  key: stripe-pro-price-id
+                  optional: true
+            - name: STRIPE_BILLING_PORTAL_CONFIG_ID
+              valueFrom:
+                secretKeyRef:
+                  name: spooled-secrets
+                  key: stripe-billing-portal-config-id
                   optional: true
             
             # OpenTelemetry / Distributed Tracing
