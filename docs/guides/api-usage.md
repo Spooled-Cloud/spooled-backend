@@ -588,6 +588,17 @@ Authorization: Bearer <token>
 - `0 0 0 * * 1` - Every Monday at midnight
 - `0 0 0 1 * *` - First of every month
 
+**Timezone:** cron fields are evaluated in the schedule's `timezone` (IANA
+name or `+HH:MM` offset, default `UTC`), DST-aware. Times skipped by a
+spring-forward transition are not fired that day; times repeated by a
+fall-back transition fire once, at the first occurrence.
+
+**Catch-up policy:** fires missed while the platform is down are skipped, not
+backfilled — the schedule runs once when service resumes and then advances to
+the next future occurrence. Skipped fires are logged server-side. Design jobs
+to be idempotent and, where gaps matter, derive work from state (e.g. "process
+everything since last success") rather than from fire count.
+
 ### List Schedules
 
 ```bash

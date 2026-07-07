@@ -290,6 +290,7 @@ impl Scheduler {
             max_retries: i32,
             timeout_seconds: i32,
             tags: Option<serde_json::Value>,
+            next_run_at: Option<chrono::DateTime<Utc>>,
         }
 
         // First, get IDs of schedules that are due (without lock, just to know what to process)
@@ -315,7 +316,8 @@ impl Scheduler {
             let schedule: Option<ScheduleRecord> = sqlx::query_as(
                 r#"
                 SELECT id, organization_id, cron_expression, timezone, queue_name,
-                       payload_template, priority, max_retries, timeout_seconds, tags
+                       payload_template, priority, max_retries, timeout_seconds, tags,
+                       next_run_at
                 FROM schedules
                 WHERE id = $1
                   AND is_active = TRUE
@@ -343,11 +345,39 @@ impl Scheduler {
         let now = Utc::now();
 
         for (schedule, mut tx) in schedules {
+            let cron = CronSchedule::parse(&schedule.cron_expression).ok();
+
             // Calculate next run time FIRST (before any DB operations), in the
             // schedule's own timezone (DST-aware); stored value is UTC.
-            let next_run = CronSchedule::parse(&schedule.cron_expression)
-                .ok()
+            let next_run = cron
+                .as_ref()
                 .and_then(|c| c.next_run_after_in_timezone(now, &schedule.timezone));
+
+            // Catch-up policy: fires missed while the scheduler was down are
+            // SKIPPED, not backfilled — the schedule runs once now and advances
+            // to the next future occurrence. Backfilling would burst-enqueue an
+            // unbounded number of stale jobs after long downtime. The skipped
+            // occurrences are logged so the gap is visible to operators.
+            if let (Some(cron), Some(stored_next)) = (cron.as_ref(), schedule.next_run_at) {
+                let mut missed = 0u32;
+                let mut t = stored_next;
+                while let Some(fire) = cron.next_run_after_in_timezone(t, &schedule.timezone) {
+                    if fire >= now || missed >= 100 {
+                        break;
+                    }
+                    missed += 1;
+                    t = fire;
+                }
+                if missed > 0 {
+                    warn!(
+                        schedule_id = %schedule.id,
+                        org_id = %schedule.organization_id,
+                        missed_fires = missed,
+                        due_since = %stored_next,
+                        "Skipping cron fires missed during scheduler downtime (catch-up policy: skip, run once now)"
+                    );
+                }
+            }
 
             // Enforce plan limits BEFORE inserting cron jobs.
             // Important: cron-triggered jobs must count toward daily quota + payload limits.
