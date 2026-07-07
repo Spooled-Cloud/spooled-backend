@@ -437,7 +437,7 @@ async fn handle_subscription_updated(state: &AppState, event: &StripeEvent) -> A
     let subscription_id = subscription["id"].as_str();
     let customer_id = subscription["customer"].as_str();
     let status = subscription["status"].as_str();
-    let current_period_end = subscription["current_period_end"].as_i64();
+    let current_period_end = subscription_period_end(subscription);
     let cancel_at_period_end = subscription["cancel_at_period_end"].as_bool();
 
     // Determine plan tier from price
@@ -564,7 +564,7 @@ pub(crate) async fn reconcile_org_from_subscription_id(
 
     let customer_id = subscription["customer"].as_str();
     let status = subscription["status"].as_str();
-    let current_period_end = subscription["current_period_end"].as_i64();
+    let current_period_end = subscription_period_end(&subscription);
     let cancel_at_period_end = subscription["cancel_at_period_end"].as_bool();
     let plan_tier = determine_plan_tier(&subscription, state);
     let period_end = current_period_end.and_then(|ts| DateTime::from_timestamp(ts, 0));
@@ -818,6 +818,17 @@ async fn handle_payment_failed(state: &AppState, event: &StripeEvent) -> AppResu
     Ok(())
 }
 
+/// Current period end of a subscription, in unix seconds.
+///
+/// Stripe API "Basil" (2025-03-31+) removed the top-level
+/// `current_period_end`; it now lives on each subscription item. Accept both
+/// so the column stops being stored as NULL on current API versions.
+fn subscription_period_end(subscription: &serde_json::Value) -> Option<i64> {
+    subscription["current_period_end"]
+        .as_i64()
+        .or_else(|| subscription["items"]["data"][0]["current_period_end"].as_i64())
+}
+
 /// Determine plan tier from subscription prices
 fn determine_plan_tier(subscription: &serde_json::Value, state: &AppState) -> Option<String> {
     let items = subscription["items"]["data"].as_array()?;
@@ -836,21 +847,31 @@ fn determine_plan_tier(subscription: &serde_json::Value, state: &AppState) -> Op
         }
     }
 
-    // Default: keep current plan
+    // Unknown price: the tier is intentionally kept (COALESCE), but silently
+    // doing so hides entitlement drift — the customer is being charged a price
+    // we can't map (rotated/annual/enterprise price id missing from env).
+    error!(
+        price_id = %price_id,
+        subscription_id = ?subscription["id"].as_str(),
+        "Stripe price id not mapped to any plan tier; keeping current tier — check STRIPE_*_PRICE_ID configuration"
+    );
     None
 }
 
 /// Verify Stripe webhook signature
 fn verify_stripe_signature(secret: &str, body: &[u8], signature: &str) -> AppResult<()> {
     // Parse Stripe signature format: t=timestamp,v1=signature
+    // During webhook-secret rotation Stripe signs with both secrets and sends
+    // MULTIPLE v1 entries — keep them all and accept any match, otherwise
+    // webhooks are transiently lost for the whole rotation window.
     let mut timestamp = None;
-    let mut v1_signature = None;
+    let mut v1_signatures: Vec<&str> = Vec::new();
 
     for part in signature.split(',') {
         if let Some((key, value)) = part.split_once('=') {
             match key {
                 "t" => timestamp = Some(value),
-                "v1" => v1_signature = Some(value),
+                "v1" => v1_signatures.push(value),
                 _ => {}
             }
         }
@@ -858,8 +879,11 @@ fn verify_stripe_signature(secret: &str, body: &[u8], signature: &str) -> AppRes
 
     let timestamp_str = timestamp
         .ok_or_else(|| AppError::Authentication("Missing timestamp in signature".to_string()))?;
-    let expected =
-        v1_signature.ok_or_else(|| AppError::Authentication("Missing v1 signature".to_string()))?;
+    if v1_signatures.is_empty() {
+        return Err(AppError::Authentication(
+            "Missing v1 signature".to_string(),
+        ));
+    }
 
     // Validate timestamp
     let timestamp_secs: i64 = timestamp_str
@@ -890,7 +914,10 @@ fn verify_stripe_signature(secret: &str, body: &[u8], signature: &str) -> AppRes
 
     let computed = hex::encode(mac.finalize().into_bytes());
 
-    if !constant_time_compare(&computed, expected) {
+    if !v1_signatures
+        .iter()
+        .any(|expected| constant_time_compare(&computed, expected))
+    {
         return Err(AppError::Authentication(
             "Invalid webhook signature".to_string(),
         ));
@@ -1051,6 +1078,46 @@ mod tests {
         assert_eq!(parts.len(), 2);
         assert!(parts[0].starts_with("t="));
         assert!(parts[1].starts_with("v1="));
+    }
+
+    #[test]
+    fn test_stripe_signature_accepts_any_v1_during_rotation() {
+        use hmac::Mac;
+
+        let secret = "whsec_test_secret";
+        let body = b"{\"id\":\"evt_1\"}";
+        let ts = Utc::now().timestamp().to_string();
+
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(format!("{}.{}", ts, String::from_utf8_lossy(body)).as_bytes());
+        let valid = hex::encode(mac.finalize().into_bytes());
+
+        // Valid signature first, stale one second (the rotation ordering that
+        // used to fail because only the LAST v1 was kept).
+        let header = format!("t={},v1={},v1={}", ts, valid, "0".repeat(64));
+        assert!(verify_stripe_signature(secret, body, &header).is_ok());
+
+        // And the reverse order still verifies.
+        let header = format!("t={},v1={},v1={}", ts, "0".repeat(64), valid);
+        assert!(verify_stripe_signature(secret, body, &header).is_ok());
+
+        // No valid signature at all fails.
+        let header = format!("t={},v1={}", ts, "0".repeat(64));
+        assert!(verify_stripe_signature(secret, body, &header).is_err());
+    }
+
+    #[test]
+    fn test_subscription_period_end_basil_and_legacy() {
+        let legacy = serde_json::json!({ "current_period_end": 1700000000 });
+        assert_eq!(subscription_period_end(&legacy), Some(1700000000));
+
+        let basil = serde_json::json!({
+            "items": { "data": [ { "current_period_end": 1800000000 } ] }
+        });
+        assert_eq!(subscription_period_end(&basil), Some(1800000000));
+
+        let none = serde_json::json!({});
+        assert_eq!(subscription_period_end(&none), None);
     }
 
     #[test]
