@@ -226,6 +226,31 @@ pub async fn webhook(
 
     info!(event_type = %event.event_type, event_id = %event.id, "Processing Stripe billing webhook");
 
+    let handled = matches!(
+        event.event_type.as_str(),
+        "checkout.session.completed"
+            | "customer.subscription.created"
+            | "customer.subscription.updated"
+            | "customer.subscription.deleted"
+            | "invoice.paid"
+            | "invoice.payment_failed"
+    );
+
+    // Idempotency: Stripe re-delivers events (retries for up to ~3 days) with the
+    // same event id. Skip anything we've already applied successfully.
+    if handled {
+        let already_processed: Option<(String,)> =
+            sqlx::query_as("SELECT event_id FROM processed_stripe_events WHERE event_id = $1")
+                .bind(&event.id)
+                .fetch_optional(state.db.pool())
+                .await?;
+
+        if already_processed.is_some() {
+            info!(event_id = %event.id, event_type = %event.event_type, "Skipping already-processed Stripe event");
+            return Ok(StatusCode::OK);
+        }
+    }
+
     // Handle different event types
     match event.event_type.as_str() {
         "checkout.session.completed" => {
@@ -248,6 +273,28 @@ pub async fn webhook(
         }
     }
 
+    // Record the event only after successful processing: a handler error must
+    // return 5xx *without* marking the event processed, so Stripe's retry of the
+    // same event id is applied rather than skipped as a duplicate.
+    if handled {
+        sqlx::query(
+            "INSERT INTO processed_stripe_events (event_id) VALUES ($1) ON CONFLICT (event_id) DO NOTHING",
+        )
+        .bind(&event.id)
+        .execute(state.db.pool())
+        .await?;
+
+        // Opportunistic pruning far beyond Stripe's retry window.
+        if let Err(e) = sqlx::query(
+            "DELETE FROM processed_stripe_events WHERE received_at < NOW() - INTERVAL '30 days'",
+        )
+        .execute(state.db.pool())
+        .await
+        {
+            warn!(error = %e, "Failed to prune processed_stripe_events");
+        }
+    }
+
     Ok(StatusCode::OK)
 }
 
@@ -256,7 +303,20 @@ struct StripeEvent {
     id: String,
     #[serde(rename = "type")]
     event_type: String,
+    /// Stripe-side creation time (unix seconds); used as the ordering guard.
+    #[serde(default)]
+    created: i64,
     data: StripeEventData,
+}
+
+/// Stripe-side creation time of the event, falling back to "now" if absent so a
+/// malformed event is treated as fresh rather than silently discarded as stale.
+fn event_created_at(event: &StripeEvent) -> DateTime<Utc> {
+    if event.created > 0 {
+        DateTime::from_timestamp(event.created, 0).unwrap_or_else(Utc::now)
+    } else {
+        Utc::now()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -283,21 +343,38 @@ async fn handle_checkout_completed(state: &AppState, event: &StripeEvent) -> App
         .fetch_optional(state.db.pool())
         .await?;
 
-        // Update organization with Stripe customer ID
-        sqlx::query(
+        // Update organization with Stripe customer ID. The stripe_last_event_at
+        // guard rejects stale re-deliveries: an old checkout event from a previous
+        // session must never relink the org (and trigger the cancel backstop below)
+        // after a newer billing event has been applied.
+        let event_time = event_created_at(event);
+        let relinked = sqlx::query(
             r#"
             UPDATE organizations
             SET stripe_customer_id = $1,
                 stripe_subscription_id = $2,
+                stripe_last_event_at = $3,
                 updated_at = NOW()
-            WHERE id = $3
+            WHERE id = $4
+              AND (stripe_last_event_at IS NULL OR stripe_last_event_at <= $3)
             "#,
         )
         .bind(customer_id)
         .bind(subscription_id)
+        .bind(event_time)
         .bind(org_id)
         .execute(state.db.pool())
         .await?;
+
+        if relinked.rows_affected() == 0 {
+            warn!(
+                org_id = %org_id,
+                customer_id = %customer_id,
+                event_id = %event.id,
+                "Skipping checkout.session.completed: org missing or a newer billing event was already applied"
+            );
+            return Ok(());
+        }
 
         // Backstop against double billing: cancel the superseded subscription, if any.
         if let Some((prev_customer_id, Some(prev_subscription_id))) = previous {
@@ -362,19 +439,25 @@ async fn handle_subscription_updated(state: &AppState, event: &StripeEvent) -> A
 
     if let (Some(customer_id), Some(status)) = (customer_id, status) {
         let period_end = current_period_end.and_then(|ts| DateTime::from_timestamp(ts, 0));
+        let event_time = event_created_at(event);
 
-        // Update organization
+        // Update organization. The stripe_last_event_at guard ignores stale
+        // re-deliveries — Stripe does not guarantee ordering, and an old
+        // subscription.updated replayed after cancellation used to restore paid
+        // state on a canceled org.
         let result = sqlx::query(
             r#"
-            UPDATE organizations 
-            SET 
+            UPDATE organizations
+            SET
                 stripe_subscription_id = $1,
                 stripe_subscription_status = $2,
                 stripe_current_period_end = $3,
                 stripe_cancel_at_period_end = $4,
                 plan_tier = COALESCE($5, plan_tier),
+                stripe_last_event_at = $7,
                 updated_at = NOW()
             WHERE stripe_customer_id = $6
+              AND (stripe_last_event_at IS NULL OR stripe_last_event_at <= $7)
             "#,
         )
         .bind(subscription_id)
@@ -383,17 +466,20 @@ async fn handle_subscription_updated(state: &AppState, event: &StripeEvent) -> A
         .bind(cancel_at_period_end)
         .bind(&plan_tier)
         .bind(customer_id)
+        .bind(event_time)
         .execute(state.db.pool())
         .await?;
 
         if result.rows_affected() == 0 {
-            // Likely received subscription event before checkout completed linked customer -> org.
+            // Either no org is linked to this customer yet (event arrived before
+            // checkout.session.completed) or a newer billing event was already applied.
             warn!(
                 customer_id = %customer_id,
                 subscription_id = ?subscription_id,
                 status = %status,
                 plan_tier = ?plan_tier,
-                "Subscription update received but no org is linked to this Stripe customer yet"
+                event_id = %event.id,
+                "Subscription update not applied: org not linked yet or event is stale"
             );
         } else {
             info!(
@@ -541,6 +627,8 @@ async fn handle_subscription_deleted(state: &AppState, event: &StripeEvent) -> A
         // deletion event for a superseded subscription (e.g. one we auto-canceled after a
         // duplicate checkout) can never downgrade an org that already moved to a newer
         // subscription. NULL id is matched for legacy rows linked by customer only.
+        // The stripe_last_event_at guard additionally ignores stale re-deliveries.
+        let event_time = event_created_at(event);
         sqlx::query(
             r#"
             UPDATE organizations
@@ -549,13 +637,16 @@ async fn handle_subscription_deleted(state: &AppState, event: &StripeEvent) -> A
                 stripe_subscription_status = 'canceled',
                 stripe_cancel_at_period_end = FALSE,
                 plan_tier = 'free',
+                stripe_last_event_at = $3,
                 updated_at = NOW()
             WHERE stripe_customer_id = $1
               AND (stripe_subscription_id IS NULL OR stripe_subscription_id = $2)
+              AND (stripe_last_event_at IS NULL OR stripe_last_event_at <= $3)
             "#,
         )
         .bind(customer_id)
         .bind(subscription_id)
+        .bind(event_time)
         .execute(state.db.pool())
         .await?;
 
@@ -573,17 +664,22 @@ async fn handle_invoice_paid(state: &AppState, event: &StripeEvent) -> AppResult
     let subscription_id = invoice["subscription"].as_str();
 
     if let (Some(customer_id), Some(_sub_id)) = (customer_id, subscription_id) {
-        // Ensure subscription is active
+        // Ensure subscription is active. Stale re-deliveries are ignored via the
+        // stripe_last_event_at guard.
+        let event_time = event_created_at(event);
         sqlx::query(
             r#"
-            UPDATE organizations 
-            SET 
+            UPDATE organizations
+            SET
                 stripe_subscription_status = 'active',
+                stripe_last_event_at = $2,
                 updated_at = NOW()
             WHERE stripe_customer_id = $1
+              AND (stripe_last_event_at IS NULL OR stripe_last_event_at <= $2)
             "#,
         )
         .bind(customer_id)
+        .bind(event_time)
         .execute(state.db.pool())
         .await?;
 
@@ -600,17 +696,22 @@ async fn handle_payment_failed(state: &AppState, event: &StripeEvent) -> AppResu
     let customer_id = invoice["customer"].as_str();
 
     if let Some(customer_id) = customer_id {
-        // Mark as past_due
+        // Mark as past_due. Stale re-deliveries are ignored via the
+        // stripe_last_event_at guard.
+        let event_time = event_created_at(event);
         sqlx::query(
             r#"
-            UPDATE organizations 
-            SET 
+            UPDATE organizations
+            SET
                 stripe_subscription_status = 'past_due',
+                stripe_last_event_at = $2,
                 updated_at = NOW()
             WHERE stripe_customer_id = $1
+              AND (stripe_last_event_at IS NULL OR stripe_last_event_at <= $2)
             "#,
         )
         .bind(customer_id)
+        .bind(event_time)
         .execute(state.db.pool())
         .await?;
 
@@ -792,6 +893,7 @@ mod tests {
         let json = r#"{
             "id": "evt_123",
             "type": "customer.subscription.updated",
+            "created": 1700000000,
             "data": {
                 "object": {
                     "id": "sub_123",
@@ -803,8 +905,28 @@ mod tests {
         let event: StripeEvent = serde_json::from_str(json).unwrap();
         assert_eq!(event.id, "evt_123");
         assert_eq!(event.event_type, "customer.subscription.updated");
+        assert_eq!(event.created, 1700000000);
         assert_eq!(event.data.object["id"], "sub_123");
         assert_eq!(event.data.object["status"], "active");
+
+        let created = event_created_at(&event);
+        assert_eq!(created.timestamp(), 1700000000);
+    }
+
+    #[test]
+    fn test_stripe_event_without_created_treated_as_fresh() {
+        let json = r#"{
+            "id": "evt_456",
+            "type": "invoice.paid",
+            "data": { "object": {} }
+        }"#;
+
+        let event: StripeEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event.created, 0);
+
+        // Missing created must be treated as "now", never as stale.
+        let before = Utc::now().timestamp() - 5;
+        assert!(event_created_at(&event).timestamp() >= before);
     }
 
     #[test]
