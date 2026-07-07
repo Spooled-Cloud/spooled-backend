@@ -73,10 +73,28 @@ pub fn router(state: AppState) -> Router {
     // Only allow Any origin in development
     // In production, CORS should be restricted to prevent CSRF attacks
     let cors = if state.settings.server.environment == Environment::Production {
-        // In production, be restrictive with CORS
-        // Origins should be configured via environment variable
-        tracing::info!("Production mode: Using restrictive CORS policy");
+        // In production, only the configured origins are allowed. Reflecting the
+        // request origin (mirror_request) is equivalent to Any for browsers and
+        // defeats CORS entirely.
+        let allowed_origins: Vec<axum::http::HeaderValue> = state
+            .settings
+            .server
+            .cors_allowed_origins
+            .iter()
+            .filter_map(|origin| match origin.parse() {
+                Ok(v) => Some(v),
+                Err(_) => {
+                    tracing::warn!(origin = %origin, "Ignoring invalid CORS origin");
+                    None
+                }
+            })
+            .collect();
+        tracing::info!(
+            origins = ?state.settings.server.cors_allowed_origins,
+            "Production mode: CORS restricted to configured origins"
+        );
         CorsLayer::new()
+            .allow_origin(tower_http::cors::AllowOrigin::list(allowed_origins))
             .allow_methods([
                 axum::http::Method::GET,
                 axum::http::Method::POST,
@@ -93,9 +111,6 @@ pub fn router(state: AppState) -> Router {
                 axum::http::header::HeaderName::from_static("x-admin-key"),
                 axum::http::header::HeaderName::from_static("x-organization-id"),
             ])
-            // In production, origins should come from config
-            // For now, we use permissive but not "Any" - actual origins should be configured
-            .allow_origin(tower_http::cors::AllowOrigin::mirror_request())
     } else {
         // Development mode: allow any origin for easier testing
         tracing::info!("Development mode: Using permissive CORS policy");

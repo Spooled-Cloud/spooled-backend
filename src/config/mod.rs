@@ -81,6 +81,9 @@ pub struct ServerSettings {
     /// Optional token for metrics endpoint authentication
     /// When set, /metrics endpoint requires Authorization: Bearer <token>
     pub metrics_token: Option<String>,
+    /// Origins allowed by CORS in production (comma-separated in
+    /// CORS_ALLOWED_ORIGINS). Never reflected from the request.
+    pub cors_allowed_origins: Vec<String>,
 }
 
 /// Environment type
@@ -260,6 +263,15 @@ impl Settings {
                     .context("Invalid GRPC_PORT")?,
                 external_url: env::var("EXTERNAL_URL").ok(),
                 metrics_token: env::var("METRICS_TOKEN").ok(),
+                cors_allowed_origins: env::var("CORS_ALLOWED_ORIGINS")
+                    .unwrap_or_else(|_| {
+                        "https://spooled.cloud,https://www.spooled.cloud,https://app.spooled.cloud"
+                            .to_string()
+                    })
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
                 environment: match env::var("RUST_ENV")
                     .unwrap_or_else(|_| "development".to_string())
                     .as_str()
@@ -541,6 +553,7 @@ impl Settings {
                 environment: Environment::Development,
                 external_url: None,
                 metrics_token: None,
+                cors_allowed_origins: vec![],
             },
             database: DatabaseSettings {
                 url: "postgres://test:test@localhost:5432/test".to_string(),
