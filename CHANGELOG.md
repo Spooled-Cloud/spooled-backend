@@ -7,6 +7,26 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.82] - 2026-07-08
+
+### Fixed
+- **Admin hard-delete of an organization no longer fails and no longer destroys
+  data partially.** `DELETE /api/v1/admin/organizations/{id}?hard_delete=true`
+  ran `DELETE FROM queue_configs`, but the table is `queue_config` (singular),
+  so every hard delete errored with a database error — *after* it had already
+  deleted the org's jobs, workflows, workers, schedules, api_keys and
+  outgoing_webhooks on the connection pool (no transaction), leaving the
+  organization row present but its data gone. The delete now runs in a single
+  transaction (all-or-nothing) against the correct table, and API-key cache
+  invalidation happens only after the transaction commits.
+- **Schedule timezone validation now matches the scheduler.** `timezone` was
+  validated against a hardcoded ~30-zone list, so valid IANA zones the scheduler
+  fully supports (e.g. `Europe/Kyiv`) were rejected at create/update time.
+  Validation now uses the full IANA database via chrono-tz — the same engine
+  `next_run_after_in_timezone` uses — plus fixed offsets like `+05:30`.
+
+---
+
 ## [0.1.81] - 2026-07-08
 
 ### Fixed

@@ -573,47 +573,74 @@ pub async fn delete_organization(
     }
 
     if query.hard_delete.unwrap_or(false) {
-        // Hard delete - manually delete related data first (some tables lack ON DELETE CASCADE)
-        // Order matters due to foreign key constraints
-        // Note: job_dependencies has ON DELETE CASCADE from jobs, so no need to delete explicitly
+        // Hard delete - manually delete related data first (some tables lack ON DELETE CASCADE).
+        // Order matters due to foreign key constraints.
+        // Note: job_dependencies / schedule_runs cascade from jobs/schedules, so no explicit delete.
+        //
+        // The whole thing runs in ONE transaction: previously each DELETE ran on the pool
+        // independently, so a failure partway (e.g. the `queue_configs` typo below) left the
+        // organization row present but with its jobs/workflows/etc already destroyed. All-or-nothing.
 
-        // CRITICAL: Get API key hashes BEFORE deleting, for cache invalidation
+        // CRITICAL: Get API key hashes BEFORE deleting, for cache invalidation after commit.
         let api_key_hashes: Vec<(String,)> =
             sqlx::query_as("SELECT key_hash FROM api_keys WHERE organization_id = $1")
                 .bind(&id)
                 .fetch_all(state.db.pool())
                 .await?;
 
+        let mut tx = state.db.pool().begin().await?;
+
         // 1. Delete jobs (job_dependencies will cascade automatically)
         sqlx::query("DELETE FROM jobs WHERE organization_id = $1")
             .bind(&id)
-            .execute(state.db.pool())
+            .execute(&mut *tx)
             .await?;
 
-        // 3. Delete workflows (references organizations)
+        // 2. Delete workflows (references organizations)
         sqlx::query("DELETE FROM workflows WHERE organization_id = $1")
             .bind(&id)
-            .execute(state.db.pool())
+            .execute(&mut *tx)
             .await?;
 
-        // 4. Delete other related tables (these have CASCADE but be explicit)
+        // 3. Delete other related tables
         sqlx::query("DELETE FROM workers WHERE organization_id = $1")
             .bind(&id)
-            .execute(state.db.pool())
+            .execute(&mut *tx)
             .await?;
 
         sqlx::query("DELETE FROM schedules WHERE organization_id = $1")
             .bind(&id)
-            .execute(state.db.pool())
+            .execute(&mut *tx)
             .await?;
 
         sqlx::query("DELETE FROM api_keys WHERE organization_id = $1")
             .bind(&id)
-            .execute(state.db.pool())
+            .execute(&mut *tx)
             .await?;
 
-        // CRITICAL: Invalidate all cached API keys for this org
-        // Without this, deleted org's API keys remain valid in cache for up to 1 hour!
+        sqlx::query("DELETE FROM outgoing_webhooks WHERE organization_id = $1")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+
+        // Table is `queue_config` (singular) — the previous `queue_configs` did not exist and
+        // made every hard delete fail with a database error after the deletes above had run.
+        sqlx::query("DELETE FROM queue_config WHERE organization_id = $1")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+
+        // 4. Finally delete the organization (dead_letter_queue etc. cascade via organization_id).
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+
+        // CRITICAL: Invalidate all cached API keys for this org only after the delete committed —
+        // otherwise a rolled-back delete would have wrongly evicted a live org's keys. Without this,
+        // a deleted org's API keys would remain valid in cache for up to 1 hour.
         if let Some(ref cache) = state.cache {
             for (key_hash,) in api_key_hashes {
                 let hash_prefix = if key_hash.len() >= 16 {
@@ -629,22 +656,6 @@ pub async fn delete_organization(
                 }
             }
         }
-
-        sqlx::query("DELETE FROM outgoing_webhooks WHERE organization_id = $1")
-            .bind(&id)
-            .execute(state.db.pool())
-            .await?;
-
-        sqlx::query("DELETE FROM queue_configs WHERE organization_id = $1")
-            .bind(&id)
-            .execute(state.db.pool())
-            .await?;
-
-        // 5. Finally delete the organization
-        sqlx::query("DELETE FROM organizations WHERE id = $1")
-            .bind(&id)
-            .execute(state.db.pool())
-            .await?;
 
         tracing::warn!(org_id = %id, "Organization hard deleted by admin (all related data removed)");
     } else {

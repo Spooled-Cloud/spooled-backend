@@ -68,63 +68,25 @@ fn validate_payload_template_size_required(
 
 /// Validate timezone string
 fn validate_timezone(timezone: &str) -> Result<(), validator::ValidationError> {
-    // List of valid IANA timezones (common ones)
-    // In production, use chrono-tz crate for full validation
-    let valid_timezones = [
-        "UTC",
-        "GMT",
-        "America/New_York",
-        "America/Los_Angeles",
-        "America/Chicago",
-        "America/Denver",
-        "America/Toronto",
-        "America/Vancouver",
-        "America/Mexico_City",
-        "America/Sao_Paulo",
-        "Europe/London",
-        "Europe/Paris",
-        "Europe/Berlin",
-        "Europe/Moscow",
-        "Europe/Rome",
-        "Asia/Tokyo",
-        "Asia/Shanghai",
-        "Asia/Singapore",
-        "Asia/Hong_Kong",
-        "Asia/Seoul",
-        "Asia/Dubai",
-        "Asia/Kolkata",
-        "Asia/Bangkok",
-        "Australia/Sydney",
-        "Australia/Melbourne",
-        "Australia/Perth",
-        "Pacific/Auckland",
-        "Pacific/Honolulu",
-        "Africa/Cairo",
-        "Africa/Johannesburg",
-        "Africa/Lagos",
-    ];
+    // Validate against the FULL IANA database via chrono-tz — the same engine the scheduler
+    // uses in `next_run_after_in_timezone`. A previous hardcoded ~30-zone allow-list rejected
+    // valid zones the scheduler could actually honor (e.g. "Europe/Kyiv"), so validation and
+    // execution disagreed. This keeps them in lockstep.
+    let tz = timezone.trim();
 
-    // Check if timezone is valid or starts with valid region
-    if valid_timezones.contains(&timezone) {
+    // Full IANA names (covers UTC, GMT, Etc/GMT±N, and every region/city).
+    if tz.parse::<chrono_tz::Tz>().is_ok() {
         return Ok(());
     }
 
-    // Also allow Etc/GMT+N and Etc/GMT-N formats
-    if timezone.starts_with("Etc/GMT") {
-        return Ok(());
-    }
-
-    // Allow offset formats like +00:00, -05:00
-    if (timezone.starts_with('+') || timezone.starts_with('-'))
-        && timezone.len() == 6
-        && timezone.chars().nth(3) == Some(':')
-    {
+    // Fixed UTC offsets like "+05:30" / "-08:00" (honored by the scheduler's parse_fixed_offset).
+    if parse_fixed_offset(tz).is_some() {
         return Ok(());
     }
 
     let mut err = validator::ValidationError::new("invalid_timezone");
     err.message = Some(std::borrow::Cow::Borrowed(
-        "Invalid timezone. Use IANA timezone names like 'UTC', 'America/New_York', etc.",
+        "Invalid timezone. Use an IANA name like 'UTC' or 'America/New_York', or a fixed offset like '+05:30'.",
     ));
     Err(err)
 }
@@ -696,5 +658,22 @@ mod tests {
             &CronField::List(vec![1, 3, 5]),
             2
         ));
+    }
+
+    #[test]
+    fn test_validate_timezone_accepts_full_iana_and_offsets() {
+        // Previously-listed zones still pass.
+        assert!(validate_timezone("UTC").is_ok());
+        assert!(validate_timezone("America/New_York").is_ok());
+        // Valid IANA zones that the old hardcoded list rejected but the scheduler supports.
+        assert!(validate_timezone("Europe/Kyiv").is_ok());
+        assert!(validate_timezone("America/Argentina/Buenos_Aires").is_ok());
+        assert!(validate_timezone("Etc/GMT+5").is_ok());
+        // Fixed offsets.
+        assert!(validate_timezone("+05:30").is_ok());
+        assert!(validate_timezone("-08:00").is_ok());
+        // Still rejects nonsense.
+        assert!(validate_timezone("Not/A_Zone").is_err());
+        assert!(validate_timezone("+99:99").is_err());
     }
 }
