@@ -265,7 +265,13 @@ impl Settings {
                 metrics_token: env::var("METRICS_TOKEN").ok(),
                 cors_allowed_origins: env::var("CORS_ALLOWED_ORIGINS")
                     .unwrap_or_else(|_| {
-                        "https://spooled.cloud,https://www.spooled.cloud,https://app.spooled.cloud"
+                        // Default matches the live production topology: the marketing
+                        // site (apex + www) and the dashboard SPA. The dashboard is
+                        // served at dashboard.spooled.cloud — omitting it here (an
+                        // earlier default listed a non-existent app.spooled.cloud)
+                        // CORS-blocks every dashboard→API call, including admin login.
+                        // Deployments should still set CORS_ALLOWED_ORIGINS explicitly.
+                        "https://spooled.cloud,https://www.spooled.cloud,https://dashboard.spooled.cloud"
                             .to_string()
                     })
                     .split(',')

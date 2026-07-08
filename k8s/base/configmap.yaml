@@ -61,6 +61,11 @@ data:
   # =============================================================================
   # Enable HSTS header (set to "true" in production with TLS)
   ENABLE_HSTS: "true"
+
+  # Comma-separated CORS allow-list. The API never reflects the request origin,
+  # so every browser origin that calls the API must be listed here explicitly:
+  # the marketing site (apex + www) and the dashboard SPA.
+  CORS_ALLOWED_ORIGINS: "https://spooled.cloud,https://www.spooled.cloud,https://dashboard.spooled.cloud"
   
   # =============================================================================
   # Observability - OpenTelemetry / Distributed Tracing

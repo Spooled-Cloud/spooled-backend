@@ -77,6 +77,14 @@ spec:
                   name: spooled-config
                   key: RUST_ENV
                   optional: true
+            # CORS allow-list (browser origins permitted to call the API).
+            # Must include the dashboard origin or the SPA is CORS-blocked.
+            - name: CORS_ALLOWED_ORIGINS
+              valueFrom:
+                configMapKeyRef:
+                  name: spooled-config
+                  key: CORS_ALLOWED_ORIGINS
+                  optional: true
             - name: HOST
               value: "0.0.0.0"
             - name: PORT

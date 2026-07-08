@@ -7,6 +7,26 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.81] - 2026-07-08
+
+### Fixed
+- **CORS default no longer blocks the dashboard.** The allow-list added in
+  0.1.80 shipped a default origin list of
+  `spooled.cloud, www.spooled.cloud, app.spooled.cloud`. Production serves the
+  dashboard at `dashboard.spooled.cloud` (and `app.spooled.cloud` does not
+  exist), and no `CORS_ALLOWED_ORIGINS` was set, so the default took effect and
+  the browser blocked *every* dashboard→API call — admin login and normal user
+  login included. The default now lists the real topology
+  (`spooled.cloud, www.spooled.cloud, dashboard.spooled.cloud`), and
+  `CORS_ALLOWED_ORIGINS` is set explicitly in the Kubernetes config so the
+  running deployment no longer relies on the code default.
+
+### Notes
+- No behavioral change to the CORS mechanism itself (still a strict allow-list,
+  never origin reflection) — only the set of permitted origins was corrected.
+
+---
+
 ## [0.1.80] - 2026-07-07
 
 ### Security
