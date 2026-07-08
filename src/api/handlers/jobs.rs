@@ -3,6 +3,7 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
+    response::IntoResponse,
     Json,
 };
 use chrono::Utc;
@@ -11,7 +12,10 @@ use std::sync::Arc;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::api::middleware::limits::{check_job_limits, check_payload_size, increment_daily_jobs};
+use crate::api::middleware::limits::{
+    check_job_limits, check_payload_size, daily_jobs_limit, increment_daily_jobs,
+    try_increment_daily_jobs,
+};
 use crate::api::middleware::ValidatedJson;
 use crate::api::AppState;
 use crate::error::{AppError, AppResult};
@@ -273,12 +277,42 @@ pub async fn create(
 
     // Update metrics and usage counters
     if created {
-        state.metrics.jobs_enqueued.inc();
-        state.metrics.jobs_pending.inc();
-
-        // Increment daily job counter for plan limit tracking
-        if let Err(e) = increment_daily_jobs(state.db.pool(), &org_id, 1).await {
-            tracing::warn!(error = %e, org_id = %org_id, "Failed to increment daily job counter");
+        // Atomically enforce + increment the daily quota. The pre-insert
+        // check_job_limits above rejects the common over-limit case; this closes
+        // the concurrency window where N simultaneous enqueues each passed that
+        // check and then all incremented, overshooting the cap.
+        let limit = daily_jobs_limit(state.db.pool(), &org_id)
+            .await
+            .unwrap_or(-1);
+        match try_increment_daily_jobs(state.db.pool(), &org_id, 1, limit).await {
+            Ok(count) if count >= 0 => {
+                state.metrics.jobs_enqueued.inc();
+                state.metrics.jobs_pending.inc();
+            }
+            Ok(_) => {
+                // Over the daily cap. The job we just created is brand new with no
+                // dependents yet, so remove it and reject with the standard limit
+                // error rather than leaving an uncounted job that exceeds quota.
+                let _ = sqlx::query("DELETE FROM jobs WHERE id = $1 AND organization_id = $2")
+                    .bind(&job_id)
+                    .bind(&org_id)
+                    .execute(state.db.pool())
+                    .await;
+                let response = check_job_limits(state.db.pool(), &org_id, 1)
+                    .await
+                    .err()
+                    .unwrap_or_else(|| {
+                        (StatusCode::TOO_MANY_REQUESTS, "Daily job limit reached").into_response()
+                    });
+                return Err(AppError::LimitExceeded(Box::new(response)));
+            }
+            Err(e) => {
+                // Counter DB error: keep the job (best-effort, as before) rather
+                // than failing an accepted enqueue.
+                tracing::warn!(error = %e, org_id = %org_id, "Failed to increment daily job counter");
+                state.metrics.jobs_enqueued.inc();
+                state.metrics.jobs_pending.inc();
+            }
         }
     }
 

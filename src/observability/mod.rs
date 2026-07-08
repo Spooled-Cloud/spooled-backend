@@ -294,12 +294,15 @@ impl MetricsRateLimiter {
     }
 }
 
-/// Start the metrics server
+/// Start the metrics server.
 ///
-/// Metrics endpoint now requires Bearer token authentication
-/// or can be accessed only from localhost/internal network
-///
-/// Token comparison now uses constant-time algorithm to prevent timing attacks
+/// Auth: when `METRICS_TOKEN` is set the endpoint requires
+/// `Authorization: Bearer <token>` (constant-time compared). When it is NOT set
+/// the endpoint is UNAUTHENTICATED — it binds to the configured host (`0.0.0.0`
+/// by default so an in-cluster Prometheus can scrape it), so anyone able to
+/// reach the port can read the metrics. There is no localhost-only enforcement;
+/// restrict access with `METRICS_TOKEN` and/or network policy. A warning is
+/// logged at startup when no token is configured.
 ///
 pub async fn start_metrics_server(
     addr: SocketAddr,
@@ -361,6 +364,15 @@ pub async fn start_metrics_server(
         .route("/ready", get(|| async { "READY" })); // Added readiness probe
 
     tracing::info!(%addr, token_required = metrics_token.is_some(), "Metrics server starting");
+
+    if metrics_token.is_none() {
+        tracing::warn!(
+            %addr,
+            "Metrics endpoint is UNAUTHENTICATED (METRICS_TOKEN not set) and bound to {addr} — \
+             anyone able to reach this address can scrape internal metrics. Set METRICS_TOKEN \
+             and/or restrict access with network policy in production."
+        );
+    }
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();

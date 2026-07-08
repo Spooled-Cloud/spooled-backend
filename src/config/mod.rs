@@ -278,13 +278,30 @@ impl Settings {
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect(),
-                environment: match env::var("RUST_ENV")
-                    .unwrap_or_else(|_| "development".to_string())
-                    .as_str()
-                {
-                    "production" => Environment::Production,
-                    "staging" => Environment::Staging,
-                    _ => Environment::Development,
+                // Fail-safe: an unset or unrecognized RUST_ENV resolves to
+                // Production, not Development. Development disables JWT-secret
+                // strength validation and uses permissive CORS, so a prod deploy
+                // that forgets (or typos) RUST_ENV must not silently fall into it.
+                // Local dev opts in explicitly (`.env.example` sets
+                // RUST_ENV=development).
+                environment: match env::var("RUST_ENV").as_deref() {
+                    Ok("production") => Environment::Production,
+                    Ok("staging") => Environment::Staging,
+                    Ok("development") | Ok("dev") => Environment::Development,
+                    Ok(other) => {
+                        eprintln!(
+                            "WARNING: RUST_ENV=\"{other}\" is unrecognized; defaulting to \
+                             production (fail-safe). Set RUST_ENV=development for local dev."
+                        );
+                        Environment::Production
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "WARNING: RUST_ENV is not set; defaulting to production (fail-safe). \
+                             Set RUST_ENV=development for local dev."
+                        );
+                        Environment::Production
+                    }
                 },
             },
             database: DatabaseSettings {

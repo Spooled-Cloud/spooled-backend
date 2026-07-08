@@ -7,6 +7,33 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.84] - 2026-07-08
+
+### Security
+
+- **`RUST_ENV` now fails safe.** An unset or unrecognized `RUST_ENV` resolves to
+  `production` (previously `development`), so a deploy that forgets the variable
+  no longer silently disables JWT-secret strength validation and permissive-CORS
+  protection. Local development opts in explicitly (`.env.example` sets
+  `RUST_ENV=development`).
+- **Metrics endpoint exposure is now documented accurately and logged.** The doc
+  comment falsely claimed localhost-only access; corrected. When `METRICS_TOKEN`
+  is unset the endpoint is unauthenticated (bound to `0.0.0.0` for in-cluster
+  scraping), and a startup warning is now emitted so this is visible.
+
+### Fixed
+
+- **Daily job quota is now enforced atomically.** Enqueue checked the daily
+  count and incremented it in two separate statements, so concurrent enqueues
+  could all pass the check and overshoot the per-plan `jobs_per_day` cap. A new
+  row-locked `try_increment_daily_jobs` function does the check-and-increment
+  atomically; an over-cap enqueue is rejected and the just-created job removed
+  (migration `20260708120000_atomic_daily_quota.sql`).
+- **Cron expressions now accept the standard 5-field form** (`min hour dom mon
+  dow`) in addition to the 6-field form with leading seconds. Seconds default to
+  `0`. This matches the SDK README examples and common cron usage.
+
+
 ## [0.1.83] - 2026-07-08
 
 Fixes from a deep multi-agent + live-traffic bug hunt. Multi-tenant isolation was

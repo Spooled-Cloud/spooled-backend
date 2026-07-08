@@ -292,11 +292,18 @@ impl CronSchedule {
     /// "0 0 0 * * *" - daily at midnight
     /// "0 0 0 * * 1" - every Monday at midnight
     pub fn parse(expression: &str) -> Result<Self, String> {
-        let parts: Vec<&str> = expression.split_whitespace().collect();
+        let mut parts: Vec<&str> = expression.split_whitespace().collect();
+
+        // Accept standard 5-field cron (min hour dom mon dow) by defaulting the
+        // seconds field to 0, alongside the 6-field (leading seconds) form. Most
+        // users — and the SDK README examples — write 5-field cron.
+        if parts.len() == 5 {
+            parts.insert(0, "0");
+        }
 
         if parts.len() != 6 {
             return Err(format!(
-                "expected 6 fields (sec min hour dom mon dow), got {}",
+                "expected 5 fields (min hour dom mon dow) or 6 fields (with leading seconds), got {}",
                 parts.len()
             ));
         }
@@ -637,6 +644,22 @@ mod tests {
             .next_run_after_in_timezone(now, "Not/A_Zone")
             .unwrap();
         assert_eq!(next, Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn test_parse_accepts_5_field_cron() {
+        // Standard 5-field cron (min hour dom mon dow) — seconds default to 0.
+        let five = CronSchedule::parse("0 9 * * *").unwrap();
+        let six = CronSchedule::parse("0 0 9 * * *").unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 8, 0, 0, 0).unwrap();
+        assert_eq!(five.next_run_after(now), six.next_run_after(now));
+        assert_eq!(
+            five.next_run_after(now),
+            Some(Utc.with_ymd_and_hms(2026, 7, 8, 9, 0, 0).unwrap())
+        );
+        // Other field counts are still rejected.
+        assert!(CronSchedule::parse("0 9 * *").is_err());
+        assert!(CronSchedule::parse("0 0 0 9 * * *").is_err());
     }
 
     #[test]

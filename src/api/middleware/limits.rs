@@ -349,6 +349,34 @@ pub async fn increment_daily_jobs(
     Ok(row.0)
 }
 
+/// The org plan's daily jobs cap as an `i64` (`-1` = unlimited).
+pub async fn daily_jobs_limit(pool: &PgPool, org_id: &str) -> Result<i64, sqlx::Error> {
+    let (plan_tier, custom_limits) = get_org_plan_and_limits(pool, org_id).await?;
+    let limits = PlanLimits::for_tier_with_overrides(&plan_tier, custom_limits.as_ref());
+    Ok(limits.max_jobs_per_day.map(|v| v as i64).unwrap_or(-1))
+}
+
+/// Atomically enforce **and** increment the daily job counter.
+///
+/// Returns the new daily count, or `-1` if the increment would exceed `limit`
+/// (`limit < 0` = unlimited). This replaces the previous check-then-increment
+/// pattern that let concurrent enqueues overshoot the cap.
+pub async fn try_increment_daily_jobs(
+    pool: &PgPool,
+    org_id: &str,
+    count: i32,
+    limit: i64,
+) -> Result<i64, sqlx::Error> {
+    let row: (i64,) = sqlx::query_as("SELECT try_increment_daily_jobs($1, $2, $3)")
+        .bind(org_id)
+        .bind(count)
+        .bind(limit)
+        .fetch_one(pool)
+        .await?;
+
+    Ok(row.0)
+}
+
 /// Get organization usage and limits info for display
 #[derive(Debug, Serialize)]
 pub struct UsageInfo {

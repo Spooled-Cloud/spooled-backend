@@ -3557,7 +3557,7 @@ dependencies = [
 
 [[package]]
 name = "spooled-backend"
-version = "0.1.83"
+version = "0.1.84"
 dependencies = [
  "anyhow",
  "async-stream",
