@@ -236,55 +236,58 @@ pub async fn webhook(
             | "invoice.payment_failed"
     );
 
-    // Idempotency: Stripe re-delivers events (retries for up to ~3 days) with the
-    // same event id. Skip anything we've already applied successfully.
+    // Idempotency: atomically CLAIM the event id before processing. `INSERT ... ON
+    // CONFLICT DO NOTHING` is atomic on the primary key, so concurrent re-deliveries of
+    // the same event id race and exactly one wins; the losers skip. (The previous
+    // SELECT-then-INSERT let two concurrent duplicates both pass the SELECT and both
+    // process the event.) The claim is only made durable on success — see below.
     if handled {
-        let already_processed: Option<(String,)> =
-            sqlx::query_as("SELECT event_id FROM processed_stripe_events WHERE event_id = $1")
-                .bind(&event.id)
-                .fetch_optional(state.db.pool())
-                .await?;
-
-        if already_processed.is_some() {
-            info!(event_id = %event.id, event_type = %event.event_type, "Skipping already-processed Stripe event");
-            return Ok(StatusCode::OK);
-        }
-    }
-
-    // Handle different event types
-    match event.event_type.as_str() {
-        "checkout.session.completed" => {
-            handle_checkout_completed(&state, &event).await?;
-        }
-        "customer.subscription.created" | "customer.subscription.updated" => {
-            handle_subscription_updated(&state, &event).await?;
-        }
-        "customer.subscription.deleted" => {
-            handle_subscription_deleted(&state, &event).await?;
-        }
-        "invoice.paid" => {
-            handle_invoice_paid(&state, &event).await?;
-        }
-        "invoice.payment_failed" => {
-            handle_payment_failed(&state, &event).await?;
-        }
-        _ => {
-            info!(event_type = %event.event_type, "Ignoring unhandled Stripe event");
-        }
-    }
-
-    // Record the event only after successful processing: a handler error must
-    // return 5xx *without* marking the event processed, so Stripe's retry of the
-    // same event id is applied rather than skipped as a duplicate.
-    if handled {
-        sqlx::query(
+        let claimed = sqlx::query(
             "INSERT INTO processed_stripe_events (event_id) VALUES ($1) ON CONFLICT (event_id) DO NOTHING",
         )
         .bind(&event.id)
         .execute(state.db.pool())
         .await?;
 
-        // Opportunistic pruning far beyond Stripe's retry window.
+        if claimed.rows_affected() == 0 {
+            info!(event_id = %event.id, event_type = %event.event_type, "Skipping already-claimed Stripe event");
+            return Ok(StatusCode::OK);
+        }
+    }
+
+    // Handle different event types.
+    let outcome: AppResult<()> = match event.event_type.as_str() {
+        "checkout.session.completed" => handle_checkout_completed(&state, &event).await,
+        "customer.subscription.created" | "customer.subscription.updated" => {
+            handle_subscription_updated(&state, &event).await
+        }
+        "customer.subscription.deleted" => handle_subscription_deleted(&state, &event).await,
+        "invoice.paid" => handle_invoice_paid(&state, &event).await,
+        "invoice.payment_failed" => handle_payment_failed(&state, &event).await,
+        _ => {
+            info!(event_type = %event.event_type, "Ignoring unhandled Stripe event");
+            Ok(())
+        }
+    };
+
+    // On a handler error, RELEASE the claim so Stripe's retry of the same event id is
+    // reprocessed rather than skipped as a duplicate (handlers are idempotent + ordering
+    // guarded, so reprocessing is safe). The claim only becomes durable on success.
+    if let Err(e) = outcome {
+        if handled {
+            if let Err(del) = sqlx::query("DELETE FROM processed_stripe_events WHERE event_id = $1")
+                .bind(&event.id)
+                .execute(state.db.pool())
+                .await
+            {
+                error!(error = %del, event_id = %event.id, "Failed to release Stripe event claim after handler error; retry may be skipped");
+            }
+        }
+        return Err(e);
+    }
+
+    // Success: the claim stays. Opportunistically prune rows far beyond Stripe's retry window.
+    if handled {
         if let Err(e) = sqlx::query(
             "DELETE FROM processed_stripe_events WHERE received_at < NOW() - INTERVAL '30 days'",
         )

@@ -499,7 +499,7 @@ pub async fn update_organization(
         None => existing.custom_limits,
     };
 
-    let updated: Organization = sqlx::query_as(
+    let mut updated: Organization = sqlx::query_as(
         r#"
         UPDATE organizations
         SET
@@ -536,6 +536,12 @@ pub async fn update_organization(
                     "Failed to reconcile org billing after admin update"
                 );
             }
+            // Reconcile may have overwritten plan_tier/status from Stripe. Re-read so the
+            // response reflects the actual persisted state, not the pre-reconcile snapshot.
+            updated = sqlx::query_as("SELECT * FROM organizations WHERE id = $1")
+                .bind(&id)
+                .fetch_one(state.db.pool())
+                .await?;
         }
     }
 
@@ -924,6 +930,11 @@ pub async fn create_organization(
         "webhook_token": webhook_token
     });
 
+    // Create the organization and its initial API key in ONE transaction: a failure
+    // inserting the API key previously left an orphan organization holding the (now
+    // taken) slug, which the caller could neither use nor recreate.
+    let mut tx = state.db.pool().begin().await?;
+
     // Create organization with specified plan tier
     let org = sqlx::query_as::<_, Organization>(
         r#"
@@ -939,7 +950,7 @@ pub async fn create_organization(
     .bind(&request.billing_email)
     .bind(&initial_settings)
     .bind(now)
-    .fetch_one(state.db.pool())
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| {
         if e.to_string().contains("duplicate key") {
@@ -984,8 +995,10 @@ pub async fn create_organization(
     .bind(&key_name)
     .bind(&queues)
     .bind(now)
-    .execute(state.db.pool())
+    .execute(&mut *tx)
     .await?;
+
+    tx.commit().await?;
 
     tracing::info!(
         org_id = %org_id,

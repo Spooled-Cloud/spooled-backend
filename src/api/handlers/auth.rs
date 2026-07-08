@@ -620,6 +620,29 @@ pub async fn me(
         }
     }
 
+    // The JWT outlives the API key it was minted from: if that key has since been
+    // revoked or deleted, the token must stop working here too (the auth middleware
+    // enforces is_active on every other request; /auth/me did not).
+    let key_active: Option<(bool,)> =
+        sqlx::query_as("SELECT is_active FROM api_keys WHERE id = $1")
+            .bind(&token_data.claims.api_key_id)
+            .fetch_optional(state.db.pool())
+            .await
+            .map_err(|e| {
+                error!(error = %e, "Failed to check API key status for /auth/me");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse::internal()),
+                )
+            })?;
+    if !matches!(key_active, Some((true,))) {
+        warn!(api_key_id = %token_data.claims.api_key_id, "Revoked or missing API key used on /auth/me");
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse::unauthorized()),
+        ));
+    }
+
     // Fetch organization details
     let org_info: Option<(String, String, String, String, Option<String>)> = sqlx::query_as(
         "SELECT id, name, slug, plan_tier, billing_email FROM organizations WHERE id = $1",

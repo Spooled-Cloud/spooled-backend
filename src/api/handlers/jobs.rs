@@ -188,6 +188,33 @@ pub async fn create(
         .timeout_seconds
         .unwrap_or(state.settings.queue.default_timeout_secs);
 
+    // If a parent job is declared, the child must not run until the parent completes.
+    // Validate the parent belongs to THIS org, then gate the child
+    // (dependencies_met = FALSE) unless the parent has already completed. A
+    // job_dependencies edge is recorded after insert so the existing completion
+    // trigger releases the child (and the scheduler cancel-sweep terminates it if the
+    // parent fails). Previously parent_job_id was stored but the child ran immediately.
+    let parent_already_completed = if let Some(ref parent_id) = request.parent_job_id {
+        let parent: Option<(String,)> =
+            sqlx::query_as("SELECT status FROM jobs WHERE id = $1 AND organization_id = $2")
+                .bind(parent_id)
+                .bind(&org_id)
+                .fetch_optional(state.db.pool())
+                .await?;
+        match parent {
+            Some((status,)) => status == "completed",
+            None => {
+                return Err(AppError::Validation(
+                    "parent_job_id does not reference a job in this organization".to_string(),
+                ));
+            }
+        }
+    } else {
+        false
+    };
+    // Gated only when a parent exists and has not completed yet.
+    let dependencies_met = request.parent_job_id.is_none() || parent_already_completed;
+
     // Determine initial status
     let initial_status = if request.scheduled_at.is_some() && request.scheduled_at > Some(now) {
         "scheduled"
@@ -202,13 +229,13 @@ pub async fn create(
         INSERT INTO jobs (
             id, organization_id, queue_name, status, payload, priority,
             max_retries, timeout_seconds, created_at, scheduled_at,
-            idempotency_key, updated_at, tags, parent_job_id, 
-            completion_webhook, expires_at
+            idempotency_key, updated_at, tags, parent_job_id,
+            completion_webhook, expires_at, dependencies_met
         )
-        VALUES ($1, $2, $3, $4, $5::JSONB, $6, $7, $8, $9, $10, $11, $9, $12::JSONB, $13, $14, $15)
-        ON CONFLICT (organization_id, idempotency_key) 
+        VALUES ($1, $2, $3, $4, $5::JSONB, $6, $7, $8, $9, $10, $11, $9, $12::JSONB, $13, $14, $15, $16)
+        ON CONFLICT (organization_id, idempotency_key)
         WHERE idempotency_key IS NOT NULL
-        DO UPDATE SET updated_at = NOW() 
+        DO UPDATE SET updated_at = NOW()
         RETURNING id
         "#,
     )
@@ -232,6 +259,7 @@ pub async fn create(
     .bind(&request.parent_job_id)
     .bind(&request.completion_webhook)
     .bind(request.expires_at)
+    .bind(dependencies_met)
     .fetch_one(state.db.pool())
     .await
     // Sanitize SQL errors
@@ -251,6 +279,40 @@ pub async fn create(
         // Increment daily job counter for plan limit tracking
         if let Err(e) = increment_daily_jobs(state.db.pool(), &org_id, 1).await {
             tracing::warn!(error = %e, org_id = %org_id, "Failed to increment daily job counter");
+        }
+    }
+
+    // Record the parent dependency edge so the parent's completion trigger releases
+    // this gated child. Recompute dependencies_met afterward to close the race where
+    // the parent completed between the status check above and this insert (its trigger
+    // would have fired before the edge existed).
+    if created && !dependencies_met {
+        if let Some(ref parent_id) = request.parent_job_id {
+            match sqlx::query(
+                "INSERT INTO job_dependencies (id, job_id, depends_on_job_id, dependency_type) \
+                 VALUES ($1, $2, $3, 'all') ON CONFLICT (job_id, depends_on_job_id) DO NOTHING",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(&returned_id)
+            .bind(parent_id)
+            .execute(state.db.pool())
+            .await
+            {
+                Ok(_) => {
+                    let _ = sqlx::query(
+                        "UPDATE jobs SET dependencies_met = check_job_dependencies_met(id) \
+                         WHERE id = $1 AND organization_id = $2",
+                    )
+                    .bind(&returned_id)
+                    .bind(&org_id)
+                    .execute(state.db.pool())
+                    .await;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, job_id = %returned_id, parent_job_id = %parent_id,
+                        "Failed to record parent job dependency edge; child remains gated");
+                }
+            }
         }
     }
 
@@ -827,13 +889,22 @@ pub async fn bulk_enqueue(
                 $7::TEXT[]
             ) AS t(idx, jid, stat, pay, pri, sch, idem)
         ),
+        -- Deduplicate within the batch: two items sharing one idempotency_key would
+        -- make `ON CONFLICT DO UPDATE` "affect a row a second time" and abort the whole
+        -- INSERT. Keep only the first row per key (null keys stay distinct via their jid);
+        -- the final SELECT below still maps every input row to the resulting job id.
+        dedup_input AS (
+            SELECT DISTINCT ON (COALESCE(idem, jid)) idx, jid, stat, pay, pri, sch, idem
+            FROM input_jobs
+            ORDER BY COALESCE(idem, jid), idx
+        ),
         inserted AS (
             INSERT INTO jobs (
                 id, organization_id, queue_name, status, payload, priority,
                 max_retries, timeout_seconds, created_at, scheduled_at,
                 idempotency_key, updated_at
             )
-            SELECT 
+            SELECT
                 ij.jid,
                 $8,
                 $9,
@@ -846,8 +917,8 @@ pub async fn bulk_enqueue(
                 ij.sch,
                 ij.idem,
                 $12
-            FROM input_jobs ij
-            ON CONFLICT (organization_id, idempotency_key) 
+            FROM dedup_input ij
+            ON CONFLICT (organization_id, idempotency_key)
             WHERE idempotency_key IS NOT NULL
             DO UPDATE SET updated_at = NOW()
             RETURNING id, idempotency_key
@@ -1103,6 +1174,18 @@ pub async fn retry_dlq(
 ) -> AppResult<Json<crate::models::RetryDlqResponse>> {
     // Use safe_limit method to enforce bounds
     let limit = request.safe_limit();
+
+    // Bound the client-supplied id list to the same safe limit as the queue path.
+    // The job_ids branch uses `id = ANY($1)` with no cap, so without this a caller
+    // could submit an arbitrarily large array (unbounded query + retry).
+    if let Some(ref job_ids) = request.job_ids {
+        if job_ids.len() as i64 > limit {
+            return Err(AppError::Validation(format!(
+                "job_ids exceeds the maximum of {} ids per retry request",
+                limit
+            )));
+        }
+    }
 
     // First, count how many jobs would be retried (to check limits)
     // Note: Using subquery with LIMIT since COUNT(*) ignores LIMIT clause

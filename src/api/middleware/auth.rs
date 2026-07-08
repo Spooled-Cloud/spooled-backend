@@ -305,6 +305,12 @@ async fn fetch_api_key(
     Err((StatusCode::UNAUTHORIZED, "Invalid API key".to_string()))
 }
 
+/// TTL for cached API-key records. Kept short so that if a key is revoked in the
+/// narrow window that races the cache write (revoke invalidates the entry before
+/// this write lands), the stale-but-active record self-expires quickly instead of
+/// staying valid for an hour.
+const API_KEY_CACHE_TTL_SECS: u64 = 60;
+
 /// Fetch API key from database and cache it
 async fn fetch_and_cache_api_key(
     state: &AppState,
@@ -312,22 +318,39 @@ async fn fetch_and_cache_api_key(
 ) -> Result<ApiKeyRecord, (StatusCode, String)> {
     let record = fetch_api_key(state, token).await?;
 
-    // Cache for 1 hour
     if let Some(ref cache) = state.cache {
+        // Re-check is_active immediately before caching. fetch_api_key's SELECT runs
+        // BEFORE the (slow) bcrypt verify, so a revoke that commits during bcrypt would
+        // otherwise be papered over by caching a stale active record for the full TTL.
+        // If the key was revoked in that window, refuse it and do not cache.
+        let still_active: Option<(bool,)> =
+            sqlx::query_as("SELECT is_active FROM api_keys WHERE id = $1")
+                .bind(&record.id)
+                .fetch_optional(state.db.pool())
+                .await
+                .ok()
+                .flatten();
+        if !matches!(still_active, Some((true,))) {
+            return Err((StatusCode::UNAUTHORIZED, "API key is inactive".to_string()));
+        }
+
         let lookup_hash = hash_for_lookup(token);
         let cache_key = format!("api_key:{}", lookup_hash);
-        let _ = cache.set_json(&cache_key, &record, 3600).await;
+        let _ = cache
+            .set_json(&cache_key, &record, API_KEY_CACHE_TTL_SECS)
+            .await;
 
         // CRITICAL: Also set reverse mapping (bcrypt hash prefix -> lookup hash)
         // This allows cache invalidation when the API key is revoked.
-        // Without this, revoked keys remain valid in cache for up to 1 hour!
         let hash_prefix = if record.key_hash.len() >= 16 {
             &record.key_hash[..16]
         } else {
             &record.key_hash
         };
         let reverse_key = format!("api_key_reverse:{}", hash_prefix);
-        let _ = cache.set(&reverse_key, &lookup_hash, 3600).await;
+        let _ = cache
+            .set(&reverse_key, &lookup_hash, API_KEY_CACHE_TTL_SECS)
+            .await;
     }
 
     Ok(record)

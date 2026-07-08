@@ -328,10 +328,16 @@ impl Scheduler {
         .fetch_all(&*self.db)
         .await?;
 
-        // Process each schedule in its own transaction with proper locking
-        let mut schedules_to_process = Vec::new();
+        let mut processed = 0;
+        let now = Utc::now();
+
+        // Lock and process each due schedule in ITS OWN transaction, one at a time. The
+        // previous code opened a transaction (holding a pool connection + row lock) for
+        // every due schedule up front and only processed them afterward — with LIMIT 100
+        // and a default pool of 25, the 26th begin() blocked until acquire_timeout and then
+        // errored, so nothing ran, and meanwhile every pool connection was held, starving
+        // the rest of the app. Holding a single transaction at a time avoids that.
         for (schedule_id,) in schedule_ids {
-            // Start transaction and lock the specific schedule
             let mut tx = self.db.begin().await?;
 
             let schedule: Option<ScheduleRecord> = sqlx::query_as(
@@ -351,21 +357,12 @@ impl Scheduler {
             .fetch_optional(&mut *tx)
             .await?;
 
-            if let Some(s) = schedule {
-                schedules_to_process.push((s, tx));
-            } else {
-                // Schedule was already processed by another instance, rollback
+            let Some(schedule) = schedule else {
+                // Already processed/locked by another worker instance.
                 tx.rollback().await?;
-            }
-        }
+                continue;
+            };
 
-        // Alias for backward compatibility with existing loop
-        let schedules = schedules_to_process;
-
-        let mut processed = 0;
-        let now = Utc::now();
-
-        for (schedule, mut tx) in schedules {
             let cron = CronSchedule::parse(&schedule.cron_expression).ok();
 
             // Calculate next run time FIRST (before any DB operations), in the

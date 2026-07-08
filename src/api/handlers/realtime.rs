@@ -281,16 +281,22 @@ pub async fn websocket_handler(
         return Err((StatusCode::BAD_REQUEST, e));
     }
 
-    // Implement connection counting per org using Redis
+    // Enforce the per-org connection limit with a READ-ONLY check here. The increment
+    // used to happen at this point, before the upgrade — but the on_upgrade callback only
+    // fires on a *successful* upgrade, so a client that aborted the handshake incremented
+    // the counter with no matching decrement, and incr_with_ttl kept bumping the TTL so the
+    // leaked count never expired and permanently locked the org out. The increment now
+    // happens inside handle_websocket after the upgrade, paired with the decrement on close.
     if let Some(ref cache) = state.cache {
         let conn_key = format!("ws_connections:{}", org_id);
-        match cache.incr_with_ttl(&conn_key, 3600).await {
-            Ok(count) if count as usize > MAX_WEBSOCKET_CONNECTIONS_PER_ORG => {
-                // Decrement since we're rejecting
-                let _ = cache.decr(&conn_key).await;
+        if let Ok(Some(v)) = cache.get(&conn_key).await {
+            if v.parse::<usize>()
+                .map(|c| c >= MAX_WEBSOCKET_CONNECTIONS_PER_ORG)
+                .unwrap_or(false)
+            {
                 warn!(
                     org_id = %org_id,
-                    count = count,
+                    count = %v,
                     limit = MAX_WEBSOCKET_CONNECTIONS_PER_ORG,
                     "WebSocket connection limit exceeded"
                 );
@@ -298,13 +304,6 @@ pub async fn websocket_handler(
                     StatusCode::TOO_MANY_REQUESTS,
                     "Too many WebSocket connections",
                 ));
-            }
-            Ok(count) => {
-                debug!(org_id = %org_id, count = count, "WebSocket connection count incremented");
-            }
-            Err(e) => {
-                // Log but allow connection if Redis is down
-                warn!(org_id = %org_id, error = %e, "Failed to check WebSocket connection count");
             }
         }
     }
@@ -323,6 +322,13 @@ async fn handle_websocket(
     state: AppState,
 ) {
     let (mut sender, mut receiver) = socket.split();
+
+    // Increment the per-org connection counter now that the upgrade succeeded (the limit
+    // was checked read-only before the upgrade). Paired with the decrement in cleanup.
+    if let Some(ref cache) = state.cache {
+        let conn_key = format!("ws_connections:{}", org_id);
+        let _ = cache.incr_with_ttl(&conn_key, 3600).await;
+    }
 
     // Parse event filter
     let event_filter: Option<Vec<String>> = query
@@ -345,14 +351,14 @@ async fn handle_websocket(
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<RealtimeEvent>(100);
 
     // Subscribe to Redis pub/sub for this organization's events
-    if let Some(ref cache) = state.cache {
+    let pubsub_task = if let Some(ref cache) = state.cache {
         let cache_clone = cache.clone();
         let org_id_clone = org_id.clone();
         let queue_filter_clone = queue_filter.clone();
         let event_tx_clone = event_tx.clone();
 
         // Spawn task to listen for Redis pub/sub messages
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             // Subscribe to org-specific channel
             let channel = format!("org:{}:events", org_id_clone);
             match cache_clone.subscribe(&channel).await {
@@ -396,8 +402,10 @@ async fn handle_websocket(
                     warn!(error = %e, "Failed to subscribe to Redis pub/sub");
                 }
             }
-        });
-    }
+        }))
+    } else {
+        None
+    };
 
     // Send initial ping
     let ping = RealtimeEvent::Ping {
@@ -408,6 +416,9 @@ async fn handle_websocket(
         .await
     {
         error!("Failed to send initial ping: {}", e);
+        if let Some(t) = &pubsub_task {
+            t.abort();
+        }
         cleanup_websocket_connection(&state, &org_id).await;
         return;
     }
@@ -416,7 +427,7 @@ async fn handle_websocket(
     let ping_interval = std::time::Duration::from_secs(WEBSOCKET_PING_INTERVAL_SECS);
     let (ping_tx, mut ping_rx) = tokio::sync::mpsc::channel::<()>(1);
 
-    tokio::spawn(async move {
+    let ping_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(ping_interval);
         loop {
             interval.tick().await;
@@ -498,6 +509,15 @@ async fn handle_websocket(
             }
         }
     }
+
+    // Abort the background tasks so their Redis pub/sub connection and ping timer are
+    // released immediately on disconnect. The pub/sub task blocks on on_message().next(),
+    // so for an idle org (no events) it would otherwise never observe the dropped receiver
+    // and would leak its Redis connection indefinitely.
+    if let Some(t) = &pubsub_task {
+        t.abort();
+    }
+    ping_task.abort();
 
     // Cleanup: decrement connection count
     cleanup_websocket_connection(&state, &org_id).await;

@@ -7,6 +7,92 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.83] - 2026-07-08
+
+Fixes from a deep multi-agent + live-traffic bug hunt. Multi-tenant isolation was
+audited (static + live cross-org probing) and found clean. Two of these were
+reproduced against production before fixing (cron `*/N`, `parent_job_id` gating).
+
+### Fixed — correctness
+- **Cron `*/N` fired on the wrong dates for day-of-month and month.** Step matching
+  used `value % N == 0`, correct only for 0-based fields; day-of-month and month are
+  1-based, so `*/2` day-of-month ran on even days (2,4,6…) instead of 1,3,5…, and
+  `1 */3` month ran in Mar/Jun/Sep/Dec instead of Jan/Apr/Jul/Oct. Step now counts
+  from each field's minimum.
+- **Schedules double-fired during the DST fall-back hour.** `next_run` computed from a
+  fire instant returned the repeated wall-clock time one hour later. The next run now
+  must be strictly after the previous wall clock.
+- **Sparse schedules could stall.** When only date fields didn't match, the search
+  crawled a minute at a time and could exhaust the iteration cap (e.g. a once-a-year
+  schedule); it now jumps a day at a time.
+- **`parent_job_id` children ran immediately instead of after the parent.** The child
+  was inserted with `dependencies_met = TRUE` (column default) and no dependency edge.
+  Children are now gated and released by the parent's completion (and cancelled by the
+  scheduler sweep if the parent fails).
+- **Bulk enqueue aborted the whole batch** when two items shared an idempotency key
+  (`ON CONFLICT DO UPDATE` affecting a row twice). Items are now deduplicated per key.
+- **Retry backoff could overflow.** `2^retry_count` overflowed `i64` for high
+  `max_retries`; the exponent is now clamped (the backoff was capped at 60s anyway).
+- **`/auth/me` accepted a revoked API key's JWT.** It now checks `is_active`.
+
+### Fixed — atomicity / transactions
+- **Workflow creation is now a single transaction** (was per-statement on the pool);
+  duplicate job keys are rejected instead of silently collapsing and orphaning jobs.
+- **`add_dependencies` cycle check + insert** now run under a per-org advisory lock, so
+  concurrent calls can't race to create a cycle that deadlocks jobs.
+- **Admin `create_organization`** wraps the org + initial API key in one transaction
+  (a failed key insert used to orphan the org and its now-taken slug).
+- **Admin `update_organization`** re-reads after Stripe reconcile so the response
+  reflects the persisted state instead of a stale pre-reconcile snapshot.
+- **Stripe webhook idempotency is now atomic**: the event id is claimed up front via
+  `INSERT … ON CONFLICT DO NOTHING` (releasing the claim on handler error so retries
+  still reprocess), replacing a SELECT-then-INSERT that let concurrent duplicate
+  deliveries both process.
+
+### Fixed — security
+- **Email login attempt cap is now race-free.** The per-code lockout was a
+  read-then-check-then-increment; parallel verifications could all read a low count and
+  all get a guess, amplifying brute force. It is now a single atomic conditional
+  `UPDATE … WHERE attempts < MAX`.
+- **Revoked API keys could linger in cache for up to an hour.** The cache TTL is reduced
+  to 60s and `is_active` is re-checked immediately before caching (the DB read runs
+  before the slow bcrypt verify, so a revoke racing that window is no longer papered
+  over).
+- **Signup: the one-time token was consumed before validation**, so a bad slug or a
+  taken email/slug left the user unable to retry. The token is now consumed atomically
+  only after validation passes.
+- **Login codes could be shadowed by a pending signup token** for the same email; the
+  login lookup now excludes `signup:` rows.
+- **`retry_dlq` accepted an unbounded id array**; it's now capped at the same safe limit
+  as the queue path.
+
+### Fixed — reliability / resources
+- **Cron scheduler could exhaust the DB connection pool.** It opened a transaction for
+  every due schedule (up to 100) before processing any; with a 25-connection pool the
+  scheduler stalled and starved the app. Each schedule is now locked, processed, and
+  committed one at a time.
+- **WebSocket connection counter leaked upward, permanently locking an org out.** The
+  per-org counter was incremented before the upgrade (so aborted handshakes leaked it,
+  and its TTL kept being bumped). The increment now happens after a successful upgrade,
+  paired with the decrement on close; the pre-upgrade limit check is read-only.
+- **WebSocket disconnects leaked a Redis pub/sub task + connection.** The subscriber
+  task and ping timer are now aborted on disconnect.
+- **Org settings update wiped the webhook token.** Replacing the settings object via
+  `PUT` silently dropped `webhook_token`; it is now preserved unless explicitly changed.
+- **An IPv6 `HOST` crashed gRPC startup** (bare `host:port` concatenation); the address
+  is now built with `SocketAddr::new`.
+
+### Known follow-ups (not in this release)
+- Daily/active job quota and the API-key / slug-check counters are still
+  check-then-act under high concurrency (bounded overshoot); an atomic
+  increment-with-limit needs load testing before shipping.
+- `RUST_ENV` still defaults to `development` (production sets it explicitly); the metrics
+  endpoint binds all interfaces by design for in-cluster scraping (require `METRICS_TOKEN`).
+- The Stripe ordering guard is `<=` on second-granularity timestamps (no finer signal
+  available).
+
+---
+
 ## [0.1.82] - 2026-07-08
 
 ### Fixed

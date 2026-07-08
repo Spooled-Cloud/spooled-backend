@@ -575,7 +575,12 @@ impl QueueManager {
             //
             // NOTE: This is intentionally seconds (not minutes) to keep retries responsive and
             // to match our documentation/examples.
-            let base_backoff_seconds = 2_i64.pow(job.retry_count as u32).min(60);
+            // Cap the exponent before pow: max_retries can be up to 100, and
+            // 2^retry_count overflows i64 (panics in debug) well before then. The
+            // backoff is capped at 60s and 2^6 = 64 > 60, so exponent 6 already
+            // saturates the cap — clamp there to avoid the overflow entirely.
+            let backoff_exp = job.retry_count.clamp(0, 6) as u32;
+            let base_backoff_seconds = 2_i64.pow(backoff_exp).min(60);
             let jitter_ms: i64 = (rand::random::<u16>() % 500) as i64;
             let next_run = Utc::now()
                 + Duration::seconds(base_backoff_seconds)

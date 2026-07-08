@@ -659,7 +659,18 @@ pub async fn update(
                 MAX_SETTINGS_SIZE
             )));
         }
-        new_settings.clone()
+        // Preserve the security-critical webhook_token. This handler replaces the whole
+        // settings object, so a PUT that omits webhook_token would silently delete it —
+        // even though clear_webhook_token is meant to be the only way to remove it. Carry
+        // the existing token over unless the caller explicitly provides a new one.
+        let mut merged = new_settings.clone();
+        if let Some(existing_tok) = existing.settings.get("webhook_token").cloned() {
+            if let Some(obj) = merged.as_object_mut() {
+                obj.entry("webhook_token".to_string())
+                    .or_insert(existing_tok);
+            }
+        }
+        merged
     } else {
         existing.settings
     };

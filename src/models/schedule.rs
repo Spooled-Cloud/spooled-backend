@@ -272,7 +272,13 @@ pub enum CronField {
     Any,
     Value(u8),
     Range(u8, u8),
-    Step(u8),
+    /// `*/N`. `min` is the field's minimum (0 for sec/min/hour/dow, 1 for
+    /// day-of-month and month) so that `*/N` counts from the field minimum as
+    /// standard cron requires (e.g. day-of-month `*/2` = 1,3,5,... not 2,4,6,...).
+    Step {
+        step: u8,
+        min: u8,
+    },
     List(Vec<u8>),
 }
 
@@ -326,7 +332,7 @@ impl CronSchedule {
                     step, max
                 ));
             }
-            return Ok(CronField::Step(step));
+            return Ok(CronField::Step { step, min });
         }
 
         // Handle ranges (1-5)
@@ -375,7 +381,10 @@ impl CronSchedule {
             CronField::Any => true,
             CronField::Value(v) => *v == value,
             CronField::Range(start, end) => value >= *start && value <= *end,
-            CronField::Step(step) => value.is_multiple_of(*step),
+            // Standard cron: `*/N` fires at min, min+N, min+2N, ... within the
+            // field range. Counting from `min` is required for day-of-month and
+            // month (min=1); counting from 0 there fires on the wrong dates.
+            CronField::Step { step, min } => value >= *min && (value - *min).is_multiple_of(*step),
             CronField::List(values) => values.contains(&value),
         }
     }
@@ -428,7 +437,14 @@ impl CronSchedule {
     ) -> Option<DateTime<Utc>> {
         use chrono::{Datelike, Duration, Timelike};
 
-        let mut current = after.with_timezone(tz) + Duration::seconds(1);
+        let after_local = after.with_timezone(tz);
+        // Wall-clock of the reference instant. During a DST fall-back the same wall
+        // clock occurs at two instants; without this guard next_run computed from a
+        // fire instant returns the *repeated* wall time one hour later, double-firing
+        // the schedule. Requiring the match's wall clock to be strictly after this
+        // skips the repeat while leaving every normal (monotonic) case untouched.
+        let after_naive = after_local.naive_local();
+        let mut current = after_local + Duration::seconds(1);
         // Set to start of second
         current = current.clone().with_nanosecond(0).unwrap_or(current);
 
@@ -452,12 +468,15 @@ impl CronSchedule {
                 && Self::field_matches(&self.day_of_month, day)
                 && Self::field_matches(&self.month, month)
                 && Self::field_matches(&self.day_of_week, weekday)
+                // DST fall-back guard: never return a wall clock that is not strictly
+                // after the reference wall clock (skips the repeated hour's re-occurrence).
+                && current.naive_local() > after_naive
             {
                 return Some(current.with_timezone(&Utc));
             }
 
-            // Smart stepping - if seconds don't match, skip to next minute
-            // This reduces iterations dramatically for typical cron expressions
+            // Smart stepping - skip ahead by the coarsest unit that cannot match yet.
+            // This reduces iterations dramatically for typical cron expressions.
             let step = if !Self::field_matches(&self.minute, minute)
                 && !Self::field_matches(&self.hour, hour)
             {
@@ -469,9 +488,18 @@ impl CronSchedule {
             } else if !Self::field_matches(&self.second, second) {
                 // Just step by 1 second if only second doesn't match
                 Duration::seconds(1)
+            } else if !Self::field_matches(&self.hour, hour) {
+                // Second and minute match but the hour does not: jump to the next
+                // hour boundary rather than crawling minute by minute.
+                Duration::seconds(3600 - (minute as i64 * 60) - second as i64)
             } else {
-                // Something else doesn't match, step by 1 minute to be safe
-                Duration::seconds(60)
+                // Time-of-day (sec/min/hour) fully matches but a DATE field
+                // (day-of-month/month/day-of-week) does not: jump to the start of the
+                // next day, so sparse schedules (e.g. once a year) resolve in ~365
+                // iterations instead of exhausting the iteration cap and stalling.
+                Duration::seconds(
+                    86400 - (hour as i64 * 3600) - (minute as i64 * 60) - second as i64,
+                )
             };
 
             current += step.max(Duration::seconds(1));
@@ -503,7 +531,10 @@ mod tests {
     #[test]
     fn test_parse_every_5_minutes() {
         let schedule = CronSchedule::parse("0 */5 * * * *").unwrap();
-        assert!(matches!(schedule.minute, CronField::Step(5)));
+        assert!(matches!(
+            schedule.minute,
+            CronField::Step { step: 5, min: 0 }
+        ));
     }
 
     #[test]
@@ -648,8 +679,24 @@ mod tests {
         assert!(!CronSchedule::field_matches(&CronField::Value(5), 6));
         assert!(CronSchedule::field_matches(&CronField::Range(3, 7), 5));
         assert!(!CronSchedule::field_matches(&CronField::Range(3, 7), 2));
-        assert!(CronSchedule::field_matches(&CronField::Step(5), 10));
-        assert!(!CronSchedule::field_matches(&CronField::Step(5), 11));
+        assert!(CronSchedule::field_matches(
+            &CronField::Step { step: 5, min: 0 },
+            10
+        ));
+        assert!(!CronSchedule::field_matches(
+            &CronField::Step { step: 5, min: 0 },
+            11
+        ));
+        // Day-of-month/month are 1-based: `*/2` dom = 1,3,5,... and `*/3` month = 1,4,7,10.
+        let dom = CronSchedule::parse("0 0 0 */2 * *").unwrap().day_of_month;
+        assert!(CronSchedule::field_matches(&dom, 1));
+        assert!(!CronSchedule::field_matches(&dom, 2));
+        assert!(CronSchedule::field_matches(&dom, 3));
+        let mon = CronSchedule::parse("0 0 0 1 */3 *").unwrap().month;
+        assert!(CronSchedule::field_matches(&mon, 1));
+        assert!(CronSchedule::field_matches(&mon, 4));
+        assert!(!CronSchedule::field_matches(&mon, 3));
+        assert!(CronSchedule::field_matches(&mon, 10));
         assert!(CronSchedule::field_matches(
             &CronField::List(vec![1, 3, 5]),
             3
@@ -658,6 +705,33 @@ mod tests {
             &CronField::List(vec![1, 3, 5]),
             2
         ));
+    }
+
+    #[test]
+    fn test_next_run_no_double_fire_on_dst_fall_back() {
+        // US DST ends 2026-11-01: 02:00 EDT -> 01:00 EST, so 01:30 local occurs
+        // twice (05:30 UTC in EDT, 06:30 UTC in EST). A 01:30 daily schedule must
+        // fire ONCE on Nov 1, not twice.
+        let schedule = CronSchedule::parse("0 30 1 * * *").unwrap();
+        let start = Utc.with_ymd_and_hms(2026, 10, 31, 12, 0, 0).unwrap();
+        let first = schedule
+            .next_run_after_in_timezone(start, "America/New_York")
+            .unwrap();
+        assert_eq!(first, Utc.with_ymd_and_hms(2026, 11, 1, 5, 30, 0).unwrap());
+        let second = schedule
+            .next_run_after_in_timezone(first, "America/New_York")
+            .unwrap();
+        // The repeated 06:30 UTC occurrence is skipped; next fire is the following day.
+        assert_eq!(second, Utc.with_ymd_and_hms(2026, 11, 2, 6, 30, 0).unwrap());
+    }
+
+    #[test]
+    fn test_next_run_sparse_yearly_schedule_resolves() {
+        // Once-a-year schedule must resolve without exhausting the iteration cap.
+        let schedule = CronSchedule::parse("0 0 0 1 1 *").unwrap(); // Jan 1 00:00
+        let start = Utc.with_ymd_and_hms(2026, 3, 15, 0, 0, 0).unwrap();
+        let next = schedule.next_run_after(start).unwrap();
+        assert_eq!(next, Utc.with_ymd_and_hms(2027, 1, 1, 0, 0, 0).unwrap());
     }
 
     #[test]

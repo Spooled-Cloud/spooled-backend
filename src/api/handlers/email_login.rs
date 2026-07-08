@@ -333,9 +333,13 @@ pub async fn verify(
         r#"
         SELECT id, code, organization_id, attempts
         FROM email_login_codes
-        WHERE email = $1 
+        WHERE email = $1
           AND expires_at > NOW()
           AND used_at IS NULL
+          -- Signup tokens ("signup:<token>") live in this same table; excluding them
+          -- stops a pending signup row from shadowing the real 6-digit login code
+          -- (ORDER BY created_at DESC would otherwise pick it and reject valid logins).
+          AND code NOT LIKE 'signup:%'
         ORDER BY created_at DESC
         LIMIT 1
         "#,
@@ -344,16 +348,29 @@ pub async fn verify(
     .fetch_optional(state.db.pool())
     .await?;
 
-    let Some((code_id, stored_code, org_id, attempts)) = login_code else {
+    let Some((code_id, stored_code, org_id, _attempts)) = login_code else {
         warn!(email = %mask_email(&email), "No valid login code found");
         return Err(AppError::Authentication(
             "Invalid or expired code. Please request a new one.".to_string(),
         ));
     };
 
-    // Check attempts
-    if attempts >= MAX_CODE_ATTEMPTS {
-        // Invalidate the code
+    // Atomically consume one attempt. Combining the cap check and the increment into a
+    // single conditional UPDATE (guarded by `attempts < MAX`) is what makes the cap safe
+    // under concurrency: the previous read-then-check-then-increment let many parallel
+    // verifications all read a low `attempts`, all pass the guard, and all get a guess —
+    // bypassing the per-code lockout and amplifying brute force against the code space.
+    let new_attempts: Option<(i32,)> = sqlx::query_as(
+        "UPDATE email_login_codes SET attempts = attempts + 1 \
+         WHERE id = $1 AND attempts < $2 RETURNING attempts",
+    )
+    .bind(code_id)
+    .bind(MAX_CODE_ATTEMPTS)
+    .fetch_optional(state.db.pool())
+    .await?;
+
+    let Some((attempts_now,)) = new_attempts else {
+        // Cap already reached (this row's attempts are >= MAX): invalidate and reject.
         sqlx::query("UPDATE email_login_codes SET used_at = NOW() WHERE id = $1")
             .bind(code_id)
             .execute(state.db.pool())
@@ -362,18 +379,12 @@ pub async fn verify(
         return Err(AppError::Authentication(
             "Too many attempts. Please request a new code.".to_string(),
         ));
-    }
-
-    // Increment attempts
-    sqlx::query("UPDATE email_login_codes SET attempts = attempts + 1 WHERE id = $1")
-        .bind(code_id)
-        .execute(state.db.pool())
-        .await?;
+    };
 
     // SECURITY: Use constant-time comparison to prevent timing attacks
     // An attacker could otherwise determine the correct code digit-by-digit
     if !constant_time_compare(&code, &stored_code) {
-        warn!(email = %mask_email(&email), attempts = attempts + 1, "Invalid login code");
+        warn!(email = %mask_email(&email), attempts = attempts_now, "Invalid login code");
         return Err(AppError::Authentication("Invalid code".to_string()));
     }
 
@@ -556,11 +567,9 @@ pub async fn complete_signup(
         ));
     };
 
-    // Mark token as used
-    sqlx::query("UPDATE email_login_codes SET used_at = NOW() WHERE id = $1")
-        .bind(record_id)
-        .execute(state.db.pool())
-        .await?;
+    // NOTE: the one-time token is consumed further below, only AFTER slug/duplicate
+    // validation passes — burning it here meant a bad slug or a taken email/slug left
+    // the user unable to retry without re-verifying their email.
 
     // Validate slug format
     let slug = request.slug.to_lowercase().trim().to_string();
@@ -601,6 +610,20 @@ pub async fn complete_signup(
     if existing_slug.is_some() {
         return Err(AppError::Conflict(
             "This slug is already taken. Please choose another.".to_string(),
+        ));
+    }
+
+    // Consume the one-time signup token now that validation has passed. The conditional
+    // UPDATE (used_at IS NULL) also blocks a concurrent double-use of the same token.
+    let consumed: Option<(Uuid,)> = sqlx::query_as(
+        "UPDATE email_login_codes SET used_at = NOW() WHERE id = $1 AND used_at IS NULL RETURNING id",
+    )
+    .bind(record_id)
+    .fetch_optional(state.db.pool())
+    .await?;
+    if consumed.is_none() {
+        return Err(AppError::Authentication(
+            "Invalid or expired signup token. Please verify your email again.".to_string(),
         ));
     }
 

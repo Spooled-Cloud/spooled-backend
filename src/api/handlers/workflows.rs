@@ -284,7 +284,20 @@ pub async fn create(
         ));
     }
 
-    // Create the workflow
+    // Reject duplicate job keys. Keys index job_mappings and the key set; duplicates
+    // silently collapse, mis-wiring dependencies and leaving orphan jobs.
+    if job_keys.len() != request.jobs.len() {
+        return Err(AppError::BadRequest(
+            "Workflow job keys must be unique".to_string(),
+        ));
+    }
+
+    // Build the whole workflow (workflow row + jobs + dependency edges) in ONE
+    // transaction. Previously each INSERT ran on the pool independently, so a
+    // mid-sequence failure (e.g. a duplicate dependency edge) left a half-built
+    // workflow committed — root jobs already runnable, others missing. All-or-nothing.
+    let mut tx = state.db.pool().begin().await?;
+
     sqlx::query(
         r#"
         INSERT INTO workflows (id, organization_id, name, description, status, total_jobs, metadata, created_at)
@@ -298,7 +311,7 @@ pub async fn create(
     .bind(request.jobs.len() as i32)
     .bind(&request.metadata)
     .bind(now)
-    .execute(state.db.pool())
+    .execute(&mut *tx)
     .await?;
 
     // Create jobs and track their IDs
@@ -333,7 +346,7 @@ pub async fn create(
         .bind(job_def.dependency_mode.to_string())
         .bind(!has_dependencies) // dependencies_met = true if no dependencies
         .bind(now)
-        .execute(state.db.pool())
+        .execute(&mut *tx)
         .await?;
 
         job_mappings.insert(job_def.key.clone(), job_id.clone());
@@ -357,10 +370,12 @@ pub async fn create(
             .bind(job_id)
             .bind(dep_job_id)
             .bind(job_def.dependency_mode.to_string())
-            .execute(state.db.pool())
+            .execute(&mut *tx)
             .await?;
         }
     }
+
+    tx.commit().await?;
 
     info!(
         workflow_id = %workflow_id,
@@ -727,13 +742,25 @@ pub async fn add_dependencies(
         }
     }
 
+    // Serialize dependency-graph mutations per org in a transaction guarded by an
+    // advisory lock. would_create_cycle + the edge INSERT were separate statements, so
+    // two concurrent calls (A->B and B->A) could each pass the cycle check before either
+    // edge existed and both insert, forming a cycle that deadlocks the jobs forever. The
+    // lock forces the second caller to wait until the first commits, so its cycle check
+    // observes the first edge.
+    let mut tx = state.db.pool().begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(format!("job_deps:{}", ctx.organization_id))
+        .execute(&mut *tx)
+        .await?;
+
     // Update dependency mode
     // SECURITY: Include organization_id for defense-in-depth
     sqlx::query("UPDATE jobs SET dependency_mode = $1, dependencies_met = FALSE WHERE id = $2 AND organization_id = $3")
         .bind(request.dependency_mode.to_string())
         .bind(&job_id)
         .bind(&ctx.organization_id)
-        .execute(state.db.pool())
+        .execute(&mut *tx)
         .await?;
 
     // Add dependencies
@@ -765,7 +792,7 @@ pub async fn add_dependencies(
         .bind(&job_id)
         .bind(dep_job_id)
         .bind(request.dependency_mode.to_string())
-        .execute(state.db.pool())
+        .execute(&mut *tx)
         .await?;
 
         added += result.rows_affected() as i32;
@@ -774,7 +801,7 @@ pub async fn add_dependencies(
     // Check if dependencies are met
     let dependencies_met: bool = sqlx::query_scalar("SELECT check_job_dependencies_met($1)")
         .bind(&job_id)
-        .fetch_one(state.db.pool())
+        .fetch_one(&mut *tx)
         .await
         .unwrap_or(true);
 
@@ -784,8 +811,10 @@ pub async fn add_dependencies(
         .bind(dependencies_met)
         .bind(&job_id)
         .bind(&ctx.organization_id)
-        .execute(state.db.pool())
+        .execute(&mut *tx)
         .await?;
+
+    tx.commit().await?;
 
     Ok(Json(AddDependenciesResponse {
         dependencies_added: added,

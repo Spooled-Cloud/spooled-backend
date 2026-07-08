@@ -109,9 +109,15 @@ async fn main() -> Result<()> {
     // Create shutdown channel for all components
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    // Start gRPC server (optional, configured via GRPC_PORT env var)
-    let grpc_addr: SocketAddr =
-        format!("{}:{}", settings.server.host, settings.server.grpc_port).parse()?;
+    // Start gRPC server (optional, configured via GRPC_PORT env var).
+    // Build the address without "host:port" string concatenation: an IPv6 HOST (e.g. "::1")
+    // needs bracket form ("[::1]:port"), so the old concat produced an unparseable address
+    // and crashed startup. SocketAddr::new handles v4 and v6 literals correctly.
+    let grpc_addr: SocketAddr = if let Ok(ip) = settings.server.host.parse::<std::net::IpAddr>() {
+        SocketAddr::new(ip, settings.server.grpc_port)
+    } else {
+        format!("{}:{}", settings.server.host, settings.server.grpc_port).parse()?
+    };
     let grpc_db = Arc::new(db.clone());
     let grpc_metrics = state.metrics.clone();
     let grpc_cache = cache.clone();
