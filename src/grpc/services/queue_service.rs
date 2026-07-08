@@ -351,7 +351,14 @@ impl QueueService for QueueServiceImpl {
         .bind(&payload)
         .bind(req.priority)
         .bind(req.max_retries.max(0))
-        .bind(req.timeout_seconds.clamp(1, 86400))
+        // proto3 int32 is 0 when the field is omitted; treat 0 as "use the
+        // default" (300s, matching the REST handler) instead of clamping to a
+        // 1-second budget that deadletters any job taking longer than a second.
+        .bind(if req.timeout_seconds <= 0 {
+            300
+        } else {
+            req.timeout_seconds.clamp(1, 86400)
+        })
         .bind(scheduled_at)
         .bind(if req.idempotency_key.is_empty() {
             None

@@ -468,6 +468,12 @@ pub async fn retry(
         )));
     }
 
+    // Reset the jobs AND flip the workflow back to running in ONE transaction:
+    // previously these were separate statements, so when the (buggy) workflow
+    // UPDATE failed the jobs were already reset to pending while the workflow
+    // stayed 'failed' — a divergent state the reset jobs could never recover from.
+    let mut tx = state.db.pool().begin().await?;
+
     // Reset failed/deadletter jobs back to pending and clear retry counts
     let updated = sqlx::query(
         r#"
@@ -485,46 +491,49 @@ pub async fn retry(
     )
     .bind(&workflow_id)
     .bind(&ctx.organization_id)
-    .execute(state.db.pool())
+    .execute(&mut *tx)
     .await?;
 
     let jobs_retried = updated.rows_affected();
 
-    // Update workflow status back to running
+    // Update workflow status back to running. NOTE: the workflows table has no
+    // `updated_at` column — referencing it here raised 42703 (undefined_column)
+    // and 500'd every retry. Only touch columns that exist (cancel() is the model).
     sqlx::query(
         r#"
-        UPDATE workflows 
-        SET status = 'running', 
-            completed_at = NULL,
-            updated_at = NOW()
+        UPDATE workflows
+        SET status = 'running',
+            completed_at = NULL
         WHERE id = $1 AND organization_id = $2
         "#,
     )
     .bind(&workflow_id)
     .bind(&ctx.organization_id)
-    .execute(state.db.pool())
+    .execute(&mut *tx)
     .await?;
 
     // Recalculate completed/failed job counts
     let (completed_count,): (i64,) =
         sqlx::query_as("SELECT COUNT(*) FROM jobs WHERE workflow_id = $1 AND status = 'completed'")
             .bind(&workflow_id)
-            .fetch_one(state.db.pool())
+            .fetch_one(&mut *tx)
             .await?;
 
     let (failed_count,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM jobs WHERE workflow_id = $1 AND status IN ('failed', 'deadletter')",
     )
     .bind(&workflow_id)
-    .fetch_one(state.db.pool())
+    .fetch_one(&mut *tx)
     .await?;
 
     sqlx::query("UPDATE workflows SET completed_jobs = $1, failed_jobs = $2 WHERE id = $3")
         .bind(completed_count as i32)
         .bind(failed_count as i32)
         .bind(&workflow_id)
-        .execute(state.db.pool())
+        .execute(&mut *tx)
         .await?;
+
+    tx.commit().await?;
 
     info!(
         workflow_id = %workflow_id,

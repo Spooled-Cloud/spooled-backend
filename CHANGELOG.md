@@ -7,6 +7,22 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.87] - 2026-07-08
+
+### Fixed
+
+- **Workflow retry no longer 500s (for real this time).** `POST /workflows/{id}/retry`
+  ran `UPDATE workflows SET ... updated_at = NOW()`, but the `workflows` table has
+  no `updated_at` column, so every retry hit `42703 undefined_column` -> 500. The
+  v0.1.85 fix only corrected the *jobs*-reset query; this second statement was
+  still broken. The column reference is removed, and the job-reset + workflow-status
+  + count updates now run in ONE transaction so a failure can no longer leave jobs
+  reset to `pending` while the workflow stays `failed`.
+- **gRPC Enqueue honors the default job timeout.** proto3 `int32` is `0` when
+  `timeout_seconds` is omitted, and the handler clamped that to a 1-second budget,
+  so gRPC-enqueued jobs without an explicit timeout deadlettered after 1s. Unset
+  now uses the 300s default, matching the REST handler.
+
 ## [0.1.86] - 2026-07-08
 
 ### Fixed
