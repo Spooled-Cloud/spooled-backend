@@ -16,6 +16,9 @@ use crate::config::{LimitError, PlanLimits};
 #[derive(Debug, Serialize)]
 pub struct LimitExceededResponse {
     pub error: String,
+    /// Stable machine-readable code so SDKs classify this correctly (previously
+    /// the body had no `code`, so clients fell back to "UNKNOWN_ERROR").
+    pub code: String,
     pub message: String,
     pub resource: String,
     pub current: u64,
@@ -29,6 +32,7 @@ impl From<LimitError> for LimitExceededResponse {
     fn from(err: LimitError) -> Self {
         Self {
             error: "limit_exceeded".to_string(),
+            code: "QUOTA_EXCEEDED".to_string(),
             message: err.to_string(),
             resource: err.resource,
             current: err.current,
@@ -41,7 +45,9 @@ impl From<LimitError> for LimitExceededResponse {
 
 impl IntoResponse for LimitExceededResponse {
     fn into_response(self) -> Response {
-        (StatusCode::FORBIDDEN, Json(self)).into_response()
+        // 429 (not 403): exceeding a plan quota/limit is a "too many" condition,
+        // matching the concurrency-race path that already returned 429.
+        (StatusCode::TOO_MANY_REQUESTS, Json(self)).into_response()
     }
 }
 
@@ -167,6 +173,86 @@ pub async fn check_resource_limit(
         "schedules" => counts.schedules,
         "workflows" => counts.workflows,
         "webhooks" => counts.webhooks,
+        _ => return Ok(()), // Unknown resource, allow
+    };
+
+    limits
+        .check_limit(resource, current, adding)
+        .map_err(|e| LimitExceededResponse::from(e).into_response())
+}
+
+/// Acquire a per-`(org, resource)` transaction-scoped advisory lock so that
+/// concurrent creators of the same resource for the same org serialize. The lock
+/// releases automatically when the transaction commits/rolls back. Must be held
+/// across [`check_resource_limit_conn`] AND the caller's INSERT so the cap is
+/// enforced atomically (otherwise concurrent creates each read count < limit).
+pub async fn lock_resource(
+    conn: &mut sqlx::PgConnection,
+    org_id: &str,
+    resource: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(format!("res_limit:{}:{}", org_id, resource))
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// Same as [`check_resource_limit`] but runs the plan + count reads on a
+/// caller-provided connection, so the check and the caller's INSERT can share
+/// one transaction guarded by [`lock_resource`]. This is what makes the resource
+/// cap exact under concurrency.
+pub async fn check_resource_limit_conn(
+    conn: &mut sqlx::PgConnection,
+    org_id: &str,
+    resource: &str,
+    adding: u64,
+) -> Result<(), Response> {
+    let (plan_tier, custom_limits): (String, Option<serde_json::Value>) =
+        sqlx::query_as("SELECT plan_tier, custom_limits FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "Failed to get org plan tier");
+                (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
+            })?;
+
+    let limits = PlanLimits::for_tier_with_overrides(&plan_tier, custom_limits.as_ref());
+
+    if limits.is_disabled(resource) {
+        return Err(FeatureDisabledResponse {
+            error: "feature_disabled".to_string(),
+            message: format!(
+                "{} is not available on the {} plan. Upgrade to unlock this feature.",
+                resource, limits.display_name
+            ),
+            feature: resource.to_string(),
+            plan: limits.tier.clone(),
+            upgrade_to: Some("starter".to_string()),
+        }
+        .into_response());
+    }
+
+    let row: (i64, i64, i64, i64, i64, i64, i64, i64) =
+        sqlx::query_as("SELECT * FROM get_org_resource_counts($1)")
+            .bind(org_id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "Failed to get resource counts");
+                (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
+            })?;
+
+    let current = match resource {
+        "jobs_per_day" => row.7 as u64,
+        "active_jobs" => row.0 as u64,
+        "queues" => row.1 as u64,
+        "workers" => row.2 as u64,
+        "api_keys" => row.3 as u64,
+        "schedules" => row.4 as u64,
+        "workflows" => row.5 as u64,
+        "webhooks" => row.6 as u64,
         _ => return Ok(()), // Unknown resource, allow
     };
 
@@ -520,6 +606,7 @@ mod tests {
     fn test_limit_exceeded_response_serialization() {
         let response = LimitExceededResponse {
             error: "limit_exceeded".to_string(),
+            code: "QUOTA_EXCEEDED".to_string(),
             message: "You've reached the limit".to_string(),
             resource: "queues".to_string(),
             current: 10,
@@ -540,6 +627,7 @@ mod tests {
     fn test_limit_exceeded_response_without_upgrade() {
         let response = LimitExceededResponse {
             error: "limit_exceeded".to_string(),
+            code: "QUOTA_EXCEEDED".to_string(),
             message: "Maximum reached".to_string(),
             resource: "workers".to_string(),
             current: 200,
@@ -550,6 +638,7 @@ mod tests {
 
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("enterprise"));
+        assert!(json.contains("QUOTA_EXCEEDED"));
         // upgrade_to should be skipped
         assert!(!json.contains("upgrade_to"));
     }

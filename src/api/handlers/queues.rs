@@ -7,7 +7,7 @@ use axum::{
 };
 use chrono::Utc;
 
-use crate::api::middleware::limits::check_resource_limit;
+use crate::api::middleware::limits::{check_resource_limit_conn, lock_resource};
 use crate::api::AppState;
 use crate::error::{AppError, AppResult};
 use crate::models::{
@@ -161,19 +161,25 @@ pub async fn update_config(
     Path(name): Path<String>,
     Json(request): Json<UpsertQueueConfigRequest>,
 ) -> AppResult<Json<QueueConfig>> {
+    // Enforce the queues cap atomically: an advisory lock serializes concurrent
+    // config-creates for this org, so two requests can't both see "not existing"
+    // and both insert past the plan limit.
+    let mut tx = state.db.pool().begin().await?;
+    lock_resource(&mut tx, &ctx.organization_id, "queues").await?;
+
     // Check if queue already exists (to distinguish create vs update)
     let existing: Option<(String,)> = sqlx::query_as(
         "SELECT id FROM queue_config WHERE queue_name = $1 AND organization_id = $2",
     )
     .bind(&name)
     .bind(&ctx.organization_id)
-    .fetch_optional(state.db.pool())
+    .fetch_optional(&mut *tx)
     .await?;
 
     // Only check limit when creating a NEW queue
     if existing.is_none() {
         if let Err(response) =
-            check_resource_limit(state.db.pool(), &ctx.organization_id, "queues", 1).await
+            check_resource_limit_conn(&mut tx, &ctx.organization_id, "queues", 1).await
         {
             return Err(AppError::LimitExceeded(Box::new(response)));
         }
@@ -225,8 +231,10 @@ pub async fn update_config(
     .bind(rate_limit) // Use validated rate_limit
     .bind(enabled)
     .bind(request.settings.unwrap_or(serde_json::json!({})))
-    .fetch_one(state.db.pool())
+    .fetch_one(&mut *tx)
     .await?;
+
+    tx.commit().await?;
 
     Ok(Json(config))
 }
@@ -279,15 +287,18 @@ pub async fn pause(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
     Path(name): Path<String>,
-    Json(request): Json<PauseQueueRequest>,
+    // Optional body: `reason` is the only field and it is optional, so a
+    // body-less pause must succeed (a mandatory `Json` extractor 415s on no body).
+    body: Option<Json<PauseQueueRequest>>,
 ) -> AppResult<Json<PauseQueueResponse>> {
     let now = Utc::now();
+    let reason = body.and_then(|Json(r)| r.reason);
 
     // Upsert queue config with enabled=false and paused metadata
     let paused_settings = serde_json::json!({
         "paused": true,
         "paused_at": now.to_rfc3339(),
-        "paused_reason": request.reason
+        "paused_reason": reason.clone()
     });
 
     let result = sqlx::query(
@@ -329,7 +340,7 @@ pub async fn pause(
         queue_name: name,
         paused: true,
         paused_at: now,
-        reason: request.reason,
+        reason,
     }))
 }
 

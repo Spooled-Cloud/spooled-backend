@@ -61,10 +61,11 @@ pub struct QueueConfig {
 ///
 #[derive(Debug, Deserialize, Validate)]
 pub struct UpsertQueueConfigRequest {
-    /// Queue name
-    #[validate(length(min = 1, max = 100, message = "Queue name must be 1-100 characters"))]
-    #[validate(custom(function = "validate_queue_name_chars"))]
-    pub queue_name: String,
+    /// Optional and ignored: the queue name comes from the `{name}` path
+    /// parameter, which is authoritative. Accepted for backward compatibility so
+    /// clients that still send it are not rejected.
+    #[serde(default)]
+    pub queue_name: Option<String>,
 
     /// Maximum retries
     #[validate(range(min = 0, max = 100, message = "Max retries must be between 0 and 100"))]

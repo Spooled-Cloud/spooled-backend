@@ -1082,12 +1082,6 @@ pub async fn bulk_enqueue(
     }))
 }
 
-/// Maximum priority value
-const MAX_PRIORITY: i32 = 1000;
-
-/// Minimum priority value
-const MIN_PRIORITY: i32 = -1000;
-
 /// Boost job priority
 ///
 /// Now validates priority bounds
@@ -1097,15 +1091,9 @@ pub async fn boost_priority(
     Path(id): Path<String>,
     ValidatedJson(request): ValidatedJson<crate::models::BoostPriorityRequest>,
 ) -> AppResult<Json<crate::models::BoostPriorityResponse>> {
-    // Validate priority bounds
-    let new_priority = request.priority.clamp(MIN_PRIORITY, MAX_PRIORITY);
-    if new_priority != request.priority {
-        tracing::warn!(
-            requested = request.priority,
-            clamped = new_priority,
-            "Priority clamped to valid range"
-        );
-    }
+    // `priority` is already validated to [-100, 100] by ValidatedJson, so no
+    // additional clamp is needed (the previous ±1000 clamp was unreachable).
+    let new_priority = request.priority;
 
     // Get current priority - with organization check
     let job: Option<(i32,)> = sqlx::query_as(

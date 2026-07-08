@@ -42,6 +42,8 @@ pub struct AppState {
     pub settings: Settings,
     /// Stripe configuration (extracted for easy access)
     pub stripe: crate::config::StripeSettings,
+    /// Process start time, for reporting server uptime (e.g. /admin/stats).
+    pub start_time: std::time::Instant,
 }
 
 impl AppState {
@@ -58,6 +60,7 @@ impl AppState {
             metrics: Arc::new(metrics),
             settings,
             stripe,
+            start_time: std::time::Instant::now(),
         }
     }
 }

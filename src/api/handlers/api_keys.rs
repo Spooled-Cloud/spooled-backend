@@ -8,7 +8,7 @@ use axum::{
 use chrono::Utc;
 use uuid::Uuid;
 
-use crate::api::middleware::limits::check_resource_limit;
+use crate::api::middleware::limits::{check_resource_limit_conn, lock_resource};
 use crate::api::middleware::ValidatedJson;
 use crate::api::AppState;
 use crate::error::{AppError, AppResult};
@@ -62,13 +62,6 @@ pub async fn create(
     Extension(ctx): Extension<ApiKeyContext>,
     ValidatedJson(request): ValidatedJson<CreateApiKeyRequest>,
 ) -> AppResult<(StatusCode, Json<CreateApiKeyResponse>)> {
-    // Check API key limit before creating
-    if let Err(response) =
-        check_resource_limit(state.db.pool(), &ctx.organization_id, "api_keys", 1).await
-    {
-        return Err(AppError::LimitExceeded(Box::new(response)));
-    }
-
     let key_id = Uuid::new_v4().to_string();
     let now = Utc::now();
 
@@ -87,11 +80,22 @@ pub async fn create(
     // Extract key prefix for fast indexed lookup (first 8 chars)
     let key_prefix: String = raw_key.chars().take(8).collect();
 
-    // Hash the key using bcrypt (verification happens in Rust, NOT in database)
+    // Hash the key using bcrypt (verification happens in Rust, NOT in database).
+    // Done BEFORE the transaction so the advisory lock below is held minimally.
     let key_hash = bcrypt::hash(&raw_key, bcrypt::DEFAULT_COST)
         .map_err(|e| AppError::Internal(format!("Failed to hash API key: {}", e)))?;
 
     let queues: Vec<String> = request.queues.unwrap_or_default();
+
+    // Enforce the api_keys cap atomically: the advisory lock serializes concurrent
+    // creates for this org so the count + insert cannot overshoot the plan limit.
+    let mut tx = state.db.pool().begin().await?;
+    lock_resource(&mut tx, &ctx.organization_id, "api_keys").await?;
+    if let Err(response) =
+        check_resource_limit_conn(&mut tx, &ctx.organization_id, "api_keys", 1).await
+    {
+        return Err(AppError::LimitExceeded(Box::new(response)));
+    }
 
     sqlx::query(
         r#"
@@ -111,8 +115,10 @@ pub async fn create(
     .bind(request.rate_limit)
     .bind(now)
     .bind(request.expires_at)
-    .execute(state.db.pool())
+    .execute(&mut *tx)
     .await?;
+
+    tx.commit().await?;
 
     Ok((
         StatusCode::CREATED,

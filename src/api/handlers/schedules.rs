@@ -12,8 +12,8 @@ use serde::Deserialize;
 use tracing::{error, info};
 
 use crate::api::middleware::limits::{
-    check_job_limits_generic, check_payload_size_generic, check_resource_limit,
-    increment_daily_jobs, LimitCheckError,
+    check_job_limits_generic, check_payload_size_generic, check_resource_limit_conn,
+    increment_daily_jobs, lock_resource, LimitCheckError,
 };
 use crate::api::middleware::validation::ValidatedJson;
 use crate::api::AppState;
@@ -104,17 +104,6 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<CreateScheduleResponse>), (StatusCode, String)> {
     let org_id = &ctx.organization_id;
 
-    // Check schedule limit before creating
-    if check_resource_limit(state.db.pool(), org_id, "schedules", 1)
-        .await
-        .is_err()
-    {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "Schedule limit exceeded for your plan".to_string(),
-        ));
-    }
-
     // Enforce plan payload size for schedule payload_template at creation time too.
     let payload_json = serde_json::to_string(&req.payload_template).unwrap_or_default();
     check_payload_size_generic(state.db.pool(), org_id, payload_json.len())
@@ -146,6 +135,34 @@ pub async fn create(
     let id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now();
 
+    // Enforce the schedules cap atomically under an advisory lock so concurrent
+    // creates for this org cannot overshoot the plan limit.
+    let tx_err = || {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to create schedule".to_string(),
+        )
+    };
+    let mut tx = state.db.pool().begin().await.map_err(|e| {
+        error!(error = %e, "Failed to begin transaction for schedule create");
+        tx_err()
+    })?;
+    lock_resource(&mut tx, org_id, "schedules")
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Failed to acquire schedule limit lock");
+            tx_err()
+        })?;
+    if check_resource_limit_conn(&mut tx, org_id, "schedules", 1)
+        .await
+        .is_err()
+    {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "Schedule limit exceeded for your plan".to_string(),
+        ));
+    }
+
     sqlx::query(
         r#"
         INSERT INTO schedules (
@@ -171,7 +188,7 @@ pub async fn create(
     .bind(&req.tags)
     .bind(&req.metadata)
     .bind(now)
-    .execute(state.db.pool())
+    .execute(&mut *tx)
     .await
     // Don't leak database error details
     .map_err(|e| {
@@ -180,6 +197,11 @@ pub async fn create(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to create schedule".to_string(),
         )
+    })?;
+
+    tx.commit().await.map_err(|e| {
+        error!(error = %e, "Failed to commit schedule create");
+        tx_err()
     })?;
 
     info!(schedule_id = %id, name = %req.name, "Schedule created");

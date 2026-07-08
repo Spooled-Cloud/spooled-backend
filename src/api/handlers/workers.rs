@@ -8,7 +8,7 @@ use axum::{
 use chrono::Utc;
 use uuid::Uuid;
 
-use crate::api::middleware::limits::check_resource_limit;
+use crate::api::middleware::limits::{check_resource_limit_conn, lock_resource};
 use crate::api::middleware::ValidatedJson;
 use crate::api::AppState;
 use crate::error::{AppError, AppResult};
@@ -50,13 +50,6 @@ pub async fn register(
     Extension(ctx): Extension<ApiKeyContext>,
     ValidatedJson(request): ValidatedJson<RegisterWorkerRequest>,
 ) -> AppResult<(StatusCode, Json<RegisterWorkerResponse>)> {
-    // Enforce worker limit before creating a new worker record
-    if let Err(response) =
-        check_resource_limit(state.db.pool(), &ctx.organization_id, "workers", 1).await
-    {
-        return Err(AppError::LimitExceeded(Box::new(response)));
-    }
-
     // Validate queue name characters
     if !request
         .queue_name
@@ -99,6 +92,16 @@ pub async fn register(
     let now = Utc::now();
     let max_concurrency = request.max_concurrency.unwrap_or(5);
 
+    // Enforce the workers cap atomically under an advisory lock so concurrent
+    // registrations for this org cannot overshoot the plan limit.
+    let mut tx = state.db.pool().begin().await?;
+    lock_resource(&mut tx, &ctx.organization_id, "workers").await?;
+    if let Err(response) =
+        check_resource_limit_conn(&mut tx, &ctx.organization_id, "workers", 1).await
+    {
+        return Err(AppError::LimitExceeded(Box::new(response)));
+    }
+
     // Set both queue_name (legacy, NOT NULL) and queue_names (array, new)
     // The queue_name column has a NOT NULL constraint from initial migration.
     //
@@ -128,13 +131,15 @@ pub async fn register(
     .bind(now)
     .bind(request.metadata.unwrap_or(serde_json::json!({})))
     .bind(&request.version)
-    .execute(state.db.pool())
+    .execute(&mut *tx)
     .await?;
 
     // Check if registration succeeded - if rows_affected is 0, worker ID exists for different org
     if result.rows_affected() == 0 {
         return Err(AppError::Conflict("Worker ID already in use".to_string()));
     }
+
+    tx.commit().await?;
 
     state.metrics.workers_active.inc();
     state.metrics.workers_healthy.inc();

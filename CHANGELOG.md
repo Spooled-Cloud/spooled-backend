@@ -7,6 +7,32 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.86] - 2026-07-08
+
+### Fixed
+
+- **Plan resource caps are now enforced atomically.** Creating workflows, queues,
+  workers, API keys, schedules, or webhooks checked the count and inserted in two
+  separate statements, so concurrent requests could all pass the check and
+  overshoot the per-plan cap. Each create now takes a per-`(org, resource)`
+  advisory lock (`pg_advisory_xact_lock`) around the check + insert in one
+  transaction, so concurrent creates serialize and the cap holds. (The daily-jobs
+  cap was already atomic; `active_jobs` remains a best-effort pre-check since it is
+  a transient, self-draining count and lives on the hot enqueue path.)
+- **Quota/limit-exceeded now returns `429 Too Many Requests`** with a stable
+  `code: "QUOTA_EXCEEDED"` (was `403` with no code, which surfaced as
+  `UNKNOWN_ERROR` in the SDKs). The concurrency-race path already returned 429;
+  both are now consistent.
+- **`POST /queues/{name}/pause` accepts an empty body** (the `reason` field is
+  optional; a mandatory JSON extractor previously returned `415`).
+- **Queue-config `queue_name` in the body is now optional and ignored** (the
+  `{name}` path parameter is authoritative), so clients aren't forced to send a
+  redundant field.
+- **`GET /admin/stats` reports real `uptime_seconds`** (tracked from process
+  start) instead of a hardcoded `0`.
+- Removed an unreachable priority clamp in the boost-priority handler (validation
+  already caps priority at ±100).
+
 ## [0.1.85] - 2026-07-08
 
 ### Fixed

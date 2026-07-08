@@ -20,7 +20,7 @@ use serde::Serialize;
 use uuid::Uuid;
 use validator::Validate;
 
-use crate::api::middleware::limits::check_resource_limit;
+use crate::api::middleware::limits::{check_resource_limit_conn, lock_resource};
 use crate::api::AppState;
 use crate::error::{AppError, AppResult};
 use crate::models::{
@@ -81,15 +81,6 @@ pub async fn create(
     Extension(ctx): Extension<ApiKeyContext>,
     Json(request): Json<CreateOutgoingWebhookRequest>,
 ) -> AppResult<(StatusCode, Json<OutgoingWebhook>)> {
-    // Check webhook limit before creating.
-    // Note: resource counts track ENABLED webhooks, so only count towards limit when enabled=true.
-    let adding = if request.enabled { 1 } else { 0 };
-    if let Err(response) =
-        check_resource_limit(state.db.pool(), &ctx.organization_id, "webhooks", adding).await
-    {
-        return Err(AppError::LimitExceeded(Box::new(response)));
-    }
-
     // Validate request
     request
         .validate()
@@ -113,6 +104,17 @@ pub async fn create(
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
 
+    // Enforce the webhooks cap atomically under an advisory lock. Counts track
+    // ENABLED webhooks, so a disabled webhook adds 0.
+    let adding = if request.enabled { 1 } else { 0 };
+    let mut tx = state.db.pool().begin().await?;
+    lock_resource(&mut tx, &ctx.organization_id, "webhooks").await?;
+    if let Err(response) =
+        check_resource_limit_conn(&mut tx, &ctx.organization_id, "webhooks", adding).await
+    {
+        return Err(AppError::LimitExceeded(Box::new(response)));
+    }
+
     let webhook: OutgoingWebhook = sqlx::query_as(
         r#"
         INSERT INTO outgoing_webhooks (
@@ -132,8 +134,10 @@ pub async fn create(
     .bind(&request.events)
     .bind(request.enabled)
     .bind(now)
-    .fetch_one(state.db.pool())
+    .fetch_one(&mut *tx)
     .await?;
+
+    tx.commit().await?;
 
     tracing::info!(
         webhook_id = %id,

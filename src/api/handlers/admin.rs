@@ -738,7 +738,7 @@ pub async fn get_platform_stats(State(state): State<AppState>) -> AppResult<Json
         },
         system: SystemStats {
             api_version: "v1".to_string(),
-            uptime_seconds: 0, // Would need to track server start time
+            uptime_seconds: state.start_time.elapsed().as_secs(),
         },
     }))
 }

@@ -14,7 +14,9 @@ use tracing::{info, warn};
 use crate::{
     api::{
         middleware::{
-            limits::{check_job_limits, check_payload_size, check_resource_limit},
+            limits::{
+                check_job_limits, check_payload_size, check_resource_limit_conn, lock_resource,
+            },
             ValidatedJson,
         },
         AppState,
@@ -237,12 +239,8 @@ pub async fn create(
     let workflow_id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now();
 
-    // Enforce workflow count / feature availability (e.g. Free disables workflows)
-    if let Err(response) =
-        check_resource_limit(state.db.pool(), &ctx.organization_id, "workflows", 1).await
-    {
-        return Err(AppError::LimitExceeded(Box::new(response)));
-    }
+    // (The authoritative workflows-count check runs inside the transaction below
+    // under an advisory lock so concurrent creates can't overshoot the cap.)
 
     // Check job limits (daily + active) before creating workflow jobs
     let job_count = request.jobs.len() as u64;
@@ -297,6 +295,16 @@ pub async fn create(
     // mid-sequence failure (e.g. a duplicate dependency edge) left a half-built
     // workflow committed — root jobs already runnable, others missing. All-or-nothing.
     let mut tx = state.db.pool().begin().await?;
+
+    // Enforce workflow count / feature availability (Free disables workflows)
+    // atomically: the advisory lock serializes concurrent creates for this org so
+    // the count + inserts cannot overshoot the plan cap.
+    lock_resource(&mut tx, &ctx.organization_id, "workflows").await?;
+    if let Err(response) =
+        check_resource_limit_conn(&mut tx, &ctx.organization_id, "workflows", 1).await
+    {
+        return Err(AppError::LimitExceeded(Box::new(response)));
+    }
 
     sqlx::query(
         r#"
