@@ -466,12 +466,12 @@ pub async fn retry(
         UPDATE jobs
         SET status = 'pending',
             retry_count = 0,
-            error_message = NULL,
+            last_error = NULL,
             started_at = NULL,
             completed_at = NULL,
             updated_at = NOW()
-        WHERE workflow_id = $1 
-          AND organization_id = $2 
+        WHERE workflow_id = $1
+          AND organization_id = $2
           AND status IN ('failed', 'deadletter')
         "#,
     )

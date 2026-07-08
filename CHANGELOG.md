@@ -7,6 +7,27 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.85] - 2026-07-08
+
+### Fixed
+
+- **Workflow retry no longer 500s.** `POST /workflows/{id}/retry` referenced a
+  non-existent `error_message` column (the column is `last_error`), so every
+  retry of a failed workflow returned `500 DATABASE_ERROR`. The retry feature
+  now works.
+- **Soft-deleting an organization revokes its API keys.** Admin soft-delete
+  marked the plan `deleted` but left every API key valid (auth only checks
+  `api_keys.is_active`), so a "deleted" org could keep using the API. Soft-delete
+  now deactivates the org's keys and evicts them from the auth cache.
+- **Admin org list honors sort_by in every filter combination.** `sort_by` of
+  slug/plan_tier/updated_at was silently ignored unless BOTH a plan filter and a
+  search term were present; the ordering is now applied in all cases.
+- **Manual schedule triggers are recorded in history.** `POST /schedules/{id}/trigger`
+  bumped `run_count` but wrote no `schedule_runs` row, so triggered runs were
+  missing from `/schedules/{id}/history`. They are now recorded.
+- **Day-of-week `7` is accepted as Sunday** in cron expressions (both `0` and `7`
+  mean Sunday, per standard cron).
+
 ## [0.1.84] - 2026-07-08
 
 ### Security

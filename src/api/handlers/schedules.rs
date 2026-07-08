@@ -527,6 +527,23 @@ pub async fn trigger(
     .await
     .ok();
 
+    // Record the run in schedule_runs so manual triggers appear in history (the
+    // cron worker records its runs; a manual trigger previously bumped run_count
+    // but wrote no history row, so run_count and history diverged).
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let _ = sqlx::query(
+        r#"
+        INSERT INTO schedule_runs (id, schedule_id, job_id, status, started_at, completed_at)
+        VALUES ($1, $2, $3, 'completed', $4, $4)
+        "#,
+    )
+    .bind(&run_id)
+    .bind(&id)
+    .bind(&job_id)
+    .bind(now)
+    .execute(state.db.pool())
+    .await;
+
     info!(schedule_id = %id, job_id = %job_id, org_id = %ctx.organization_id, "Schedule triggered manually");
 
     // Increment daily job counter for plan limit tracking

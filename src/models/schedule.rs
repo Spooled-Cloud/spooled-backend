@@ -314,7 +314,8 @@ impl CronSchedule {
             hour: Self::parse_field(parts[2], 0, 23)?,
             day_of_month: Self::parse_field(parts[3], 1, 31)?,
             month: Self::parse_field(parts[4], 1, 12)?,
-            day_of_week: Self::parse_field(parts[5], 0, 6)?,
+            // Day-of-week accepts 0-7 where both 0 and 7 mean Sunday (standard cron).
+            day_of_week: Self::parse_field(parts[5], 0, 7)?,
         })
     }
 
@@ -474,7 +475,10 @@ impl CronSchedule {
                 && Self::field_matches(&self.hour, hour)
                 && Self::field_matches(&self.day_of_month, day)
                 && Self::field_matches(&self.month, month)
-                && Self::field_matches(&self.day_of_week, weekday)
+                // Sunday is both 0 and 7 in cron; chrono reports it as 0, so also
+                // match a literal 7 in the day-of-week field.
+                && (Self::field_matches(&self.day_of_week, weekday)
+                    || (weekday == 0 && Self::field_matches(&self.day_of_week, 7)))
                 // DST fall-back guard: never return a wall clock that is not strictly
                 // after the reference wall clock (skips the repeated hour's re-occurrence).
                 && current.naive_local() > after_naive
