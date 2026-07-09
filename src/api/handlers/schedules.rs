@@ -160,9 +160,7 @@ pub async fn create(
     // Propagate the STRUCTURED limit response (JSON with code "QUOTA_EXCEEDED"),
     // matching every other create handler — previously this returned a plain-text
     // 429 so SDKs classified schedule-quota errors as UNKNOWN_ERROR.
-    if let Err(resp) = check_resource_limit_conn(&mut tx, org_id, "schedules", 1).await {
-        return Err(resp);
-    }
+    check_resource_limit_conn(&mut tx, org_id, "schedules", 1).await?;
 
     sqlx::query(
         r#"
