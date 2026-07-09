@@ -2584,7 +2584,7 @@ components:
           type: string
         cron_expression:
           type: string
-          description: 6-field cron expression (second minute hour day month weekday)
+          description: Cron expression: 5-field (minute hour day month weekday) or 6-field (leading seconds). 5-field defaults seconds to 0.
           example: '0 */5 * * * *'
         timezone:
           type: string
@@ -2636,7 +2636,7 @@ components:
           maxLength: 1000
         cron_expression:
           type: string
-          description: 6-field cron expression
+          description: Cron expression (5-field, or 6-field with leading seconds)
         timezone:
           type: string
           default: UTC

@@ -118,6 +118,9 @@ Job queue operations for enqueueing, processing, and managing jobs.
 | `StreamJobs` | `StreamJobsRequest` | `stream Job` | Server-side streaming of jobs |
 | `ProcessJobs` | `stream ProcessRequest` | `stream ProcessResponse` | Bidirectional streaming |
 
+> **`Enqueue` timeouts**: if `timeout_seconds` is omitted (or `0`), the job
+> timeout defaults to `300` seconds (matching the REST API).
+
 ### 2. WorkerService (`spooled.v1.WorkerService`)
 
 Worker lifecycle management for registering and monitoring workers.

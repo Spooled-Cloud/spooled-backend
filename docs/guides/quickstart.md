@@ -121,7 +121,7 @@ cargo run
 
 You should see:
 ```
-INFO spooled_backend: Starting Spooled Backend v1.0.0
+INFO spooled_backend: Starting Spooled Backend v0.1.87
 INFO spooled_backend: Database connection pool established
 INFO spooled_backend: Database migrations completed
 INFO spooled_backend: Redis cache connected
@@ -146,7 +146,7 @@ curl http://localhost:8080/health
 
 Expected response:
 ```json
-{"status":"healthy","version":"1.0.0","database":true,"cache":true}
+{"status":"healthy","version":"0.1.87","database":true,"cache":true}
 ```
 
 ### Step 5: Create Your Organization
@@ -587,8 +587,13 @@ Response:
 
 ### WebSocket Connection
 
+WebSocket auth uses a JWT in the `?token=` query parameter (headers aren't
+available on the WebSocket handshake). Exchange your API key for a JWT via
+`POST /api/v1/auth/login` first, then pass the returned token:
+
 ```javascript
-const ws = new WebSocket('ws://localhost:8080/api/v1/ws?token=sp_live_...');
+// token is a JWT from POST /api/v1/auth/login (starts with "eyJ..."), not an API key
+const ws = new WebSocket('ws://localhost:8080/api/v1/ws?token=eyJ...');
 
 ws.onopen = () => {
   // Subscribe to queue events
@@ -804,11 +809,16 @@ kill -9 <PID>
 
 ### "Rate Limited"
 
+Per-second rate limiting returns HTTP `429 Too Many Requests`:
+
 ```json
 {
-  "error": "rate_limit_exceeded",
-  "message": "Too many requests",
-  "retry_after": 60
+  "error": "Rate limit exceeded",
+  "code": "RATE_LIMIT_EXCEEDED",
+  "retry_after_secs": 60,
+  "limit": 100,
+  "remaining": 0,
+  "reset_at": 1704067200
 }
 ```
 

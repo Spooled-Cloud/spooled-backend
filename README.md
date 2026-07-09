@@ -474,11 +474,12 @@ Limits are **automatically enforced** on:
 
 ### Limit Exceeded Response
 
-When a limit is exceeded, the API returns `403 Forbidden`:
+When a limit is exceeded, the API returns `429 Too Many Requests`:
 
 ```json
 {
   "error": "limit_exceeded",
+  "code": "QUOTA_EXCEEDED",
   "message": "active jobs limit reached (10/10). Upgrade to starter for higher limits.",
   "resource": "active_jobs",
   "current": 10,

@@ -49,11 +49,12 @@ Limits are **automatically checked** before:
 
 ### Limit Exceeded Response
 
-When a limit is exceeded, the API returns `403 Forbidden`:
+When a limit is exceeded, the API returns `429 Too Many Requests`:
 
 ```json
 {
   "error": "limit_exceeded",
+  "code": "QUOTA_EXCEEDED",
   "message": "active jobs limit reached (10/10). Upgrade to starter for higher limits.",
   "resource": "active_jobs",
   "current": 10,
@@ -106,6 +107,14 @@ Include your API key in the `Authorization` header:
 ```bash
 Authorization: Bearer sp_live_xxxxxxxxxxxxxxxxxxxx
 ```
+
+The `Authorization: Bearer` header accepts **either** an API key or a JWT — the
+API auto-detects a JWT by its `eyJ` prefix. You can also pass credentials as a
+query parameter (`?api_key=sp_live_...` or `?token=<jwt>`) when a header isn't
+convenient.
+
+> The `X-API-Key` header is **gRPC-only** and returns `401` on REST endpoints.
+> Use `Authorization: Bearer` (or the query parameters above) for the REST API.
 
 ### JWT Authentication
 
@@ -570,8 +579,13 @@ Authorization: Bearer <token>
 ```
 
 **Cron Expression Format:**
+
+Both the standard 5-field form (`min hour dom mon dow`) and the 6-field form
+with a leading seconds field are accepted. When 5 fields are given, the seconds
+default to `0`.
+
 ```
-┌───────────── second (0 - 59)
+┌───────────── second (0 - 59)   ← optional; defaults to 0 when omitted
 │ ┌───────────── minute (0 - 59)
 │ │ ┌───────────── hour (0 - 23)
 │ │ │ ┌───────────── day of month (1 - 31)
@@ -582,11 +596,16 @@ Authorization: Bearer <token>
 ```
 
 **Examples:**
-- `0 * * * * *` - Every minute
-- `0 */5 * * * *` - Every 5 minutes
-- `0 0 9 * * *` - Daily at 9 AM
-- `0 0 0 * * 1` - Every Monday at midnight
-- `0 0 0 1 * *` - First of every month
+- `* * * * *` - Every minute (5-field)
+- `*/5 * * * *` - Every 5 minutes (5-field)
+- `0 9 * * *` - Daily at 9 AM (5-field)
+- `0 0 9 * * *` - Daily at 9 AM (6-field, seconds explicit)
+- `0 0 * * 1` - Every Monday at midnight
+- `0 0 1 * *` - First of every month
+
+**Step values (`*/N`)** count from each field's minimum, so on day-of-month
+`*/2` matches the 1st, 3rd, 5th, … and on month `*/3` matches January, April,
+July, October.
 
 **Timezone:** cron fields are evaluated in the schedule's `timezone` (IANA
 name or `+HH:MM` offset, default `UTC`), DST-aware. Times skipped by a
@@ -1095,10 +1114,14 @@ Redirect the user to this URL to manage their subscription, payment methods, and
 
 ### WebSocket
 
-Connect to receive real-time updates:
+Connect to receive real-time updates. WebSocket auth requires a JWT in the
+`?token=` query parameter (headers aren't available on the handshake). Get a JWT
+from `POST /api/v1/auth/login` using your API key, then pass it as `token`. API
+keys are **not** accepted here:
 
 ```javascript
-const ws = new WebSocket('wss://api.example.com/api/v1/ws?queues=emails,notifications');
+// token is a JWT from POST /api/v1/auth/login (starts with "eyJ..."), not an API key
+const ws = new WebSocket('wss://api.example.com/api/v1/ws?token=eyJ...&queues=emails,notifications');
 
 ws.onopen = () => {
   console.log('Connected');
@@ -1196,6 +1219,8 @@ grpcurl -plaintext \
   }' \
   localhost:50051 spooled.v1.QueueService/Enqueue
 ```
+
+If `timeout_seconds` is omitted (or `0`), it defaults to `300` seconds.
 
 Response:
 ```json

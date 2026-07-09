@@ -145,7 +145,7 @@ cargo run
 
 ```bash
 curl http://localhost:8080/health
-# {"status":"healthy","version":"1.0.0","database":true,"cache":true}
+# {"status":"healthy","version":"0.1.87","database":true,"cache":true}
 ```
 
 ---

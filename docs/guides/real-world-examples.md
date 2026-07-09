@@ -349,9 +349,12 @@ Example: “Every day at 9:00 AM, run cleanup”.
 
 ### Step-by-step
 
-Spooled uses **6-field cron**: `second minute hour day month weekday`
+Spooled accepts both **standard 5-field cron** (`minute hour day month weekday`)
+and **6-field cron** with a leading seconds field (`second minute hour day month
+weekday`). With 5 fields the seconds default to `0`.
 
-Example: `0 0 9 * * *` = 09:00:00 every day.
+Example: `0 9 * * *` (5-field) and `0 0 9 * * *` (6-field) both mean 09:00:00
+every day.
 
 1) Create a schedule:
 
