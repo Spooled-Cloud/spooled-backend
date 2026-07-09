@@ -7,6 +7,19 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.88] - 2026-07-09
+
+### Fixed
+
+- **Worker operations on an expired lease are now rejected.** `complete`, `fail`,
+  and `heartbeat` (REST + gRPC + the ProcessJobs stream) previously succeeded even
+  after the job's lease had expired, letting a zombie worker act on a job the
+  scheduler had already reclaimed. Every worker-scoped update now requires
+  `lease_expires_at > NOW()`; an expired lease returns HTTP 409 `LEASE_EXPIRED`
+  (gRPC `FAILED_PRECONDITION`), distinct from 404 not-owned. The REST fail path is
+  now a single atomic update (no TOCTOU), gRPC fail inserts a `dead_letter_queue`
+  row to match REST, and the lease-recovery ticker runs every 10s (was 30s).
+
 ## [0.1.87] - 2026-07-08
 
 ### Fixed
