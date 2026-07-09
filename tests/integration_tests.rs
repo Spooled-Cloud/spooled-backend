@@ -2318,7 +2318,10 @@ async fn test_fail_by_worker_reschedules_with_valid_lease() {
             .fetch_one(db.pool())
             .await
             .expect("Failed to query job");
-    assert!(assigned.is_none(), "assigned_worker_id must be cleared on fail");
+    assert!(
+        assigned.is_none(),
+        "assigned_worker_id must be cleared on fail"
+    );
     assert!(lease.is_none(), "lease_expires_at must be cleared on fail");
 }
 
@@ -2418,13 +2421,12 @@ async fn test_recover_expired_leases_reclaims_within_ticker_budget() {
         reclaimed
     );
 
-    let (status, assigned): (String, Option<String>) = sqlx::query_as(
-        "SELECT status, assigned_worker_id FROM jobs WHERE id = $1",
-    )
-    .bind(&job_id)
-    .fetch_one(db.pool())
-    .await
-    .expect("Failed to query job");
+    let (status, assigned): (String, Option<String>) =
+        sqlx::query_as("SELECT status, assigned_worker_id FROM jobs WHERE id = $1")
+            .bind(&job_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("Failed to query job");
     assert_eq!(status, "pending", "Reclaimed job should be pending");
     assert!(
         assigned.is_none(),

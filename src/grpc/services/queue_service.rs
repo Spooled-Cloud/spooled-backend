@@ -519,15 +519,13 @@ impl QueueService for QueueServiceImpl {
         })?;
 
         if db_result.rows_affected() == 0 {
-            return Err(
-                classify_worker_miss_status(
-                    self.pool.as_ref(),
-                    &req.job_id,
-                    &req.worker_id,
-                    &auth.organization_id,
-                )
-                .await,
-            );
+            return Err(classify_worker_miss_status(
+                self.pool.as_ref(),
+                &req.job_id,
+                &req.worker_id,
+                &auth.organization_id,
+            )
+            .await);
         }
 
         self.metrics.jobs_completed.inc();
@@ -619,15 +617,13 @@ impl QueueService for QueueServiceImpl {
         let result = match result {
             Some(r) => r,
             None => {
-                return Err(
-                    classify_worker_miss_status(
-                        self.pool.as_ref(),
-                        &req.job_id,
-                        &req.worker_id,
-                        &auth.organization_id,
-                    )
-                    .await,
-                );
+                return Err(classify_worker_miss_status(
+                    self.pool.as_ref(),
+                    &req.job_id,
+                    &req.worker_id,
+                    &auth.organization_id,
+                )
+                .await);
             }
         };
 
@@ -729,15 +725,13 @@ impl QueueService for QueueServiceImpl {
         })?;
 
         if result.rows_affected() == 0 {
-            return Err(
-                classify_worker_miss_status(
-                    self.pool.as_ref(),
-                    &req.job_id,
-                    &req.worker_id,
-                    &auth.organization_id,
-                )
-                .await,
-            );
+            return Err(classify_worker_miss_status(
+                self.pool.as_ref(),
+                &req.job_id,
+                &req.worker_id,
+                &auth.organization_id,
+            )
+            .await);
         }
 
         debug!(

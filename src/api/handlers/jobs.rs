@@ -541,7 +541,12 @@ pub async fn fail(
     );
 
     let outcome = queue
-        .fail_by_worker(&id, &request.worker_id, &ctx.organization_id, &request.error)
+        .fail_by_worker(
+            &id,
+            &request.worker_id,
+            &ctx.organization_id,
+            &request.error,
+        )
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 

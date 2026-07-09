@@ -710,9 +710,7 @@ impl QueueManager {
 
         match row {
             Some((status, lease)) if status == "processing" => {
-                let expired = lease
-                    .map(|t| t <= Utc::now())
-                    .unwrap_or(true);
+                let expired = lease.map(|t| t <= Utc::now()).unwrap_or(true);
                 if expired {
                     Ok(WorkerOpOutcome::LeaseExpired)
                 } else {
