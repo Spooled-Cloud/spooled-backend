@@ -16,7 +16,7 @@ use sqlx::PgPool;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::api::middleware::limits::{
     check_job_limits_generic, check_payload_size_generic, increment_daily_jobs, LimitCheckError,
@@ -126,37 +126,36 @@ impl QueueServiceImpl {
             }
         };
 
-        // Org token bucket (plan rps/burst)
+        // Org token bucket (plan rps/burst). Fail OPEN on a transient Redis error:
+        // a rate-limit backend blip must not reject a legitimate worker op
+        // (rate limiting is best-effort, not a correctness gate).
         let bucket_key = format!("rate_limit:grpc:org:{}", org_id);
-        let result = cache
+        match cache
             .check_token_bucket(&bucket_key, org_limits.rps, org_limits.burst)
             .await
-            .map_err(|e| {
-                error!(error = %e, org_id = %org_id, "Redis error during gRPC org rate limit");
-                Status::internal("Rate limiting unavailable")
-            })?;
-
-        if !result.allowed {
-            return Err(Status::resource_exhausted("Rate limit exceeded"));
+        {
+            Ok(result) if !result.allowed => {
+                return Err(Status::resource_exhausted("Rate limit exceeded"));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(error = %e, org_id = %org_id, "Redis error during gRPC org rate limit — allowing (fail-open)");
+            }
         }
 
-        // Optional per-key override (requests per minute)
+        // Optional per-key override (requests per minute). Also fail-open on a
+        // transient Redis error rather than rejecting a legitimate worker op.
         if let Some(per_min) = api_key_per_minute {
             let per_min = per_min.max(1) as u32;
             let key = format!("rate_limit:grpc:api_key:{}", api_key_id);
-            let rl = cache
-                .check_rate_limit(&key, per_min, 60)
-                .await
-                .map_err(|e| {
-                    error!(
-                        error = %e,
-                        api_key_id = %api_key_id,
-                        "Redis error during gRPC api-key rate limit"
-                    );
-                    Status::internal("Rate limiting unavailable")
-                })?;
-            if !rl.allowed {
-                return Err(Status::resource_exhausted("Rate limit exceeded"));
+            match cache.check_rate_limit(&key, per_min, 60).await {
+                Ok(rl) if !rl.allowed => {
+                    return Err(Status::resource_exhausted("Rate limit exceeded"));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(error = %e, api_key_id = %api_key_id, "Redis error during gRPC api-key rate limit — allowing (fail-open)");
+                }
             }
         }
 

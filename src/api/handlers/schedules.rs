@@ -101,7 +101,8 @@ pub async fn create(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
     ValidatedJson(req): ValidatedJson<CreateScheduleRequest>,
-) -> Result<(StatusCode, Json<CreateScheduleResponse>), (StatusCode, String)> {
+) -> Result<(StatusCode, Json<CreateScheduleResponse>), axum::response::Response> {
+    use axum::response::IntoResponse;
     let org_id = &ctx.organization_id;
 
     // Enforce plan payload size for schedule payload_template at creation time too.
@@ -115,9 +116,10 @@ pub async fn create(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Failed to check limits".to_string(),
                 )
+                    .into_response()
             }
             // Return 403 to match other plan-limit errors in this handler module.
-            _ => (StatusCode::FORBIDDEN, e.to_string()),
+            _ => (StatusCode::FORBIDDEN, e.to_string()).into_response(),
         })?;
 
     // Validate cron expression
@@ -126,6 +128,7 @@ pub async fn create(
             StatusCode::BAD_REQUEST,
             format!("Invalid cron expression: {}", e),
         )
+            .into_response()
     })?;
 
     // Calculate next run time in the schedule's timezone (stored as UTC)
@@ -142,6 +145,7 @@ pub async fn create(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to create schedule".to_string(),
         )
+            .into_response()
     };
     let mut tx = state.db.pool().begin().await.map_err(|e| {
         error!(error = %e, "Failed to begin transaction for schedule create");
@@ -153,14 +157,11 @@ pub async fn create(
             error!(error = %e, "Failed to acquire schedule limit lock");
             tx_err()
         })?;
-    if check_resource_limit_conn(&mut tx, org_id, "schedules", 1)
-        .await
-        .is_err()
-    {
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            "Schedule limit exceeded for your plan".to_string(),
-        ));
+    // Propagate the STRUCTURED limit response (JSON with code "QUOTA_EXCEEDED"),
+    // matching every other create handler — previously this returned a plain-text
+    // 429 so SDKs classified schedule-quota errors as UNKNOWN_ERROR.
+    if let Err(resp) = check_resource_limit_conn(&mut tx, org_id, "schedules", 1).await {
+        return Err(resp);
     }
 
     sqlx::query(
@@ -197,6 +198,7 @@ pub async fn create(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to create schedule".to_string(),
         )
+            .into_response()
     })?;
 
     tx.commit().await.map_err(|e| {

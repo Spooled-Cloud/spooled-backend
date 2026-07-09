@@ -470,15 +470,30 @@ impl CronSchedule {
             let month = current.month() as u8;
             let weekday = current.weekday().num_days_from_sunday() as u8;
 
+            // Day-of-month vs day-of-week follow standard (Vixie) cron semantics:
+            // when BOTH fields are restricted (neither is `*`), the day matches if
+            // EITHER matches (OR); if either field is `*`, they combine with AND
+            // (the restricted field gates, the `*` is always true). Previously this
+            // was an unconditional AND, so e.g. `0 0 0 15 * 1` fired only on a 15th
+            // that is also a Monday instead of "the 15th OR any Monday".
+            let dom_match = Self::field_matches(&self.day_of_month, day);
+            // Sunday is both 0 and 7 in cron; chrono reports it as 0, so also
+            // match a literal 7 in the day-of-week field.
+            let dow_match = Self::field_matches(&self.day_of_week, weekday)
+                || (weekday == 0 && Self::field_matches(&self.day_of_week, 7));
+            let dom_restricted = !matches!(self.day_of_month, CronField::Any);
+            let dow_restricted = !matches!(self.day_of_week, CronField::Any);
+            let day_matches = if dom_restricted && dow_restricted {
+                dom_match || dow_match
+            } else {
+                dom_match && dow_match
+            };
+
             if Self::field_matches(&self.second, second)
                 && Self::field_matches(&self.minute, minute)
                 && Self::field_matches(&self.hour, hour)
-                && Self::field_matches(&self.day_of_month, day)
                 && Self::field_matches(&self.month, month)
-                // Sunday is both 0 and 7 in cron; chrono reports it as 0, so also
-                // match a literal 7 in the day-of-week field.
-                && (Self::field_matches(&self.day_of_week, weekday)
-                    || (weekday == 0 && Self::field_matches(&self.day_of_week, 7)))
+                && day_matches
                 // DST fall-back guard: never return a wall clock that is not strictly
                 // after the reference wall clock (skips the repeated hour's re-occurrence).
                 && current.naive_local() > after_naive
@@ -664,6 +679,32 @@ mod tests {
         // Other field counts are still rejected.
         assert!(CronSchedule::parse("0 9 * *").is_err());
         assert!(CronSchedule::parse("0 0 0 9 * * *").is_err());
+    }
+
+    #[test]
+    fn test_cron_dom_dow_or_semantics() {
+        // Standard cron: when BOTH day-of-month and day-of-week are restricted,
+        // the schedule fires when EITHER matches (OR). "0 0 0 15 * 1" = midnight
+        // on the 15th OR any Monday. From Thu 2026-07-09, next Monday is 07-13
+        // (before the 15th), so next_run = 2026-07-13.
+        let s = CronSchedule::parse("0 0 0 15 * 1").unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 9, 0, 0, 0).unwrap();
+        assert_eq!(
+            s.next_run_after(now),
+            Some(Utc.with_ymd_and_hms(2026, 7, 13, 0, 0, 0).unwrap())
+        );
+        // Only day-of-month restricted (dow = *) -> AND semantics: just the 15th.
+        let dom_only = CronSchedule::parse("0 0 0 15 * *").unwrap();
+        assert_eq!(
+            dom_only.next_run_after(now),
+            Some(Utc.with_ymd_and_hms(2026, 7, 15, 0, 0, 0).unwrap())
+        );
+        // Only day-of-week restricted (dom = *): next Monday.
+        let dow_only = CronSchedule::parse("0 0 0 * * 1").unwrap();
+        assert_eq!(
+            dow_only.next_run_after(now),
+            Some(Utc.with_ymd_and_hms(2026, 7, 13, 0, 0, 0).unwrap())
+        );
     }
 
     #[test]

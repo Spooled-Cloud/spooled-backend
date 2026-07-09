@@ -474,7 +474,14 @@ pub async fn retry(
     // stayed 'failed' — a divergent state the reset jobs could never recover from.
     let mut tx = state.db.pool().begin().await?;
 
-    // Reset failed/deadletter jobs back to pending and clear retry counts
+    // Reset every non-completed job back to pending — including jobs the failure
+    // cascade CANCELLED (dependents of the failed job). Previously only
+    // failed/deadletter were reset, so cancelled dependents stayed terminal and
+    // the retried workflow could never complete. `dependencies_met` is recomputed
+    // from the current dependency states via check_job_dependencies_met(id): a
+    // reset dependent whose parent is also being reset re-gates (FALSE) and is
+    // released by the completion trigger when the parent re-completes; one whose
+    // parent already completed is runnable immediately (TRUE).
     let updated = sqlx::query(
         r#"
         UPDATE jobs
@@ -483,10 +490,11 @@ pub async fn retry(
             last_error = NULL,
             started_at = NULL,
             completed_at = NULL,
+            dependencies_met = check_job_dependencies_met(id),
             updated_at = NOW()
         WHERE workflow_id = $1
           AND organization_id = $2
-          AND status IN ('failed', 'deadletter')
+          AND status IN ('failed', 'deadletter', 'cancelled')
         "#,
     )
     .bind(&workflow_id)

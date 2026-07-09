@@ -7,6 +7,26 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.89] - 2026-07-09
+
+### Fixed
+
+- **Workflow retry now restores cascade-cancelled dependents.** When a job
+  failed, the dependency sweep cancelled its downstream jobs and marked the
+  workflow failed; retry only reset failed/deadletter jobs, so the cancelled
+  dependents stayed terminal and the retried workflow could never complete. Retry
+  now also resets `cancelled` jobs and recomputes `dependencies_met` from current
+  dependency state, so downstream jobs run once their parent re-completes.
+- **Cron day-of-month + day-of-week follow standard (Vixie) OR semantics.** When
+  BOTH fields are restricted (neither is `*`), the schedule fires when EITHER
+  matches (e.g. `0 0 0 15 * 1` = the 15th OR any Monday). Previously it required
+  BOTH, firing far less often than users expect.
+- **Schedule quota errors return the structured 429 body** with
+  `code: "QUOTA_EXCEEDED"` like every other resource, instead of a plain-text
+  message SDKs misclassified as `UNKNOWN_ERROR`.
+- **gRPC rate limiting fails open on a transient Redis error** instead of
+  rejecting a legitimate worker operation.
+
 ## [0.1.88] - 2026-07-09
 
 ### Fixed
