@@ -260,44 +260,85 @@ async fn authenticate_api_key_token(
     })
 }
 
-/// Fetch API key from database
+/// Fetch API key from database.
 ///
-/// Uses key_prefix (first 8 chars) for indexed lookup before bcrypt verification.
-/// This prevents DoS attacks where an attacker could slow down authentication
-/// by creating many API keys (each requiring bcrypt verification).
-/// With key_prefix filtering, we only verify a small subset of keys (typically 1-2).
+/// Fast path: `lookup_hash = sha256(token)` is unique, so a single indexed row read
+/// yields the one candidate, which is then bcrypt-verified. This replaces the old
+/// prefix scan, where every `sp_live_` key shared the same `key_prefix` so a bogus
+/// key cost up to 100 bcrypt verifications (~7.7s) — a CPU-amplification vector.
+///
+/// Legacy fallback: rows created before `lookup_hash` existed have it NULL and can't
+/// be backfilled offline (the plaintext isn't recoverable from bcrypt). For those we
+/// fall back to the bounded prefix scan and, on a match, backfill `lookup_hash` so
+/// the key uses the fast path from then on. The fallback only scans `lookup_hash IS
+/// NULL` rows, so it shrinks to empty as keys re-authenticate after deploy.
 async fn fetch_api_key(
     state: &AppState,
     token: &str,
 ) -> Result<ApiKeyRecord, (StatusCode, String)> {
-    // Extract key_prefix (first 8 chars) for efficient indexed lookup
-    let key_prefix: String = token.chars().take(8).collect();
+    let db_err = |e: sqlx::Error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Database error: {}", e),
+        )
+    };
 
-    // Use key_prefix for indexed lookup - dramatically reduces bcrypt verifications
-    // The (key_prefix = $1 OR key_prefix IS NULL) handles legacy keys without prefix
-    // LIMIT 100 prevents excessive results even with prefix collisions
+    let lookup_hash = crate::models::api_key_lookup_hash(token);
+
+    // Fast path: exactly one row (or none). Mirrors the old scan's `is_active = TRUE`
+    // filter; expiry is checked by the caller from the returned `expires_at`.
+    let by_lookup: Option<ApiKeyRecord> = sqlx::query_as(
+        "SELECT id, organization_id, key_hash, queues, rate_limit, is_active, expires_at
+         FROM api_keys
+         WHERE lookup_hash = $1 AND is_active = TRUE
+         LIMIT 1",
+    )
+    .bind(&lookup_hash)
+    .fetch_optional(state.db.pool())
+    .await
+    .map_err(db_err)?;
+
+    if let Some(record) = by_lookup {
+        // Defense in depth: verify bcrypt even though lookup_hash matched, so a
+        // (practically impossible) SHA-256 collision can't authenticate.
+        if bcrypt::verify(token, &record.key_hash).unwrap_or(false) {
+            return Ok(record);
+        }
+        // Collision without a bcrypt match: fall through to the legacy scan rather
+        // than trust the lookup_hash hit.
+    }
+
+    // Legacy fallback: only keys not yet carrying a lookup_hash.
+    let key_prefix: String = token.chars().take(8).collect();
     let records: Vec<ApiKeyRecord> = sqlx::query_as(
-        "SELECT id, organization_id, key_hash, queues, rate_limit, is_active, expires_at 
-         FROM api_keys 
-         WHERE is_active = TRUE 
+        "SELECT id, organization_id, key_hash, queues, rate_limit, is_active, expires_at
+         FROM api_keys
+         WHERE is_active = TRUE
+           AND lookup_hash IS NULL
            AND (key_prefix = $1 OR key_prefix IS NULL)
          LIMIT 100",
     )
     .bind(&key_prefix)
     .fetch_all(state.db.pool())
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-    })?;
+    .map_err(db_err)?;
 
-    // Find the matching key by verifying bcrypt hash
-    // Now only verifying a small subset (typically 1-2 keys) instead of all keys
     for record in records {
-        // Use bcrypt to verify this is the correct key
         if bcrypt::verify(token, &record.key_hash).unwrap_or(false) {
+            // Backfill lookup_hash so the next auth for this key is O(1). Fire-and-forget;
+            // guarded by `lookup_hash IS NULL` so concurrent backfills are idempotent.
+            let db = state.db.pool_arc();
+            let key_id = record.id.clone();
+            let lh = lookup_hash.clone();
+            tokio::spawn(async move {
+                let _ = sqlx::query(
+                    "UPDATE api_keys SET lookup_hash = $1 WHERE id = $2 AND lookup_hash IS NULL",
+                )
+                .bind(&lh)
+                .bind(&key_id)
+                .execute(&*db)
+                .await;
+            });
             return Ok(record);
         }
     }

@@ -491,6 +491,7 @@ pub async fn create(
     let key_prefix: String = raw_key.chars().take(8).collect();
     let key_hash = bcrypt::hash(&raw_key, bcrypt::DEFAULT_COST)
         .map_err(|e| AppError::Internal(format!("Failed to hash API key: {}", e)))?;
+    let lookup_hash = crate::models::api_key_lookup_hash(&raw_key);
 
     let key_name = "Initial Admin Key".to_string();
     let queues: Vec<String> = vec!["*".to_string()]; // Full access to all queues
@@ -499,9 +500,9 @@ pub async fn create(
         r#"
         INSERT INTO api_keys (
             id, organization_id, key_hash, key_prefix, name, queues, rate_limit,
-            is_active, created_at, expires_at
+            is_active, created_at, expires_at, lookup_hash
         )
-        VALUES ($1, $2, $3, $4, $5, $6, NULL, TRUE, $7, NULL)
+        VALUES ($1, $2, $3, $4, $5, $6, NULL, TRUE, $7, NULL, $8)
         "#,
     )
     .bind(&api_key_id)
@@ -511,6 +512,7 @@ pub async fn create(
     .bind(&key_name)
     .bind(&queues)
     .bind(now)
+    .bind(&lookup_hash)
     .execute(state.db.pool())
     .await?;
 

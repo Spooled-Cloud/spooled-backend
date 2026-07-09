@@ -451,12 +451,22 @@ pub async fn retry(
     Extension(ctx): Extension<ApiKeyContext>,
     Path(workflow_id): Path<String>,
 ) -> AppResult<Json<WorkflowResponse>> {
-    // First verify workflow belongs to this organization and is in a retryable state
+    // Reset the jobs AND flip the workflow back to running in ONE transaction:
+    // previously these were separate statements, so when the (buggy) workflow
+    // UPDATE failed the jobs were already reset to pending while the workflow
+    // stayed 'failed' — a divergent state the reset jobs could never recover from.
+    let mut tx = state.db.pool().begin().await?;
+
+    // Verify + lock the workflow row inside the transaction. `FOR UPDATE` serializes
+    // concurrent retries of the same workflow: the second caller blocks here until the
+    // first commits, then observes status='running' and is rejected — instead of both
+    // reading 'failed' outside the tx (TOCTOU) and double-resetting the jobs. An early
+    // Err return below drops the tx, rolling back with no changes applied.
     let workflow: Workflow =
-        sqlx::query_as("SELECT * FROM workflows WHERE id = $1 AND organization_id = $2")
+        sqlx::query_as("SELECT * FROM workflows WHERE id = $1 AND organization_id = $2 FOR UPDATE")
             .bind(&workflow_id)
             .bind(&ctx.organization_id)
-            .fetch_optional(state.db.pool())
+            .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("Workflow {} not found", workflow_id)))?;
 
@@ -467,12 +477,6 @@ pub async fn retry(
             workflow.status
         )));
     }
-
-    // Reset the jobs AND flip the workflow back to running in ONE transaction:
-    // previously these were separate statements, so when the (buggy) workflow
-    // UPDATE failed the jobs were already reset to pending while the workflow
-    // stayed 'failed' — a divergent state the reset jobs could never recover from.
-    let mut tx = state.db.pool().begin().await?;
 
     // Reset every non-completed job back to pending — including jobs the failure
     // cascade CANCELLED (dependents of the failed job). Previously only

@@ -84,6 +84,9 @@ pub async fn create(
     // Done BEFORE the transaction so the advisory lock below is held minimally.
     let key_hash = bcrypt::hash(&raw_key, bcrypt::DEFAULT_COST)
         .map_err(|e| AppError::Internal(format!("Failed to hash API key: {}", e)))?;
+    // Fast-lookup hash so authentication resolves this key by a unique index instead
+    // of bcrypt-scanning every key sharing the `sp_live_`/`sp_test_` prefix.
+    let lookup_hash = crate::models::api_key_lookup_hash(&raw_key);
 
     let queues: Vec<String> = request.queues.unwrap_or_default();
 
@@ -101,9 +104,9 @@ pub async fn create(
         r#"
         INSERT INTO api_keys (
             id, organization_id, key_hash, key_prefix, name, queues, rate_limit,
-            is_active, created_at, expires_at
+            is_active, created_at, expires_at, lookup_hash
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, $8, $9)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, $8, $9, $10)
         "#,
     )
     .bind(&key_id)
@@ -115,6 +118,7 @@ pub async fn create(
     .bind(request.rate_limit)
     .bind(now)
     .bind(request.expires_at)
+    .bind(&lookup_hash)
     .execute(&mut *tx)
     .await?;
 

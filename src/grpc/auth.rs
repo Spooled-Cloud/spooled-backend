@@ -129,18 +129,54 @@ struct ApiKeyRecord {
     rate_limit: Option<i32>,
 }
 
-/// Validate API key using bcrypt verification
+/// Validate API key using bcrypt verification.
+///
+/// Fast path resolves the key via the unique `lookup_hash = sha256(token)` index
+/// (single row + one bcrypt verify). This replaces the old prefix scan, where every
+/// key shared the `sp_live_`/`sp_test_` prefix so a bogus key cost up to 100 bcrypt
+/// verifications — the same CPU-amplification vector fixed on the REST path. Legacy
+/// keys with a NULL `lookup_hash` fall back to the bounded scan and are backfilled
+/// on match. gRPC has no auth cache, so this path is hit on every request.
 async fn validate_api_key(pool: &PgPool, token: &str) -> Result<GrpcAuthContext, Status> {
-    // Extract key prefix for efficient indexed lookup
-    let key_prefix: String = token.chars().take(8).collect();
+    let db_err = |e: sqlx::Error| {
+        tracing::error!(error = %e, "Database error during gRPC authentication");
+        Status::internal("Authentication failed")
+    };
 
-    // Fetch candidate keys with matching prefix.
-    // Use a higher LIMIT to handle many keys sharing the same prefix (e.g. sp_test_).
+    let lookup_hash = crate::models::api_key_lookup_hash(token);
+
+    // Fast path: unique indexed lookup. is_active + expiry are filtered in SQL because
+    // the gRPC record does not carry those columns.
+    let candidate: Option<ApiKeyRecord> = sqlx::query_as(
+        r#"
+        SELECT id, organization_id, key_hash, queues, rate_limit
+        FROM api_keys
+        WHERE lookup_hash = $1
+          AND is_active = TRUE
+          AND (expires_at IS NULL OR expires_at > NOW())
+        LIMIT 1
+        "#,
+    )
+    .bind(&lookup_hash)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_err)?;
+
+    if let Some(record) = candidate {
+        if bcrypt::verify(token, &record.key_hash).unwrap_or(false) {
+            return Ok(authenticated_context(pool, record));
+        }
+        // SHA-256 collision without a bcrypt match: fall through to the legacy scan.
+    }
+
+    // Legacy fallback: only keys not yet carrying a lookup_hash.
+    let key_prefix: String = token.chars().take(8).collect();
     let records: Vec<ApiKeyRecord> = sqlx::query_as(
         r#"
         SELECT id, organization_id, key_hash, queues, rate_limit
-        FROM api_keys 
-        WHERE is_active = TRUE 
+        FROM api_keys
+        WHERE is_active = TRUE
+          AND lookup_hash IS NULL
           AND (key_prefix = $1 OR key_prefix IS NULL)
           AND (expires_at IS NULL OR expires_at > NOW())
         LIMIT 100
@@ -149,41 +185,55 @@ async fn validate_api_key(pool: &PgPool, token: &str) -> Result<GrpcAuthContext,
     .bind(&key_prefix)
     .fetch_all(pool)
     .await
-    .map_err(|e| {
-        tracing::error!(error = %e, "Database error during gRPC authentication");
-        Status::internal("Authentication failed")
-    })?;
+    .map_err(db_err)?;
 
-    // Find matching key using bcrypt verification
     for record in records {
         if bcrypt::verify(token, &record.key_hash).unwrap_or(false) {
-            info!(
-                org_id = %record.organization_id,
-                api_key_id = %record.id,
-                "gRPC request authenticated"
-            );
-
-            // Update last_used asynchronously (fire-and-forget)
+            // Backfill lookup_hash so subsequent auths for this key are O(1).
             let pool_clone = pool.clone();
             let key_id = record.id.clone();
+            let lh = lookup_hash.clone();
             tokio::spawn(async move {
-                let _ = sqlx::query("UPDATE api_keys SET last_used = NOW() WHERE id = $1")
-                    .bind(&key_id)
-                    .execute(&pool_clone)
-                    .await;
+                let _ = sqlx::query(
+                    "UPDATE api_keys SET lookup_hash = $1 WHERE id = $2 AND lookup_hash IS NULL",
+                )
+                .bind(&lh)
+                .bind(&key_id)
+                .execute(&pool_clone)
+                .await;
             });
-
-            return Ok(GrpcAuthContext {
-                organization_id: record.organization_id,
-                api_key_id: record.id,
-                queues: record.queues,
-                rate_limit: record.rate_limit,
-            });
+            return Ok(authenticated_context(pool, record));
         }
     }
 
     warn!("Invalid API key provided for gRPC request");
     Err(Status::unauthenticated("Invalid API key"))
+}
+
+/// Build the gRPC auth context for a verified key and refresh its `last_used`
+/// timestamp asynchronously (fire-and-forget).
+fn authenticated_context(pool: &PgPool, record: ApiKeyRecord) -> GrpcAuthContext {
+    info!(
+        org_id = %record.organization_id,
+        api_key_id = %record.id,
+        "gRPC request authenticated"
+    );
+
+    let pool_clone = pool.clone();
+    let key_id = record.id.clone();
+    tokio::spawn(async move {
+        let _ = sqlx::query("UPDATE api_keys SET last_used = NOW() WHERE id = $1")
+            .bind(&key_id)
+            .execute(&pool_clone)
+            .await;
+    });
+
+    GrpcAuthContext {
+        organization_id: record.organization_id,
+        api_key_id: record.id,
+        queues: record.queues,
+        rate_limit: record.rate_limit,
+    }
 }
 
 /// Extension trait for accessing auth context from request

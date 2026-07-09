@@ -674,11 +674,12 @@ pub async fn complete_signup(
     let key_prefix: String = raw_key.chars().take(8).collect();
     let key_hash = bcrypt::hash(&raw_key, bcrypt::DEFAULT_COST)
         .map_err(|e| AppError::Internal(format!("Failed to hash API key: {}", e)))?;
+    let lookup_hash = crate::models::api_key_lookup_hash(&raw_key);
 
     sqlx::query(
         r#"
-        INSERT INTO api_keys (id, organization_id, key_hash, key_prefix, name, queues, is_active, created_at)
-        VALUES ($1, $2, $3, $4, 'Initial Admin Key', ARRAY['*'], TRUE, $5)
+        INSERT INTO api_keys (id, organization_id, key_hash, key_prefix, name, queues, is_active, created_at, lookup_hash)
+        VALUES ($1, $2, $3, $4, 'Initial Admin Key', ARRAY['*'], TRUE, $5, $6)
         "#,
     )
     .bind(&api_key_id)
@@ -686,6 +687,7 @@ pub async fn complete_signup(
     .bind(&key_hash)
     .bind(&key_prefix)
     .bind(now)
+    .bind(&lookup_hash)
     .execute(state.db.pool())
     .await?;
 
@@ -1129,11 +1131,12 @@ async fn get_or_create_email_api_key(
     let key_hash = bcrypt::hash(&raw_key, 10)
         .map_err(|e| AppError::Internal(format!("Failed to hash key: {}", e)))?;
     let key_prefix = raw_key.chars().take(8).collect::<String>();
+    let lookup_hash = crate::models::api_key_lookup_hash(&raw_key);
 
     sqlx::query(
         r#"
-        INSERT INTO api_keys (id, organization_id, name, key_hash, key_prefix, queues, is_active, created_at)
-        VALUES ($1, $2, 'Email Login', $3, $4, ARRAY['*'], TRUE, $5)
+        INSERT INTO api_keys (id, organization_id, name, key_hash, key_prefix, queues, is_active, created_at, lookup_hash)
+        VALUES ($1, $2, 'Email Login', $3, $4, ARRAY['*'], TRUE, $5, $6)
         "#,
     )
     .bind(&key_id)
@@ -1141,6 +1144,7 @@ async fn get_or_create_email_api_key(
     .bind(&key_hash)
     .bind(&key_prefix)
     .bind(now)
+    .bind(&lookup_hash)
     .execute(state.db.pool())
     .await?;
 

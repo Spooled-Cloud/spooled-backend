@@ -340,12 +340,28 @@ pub struct UpdateOrgRequest {
     pub billing_email: Option<String>,
     /// New settings (merged with existing)
     pub settings: Option<serde_json::Value>,
-    /// Custom limit overrides (null = use plan defaults, empty object = reset to defaults)
-    pub custom_limits: Option<serde_json::Value>,
+    /// Custom limit overrides (omit to keep current; null or empty object to reset to plan defaults)
+    #[serde(default, deserialize_with = "double_option")]
+    pub custom_limits: Option<Option<serde_json::Value>>,
     /// Stripe customer ID (omit to keep current; set to null to clear)
+    #[serde(default, deserialize_with = "double_option")]
     pub stripe_customer_id: Option<Option<String>>,
     /// Stripe subscription ID (omit to keep current; set to null to clear)
+    #[serde(default, deserialize_with = "double_option")]
     pub stripe_subscription_id: Option<Option<String>>,
+}
+
+/// Deserialize an optional JSON field so an ABSENT key and an explicit `null` are
+/// distinguishable: absent → `None` (keep current), present `null` → `Some(None)`
+/// (clear/reset), present value → `Some(Some(v))` (set). A plain `Option<Option<T>>`
+/// can't do this — serde collapses a present `null` into the outer `None`, identical
+/// to an absent key — so every "set to null to clear" field silently ignored `null`.
+fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    <Option<T> as serde::Deserialize>::deserialize(deserializer).map(Some)
 }
 
 /// Update organization plan or settings
@@ -385,11 +401,14 @@ pub async fn update_organization(
     let stripe_subscription_id = request
         .stripe_subscription_id
         .unwrap_or(existing.stripe_subscription_id);
-    // For custom_limits: None means keep existing, Some(null) or empty object means reset to defaults
-    let custom_limits = match &request.custom_limits {
-        Some(limits) if limits.is_null() || limits == &serde_json::json!({}) => None,
-        Some(limits) => Some(limits.clone()),
+    // custom_limits: absent → keep existing; explicit null or empty object → reset to
+    // plan defaults (NULL); any other object → override. The double_option deserializer
+    // makes a present `null` reachable as Some(None) instead of collapsing to None.
+    let custom_limits = match request.custom_limits {
         None => existing.custom_limits,
+        Some(None) => None,
+        Some(Some(limits)) if limits.is_null() || limits == serde_json::json!({}) => None,
+        Some(Some(limits)) => Some(limits),
     };
 
     let mut updated: Organization = sqlx::query_as(
@@ -900,6 +919,7 @@ pub async fn create_organization(
     let key_prefix: String = raw_key.chars().take(8).collect();
     let key_hash = bcrypt::hash(&raw_key, bcrypt::DEFAULT_COST)
         .map_err(|e| AppError::Internal(format!("Failed to hash API key: {}", e)))?;
+    let lookup_hash = crate::models::api_key_lookup_hash(&raw_key);
 
     let key_name = "Initial Admin Key".to_string();
     let queues: Vec<String> = vec!["*".to_string()];
@@ -908,9 +928,9 @@ pub async fn create_organization(
         r#"
         INSERT INTO api_keys (
             id, organization_id, key_hash, key_prefix, name, queues, rate_limit,
-            is_active, created_at, expires_at
+            is_active, created_at, expires_at, lookup_hash
         )
-        VALUES ($1, $2, $3, $4, $5, $6, NULL, TRUE, $7, NULL)
+        VALUES ($1, $2, $3, $4, $5, $6, NULL, TRUE, $7, NULL, $8)
         "#,
     )
     .bind(&api_key_id)
@@ -920,6 +940,7 @@ pub async fn create_organization(
     .bind(&key_name)
     .bind(&queues)
     .bind(now)
+    .bind(&lookup_hash)
     .execute(&mut *tx)
     .await?;
 
@@ -999,6 +1020,7 @@ pub async fn create_api_key(
     let key_prefix: String = raw_key.chars().take(8).collect();
     let key_hash = bcrypt::hash(&raw_key, bcrypt::DEFAULT_COST)
         .map_err(|e| AppError::Internal(format!("Failed to hash API key: {}", e)))?;
+    let lookup_hash = crate::models::api_key_lookup_hash(&raw_key);
 
     let queues = request.queues.unwrap_or_else(|| vec!["*".to_string()]);
 
@@ -1006,9 +1028,9 @@ pub async fn create_api_key(
         r#"
         INSERT INTO api_keys (
             id, organization_id, key_hash, key_prefix, name, queues, rate_limit,
-            is_active, created_at, expires_at
+            is_active, created_at, expires_at, lookup_hash
         )
-        VALUES ($1, $2, $3, $4, $5, $6, NULL, TRUE, $7, NULL)
+        VALUES ($1, $2, $3, $4, $5, $6, NULL, TRUE, $7, NULL, $8)
         "#,
     )
     .bind(&api_key_id)
@@ -1018,6 +1040,7 @@ pub async fn create_api_key(
     .bind(&request.name)
     .bind(&queues)
     .bind(now)
+    .bind(&lookup_hash)
     .execute(state.db.pool())
     .await?;
 
@@ -1109,6 +1132,33 @@ fn generate_webhook_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_update_org_request_distinguishes_absent_null_and_value() {
+        // Absent → None (keep current).
+        let r: UpdateOrgRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(r.custom_limits, None);
+        assert_eq!(r.stripe_customer_id, None);
+        assert_eq!(r.stripe_subscription_id, None);
+
+        // Explicit null → Some(None) (clear / reset to defaults). This is the case a
+        // plain Option<Option<T>> silently collapsed to None, so null was ignored.
+        let r: UpdateOrgRequest =
+            serde_json::from_str(r#"{"custom_limits":null,"stripe_customer_id":null}"#).unwrap();
+        assert_eq!(r.custom_limits, Some(None));
+        assert_eq!(r.stripe_customer_id, Some(None));
+
+        // Present value → Some(Some(v)) (override / set).
+        let r: UpdateOrgRequest = serde_json::from_str(
+            r#"{"custom_limits":{"max_jobs_per_day":5},"stripe_customer_id":"cus_1"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            r.custom_limits,
+            Some(Some(serde_json::json!({"max_jobs_per_day": 5})))
+        );
+        assert_eq!(r.stripe_customer_id, Some(Some("cus_1".to_string())));
+    }
 
     #[test]
     fn test_admin_usage_stats_from_resource_counts() {

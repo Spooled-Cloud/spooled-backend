@@ -7,6 +7,39 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.90] - 2026-07-09
+
+### Security
+
+- **API-key authentication no longer bcrypt-scans every key sharing a prefix.**
+  Every live key shares the `sp_live_` prefix (test keys share `sp_test_`), so the
+  indexed lookup on `key_prefix` (first 8 chars) matched effectively all keys:
+  authentication read up to 100 candidates and bcrypt-verified each — roughly 100
+  bcrypt hashes (~7.7s observed) for a single bogus key, a cheap unauthenticated
+  CPU-amplification vector, on both the REST and gRPC paths (gRPC has no auth cache,
+  so it paid this on every request). A new indexed `api_keys.lookup_hash`
+  (`sha256(plaintext)`, migration `20260709120000`) makes auth a single indexed row
+  read plus exactly one bcrypt verify. It is not a security boundary — bcrypt still
+  verifies the credential after the lookup. Keys created before this release have a
+  NULL `lookup_hash` and are backfilled lazily on their next successful auth (until
+  then they use a bounded fallback scan restricted to un-backfilled rows), so no
+  offline migration of existing keys is required.
+
+### Fixed
+
+- **`custom_limits` and the Stripe id fields honor an explicit `null` again.** In
+  the admin org-update endpoint, `custom_limits: null` (documented to reset to plan
+  defaults) and `stripe_customer_id`/`stripe_subscription_id: null` (documented to
+  clear) were silently ignored: serde collapsed a present `null` into the same
+  `None` as an absent key. A `double_option` deserializer now distinguishes absent
+  (keep) from `null` (reset/clear) from a value (set). Resetting `custom_limits` via
+  an empty object `{}` continues to work.
+- **Concurrent workflow retries no longer double-reset jobs.** `retry` read the
+  workflow's `failed` status on the pool *before* opening its transaction, so two
+  simultaneous retries could both pass the check and both reset the jobs. The
+  workflow row is now selected `FOR UPDATE` inside the transaction, serializing
+  concurrent retries — the second observes `running` and is rejected cleanly.
+
 ## [0.1.89] - 2026-07-09
 
 ### Fixed

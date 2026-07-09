@@ -10,6 +10,21 @@ use validator::Validate;
 /// Maximum number of queues per API key
 pub const MAX_QUEUES_PER_KEY: usize = 50;
 
+/// Deterministic, unsalted SHA-256 (hex) of an API key's plaintext.
+///
+/// Stored in `api_keys.lookup_hash` and used ONLY as a fast, unique index key so
+/// authentication resolves a key with a single indexed row read plus one bcrypt
+/// verify, instead of bcrypt-scanning every key that shares the non-selective
+/// `sp_live_`/`sp_test_` prefix. This is NOT a security boundary: bcrypt still
+/// verifies the credential after the lookup, so a (practically impossible) SHA-256
+/// collision cannot authenticate as the wrong key.
+pub fn api_key_lookup_hash(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 /// Validate queue names in list
 fn validate_queues(queues: &Vec<String>) -> Result<(), validator::ValidationError> {
     if queues.len() > MAX_QUEUES_PER_KEY {
@@ -255,6 +270,21 @@ mod tests {
         let json = serde_json::to_string(&summary).unwrap();
         assert!(!json.contains("secret_hash"));
         assert!(json.contains("Test Key"));
+    }
+
+    #[test]
+    fn test_api_key_lookup_hash() {
+        let a = api_key_lookup_hash("sp_live_abcdefgh12345678");
+        let b = api_key_lookup_hash("sp_live_abcdefgh12345678");
+        let c = api_key_lookup_hash("sp_live_zzzzzzzz99999999");
+        // Deterministic for the same key, distinct for different keys.
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        // Full SHA-256 rendered as lowercase hex (64 chars) so the column is unique.
+        assert_eq!(a.len(), 64);
+        assert!(a.chars().all(|ch| ch.is_ascii_hexdigit()));
+        // Differs from the 8-char key_prefix that every sp_live_ key shares.
+        assert_ne!(&a[..8], "sp_live_");
     }
 
     #[test]
