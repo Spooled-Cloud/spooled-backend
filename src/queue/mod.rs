@@ -13,6 +13,35 @@ use uuid::Uuid;
 use crate::cache::RedisCache;
 use crate::models::Job;
 
+/// Outcome of a worker-scoped job operation (complete / fail / heartbeat).
+///
+/// This lets callers distinguish "lease already expired" (client should stop
+/// working — HTTP 409 LEASE_EXPIRED / gRPC FAILED_PRECONDITION) from "job
+/// missing or not owned by this worker" (HTTP 404 NOT_FOUND / gRPC NOT_FOUND),
+/// which was previously collapsed into a single failure path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerOpOutcome {
+    /// The row was updated successfully.
+    Ok,
+    /// A row exists for this (job, org, worker) but its `lease_expires_at`
+    /// is null or already in the past.
+    LeaseExpired,
+    /// No row matched the (job, org, worker, status = 'processing') filter.
+    NotOwned,
+}
+
+/// Outcome of a `fail_by_worker` call.
+#[derive(Debug, Clone)]
+pub struct FailByWorkerOutcome {
+    pub outcome: WorkerOpOutcome,
+    /// Whether the failed job was rescheduled (`true`) or moved to
+    /// dead-letter (`false`). Undefined when `outcome != Ok`.
+    pub will_retry: bool,
+    /// New status of the job (`"pending"` or `"deadletter"`) when
+    /// `outcome == Ok`.
+    pub new_status: Option<String>,
+}
+
 /// Queue manager for enqueueing and dequeuing jobs
 #[derive(Clone)]
 pub struct QueueManager {
@@ -383,6 +412,14 @@ impl QueueManager {
     /// This version includes organization validation to prevent
     /// workers from completing jobs belonging to different organizations.
     /// Uses a transaction to ensure job completion and dependency updates are atomic.
+    ///
+    /// # Lease enforcement
+    ///
+    /// When both `worker_id` and `org_id` are provided (public REST/gRPC
+    /// path) the SQL requires `lease_expires_at IS NOT NULL AND
+    /// lease_expires_at > NOW()`. Callers that need to distinguish
+    /// "lease expired" from "not owned" should use
+    /// [`Self::complete_by_worker`] instead.
     #[instrument(
         name = "queue.complete",
         skip(self, result),
@@ -401,7 +438,7 @@ impl QueueManager {
         let result_json = result.clone().and_then(|r| serde_json::to_string(&r).ok());
 
         let query_result = match (worker_id, org_id) {
-            // Verify both worker and organization ownership
+            // Verify both worker and organization ownership + lease still valid
             (Some(wid), Some(oid)) => {
                 sqlx::query(
                     r#"
@@ -415,6 +452,8 @@ impl QueueManager {
                       AND assigned_worker_id = $3
                       AND organization_id = $4
                       AND status = 'processing'
+                      AND lease_expires_at IS NOT NULL
+                      AND lease_expires_at > NOW()
                     "#,
                 )
                 .bind(&result_json)
@@ -424,7 +463,7 @@ impl QueueManager {
                 .execute(&mut *tx)
                 .await?
             }
-            // Worker verification only (for backward compatibility)
+            // Worker verification only (for backward compatibility) + lease still valid
             (Some(wid), None) => {
                 sqlx::query(
                     r#"
@@ -437,6 +476,8 @@ impl QueueManager {
                     WHERE id = $2 
                       AND assigned_worker_id = $3
                       AND status = 'processing'
+                      AND lease_expires_at IS NOT NULL
+                      AND lease_expires_at > NOW()
                     "#,
                 )
                 .bind(&result_json)
@@ -467,8 +508,10 @@ impl QueueManager {
 
         if query_result.rows_affected() == 0 && worker_id.is_some() {
             tx.rollback().await?;
-            warn!(job_id = %job_id, "Job completion failed - not owned by worker or not processing");
-            return Err(anyhow::anyhow!("Job not found or not owned by worker"));
+            warn!(job_id = %job_id, "Job completion failed - not owned by worker, not processing, or lease expired");
+            return Err(anyhow::anyhow!(
+                "Job not found, not owned by worker, or lease expired"
+            ));
         }
 
         // Update dependencies_met for child jobs that depend on this job
@@ -541,6 +584,359 @@ impl QueueManager {
             .await?;
         info!(job_id = %job_id, "Job completed");
         Ok(())
+    }
+
+    /// Complete a job on behalf of an authenticated worker, distinguishing
+    /// between "not owned" and "lease expired".
+    ///
+    /// This is the preferred entry point for REST/gRPC handlers that must
+    /// return `404 NOT_FOUND` vs `409 LEASE_EXPIRED` per OpenAPI. When the
+    /// UPDATE affects zero rows the method performs a follow-up SELECT to
+    /// determine which case applies:
+    ///
+    /// * matching row exists with `lease_expires_at` null/past → `LeaseExpired`
+    /// * matching row exists, `status != 'processing'` → `NotOwned`
+    /// * no row → `NotOwned`
+    ///
+    /// On `Ok` this also unblocks child jobs whose only remaining parent is
+    /// this one (same transaction as [`Self::complete_with_worker_and_org`]).
+    #[instrument(
+        name = "queue.complete_by_worker",
+        skip(self, result),
+        fields(job_id = %job_id, worker_id = %worker_id, org_id = %org_id)
+    )]
+    pub async fn complete_by_worker(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        org_id: &str,
+        result: Option<serde_json::Value>,
+    ) -> Result<WorkerOpOutcome> {
+        let mut tx = self.db.begin().await?;
+        let result_json = result.clone().and_then(|r| serde_json::to_string(&r).ok());
+
+        let query_result = sqlx::query(
+            r#"
+            UPDATE jobs
+            SET
+                status = 'completed',
+                result = $1::JSONB,
+                completed_at = NOW(),
+                updated_at = NOW()
+            WHERE id = $2
+              AND assigned_worker_id = $3
+              AND organization_id = $4
+              AND status = 'processing'
+              AND lease_expires_at IS NOT NULL
+              AND lease_expires_at > NOW()
+            "#,
+        )
+        .bind(&result_json)
+        .bind(job_id)
+        .bind(worker_id)
+        .bind(org_id)
+        .execute(&mut *tx)
+        .await?;
+
+        if query_result.rows_affected() == 0 {
+            tx.rollback().await?;
+            return self.classify_worker_miss(job_id, worker_id, org_id).await;
+        }
+
+        // Unblock child jobs whose only remaining parent just completed.
+        let update_result = sqlx::query(
+            r#"
+            UPDATE jobs
+            SET
+                dependencies_met = TRUE,
+                updated_at = NOW()
+            WHERE parent_job_id = $1
+              AND organization_id = $2
+              AND status IN ('pending', 'scheduled')
+              AND dependencies_met = FALSE
+              AND NOT EXISTS (
+                  SELECT 1 FROM jobs parent
+                  WHERE parent.id = jobs.parent_job_id
+                    AND parent.organization_id = $2
+                    AND parent.status NOT IN ('completed')
+              )
+            "#,
+        )
+        .bind(job_id)
+        .bind(org_id)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        if update_result.rows_affected() > 0 {
+            info!(
+                parent_job_id = %job_id,
+                unblocked_children = update_result.rows_affected(),
+                "Unblocked child jobs after parent completion"
+            );
+        }
+
+        self.record_history(job_id, "completed", serde_json::json!({}))
+            .await?;
+        info!(job_id = %job_id, "Job completed by worker");
+        Ok(WorkerOpOutcome::Ok)
+    }
+
+    /// Classify why a worker-scoped UPDATE affected zero rows.
+    ///
+    /// Called after complete/fail/renew_lease when `rows_affected == 0`,
+    /// so handlers can return `LEASE_EXPIRED` (409) vs `NOT_FOUND` (404).
+    async fn classify_worker_miss(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        org_id: &str,
+    ) -> Result<WorkerOpOutcome> {
+        let row: Option<(String, Option<DateTime<Utc>>)> = sqlx::query_as(
+            r#"
+            SELECT status, lease_expires_at
+            FROM jobs
+            WHERE id = $1
+              AND organization_id = $2
+              AND assigned_worker_id = $3
+            "#,
+        )
+        .bind(job_id)
+        .bind(org_id)
+        .bind(worker_id)
+        .fetch_optional(&*self.db)
+        .await?;
+
+        match row {
+            Some((status, lease)) if status == "processing" => {
+                let expired = lease
+                    .map(|t| t <= Utc::now())
+                    .unwrap_or(true);
+                if expired {
+                    Ok(WorkerOpOutcome::LeaseExpired)
+                } else {
+                    // Row exists, is processing, lease still valid — but the
+                    // UPDATE missed. This is only reachable via a benign race
+                    // (row updated between UPDATE and SELECT). Treat as
+                    // NotOwned so the caller retries or gives up gracefully.
+                    Ok(WorkerOpOutcome::NotOwned)
+                }
+            }
+            // Row exists but is not in 'processing' (e.g. already completed,
+            // reclaimed, cancelled) — from the worker's perspective the job
+            // is no longer theirs to act on.
+            Some(_) => Ok(WorkerOpOutcome::NotOwned),
+            None => Ok(WorkerOpOutcome::NotOwned),
+        }
+    }
+
+    /// Fail a job on behalf of an authenticated worker, distinguishing
+    /// "not owned" from "lease expired".
+    ///
+    /// This is the preferred entry point for REST/gRPC handlers. It folds
+    /// the previous REST TOCTOU pre-check into a single atomic UPDATE that
+    /// requires `assigned_worker_id = $worker AND lease_expires_at > NOW()`,
+    /// then classifies zero-row updates via
+    /// [`Self::classify_worker_miss`].
+    ///
+    /// When the update succeeds the job is either rescheduled with
+    /// exponential backoff + jitter (seconds, capped at 60s) or moved to
+    /// dead-letter along with a DLQ row. Returns the resulting status and a
+    /// `will_retry` flag so callers can emit the correct realtime event.
+    #[instrument(
+        name = "queue.fail_by_worker",
+        skip(self),
+        fields(job_id = %job_id, worker_id = %worker_id, org_id = %org_id)
+    )]
+    pub async fn fail_by_worker(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        org_id: &str,
+        error: &str,
+    ) -> Result<FailByWorkerOutcome> {
+        // Load current retry_count under (worker, org, processing, lease>now).
+        // This is a snapshot for the reschedule/DLQ decision; the follow-up
+        // UPDATE below repeats the same predicate so no state can change
+        // between check and write without one of them failing atomically.
+        let row: Option<(i32, i32)> = sqlx::query_as(
+            r#"
+            SELECT retry_count, max_retries
+            FROM jobs
+            WHERE id = $1
+              AND organization_id = $2
+              AND assigned_worker_id = $3
+              AND status = 'processing'
+              AND lease_expires_at IS NOT NULL
+              AND lease_expires_at > NOW()
+            "#,
+        )
+        .bind(job_id)
+        .bind(org_id)
+        .bind(worker_id)
+        .fetch_optional(&*self.db)
+        .await?;
+
+        let Some((retry_count, max_retries)) = row else {
+            return Ok(FailByWorkerOutcome {
+                outcome: self.classify_worker_miss(job_id, worker_id, org_id).await?,
+                will_retry: false,
+                new_status: None,
+            });
+        };
+
+        if retry_count < max_retries {
+            // Same seconds-with-jitter backoff as `Self::fail`, but wrapped
+            // into the atomic UPDATE (folds the REST pre-check TOCTOU).
+            let backoff_exp = retry_count.clamp(0, 6) as u32;
+            let base_backoff_seconds = 2_i64.pow(backoff_exp).min(60);
+            let jitter_ms: i64 = (rand::random::<u16>() % 500) as i64;
+            let next_run = Utc::now()
+                + Duration::seconds(base_backoff_seconds)
+                + Duration::milliseconds(jitter_ms);
+
+            let updated = sqlx::query(
+                r#"
+                UPDATE jobs
+                SET
+                    status = 'pending',
+                    retry_count = $1,
+                    scheduled_at = $2,
+                    last_error = $3,
+                    assigned_worker_id = NULL,
+                    lease_id = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = NOW()
+                WHERE id = $4
+                  AND organization_id = $5
+                  AND assigned_worker_id = $6
+                  AND status = 'processing'
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at > NOW()
+                "#,
+            )
+            .bind(retry_count + 1)
+            .bind(next_run)
+            .bind(error)
+            .bind(job_id)
+            .bind(org_id)
+            .bind(worker_id)
+            .execute(&*self.db)
+            .await?;
+
+            if updated.rows_affected() == 0 {
+                return Ok(FailByWorkerOutcome {
+                    outcome: self.classify_worker_miss(job_id, worker_id, org_id).await?,
+                    will_retry: false,
+                    new_status: None,
+                });
+            }
+
+            self.record_history(
+                job_id,
+                "retry_scheduled",
+                serde_json::json!({
+                    "error": error,
+                    "retry_count": retry_count + 1,
+                    "next_run": next_run.to_rfc3339(),
+                    "organization_id": org_id
+                }),
+            )
+            .await?;
+
+            warn!(
+                job_id = %job_id,
+                organization_id = %org_id,
+                attempt = retry_count + 1,
+                next_run = %next_run,
+                "Job will retry"
+            );
+
+            Ok(FailByWorkerOutcome {
+                outcome: WorkerOpOutcome::Ok,
+                will_retry: true,
+                new_status: Some("pending".to_string()),
+            })
+        } else {
+            let updated = sqlx::query(
+                r#"
+                UPDATE jobs
+                SET
+                    status = 'deadletter',
+                    last_error = $1,
+                    assigned_worker_id = NULL,
+                    lease_id = NULL,
+                    updated_at = NOW()
+                WHERE id = $2
+                  AND organization_id = $3
+                  AND assigned_worker_id = $4
+                  AND status = 'processing'
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at > NOW()
+                "#,
+            )
+            .bind(error)
+            .bind(job_id)
+            .bind(org_id)
+            .bind(worker_id)
+            .execute(&*self.db)
+            .await?;
+
+            if updated.rows_affected() == 0 {
+                return Ok(FailByWorkerOutcome {
+                    outcome: self.classify_worker_miss(job_id, worker_id, org_id).await?,
+                    will_retry: false,
+                    new_status: None,
+                });
+            }
+
+            sqlx::query(
+                r#"
+                INSERT INTO dead_letter_queue (id, job_id, organization_id, queue_name, reason, original_payload, error_details, created_at)
+                SELECT
+                    gen_random_uuid()::TEXT,
+                    id,
+                    organization_id,
+                    queue_name,
+                    $1,
+                    payload,
+                    $2::JSONB,
+                    NOW()
+                FROM jobs WHERE id = $3 AND organization_id = $4
+                "#,
+            )
+            .bind(error)
+            .bind(serde_json::json!({"final_error": error, "total_retries": retry_count}))
+            .bind(job_id)
+            .bind(org_id)
+            .execute(&*self.db)
+            .await?;
+
+            self.record_history(
+                job_id,
+                "deadlettered",
+                serde_json::json!({
+                    "error": error,
+                    "total_retries": retry_count,
+                    "organization_id": org_id
+                }),
+            )
+            .await?;
+
+            warn!(
+                job_id = %job_id,
+                organization_id = %org_id,
+                total_retries = retry_count,
+                "Job moved to dead-letter queue"
+            );
+
+            Ok(FailByWorkerOutcome {
+                outcome: WorkerOpOutcome::Ok,
+                will_retry: false,
+                new_status: Some("deadletter".to_string()),
+            })
+        }
     }
 
     /// Mark a job as failed with retry logic
@@ -693,25 +1089,35 @@ impl QueueManager {
         Ok(())
     }
 
-    /// Renew a job's lease
+    /// Renew a job's lease.
     ///
-    /// Now requires organization_id to prevent cross-tenant lease renewal attacks.
-    /// Previously only checked worker_id, allowing malicious workers to extend
-    /// leases on other organizations' jobs.
+    /// Strict policy: expired leases are **not** extended. If the current
+    /// `lease_expires_at` is null or already in the past the method returns
+    /// [`WorkerOpOutcome::LeaseExpired`] so the caller can respond with
+    /// HTTP 409 `LEASE_EXPIRED` / gRPC `FAILED_PRECONDITION` and stop the
+    /// worker. This prevents zombie workers from blocking scheduler
+    /// reclaim by heart-beating past expiry.
+    ///
+    /// Requires `organization_id` to prevent cross-tenant lease renewal.
     pub async fn renew_lease(
         &self,
         job_id: &str,
         worker_id: &str,
         organization_id: &str,
         lease_duration_secs: i64,
-    ) -> Result<bool> {
+    ) -> Result<WorkerOpOutcome> {
         let lease_expires = Utc::now() + Duration::seconds(lease_duration_secs);
 
         let result = sqlx::query(
             r#"
             UPDATE jobs
             SET lease_expires_at = $1, updated_at = NOW()
-            WHERE id = $2 AND assigned_worker_id = $3 AND organization_id = $4 AND status = 'processing'
+            WHERE id = $2
+              AND assigned_worker_id = $3
+              AND organization_id = $4
+              AND status = 'processing'
+              AND lease_expires_at IS NOT NULL
+              AND lease_expires_at > NOW()
             "#,
         )
         .bind(lease_expires)
@@ -721,7 +1127,12 @@ impl QueueManager {
         .execute(&*self.db)
         .await?;
 
-        Ok(result.rows_affected() > 0)
+        if result.rows_affected() > 0 {
+            Ok(WorkerOpOutcome::Ok)
+        } else {
+            self.classify_worker_miss(job_id, worker_id, organization_id)
+                .await
+        }
     }
 
     /// Recover expired leases (run periodically)

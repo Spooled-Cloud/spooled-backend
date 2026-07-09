@@ -25,7 +25,7 @@ use crate::models::{
     CreateJobResponse, FailJobRequest, HeartbeatJobRequest, Job, JobStats, JobSummary,
     ListJobsQuery,
 };
-use crate::queue::QueueManager;
+use crate::queue::{QueueManager, WorkerOpOutcome};
 use axum::extract::Extension;
 
 /// Maximum jobs per list request
@@ -460,15 +460,29 @@ pub async fn complete(
         state.cache.as_ref().map(|c| Arc::new(c.clone())),
     );
 
-    queue
-        .complete_with_worker_and_org(
+    let outcome = queue
+        .complete_by_worker(
             &id,
-            Some(&request.worker_id),
-            Some(&ctx.organization_id),
+            &request.worker_id,
+            &ctx.organization_id,
             request.result,
         )
         .await
-        .map_err(|e| AppError::Validation(e.to_string()))?;
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    match outcome {
+        WorkerOpOutcome::Ok => {}
+        WorkerOpOutcome::LeaseExpired => {
+            return Err(AppError::LeaseExpired(
+                "Job lease expired before completion".to_string(),
+            ));
+        }
+        WorkerOpOutcome::NotOwned => {
+            return Err(AppError::NotFound(
+                "Job not found or not owned by worker".to_string(),
+            ));
+        }
+    }
 
     // Metrics: processing -> completed
     state.metrics.jobs_processing.dec();
@@ -518,36 +532,34 @@ pub async fn fail(
     Path(id): Path<String>,
     ValidatedJson(request): ValidatedJson<FailJobRequest>,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
-    // Enforce that this job is currently leased to this worker before failing it.
-    // This prevents workers from interfering with each other's in-flight jobs.
-    let leased: Option<(String,)> = sqlx::query_as(
-        "SELECT id FROM jobs WHERE id = $1 AND organization_id = $2 AND assigned_worker_id = $3 AND status = 'processing'",
-    )
-    .bind(&id)
-    .bind(&ctx.organization_id)
-    .bind(&request.worker_id)
-    .fetch_optional(state.db.pool())
-    .await?;
-
-    if leased.is_none() {
-        return Ok((
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "success": false, "error": "job_not_found_or_not_owned" })),
-        ));
-    }
-
+    // `fail_by_worker` folds the previous SELECT-then-UPDATE pre-check into
+    // a single atomic UPDATE guarded by the lease predicate, so a lease that
+    // expires between check and write can no longer sneak past as success.
     let queue = QueueManager::new(
         state.db.pool_arc(),
         state.cache.as_ref().map(|c| Arc::new(c.clone())),
     );
 
-    queue
-        .fail(&id, &ctx.organization_id, &request.error)
+    let outcome = queue
+        .fail_by_worker(&id, &request.worker_id, &ctx.organization_id, &request.error)
         .await
-        .map_err(|e| AppError::Validation(e.to_string()))?;
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    match outcome.outcome {
+        WorkerOpOutcome::Ok => {}
+        WorkerOpOutcome::LeaseExpired => {
+            return Err(AppError::LeaseExpired(
+                "Job lease expired before failure was reported".to_string(),
+            ));
+        }
+        WorkerOpOutcome::NotOwned => {
+            return Err(AppError::NotFound(
+                "Job not found or not owned by worker".to_string(),
+            ));
+        }
+    }
 
     // Metrics: processing -> pending (retry) OR processing -> deadletter.
-    // We don't know which without re-fetching; keep counters conservative.
     state.metrics.jobs_processing.dec();
 
     // Best-effort realtime publish (status after fail may be pending (retry), failed, or deadletter)
@@ -597,23 +609,25 @@ pub async fn heartbeat(
         state.cache.as_ref().map(|c| Arc::new(c.clone())),
     );
 
-    let ok = queue
+    let outcome = queue
         .renew_lease(
             &id,
             &request.worker_id,
             &ctx.organization_id,
             request.lease_duration_secs,
         )
-        .await?;
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    if !ok {
-        return Ok((
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "success": false, "error": "job_not_found_or_not_owned" })),
-        ));
+    match outcome {
+        WorkerOpOutcome::Ok => Ok((StatusCode::OK, Json(serde_json::json!({ "success": true })))),
+        WorkerOpOutcome::LeaseExpired => Err(AppError::LeaseExpired(
+            "Job lease expired and cannot be extended".to_string(),
+        )),
+        WorkerOpOutcome::NotOwned => Err(AppError::NotFound(
+            "Job not found or not owned by worker".to_string(),
+        )),
     }
-
-    Ok((StatusCode::OK, Json(serde_json::json!({ "success": true }))))
 }
 
 /// Get a job by ID

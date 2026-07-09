@@ -44,6 +44,13 @@ pub enum AppError {
     #[error("Conflict: {0}")]
     Conflict(String),
 
+    /// Job lease expired before the worker attempted to complete/fail/heartbeat.
+    ///
+    /// Returned as HTTP 409 with body code `LEASE_EXPIRED` so SDKs can
+    /// distinguish "lease timed out — stop working" from a generic conflict.
+    #[error("Lease expired: {0}")]
+    LeaseExpired(String),
+
     /// Rate limit exceeded with optional retry-after seconds
     #[error("Rate limit exceeded")]
     RateLimitExceeded,
@@ -159,6 +166,7 @@ impl IntoResponse for AppError {
                 (StatusCode::NOT_FOUND, "NOT_FOUND", safe_msg)
             }
             AppError::Conflict(msg) => (StatusCode::CONFLICT, "CONFLICT", msg.clone()),
+            AppError::LeaseExpired(msg) => (StatusCode::CONFLICT, "LEASE_EXPIRED", msg.clone()),
             AppError::RateLimitExceeded => (
                 StatusCode::TOO_MANY_REQUESTS,
                 "RATE_LIMIT_EXCEEDED",
@@ -398,6 +406,7 @@ mod tests {
             (AppError::Authentication("test".to_string()), 401),
             (AppError::Authorization("test".to_string()), 403),
             (AppError::Conflict("test".to_string()), 409),
+            (AppError::LeaseExpired("expired".to_string()), 409),
             (AppError::RateLimitExceeded, 429),
             (AppError::RateLimitExceededWithRetry(60), 429),
             (AppError::PayloadTooLarge, 413),

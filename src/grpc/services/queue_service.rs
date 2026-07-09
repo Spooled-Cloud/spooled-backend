@@ -503,6 +503,8 @@ impl QueueService for QueueServiceImpl {
               AND assigned_worker_id = $3 
               AND organization_id = $4
               AND status = 'processing'
+              AND lease_expires_at IS NOT NULL
+              AND lease_expires_at > NOW()
             "#,
         )
         .bind(&result_json)
@@ -517,7 +519,15 @@ impl QueueService for QueueServiceImpl {
         })?;
 
         if db_result.rows_affected() == 0 {
-            return Err(Status::not_found("Job not found or not authorized"));
+            return Err(
+                classify_worker_miss_status(
+                    self.pool.as_ref(),
+                    &req.job_id,
+                    &req.worker_id,
+                    &auth.organization_id,
+                )
+                .await,
+            );
         }
 
         self.metrics.jobs_completed.inc();
@@ -582,6 +592,8 @@ impl QueueService for QueueServiceImpl {
               AND assigned_worker_id = $4
               AND organization_id = $5
               AND status = 'processing'
+              AND lease_expires_at IS NOT NULL
+              AND lease_expires_at > NOW()
             RETURNING 
                 status as new_status,
                 retry_count as new_retry_count,
@@ -604,7 +616,20 @@ impl QueueService for QueueServiceImpl {
             Status::internal("Failed to update job")
         })?;
 
-        let result = result.ok_or_else(|| Status::not_found("Job not found or not authorized"))?;
+        let result = match result {
+            Some(r) => r,
+            None => {
+                return Err(
+                    classify_worker_miss_status(
+                        self.pool.as_ref(),
+                        &req.job_id,
+                        &req.worker_id,
+                        &auth.organization_id,
+                    )
+                    .await,
+                );
+            }
+        };
 
         self.metrics.jobs_failed.inc();
         self.metrics.jobs_processing.dec();
@@ -612,6 +637,38 @@ impl QueueService for QueueServiceImpl {
         let will_retry = result.new_status == "pending";
         if result.new_status == "deadletter" {
             self.metrics.jobs_deadlettered.inc();
+
+            // Parity with REST: also insert a dead_letter_queue row so DLQ
+            // listings surface failures made via gRPC. Best-effort — errors
+            // here are logged but do not fail the RPC (the job status has
+            // already been moved to deadletter above).
+            if let Err(e) = sqlx::query(
+                r#"
+                INSERT INTO dead_letter_queue (id, job_id, organization_id, queue_name, reason, original_payload, error_details, created_at)
+                SELECT
+                    gen_random_uuid()::TEXT,
+                    id,
+                    organization_id,
+                    queue_name,
+                    $1,
+                    payload,
+                    $2::JSONB,
+                    NOW()
+                FROM jobs WHERE id = $3 AND organization_id = $4
+                "#,
+            )
+            .bind(&error_message)
+            .bind(serde_json::json!({
+                "final_error": error_message,
+                "total_retries": result.new_retry_count,
+            }))
+            .bind(&req.job_id)
+            .bind(&auth.organization_id)
+            .execute(self.pool.as_ref())
+            .await
+            {
+                error!(error = %e, job_id = %req.job_id, "Failed to insert dead_letter_queue row via gRPC");
+            }
         }
 
         info!(
@@ -656,6 +713,8 @@ impl QueueService for QueueServiceImpl {
               AND assigned_worker_id = $3 
               AND organization_id = $4 
               AND status = 'processing'
+              AND lease_expires_at IS NOT NULL
+              AND lease_expires_at > NOW()
             "#,
         )
         .bind(new_expires_at)
@@ -669,21 +728,26 @@ impl QueueService for QueueServiceImpl {
             Status::internal("Failed to renew lease")
         })?;
 
-        let success = result.rows_affected() > 0;
+        if result.rows_affected() == 0 {
+            return Err(
+                classify_worker_miss_status(
+                    self.pool.as_ref(),
+                    &req.job_id,
+                    &req.worker_id,
+                    &auth.organization_id,
+                )
+                .await,
+            );
+        }
 
         debug!(
             job_id = %req.job_id,
-            success = success,
             "Lease renewed via gRPC"
         );
 
         Ok(Response::new(RenewLeaseResponse {
-            success,
-            new_expires_at: if success {
-                Some(datetime_to_timestamp(new_expires_at))
-            } else {
-                None
-            },
+            success: true,
+            new_expires_at: Some(datetime_to_timestamp(new_expires_at)),
         }))
     }
 
@@ -1020,6 +1084,107 @@ async fn handle_process_dequeue(
     }
 }
 
+/// Classify why a worker-scoped UPDATE affected zero rows into a
+/// `tonic::Status` for unary RPCs. Returns `FailedPrecondition`
+/// (LEASE_EXPIRED) when a matching row exists but its lease is
+/// null/past, and `NotFound` otherwise.
+async fn classify_worker_miss_status(
+    pool: &PgPool,
+    job_id: &str,
+    worker_id: &str,
+    org_id: &str,
+) -> Status {
+    /// Same shape as the ProcessJobs helper below — factored to a type alias
+    /// to appease clippy's `type_complexity` lint.
+    type WorkerMissRow = (String, Option<chrono::DateTime<Utc>>);
+
+    let row: Result<Option<WorkerMissRow>, _> = sqlx::query_as(
+        r#"
+        SELECT status, lease_expires_at
+        FROM jobs
+        WHERE id = $1
+          AND organization_id = $2
+          AND assigned_worker_id = $3
+        "#,
+    )
+    .bind(job_id)
+    .bind(org_id)
+    .bind(worker_id)
+    .fetch_optional(pool)
+    .await;
+
+    match row {
+        Ok(Some((status, lease))) if status == "processing" => {
+            let expired = lease.map(|t| t <= Utc::now()).unwrap_or(true);
+            if expired {
+                Status::failed_precondition("Lease expired")
+            } else {
+                Status::not_found("Job not found or not authorized")
+            }
+        }
+        Ok(_) => Status::not_found("Job not found or not authorized"),
+        Err(e) => {
+            error!(error = %e, job_id = %job_id, "Failed to classify worker miss");
+            Status::internal("Failed to check job state")
+        }
+    }
+}
+
+/// Same as [`classify_worker_miss_status`] but returning an in-band
+/// `ErrorResponse` for ProcessJobs streaming replies. Uses code
+/// `LEASE_EXPIRED` (mirrors REST) so clients can distinguish it from
+/// generic `NOT_FOUND`.
+async fn classify_worker_miss_process_response(
+    pool: &PgPool,
+    job_id: &str,
+    worker_id: &str,
+    org_id: &str,
+) -> ProcessResponse {
+    /// Row returned by the worker-miss classifier: current `status` and the
+    /// job's `lease_expires_at` (nullable). Factored out to keep clippy's
+    /// `type_complexity` lint happy at the call site.
+    type WorkerMissRow = (String, Option<chrono::DateTime<Utc>>);
+
+    let (code, message) = match sqlx::query_as::<_, WorkerMissRow>(
+        r#"
+        SELECT status, lease_expires_at
+        FROM jobs
+        WHERE id = $1
+          AND organization_id = $2
+          AND assigned_worker_id = $3
+        "#,
+    )
+    .bind(job_id)
+    .bind(org_id)
+    .bind(worker_id)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(Some((status, lease))) if status == "processing" => {
+            let expired = lease.map(|t| t <= Utc::now()).unwrap_or(true);
+            if expired {
+                ("LEASE_EXPIRED", "Lease expired")
+            } else {
+                ("NOT_FOUND", "Job not found or not authorized")
+            }
+        }
+        Ok(_) => ("NOT_FOUND", "Job not found or not authorized"),
+        Err(e) => {
+            error!(error = %e, job_id = %job_id, "Failed to classify worker miss in ProcessJobs");
+            ("INTERNAL", "Failed to check job state")
+        }
+    };
+
+    ProcessResponse {
+        response: Some(crate::grpc::proto::process_response::Response::Error(
+            crate::grpc::proto::ErrorResponse {
+                code: code.to_string(),
+                message: message.to_string(),
+            },
+        )),
+    }
+}
+
 /// Handle complete request in ProcessJobs stream
 async fn handle_process_complete(
     pool: &PgPool,
@@ -1041,6 +1206,8 @@ async fn handle_process_complete(
           AND assigned_worker_id = $3 
           AND organization_id = $4
           AND status = 'processing'
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at > NOW()
         "#,
     )
     .bind(&result_json)
@@ -1060,14 +1227,9 @@ async fn handle_process_complete(
                 )),
             }
         }
-        Ok(_) => ProcessResponse {
-            response: Some(crate::grpc::proto::process_response::Response::Error(
-                crate::grpc::proto::ErrorResponse {
-                    code: "NOT_FOUND".to_string(),
-                    message: "Job not found or not authorized".to_string(),
-                },
-            )),
-        },
+        Ok(_) => {
+            classify_worker_miss_process_response(pool, &req.job_id, &req.worker_id, org_id).await
+        }
         Err(e) => {
             error!(error = %e, "Failed to complete in ProcessJobs");
             ProcessResponse {
@@ -1101,6 +1263,7 @@ async fn handle_process_fail(
     #[derive(sqlx::FromRow)]
     struct UpdateResult {
         new_status: String,
+        new_retry_count: i32,
         retry_delay_secs: Option<i64>,
     }
 
@@ -1127,8 +1290,11 @@ async fn handle_process_fail(
           AND assigned_worker_id = $4
           AND organization_id = $5
           AND status = 'processing'
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at > NOW()
         RETURNING 
             status as new_status,
+            retry_count as new_retry_count,
             CASE 
                 WHEN status = 'pending' 
                 THEN EXTRACT(EPOCH FROM (scheduled_at - NOW()))::BIGINT
@@ -1151,6 +1317,35 @@ async fn handle_process_fail(
             let will_retry = update_result.new_status == "pending";
             if update_result.new_status == "deadletter" {
                 metrics.jobs_deadlettered.inc();
+
+                // Parity with REST: insert into dead_letter_queue.
+                if let Err(e) = sqlx::query(
+                    r#"
+                    INSERT INTO dead_letter_queue (id, job_id, organization_id, queue_name, reason, original_payload, error_details, created_at)
+                    SELECT
+                        gen_random_uuid()::TEXT,
+                        id,
+                        organization_id,
+                        queue_name,
+                        $1,
+                        payload,
+                        $2::JSONB,
+                        NOW()
+                    FROM jobs WHERE id = $3 AND organization_id = $4
+                    "#,
+                )
+                .bind(&error_message)
+                .bind(serde_json::json!({
+                    "final_error": error_message,
+                    "total_retries": update_result.new_retry_count,
+                }))
+                .bind(&req.job_id)
+                .bind(org_id)
+                .execute(pool)
+                .await
+                {
+                    error!(error = %e, job_id = %req.job_id, "Failed to insert dead_letter_queue row in ProcessJobs");
+                }
             }
             ProcessResponse {
                 response: Some(crate::grpc::proto::process_response::Response::Fail(
@@ -1162,14 +1357,9 @@ async fn handle_process_fail(
                 )),
             }
         }
-        Ok(None) => ProcessResponse {
-            response: Some(crate::grpc::proto::process_response::Response::Error(
-                crate::grpc::proto::ErrorResponse {
-                    code: "NOT_FOUND".to_string(),
-                    message: "Job not found or not authorized".to_string(),
-                },
-            )),
-        },
+        Ok(None) => {
+            classify_worker_miss_process_response(pool, &req.job_id, &req.worker_id, org_id).await
+        }
         Err(e) => {
             error!(error = %e, "Failed to fail in ProcessJobs");
             ProcessResponse {
@@ -1201,6 +1391,8 @@ async fn handle_process_renew(
           AND assigned_worker_id = $3 
           AND organization_id = $4 
           AND status = 'processing'
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at > NOW()
         "#,
     )
     .bind(new_expires_at)
@@ -1211,20 +1403,16 @@ async fn handle_process_renew(
     .await;
 
     match result {
-        Ok(res) => {
-            let success = res.rows_affected() > 0;
-            ProcessResponse {
-                response: Some(crate::grpc::proto::process_response::Response::RenewLease(
-                    RenewLeaseResponse {
-                        success,
-                        new_expires_at: if success {
-                            Some(datetime_to_timestamp(new_expires_at))
-                        } else {
-                            None
-                        },
-                    },
-                )),
-            }
+        Ok(res) if res.rows_affected() > 0 => ProcessResponse {
+            response: Some(crate::grpc::proto::process_response::Response::RenewLease(
+                RenewLeaseResponse {
+                    success: true,
+                    new_expires_at: Some(datetime_to_timestamp(new_expires_at)),
+                },
+            )),
+        },
+        Ok(_) => {
+            classify_worker_miss_process_response(pool, &req.job_id, &req.worker_id, org_id).await
         }
         Err(e) => {
             error!(error = %e, "Failed to renew lease in ProcessJobs");

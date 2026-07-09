@@ -44,7 +44,11 @@ impl Scheduler {
         // Task intervals
         let mut scheduled_job_ticker = interval(Duration::from_secs(5));
         let mut cron_ticker = interval(Duration::from_secs(10)); // Process cron schedules
-        let mut lease_recovery_ticker = interval(Duration::from_secs(30));
+        // API layer now rejects worker ops on expired leases (409 LEASE_EXPIRED),
+        // so this ticker is a secondary safety net that reclaims rows abandoned
+        // by crashed workers. Dropped from 30s → 10s so a second worker can
+        // reclaim within ≤15s of lease expiry (per plan).
+        let mut lease_recovery_ticker = interval(Duration::from_secs(10));
         let mut metrics_ticker = interval(Duration::from_secs(15));
         let mut cleanup_ticker = interval(Duration::from_secs(300)); // 5 minutes
         let mut dependency_ticker = interval(Duration::from_secs(10)); // Check job dependencies
