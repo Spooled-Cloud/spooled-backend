@@ -176,9 +176,13 @@ impl Scheduler {
                 retry_count = retry_count + 1,
                 last_error = 'Lease expired (worker timeout)',
                 updated_at = NOW()
-            WHERE 
+            WHERE
                 status = 'processing'
-                AND lease_expires_at < NOW()
+                -- `<=` so the expiry boundary is owned by reclaim: worker operations
+                -- require `lease_expires_at > NOW()`, so at exactly NOW() the lease is
+                -- no longer worker-usable and must be reclaimable (with `<` a lease at
+                -- the exact tick was neither usable nor reclaimable).
+                AND lease_expires_at <= NOW()
                 AND retry_count < max_retries
             "#,
         )

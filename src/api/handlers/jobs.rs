@@ -919,6 +919,44 @@ pub async fn bulk_enqueue(
         return Err(AppError::LimitExceeded(Box::new(response)));
     }
 
+    // Atomically reserve the daily-job quota for the WHOLE batch before inserting.
+    // check_job_limits above is a fast non-atomic pre-check (and still guards the soft
+    // active-jobs limit); this row-locked reservation is the authoritative daily cap,
+    // closing the window where N concurrent bulk requests each passed the pre-check and
+    // then all inserted, overshooting jobs_per_day (the single-enqueue path already does
+    // this via try_increment_daily_jobs). All-or-nothing: a batch that would exceed the
+    // cap is rejected before any job is created. A batch containing in-batch idempotency
+    // duplicates reserves its request size, i.e. counts conservatively (never overshoots).
+    let daily_limit = daily_jobs_limit(state.db.pool(), &org_id)
+        .await
+        .unwrap_or(-1);
+    let quota_reserved = match try_increment_daily_jobs(
+        state.db.pool(),
+        &org_id,
+        job_count as i32,
+        daily_limit,
+    )
+    .await
+    {
+        Ok(count) if count >= 0 => true,
+        Ok(_) => {
+            let response = check_job_limits(state.db.pool(), &org_id, job_count)
+                .await
+                .err()
+                .unwrap_or_else(|| {
+                    (StatusCode::TOO_MANY_REQUESTS, "Daily job limit reached").into_response()
+                });
+            return Err(AppError::LimitExceeded(Box::new(response)));
+        }
+        Err(e) => {
+            // Counter DB error: proceed best-effort (matching the single-enqueue path)
+            // rather than failing an otherwise-valid batch. The post-insert block below
+            // then credits the actual creations.
+            tracing::warn!(error = %e, org_id = %org_id, "Failed to reserve daily job quota for bulk enqueue");
+            false
+        }
+    };
+
     // Batch INSERT using UNNEST - single database round-trip
     // Returns: (index, returned_job_id, input_job_id) to determine which were created vs deduplicated
     let results: Result<Vec<(i32, String, String)>, sqlx::Error> = sqlx::query_as(
@@ -1042,7 +1080,26 @@ pub async fn bulk_enqueue(
     // Update metrics and usage counters
     if successful_count > 0 {
         state.metrics.jobs_enqueued.inc_by(successful_count);
+    }
 
+    // Reconcile the daily counter so it reflects the jobs actually created.
+    if quota_reserved {
+        // The whole batch (job_count) was reserved up-front to prevent overshoot; refund
+        // the credits for rows NOT created — in-batch/idempotency duplicates, or a fully
+        // failed insert (successful_count == 0) — so the net credit equals the creations.
+        let unused = job_count as i64 - successful_count as i64;
+        if unused > 0 {
+            if let Err(e) = increment_daily_jobs(state.db.pool(), &org_id, -(unused as i32)).await {
+                tracing::warn!(
+                    error = %e,
+                    org_id = %org_id,
+                    refund = unused,
+                    "Failed to refund unused daily job reservation after bulk enqueue"
+                );
+            }
+        }
+    } else if successful_count > 0 {
+        // Reservation errored above: fall back to crediting the actual creations.
         if let Err(e) =
             increment_daily_jobs(state.db.pool(), &org_id, successful_count as i32).await
         {

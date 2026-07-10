@@ -19,7 +19,8 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info, warn};
 
 use crate::api::middleware::limits::{
-    check_job_limits_generic, check_payload_size_generic, increment_daily_jobs, LimitCheckError,
+    check_job_limits_generic, check_payload_size_generic, daily_jobs_limit,
+    try_increment_daily_jobs, LimitCheckError,
 };
 use crate::cache::RedisCache;
 use crate::config::PlanLimits;
@@ -379,12 +380,34 @@ impl QueueService for QueueServiceImpl {
 
         // Update metrics and usage counters
         if created {
-            self.metrics.jobs_enqueued.inc();
-
-            // Increment daily job counter for plan limit tracking
-            if let Err(e) = increment_daily_jobs(self.pool.as_ref(), &auth.organization_id, 1).await
+            // Atomically enforce + increment the daily quota, closing the check-then-
+            // increment race the generic pre-check above leaves open (mirrors the REST
+            // enqueue path). If over the cap, remove the job we just created and reject.
+            // The enqueued metric is only bumped for jobs that are kept, so an over-cap
+            // rejection doesn't inflate it.
+            let limit = daily_jobs_limit(self.pool.as_ref(), &auth.organization_id)
+                .await
+                .unwrap_or(-1);
+            match try_increment_daily_jobs(self.pool.as_ref(), &auth.organization_id, 1, limit)
+                .await
             {
-                tracing::warn!(error = %e, org_id = %auth.organization_id, "Failed to increment daily job counter");
+                Ok(count) if count >= 0 => {
+                    self.metrics.jobs_enqueued.inc();
+                }
+                Ok(_) => {
+                    let _ = sqlx::query("DELETE FROM jobs WHERE id = $1 AND organization_id = $2")
+                        .bind(&returned_id)
+                        .bind(&auth.organization_id)
+                        .execute(self.pool.as_ref())
+                        .await;
+                    return Err(Status::resource_exhausted("Daily job limit reached"));
+                }
+                Err(e) => {
+                    // Counter DB error: keep the job (best-effort) rather than failing an
+                    // accepted enqueue, and still count it as enqueued.
+                    self.metrics.jobs_enqueued.inc();
+                    tracing::warn!(error = %e, org_id = %auth.organization_id, "Failed to increment daily job counter");
+                }
             }
         }
 
@@ -578,7 +601,7 @@ impl QueueService for QueueServiceImpl {
                 retry_count = retry_count + 1,
                 scheduled_at = CASE 
                     WHEN $1 = TRUE AND retry_count < max_retries 
-                    THEN NOW() + (POWER(2, retry_count) || ' minutes')::INTERVAL
+                    THEN NOW() + (LEAST(POWER(2, LEAST(retry_count, 6)), 60) || ' seconds')::INTERVAL
                     ELSE scheduled_at
                 END,
                 assigned_worker_id = NULL,

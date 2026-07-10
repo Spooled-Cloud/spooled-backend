@@ -5,6 +5,7 @@
 use axum::{
     extract::{Extension, Path, Query, State},
     http::StatusCode,
+    response::{IntoResponse, Response},
     Json,
 };
 use chrono::Utc;
@@ -12,7 +13,7 @@ use serde::Deserialize;
 use tracing::{error, info};
 
 use crate::api::middleware::limits::{
-    check_job_limits_generic, check_payload_size_generic, check_resource_limit_conn,
+    check_job_limits, check_payload_size, check_payload_size_generic, check_resource_limit_conn,
     increment_daily_jobs, lock_resource, LimitCheckError,
 };
 use crate::api::middleware::validation::ValidatedJson;
@@ -448,7 +449,7 @@ pub async fn trigger(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
     Path(id): Path<String>,
-) -> Result<Json<TriggerResponse>, (StatusCode, String)> {
+) -> Result<Json<TriggerResponse>, Response> {
     // Get schedule with org check
     let schedule: Option<Schedule> =
         sqlx::query_as("SELECT * FROM schedules WHERE id = $1 AND organization_id = $2")
@@ -459,47 +460,22 @@ pub async fn trigger(
             // Don't expose database error details
             .map_err(|e| {
                 error!(error = %e, "Failed to get schedule for trigger");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to get schedule".to_string(),
-                )
+                (StatusCode::INTERNAL_SERVER_ERROR, "Failed to get schedule").into_response()
             })?;
 
-    let schedule = schedule.ok_or((StatusCode::NOT_FOUND, "Schedule not found".to_string()))?;
+    let schedule =
+        schedule.ok_or_else(|| (StatusCode::NOT_FOUND, "Schedule not found").into_response())?;
 
-    // Check job limits before creating job from schedule trigger
-    check_job_limits_generic(state.db.pool(), &ctx.organization_id, 1)
-        .await
-        .map_err(|e| match e {
-            LimitCheckError::Database(msg) => {
-                error!(error = %msg, "Failed to check job limits for schedule trigger");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to check limits".to_string(),
-                )
-            }
-            LimitCheckError::LimitExceeded(err) => (StatusCode::FORBIDDEN, err.to_string()),
-            LimitCheckError::PayloadTooLarge { .. } => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Limit check error".to_string(),
-            ),
-        })?;
+    // Check job limits before creating a job from the schedule trigger. Use the same
+    // check_job_limits/check_payload_size helpers the direct enqueue path uses so a
+    // triggered job over quota returns the structured 429 `QUOTA_EXCEEDED` (and an
+    // oversized template returns 413), instead of the plain-text 403 SDKs
+    // misclassified as UNKNOWN_ERROR.
+    check_job_limits(state.db.pool(), &ctx.organization_id, 1).await?;
 
     // Also enforce plan payload size for the schedule's payload template.
     let payload_json = serde_json::to_string(&schedule.payload_template).unwrap_or_default();
-    check_payload_size_generic(state.db.pool(), &ctx.organization_id, payload_json.len())
-        .await
-        .map_err(|e| match e {
-            LimitCheckError::Database(msg) => {
-                error!(error = %msg, "Failed to check payload size for schedule trigger");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to check limits".to_string(),
-                )
-            }
-            LimitCheckError::PayloadTooLarge { .. } => (StatusCode::FORBIDDEN, e.to_string()),
-            LimitCheckError::LimitExceeded(err) => (StatusCode::FORBIDDEN, err.to_string()),
-        })?;
+    check_payload_size(state.db.pool(), &ctx.organization_id, payload_json.len()).await?;
 
     // Create job immediately
     let job_id = uuid::Uuid::new_v4().to_string();
@@ -528,10 +504,7 @@ pub async fn trigger(
     // Don't expose database error details
     .map_err(|e| {
         error!(error = %e, "Failed to create job from schedule trigger");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to create job".to_string(),
-        )
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to create job").into_response()
     })?;
 
     // Update schedule's last_run_at and run_count

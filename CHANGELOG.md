@@ -7,6 +7,50 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.91] - 2026-07-09
+
+Fixes from an independent third-party audit of the running service.
+
+### Fixed
+
+- **Payload-too-large is now HTTP 413, not 200.** The plan payload-size rejection
+  built its JSON body with `Json(..).into_response()`, which defaults to HTTP 200,
+  so clients received an `error: payload_too_large` body under a *success* status
+  and treated the rejected job as accepted. It now returns 413 with a stable
+  `code: "PAYLOAD_TOO_LARGE"`. Affects every path that enforces the plan payload
+  size (single/bulk enqueue, workflow jobs, webhooks, schedule trigger).
+- **Daily job quota is now enforced atomically on bulk and gRPC enqueue.** Only the
+  single `POST /jobs` path used the row-locked `try_increment_daily_jobs`; bulk
+  enqueue and gRPC `Enqueue` did a non-atomic check-then-increment, so concurrent
+  requests could all pass the check and overshoot `jobs_per_day` (observed 30 for a
+  cap of 25). Bulk now atomically reserves the whole batch before inserting and
+  refunds the credits for any deduplicated/failed rows (net credit == jobs created);
+  gRPC reserves-and-rejects like the single path. Workflow-create and the manual
+  schedule trigger still credit the daily counter non-atomically — a bounded race
+  gated by their own resource caps — and are tracked as a follow-up.
+- **gRPC retry backoff was in minutes; now seconds, matching REST.** A gRPC
+  `Fail`/`ProcessJobs` retry scheduled the next attempt at `2^retry_count` **minutes**
+  (unbounded — 17 hours by the 10th retry), while REST uses `2^min(retry_count,6)`
+  **seconds** capped at 60s. Both gRPC retry paths now use the same seconds-based,
+  capped formula.
+- **Schedule manual trigger returns the structured 429 on quota.** `POST
+  /schedules/{id}/trigger` returned a plain-text 403 when the daily job quota was
+  exhausted (and a 403 for oversized payloads), which SDKs misclassified as
+  `UNKNOWN_ERROR`. It now returns the same `429 QUOTA_EXCEEDED` / `413
+  PAYLOAD_TOO_LARGE` bodies as the direct enqueue path.
+- **Expired-lease reclaim uses `<=` on the boundary.** Worker operations require
+  `lease_expires_at > NOW()`; the reclaim sweep required `lease_expires_at < NOW()`,
+  leaving a lease at exactly `NOW()` neither worker-usable nor reclaimable. Reclaim
+  now uses `<=` so the expiry instant is owned by reclaim.
+
+### Audit findings intentionally not changed
+
+- The report's "gRPC complete skips `parent_job_id` child unblock" is a false
+  positive: `parent_job_id` children get a `job_dependencies` edge at creation, and
+  the `AFTER UPDATE OF status` trigger releases dependents on any completion (REST or
+  gRPC). The "admin `null` ignored" and "bogus-key ~2.9s" observations were against a
+  deployment predating v0.1.90 (both fixed there, pending redeploy).
+
 ## [0.1.90] - 2026-07-09
 
 ### Security

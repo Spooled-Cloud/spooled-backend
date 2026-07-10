@@ -403,18 +403,26 @@ pub async fn check_payload_size(
                 limit,
                 plan,
                 upgrade_to,
-            } => Json(serde_json::json!({
-                "error": "payload_too_large",
-                "message": format!(
-                    "Payload size ({} bytes) exceeds plan limit ({} bytes). Upgrade for larger payloads.",
-                    current, limit
-                ),
-                "current": current,
-                "limit": limit,
-                "plan": plan,
-                "upgrade_to": upgrade_to.is_some()
-            }))
-            .into_response(),
+            } => (
+                // Must carry an explicit status: `Json(..).into_response()` defaults to
+                // HTTP 200, so clients received an error body under a success status and
+                // treated the rejected job as accepted. 413 is the correct status for a
+                // payload that exceeds the (plan) size limit.
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({
+                    "error": "payload_too_large",
+                    "code": "PAYLOAD_TOO_LARGE",
+                    "message": format!(
+                        "Payload size ({} bytes) exceeds plan limit ({} bytes). Upgrade for larger payloads.",
+                        current, limit
+                    ),
+                    "current": current,
+                    "limit": limit,
+                    "plan": plan,
+                    "upgrade_to": upgrade_to.is_some()
+                })),
+            )
+                .into_response(),
         })
 }
 
