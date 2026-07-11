@@ -7,6 +7,7 @@ use axum::{
 };
 use chrono::Utc;
 
+use crate::api::handlers::require_queue_access;
 use crate::api::middleware::limits::{check_resource_limit_conn, lock_resource};
 use crate::api::AppState;
 use crate::error::{AppError, AppResult};
@@ -74,6 +75,9 @@ pub async fn list(
         }
     }
 
+    // Queue scope: a restricted key only sees its own queues.
+    summaries.retain(|s| ctx.can_access_queue(&s.queue_name));
+
     summaries.sort_by(|a, b| a.queue_name.cmp(&b.queue_name));
     summaries.truncate(MAX_QUEUES_PER_PAGE as usize);
 
@@ -110,6 +114,7 @@ pub async fn get(
     Path(name): Path<String>,
 ) -> AppResult<Json<QueueConfig>> {
     validate_queue_name_param(&name)?;
+    require_queue_access(&ctx, &name)?;
 
     if let Some(config) = sqlx::query_as::<_, QueueConfig>(
         "SELECT * FROM queue_config WHERE queue_name = $1 AND organization_id = $2",
@@ -161,6 +166,7 @@ pub async fn update_config(
     Path(name): Path<String>,
     Json(request): Json<UpsertQueueConfigRequest>,
 ) -> AppResult<Json<QueueConfig>> {
+    require_queue_access(&ctx, &name)?;
     // Enforce the queues cap atomically: an advisory lock serializes concurrent
     // config-creates for this org, so two requests can't both see "not existing"
     // and both insert past the plan limit.
@@ -248,6 +254,7 @@ pub async fn stats(
 ) -> AppResult<Json<QueueStats>> {
     // Validate queue name
     validate_queue_name_param(&name)?;
+    require_queue_access(&ctx, &name)?;
 
     // Check both legacy queue_name AND queue_names array for accurate worker count
     let stats = sqlx::query_as::<_, (i64, i64, i64, i64, Option<f64>, Option<i64>, i64)>(
@@ -291,6 +298,7 @@ pub async fn pause(
     // body-less pause must succeed (a mandatory `Json` extractor 415s on no body).
     body: Option<Json<PauseQueueRequest>>,
 ) -> AppResult<Json<PauseQueueResponse>> {
+    require_queue_access(&ctx, &name)?;
     let now = Utc::now();
     let reason = body.and_then(|Json(r)| r.reason);
 
@@ -351,6 +359,7 @@ pub async fn resume(
     Extension(ctx): Extension<ApiKeyContext>,
     Path(name): Path<String>,
 ) -> AppResult<Json<ResumeQueueResponse>> {
+    require_queue_access(&ctx, &name)?;
     // Get current pause state
     let config: Option<(serde_json::Value,)> = sqlx::query_as(
         "SELECT settings FROM queue_config WHERE queue_name = $1 AND organization_id = $2",
@@ -416,6 +425,7 @@ pub async fn delete(
     Extension(ctx): Extension<ApiKeyContext>,
     Path(name): Path<String>,
 ) -> AppResult<StatusCode> {
+    require_queue_access(&ctx, &name)?;
     // Check if queue has pending jobs
     let (pending_count,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM jobs WHERE queue_name = $1 AND organization_id = $2 AND status IN ('pending', 'processing')"

@@ -165,31 +165,47 @@ async fn authenticate_jwt_token(
         }
     }
 
-    // Verify the API key is still active
-    let api_key_active: Option<(bool, Option<i32>)> =
-        sqlx::query_as("SELECT is_active, rate_limit FROM api_keys WHERE id = $1")
-            .bind(&token_data.claims.api_key_id)
-            .fetch_optional(state.db.pool())
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "Failed to check API key status");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Database error".to_string(),
-                )
-            })?;
+    // Verify the API key is still active AND not expired, and read its CURRENT queue
+    // scope from the DB. Trusting the token's `claims.queues` let a key that was later
+    // narrowed (e.g. `["*"]` -> `["emails"]`) keep its old wildcard scope for the JWT's
+    // lifetime; and omitting `expires_at` let a JWT outlive the key's expiry (the direct
+    // API-key path already rejects expired keys).
+    #[allow(clippy::type_complexity)]
+    let api_key_row: Option<(
+        bool,
+        Option<i32>,
+        Option<chrono::DateTime<Utc>>,
+        Vec<String>,
+    )> = sqlx::query_as(
+        "SELECT is_active, rate_limit, expires_at, queues FROM api_keys WHERE id = $1",
+    )
+    .bind(&token_data.claims.api_key_id)
+    .fetch_optional(state.db.pool())
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, "Failed to check API key status");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Database error".to_string(),
+        )
+    })?;
 
-    match api_key_active {
-        Some((true, rate_limit)) => {
-            // API key is active, create context from JWT claims
+    match api_key_row {
+        Some((true, rate_limit, expires_at, queues)) => {
+            if let Some(expires) = expires_at {
+                if expires < Utc::now() {
+                    return Err((StatusCode::UNAUTHORIZED, "API key has expired".to_string()));
+                }
+            }
+            // Build context from the CURRENT DB scope, not the (possibly stale) token.
             Ok(ApiKeyContext {
                 api_key_id: token_data.claims.api_key_id,
                 organization_id: token_data.claims.org_id,
-                queues: token_data.claims.queues,
+                queues,
                 rate_limit,
             })
         }
-        Some((false, _)) => {
+        Some((false, _, _, _)) => {
             tracing::warn!(
                 api_key_id = %token_data.claims.api_key_id,
                 "JWT token references revoked API key"

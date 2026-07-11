@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::api::handlers::require_queue_access;
 use crate::api::middleware::limits::{
     check_job_limits, check_payload_size, daily_jobs_limit, increment_daily_jobs,
     try_increment_daily_jobs,
@@ -124,6 +125,15 @@ pub async fn list(
     let mut qb: QueryBuilder<Postgres> =
         QueryBuilder::new("SELECT * FROM jobs WHERE organization_id = ");
     qb.push_bind(org_id);
+
+    // Queue scope: a restricted key only ever lists jobs in its own queues. This must
+    // RESTRICT the result set (not merely validate an optional filter), otherwise a
+    // scoped key with no `queue_name` filter would see every queue's jobs.
+    if let Some(allowed) = ctx.queue_scope_filter() {
+        qb.push(" AND queue_name = ANY(");
+        qb.push_bind(allowed.to_vec());
+        qb.push(")");
+    }
 
     if let Some(queue) = &validated_queue {
         qb.push(" AND queue_name = ");
@@ -651,6 +661,12 @@ pub async fn get(
         // Don't expose job ID in error message
         .ok_or_else(|| AppError::NotFound("Job not found".to_string()))?;
 
+    // Queue-scope: a key restricted to certain queues must not read jobs in other
+    // queues. Return the same not-found so out-of-scope job existence isn't revealed.
+    if !ctx.can_access_queue(&job.queue_name) {
+        return Err(AppError::NotFound("Job not found".to_string()));
+    }
+
     Ok(Json(job))
 }
 
@@ -662,20 +678,25 @@ pub async fn cancel(
     Extension(ctx): Extension<ApiKeyContext>,
     Path(id): Path<String>,
 ) -> AppResult<StatusCode> {
-    // Capture current status/queue for accurate realtime event (best-effort).
-    // This is safe because it is scoped to the authenticated org.
+    // Capture current status/queue for accurate realtime event, AND authoritatively
+    // enforce queue scope: a restricted key cannot cancel jobs in queues outside its
+    // scope (returns not-found so existence isn't revealed).
     let before: Option<(String, String)> = sqlx::query_as(
         "SELECT status, queue_name FROM jobs WHERE id = $1 AND organization_id = $2",
     )
     .bind(&id)
     .bind(&ctx.organization_id)
     .fetch_optional(state.db.pool())
-    .await
-    .unwrap_or(None);
+    .await?;
+    if let Some((_, ref queue_name)) = before {
+        if !ctx.can_access_queue(queue_name) {
+            return Err(AppError::NotFound("Job not found".to_string()));
+        }
+    }
 
     let result = sqlx::query(
         r#"
-        UPDATE jobs 
+        UPDATE jobs
         SET status = 'cancelled', updated_at = NOW()
         WHERE id = $1 AND organization_id = $2 AND status IN ('pending', 'scheduled')
         "#,
@@ -747,14 +768,21 @@ pub async fn retry(
     Extension(ctx): Extension<ApiKeyContext>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Job>> {
-    // Capture previous status for realtime event (failed vs deadletter)
-    let before_status: Option<(String,)> =
-        sqlx::query_as("SELECT status FROM jobs WHERE id = $1 AND organization_id = $2")
-            .bind(&id)
-            .bind(&ctx.organization_id)
-            .fetch_optional(state.db.pool())
-            .await
-            .unwrap_or(None);
+    // Capture previous status for realtime event (failed vs deadletter) AND enforce
+    // queue scope: a restricted key cannot retry jobs in queues outside its scope.
+    let before: Option<(String, String)> = sqlx::query_as(
+        "SELECT status, queue_name FROM jobs WHERE id = $1 AND organization_id = $2",
+    )
+    .bind(&id)
+    .bind(&ctx.organization_id)
+    .fetch_optional(state.db.pool())
+    .await?;
+    if let Some((_, ref queue_name)) = before {
+        if !ctx.can_access_queue(queue_name) {
+            return Err(AppError::NotFound("Job not found".to_string()));
+        }
+    }
+    let before_status: Option<(String,)> = before.as_ref().map(|(s, _)| (s.clone(),));
 
     let job = sqlx::query_as::<_, Job>(
         r#"
@@ -1171,21 +1199,29 @@ pub async fn boost_priority(
     // additional clamp is needed (the previous ±1000 clamp was unreachable).
     let new_priority = request.priority;
 
-    // Get current priority - with organization check
-    let job: Option<(i32,)> = sqlx::query_as(
-        "SELECT priority FROM jobs WHERE id = $1 AND organization_id = $2 AND status IN ('pending', 'scheduled')"
+    // Get current priority + queue - with organization check
+    let job: Option<(i32, String)> = sqlx::query_as(
+        "SELECT priority, queue_name FROM jobs WHERE id = $1 AND organization_id = $2 AND status IN ('pending', 'scheduled')"
     )
     .bind(&id)
     .bind(&ctx.organization_id)
     .fetch_optional(state.db.pool())
     .await?;
 
-    let Some((old_priority,)) = job else {
+    let Some((old_priority, queue_name)) = job else {
         return Err(AppError::NotFound(format!(
             "Job {} not found or not in pending/scheduled state",
             id
         )));
     };
+
+    // Queue scope: a restricted key cannot boost jobs in queues outside its scope.
+    if !ctx.can_access_queue(&queue_name) {
+        return Err(AppError::NotFound(format!(
+            "Job {} not found or not in pending/scheduled state",
+            id
+        )));
+    }
 
     // Update priority - with organization check
     // Use clamped priority value
@@ -1240,6 +1276,13 @@ pub async fn list_dlq(
         QueryBuilder::new("SELECT * FROM jobs WHERE status = 'deadletter' AND organization_id = ");
     qb.push_bind(&ctx.organization_id);
 
+    // Queue scope: restrict a scoped key's DLQ listing to its own queues.
+    if let Some(allowed) = ctx.queue_scope_filter() {
+        qb.push(" AND queue_name = ANY(");
+        qb.push_bind(allowed.to_vec());
+        qb.push(")");
+    }
+
     if let Some(queue) = &validated_queue {
         qb.push(" AND queue_name = ");
         qb.push_bind(queue);
@@ -1272,6 +1315,25 @@ pub async fn retry_dlq(
 ) -> AppResult<Json<crate::models::RetryDlqResponse>> {
     // Use safe_limit method to enforce bounds
     let limit = request.safe_limit();
+
+    // Queue scope: a restricted key may only retry DLQ jobs in a queue it can access.
+    // The `job_ids` and all-queue branches can span queues, so they are denied for
+    // scoped keys — such a key must name an accessible queue_name.
+    if ctx.queue_scope_filter().is_some() {
+        if request.job_ids.is_some() {
+            return Err(AppError::Authorization(
+                "Queue-scoped API keys must retry DLQ by queue_name, not job_ids".to_string(),
+            ));
+        }
+        match &request.queue_name {
+            Some(q) => require_queue_access(&ctx, q)?,
+            None => {
+                return Err(AppError::Authorization(
+                    "Queue-scoped API keys must specify a queue_name for DLQ retry".to_string(),
+                ))
+            }
+        }
+    }
 
     // Bound the client-supplied id list to the same safe limit as the queue path.
     // The job_ids branch uses `id = ANY($1)` with no cap, so without this a caller
@@ -1463,6 +1525,20 @@ pub async fn purge_dlq(
         ));
     }
 
+    // Queue scope: a restricted key may only purge within a queue it can access. The
+    // `queue_name = None` branches below delete across ALL queues, so they are denied
+    // for scoped keys — such a key must name an accessible queue_name.
+    if ctx.queue_scope_filter().is_some() {
+        match &request.queue_name {
+            Some(q) => require_queue_access(&ctx, q)?,
+            None => {
+                return Err(AppError::Authorization(
+                    "Queue-scoped API keys must specify a queue_name to purge".to_string(),
+                ))
+            }
+        }
+    }
+
     // Get limit with max bound
     let limit = request
         .limit
@@ -1606,6 +1682,13 @@ pub async fn batch_status(
     .bind(&ctx.organization_id)
     .fetch_all(state.db.pool())
     .await?;
+
+    // Queue scope: drop jobs in queues a restricted key can't access (per-job, since
+    // the id list can span queues). Unrestricted keys keep everything.
+    let jobs: Vec<BatchJobStatus> = jobs
+        .into_iter()
+        .filter(|j| ctx.can_access_queue(&j.queue_name))
+        .collect();
 
     Ok(Json(jobs))
 }

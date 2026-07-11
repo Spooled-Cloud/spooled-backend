@@ -7,6 +7,63 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.93] - 2026-07-11
+
+Remediation of an external audit (all 10 findings verified against the code first).
+
+### Security
+
+- **Queue scope is now enforced on every path, not just enqueue/claim.** An API key's
+  `queues` list is an intra-org least-privilege boundary, but it was only checked when
+  creating/claiming jobs. A queue-scoped key could still read, cancel, retry, boost,
+  and purge-DLQ jobs, list/pause/delete queue config, receive realtime events, and
+  (via workflows/schedules) *enqueue* into queues outside its scope. Scope is now
+  enforced uniformly across:
+  - REST jobs read/control (`get`, `list`, `cancel`, `retry`, `boost_priority`,
+    `list_dlq`, `retry_dlq`, `purge_dlq`, `batch_status`) — out-of-scope jobs are
+    invisible (same "not found" as a missing job, no existence leak);
+  - REST queues (`list`, `get`, `stats`, `update_config`, `pause`, `resume`, `delete`);
+  - indirect enqueue (workflow job definitions, schedule create + trigger);
+  - realtime — the WebSocket event fan-out now drops events for out-of-scope queues
+    even with no client filter (previously a firehose), and the SSE job/queue streams
+    enforce scope;
+  - gRPC streaming (`StreamJobs`, `ProcessJobs` per message), which bypassed the check
+    the unary `Dequeue` already had.
+  Unrestricted keys (empty list or `*`) are unaffected. **Behavior change:** existing
+  queue-scoped keys that previously saw/controlled all queues are now restricted to
+  their listed queues.
+- **A queue-scoped key can no longer mint or broaden a key beyond its own scope.**
+  `POST/PUT /api-keys` now rejects granting the `*` wildcard or any queue outside the
+  caller's scope (previously a leaked worker key could create an org-wide key). New
+  `ApiKeyContext::can_grant_queues`.
+- **JWT auth now honors current key expiry and queue scope.** The JWT middleware read
+  only `is_active` and trusted the token's cached `queues`, so a JWT could outlive its
+  key's `expires_at` and retain a scope the key no longer had. It now reads
+  `expires_at` and the current `queues` from the database on every request.
+- **Self-serve email signup honors registration controls, and can't revive deleted
+  orgs.** `complete_signup` now enforces `EMAIL_SIGNUP_ENABLED` + `REGISTRATION_MODE`
+  (previously defined but never checked), and the email-login lookups exclude
+  `plan_tier = 'deleted'` organizations so a soft-deleted org can't be reactivated with
+  a fresh key.
+
+### Fixed
+
+- **gRPC `ProcessJobs` retry backoff was still in minutes.** The v0.1.91 fix corrected
+  the unary `Fail` path but missed the `ProcessJobs` stream fail path, which still used
+  `2^retry_count` **minutes** (uncapped). Now `2^min(retry,6)` seconds capped at 60s,
+  matching the rest.
+- **gRPC dequeue paths now respect paused queues.** The unary/stream/process gRPC claim
+  SQL ignored `queue_config.enabled = false`, so gRPC workers drained a queue the REST
+  path had paused. All three now skip paused queues.
+
+### Known follow-ups (deferred)
+
+- Lease fencing keys on `worker_id` + expiry, not `lease_id`, so a stale completion
+  from a re-leased same-worker job can win. A correct fix requires returning `lease_id`
+  to workers (proto + SDK changes) and is tracked separately.
+- Frontend `security.astro`/`privacy.astro` overstate DB-TLS and RBAC — corrected in
+  the frontend repo separately.
+
 ## [0.1.92] - 2026-07-10
 
 Fixes from a second independent audit of the running service.

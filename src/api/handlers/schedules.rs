@@ -12,6 +12,7 @@ use chrono::Utc;
 use serde::Deserialize;
 use tracing::{error, info};
 
+use crate::api::handlers::require_queue_access;
 use crate::api::middleware::limits::{
     check_job_limits, check_payload_size, check_payload_size_generic, check_resource_limit_conn,
     increment_daily_jobs, lock_resource, LimitCheckError,
@@ -105,6 +106,11 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<CreateScheduleResponse>), axum::response::Response> {
     use axum::response::IntoResponse;
     let org_id = &ctx.organization_id;
+
+    // Queue scope: a schedule is an indirect enqueue — a restricted key must not
+    // schedule jobs into a queue outside its scope.
+    crate::api::handlers::require_queue_access(&ctx, &req.queue_name)
+        .map_err(IntoResponse::into_response)?;
 
     // Enforce plan payload size for schedule payload_template at creation time too.
     let payload_json = serde_json::to_string(&req.payload_template).unwrap_or_default();
@@ -465,6 +471,10 @@ pub async fn trigger(
 
     let schedule =
         schedule.ok_or_else(|| (StatusCode::NOT_FOUND, "Schedule not found").into_response())?;
+
+    // Queue scope: firing a schedule is an indirect enqueue into schedule.queue_name;
+    // a restricted key must not trigger a schedule targeting a queue outside its scope.
+    require_queue_access(&ctx, &schedule.queue_name).map_err(IntoResponse::into_response)?;
 
     // Check job limits before creating a job from the schedule trigger. Use the same
     // check_job_limits/check_payload_size helpers the direct enqueue path uses so a

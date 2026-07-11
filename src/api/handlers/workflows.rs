@@ -249,9 +249,12 @@ pub async fn create(
         return Err(AppError::LimitExceeded(Box::new(response)));
     }
 
-    // Enforce plan payload size for workflow jobs too (plan overrides + custom_limits).
+    // Enforce plan payload size for workflow jobs too (plan overrides + custom_limits),
+    // AND queue scope: a workflow is an indirect enqueue, so a restricted key must not
+    // be able to place a job into a queue outside its scope via a workflow job.
     let mut max_payload_size: usize = 0;
     for job_def in &request.jobs {
+        crate::api::handlers::require_queue_access(&ctx, &job_def.queue_name)?;
         let payload_json = serde_json::to_string(&job_def.payload).unwrap_or_default();
         max_payload_size = max_payload_size.max(payload_json.len());
     }

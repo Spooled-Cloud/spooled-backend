@@ -212,6 +212,36 @@ impl ApiKeyContext {
     pub fn can_access_queue(&self, queue_name: &str) -> bool {
         self.queues.is_empty() || self.queues.iter().any(|q| q == "*" || q == queue_name)
     }
+
+    /// Whether this key has unrestricted (all-queue) access — an empty list or a
+    /// `*` entry. Restricted keys must have every operation constrained to their
+    /// listed queues.
+    pub fn is_unrestricted(&self) -> bool {
+        self.queues.is_empty() || self.queues.iter().any(|q| q == "*")
+    }
+
+    /// Whether this key may GRANT the `requested` queue set to a new/updated API
+    /// key. An unrestricted key may grant anything; a restricted key may only
+    /// grant a subset of its own queues and may never grant the `*` wildcard.
+    /// Prevents a queue-scoped key from minting a broader key (privilege
+    /// escalation).
+    pub fn can_grant_queues(&self, requested: &[String]) -> bool {
+        if self.is_unrestricted() {
+            return true;
+        }
+        !requested.iter().any(|q| q == "*") && requested.iter().all(|q| self.can_access_queue(q))
+    }
+
+    /// The allowed-queue list to use as a SQL filter, or `None` when the key is
+    /// unrestricted (no queue predicate needed). Lets read/list/delete queries
+    /// restrict rows to the key's queues with `queue_name = ANY($list)`.
+    pub fn queue_scope_filter(&self) -> Option<&[String]> {
+        if self.is_unrestricted() {
+            None
+        } else {
+            Some(&self.queues)
+        }
+    }
 }
 
 /// Validate optional API key name
@@ -248,6 +278,51 @@ pub struct UpdateApiKeyRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ctx(queues: &[&str]) -> ApiKeyContext {
+        ApiKeyContext {
+            api_key_id: "k".into(),
+            organization_id: "o".into(),
+            queues: queues.iter().map(|s| s.to_string()).collect(),
+            rate_limit: None,
+        }
+    }
+
+    #[test]
+    fn test_queue_scope_access_and_grant() {
+        let unrestricted_empty = ctx(&[]);
+        let unrestricted_star = ctx(&["*"]);
+        let scoped = ctx(&["emails", "billing"]);
+
+        // Access.
+        assert!(unrestricted_empty.can_access_queue("anything"));
+        assert!(unrestricted_star.can_access_queue("anything"));
+        assert!(scoped.can_access_queue("emails"));
+        assert!(!scoped.can_access_queue("payroll"));
+        assert!(unrestricted_empty.is_unrestricted());
+        assert!(unrestricted_star.is_unrestricted());
+        assert!(!scoped.is_unrestricted());
+
+        // Grant: unrestricted keys may grant anything (incl. `*`).
+        assert!(unrestricted_empty.can_grant_queues(&["*".into()]));
+        assert!(unrestricted_star.can_grant_queues(&["payroll".into()]));
+
+        // Grant: a scoped key may only grant a subset of its own queues, never `*`
+        // (this is the privilege-escalation guard for /api-keys create+update).
+        assert!(scoped.can_grant_queues(&["emails".into()]));
+        assert!(scoped.can_grant_queues(&["emails".into(), "billing".into()]));
+        assert!(!scoped.can_grant_queues(&["*".into()]));
+        assert!(!scoped.can_grant_queues(&["payroll".into()]));
+        assert!(!scoped.can_grant_queues(&["emails".into(), "payroll".into()]));
+
+        // Scope filter drives list restriction: None for unrestricted, Some for scoped.
+        assert!(unrestricted_empty.queue_scope_filter().is_none());
+        assert!(unrestricted_star.queue_scope_filter().is_none());
+        assert_eq!(
+            scoped.queue_scope_filter(),
+            Some(&["emails".to_string(), "billing".to_string()][..])
+        );
+    }
 
     #[test]
     fn test_api_key_summary_excludes_hash() {

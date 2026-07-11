@@ -62,6 +62,16 @@ pub async fn create(
     Extension(ctx): Extension<ApiKeyContext>,
     ValidatedJson(request): ValidatedJson<CreateApiKeyRequest>,
 ) -> AppResult<(StatusCode, Json<CreateApiKeyResponse>)> {
+    // Privilege-escalation guard: a queue-scoped key must not be able to mint a
+    // broader key. It may only grant a subset of its own queues, and never `*`.
+    // Unrestricted keys (empty list or `*`) may grant anything.
+    let requested_queues = request.queues.clone().unwrap_or_default();
+    if !ctx.can_grant_queues(&requested_queues) {
+        return Err(AppError::Authorization(
+            "API key cannot grant queues outside its own scope".to_string(),
+        ));
+    }
+
     let key_id = Uuid::new_v4().to_string();
     let now = Utc::now();
 
@@ -177,6 +187,14 @@ pub async fn update(
     let name = request.name.unwrap_or(existing.name);
     let queues = request.queues.unwrap_or(existing.queues);
     let is_active = request.is_active.unwrap_or(existing.is_active);
+
+    // Privilege-escalation guard: a queue-scoped key must not broaden any key's
+    // scope beyond its own (nor grant `*`). Unrestricted keys may set anything.
+    if !ctx.can_grant_queues(&queues) {
+        return Err(AppError::Authorization(
+            "API key cannot grant queues outside its own scope".to_string(),
+        ));
+    }
 
     let key = sqlx::query_as::<_, ApiKey>(
         r#"

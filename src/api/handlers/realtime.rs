@@ -289,19 +289,25 @@ pub async fn websocket_handler(
     }
 
     info!(org_id = %org_id, "WebSocket connection requested");
-    Ok(ws.on_upgrade(move |socket| handle_websocket(socket, query, org_id, state)))
+    // Pass the key's queue scope so the event fan-out can enforce it (a scoped key
+    // must never receive events for queues outside its scope).
+    let key_queues = ctx.queues.clone();
+    Ok(ws.on_upgrade(move |socket| handle_websocket(socket, query, org_id, key_queues, state)))
 }
 
 /// Handle WebSocket connection
 ///
-/// Org_id is now String instead of Option<String> since auth is required
+/// Org_id is now String instead of Option<String> since auth is required.
+/// `key_queues` is the authenticated key's queue scope (empty or `*` = all).
 async fn handle_websocket(
     socket: WebSocket,
     query: SubscribeQuery,
     org_id: String,
+    key_queues: Vec<String>,
     state: AppState,
 ) {
     let (mut sender, mut receiver) = socket.split();
+    let key_unrestricted = key_queues.is_empty() || key_queues.iter().any(|q| q == "*");
 
     // Increment the per-org connection counter now that the upgrade succeeded (the limit
     // was checked read-only before the upgrade). Paired with the decrement in cleanup.
@@ -336,6 +342,8 @@ async fn handle_websocket(
         let org_id_clone = org_id.clone();
         let queue_filter_clone = queue_filter.clone();
         let event_tx_clone = event_tx.clone();
+        let scope_queues = key_queues.clone();
+        let scope_unrestricted = key_unrestricted;
 
         // Spawn task to listen for Redis pub/sub messages
         Some(tokio::spawn(async move {
@@ -349,27 +357,37 @@ async fn handle_websocket(
                         if let Ok(payload) = msg.get_payload::<String>() {
                             // Try to parse as RealtimeEvent
                             if let Ok(event) = serde_json::from_str::<RealtimeEvent>(&payload) {
-                                // Filter by queue if specified
-                                let should_send = match (&queue_filter_clone, &event) {
-                                    (Some(q), RealtimeEvent::JobCreated { queue_name, .. }) => {
-                                        queue_name == q
+                                // The queue this event pertains to (if any).
+                                let event_queue: Option<&str> = match &event {
+                                    RealtimeEvent::JobStatusChange { queue_name, .. }
+                                    | RealtimeEvent::JobCreated { queue_name, .. }
+                                    | RealtimeEvent::JobCompleted { queue_name, .. }
+                                    | RealtimeEvent::JobFailed { queue_name, .. }
+                                    | RealtimeEvent::QueueStats { queue_name, .. }
+                                    | RealtimeEvent::WorkerRegistered { queue_name, .. } => {
+                                        Some(queue_name.as_str())
                                     }
-                                    (Some(q), RealtimeEvent::JobCompleted { queue_name, .. }) => {
-                                        queue_name == q
+                                    _ => None,
+                                };
+
+                                // SECURITY: a queue-scoped key must never receive events for
+                                // queues outside its scope, regardless of any client filter.
+                                // Unrestricted keys receive everything; queue-less events
+                                // (ping/system/worker lifecycle) are always allowed.
+                                let scope_ok = match event_queue {
+                                    Some(q) => {
+                                        scope_unrestricted || scope_queues.iter().any(|kq| kq == q)
                                     }
-                                    (Some(q), RealtimeEvent::JobFailed { queue_name, .. }) => {
-                                        queue_name == q
-                                    }
-                                    (
-                                        Some(q),
-                                        RealtimeEvent::JobStatusChange { queue_name, .. },
-                                    ) => queue_name == q,
-                                    (Some(q), RealtimeEvent::QueueStats { queue_name, .. }) => {
-                                        queue_name == q
-                                    }
-                                    (None, _) => true,
+                                    None => true,
+                                };
+
+                                // Client-chosen display filter (queue-less events pass).
+                                let filter_ok = match (&queue_filter_clone, event_queue) {
+                                    (Some(f), Some(eq)) => eq == f,
                                     _ => true,
                                 };
+
+                                let should_send = scope_ok && filter_ok;
 
                                 if should_send && event_tx_clone.send(event).await.is_err() {
                                     break; // Channel closed
@@ -557,6 +575,26 @@ pub async fn sse_job_handler(
         Ok::<_, std::convert::Infallible>(Event::default().comment("connected"))
     });
 
+    // Queue-scope guard (upfront): a restricted key must not stream a job in a queue
+    // outside its scope. If denied, the stream sends only the initial comment and
+    // closes — no status data, and existence is not confirmed. Unrestricted keys pass.
+    let deny = if ctx.is_unrestricted() {
+        false
+    } else {
+        let q: Option<(String,)> =
+            sqlx::query_as("SELECT queue_name FROM jobs WHERE id = $1 AND organization_id = $2")
+                .bind(&job_id)
+                .bind(&org_id)
+                .fetch_optional(state.db.pool())
+                .await
+                .ok()
+                .flatten();
+        match q {
+            Some((qn,)) => !ctx.can_access_queue(&qn),
+            None => false,
+        }
+    };
+
     // Create a stream that polls for job status changes (filtered by org)
     let body = stream::unfold(
         (
@@ -564,7 +602,7 @@ pub async fn sse_job_handler(
             org_id.clone(),
             state.clone(),
             None::<String>,
-            false,
+            deny,
             start_time,
         ),
         |(job_id, org_id, state, last_status, should_close, start_time)| async move {
@@ -677,6 +715,10 @@ pub async fn sse_queue_handler(
         Ok::<_, std::convert::Infallible>(Event::default().comment("connected"))
     });
 
+    // Queue-scope guard: a restricted key must not stream stats for a queue outside
+    // its scope. If denied, the stream sends only the initial comment and closes.
+    let deny = !ctx.is_unrestricted() && !ctx.can_access_queue(&queue_name);
+
     // Create a stream that polls for queue stats (filtered by org)
     let body = stream::unfold(
         (
@@ -684,8 +726,13 @@ pub async fn sse_queue_handler(
             org_id.clone(),
             state.clone(),
             start_time,
+            deny,
         ),
-        |(queue_name, org_id, state, start_time)| async move {
+        |(queue_name, org_id, state, start_time, deny)| async move {
+            // Deny out-of-scope queues (close immediately after the initial comment).
+            if deny {
+                return None;
+            }
             // Close connection after max duration
             if start_time.elapsed().as_secs() > MAX_SSE_DURATION_SECS {
                 tracing::debug!(queue = %queue_name, "SSE queue stream timeout - closing");
@@ -737,7 +784,7 @@ pub async fn sse_queue_handler(
                     let json = serde_json::to_string(&event).unwrap_or_default();
                     Some((
                         Ok(Event::default().event("queue.stats").data(json)),
-                        (queue_name, org_id, state, start_time),
+                        (queue_name, org_id, state, start_time, deny),
                     ))
                 }
                 Err(e) => {
@@ -749,7 +796,7 @@ pub async fn sse_queue_handler(
                     let json = serde_json::to_string(&event).unwrap_or_default();
                     Some((
                         Ok(Event::default().event("error").data(json)),
-                        (queue_name, org_id, state, start_time),
+                        (queue_name, org_id, state, start_time, deny),
                     ))
                 }
             }

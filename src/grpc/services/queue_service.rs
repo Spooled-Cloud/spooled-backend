@@ -224,6 +224,13 @@ impl QueueServiceImpl {
                   AND (scheduled_at IS NULL OR scheduled_at <= NOW())
                   AND (expires_at IS NULL OR expires_at > NOW())
                   AND (dependencies_met IS NULL OR dependencies_met = TRUE)
+                  -- Respect paused queues, matching the REST dequeue path.
+                  AND NOT EXISTS (
+                      SELECT 1 FROM queue_config qc
+                      WHERE qc.organization_id = $4
+                        AND qc.queue_name = $5
+                        AND qc.enabled = false
+                  )
                 ORDER BY priority DESC, created_at ASC
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
@@ -860,6 +867,15 @@ impl QueueService for QueueServiceImpl {
 
         Self::validate_queue_name(&req.queue_name)?;
 
+        // Queue scope: a restricted key cannot stream-claim from a queue outside its
+        // scope (mirrors the unary Dequeue check; the streaming path had none).
+        if !auth.can_access_queue(&req.queue_name) {
+            return Err(Status::permission_denied(format!(
+                "API key does not have permission for queue '{}'",
+                req.queue_name
+            )));
+        }
+
         if req.worker_id.is_empty() {
             return Err(Status::invalid_argument("Worker ID is required"));
         }
@@ -902,6 +918,14 @@ impl QueueService for QueueServiceImpl {
                           AND (scheduled_at IS NULL OR scheduled_at <= NOW())
                           AND (expires_at IS NULL OR expires_at > NOW())
                           AND (dependencies_met IS NULL OR dependencies_met = TRUE)
+                          -- Respect paused queues (queue_config.enabled = false), matching
+                          -- the REST QueueManager::dequeue_batch path.
+                          AND NOT EXISTS (
+                              SELECT 1 FROM queue_config qc
+                              WHERE qc.organization_id = $4
+                                AND qc.queue_name = $5
+                                AND qc.enabled = false
+                          )
                         ORDER BY priority DESC, created_at ASC
                         LIMIT 1
                         FOR UPDATE SKIP LOCKED
@@ -966,6 +990,8 @@ impl QueueService for QueueServiceImpl {
         let org_id = auth.organization_id.clone();
         let api_key_id = auth.api_key_id.clone();
         let api_key_rate_limit = auth.rate_limit;
+        // The key's queue scope, enforced per-message on dequeue below.
+        let allowed_queues = auth.queues.clone();
         let this = self.clone();
 
         let (tx, rx) = mpsc::channel(16);
@@ -994,7 +1020,14 @@ impl QueueService for QueueServiceImpl {
 
                 let response = match req.request {
                     Some(crate::grpc::proto::process_request::Request::Dequeue(dequeue_req)) => {
-                        handle_process_dequeue(&pool, &metrics, &org_id, dequeue_req).await
+                        handle_process_dequeue(
+                            &pool,
+                            &metrics,
+                            &org_id,
+                            &allowed_queues,
+                            dequeue_req,
+                        )
+                        .await
                     }
                     Some(crate::grpc::proto::process_request::Request::Complete(complete_req)) => {
                         handle_process_complete(&pool, &metrics, &org_id, complete_req).await
@@ -1031,15 +1064,34 @@ async fn handle_process_dequeue(
     pool: &PgPool,
     metrics: &Metrics,
     org_id: &str,
+    allowed_queues: &[String],
     req: DequeueRequest,
 ) -> ProcessResponse {
+    // Queue scope (per-message): a restricted key cannot dequeue from a queue outside
+    // its scope. The streaming path bound only org_id + queue_name in SQL, never the
+    // key's scope, so it bypassed the check the unary Dequeue enforces.
+    let unrestricted = allowed_queues.is_empty() || allowed_queues.iter().any(|q| q == "*");
+    if !unrestricted && !allowed_queues.iter().any(|q| q == &req.queue_name) {
+        return ProcessResponse {
+            response: Some(crate::grpc::proto::process_response::Response::Error(
+                crate::grpc::proto::ErrorResponse {
+                    code: "PERMISSION_DENIED".to_string(),
+                    message: format!(
+                        "API key does not have permission for queue '{}'",
+                        req.queue_name
+                    ),
+                },
+            )),
+        };
+    }
+
     let lease_id = uuid::Uuid::new_v4().to_string();
     let lease_duration = QueueServiceImpl::safe_lease_duration(req.lease_duration_secs);
 
     let job: Result<Option<DbJob>, _> = sqlx::query_as(
         r#"
         UPDATE jobs
-        SET 
+        SET
             status = 'processing',
             assigned_worker_id = $1,
             lease_id = $2,
@@ -1054,6 +1106,13 @@ async fn handle_process_dequeue(
               AND (scheduled_at IS NULL OR scheduled_at <= NOW())
               AND (expires_at IS NULL OR expires_at > NOW())
               AND (dependencies_met IS NULL OR dependencies_met = TRUE)
+              -- Respect paused queues, matching the REST dequeue path.
+              AND NOT EXISTS (
+                  SELECT 1 FROM queue_config qc
+                  WHERE qc.organization_id = $4
+                    AND qc.queue_name = $5
+                    AND qc.enabled = false
+              )
             ORDER BY priority DESC, created_at ASC
             LIMIT 1
             FOR UPDATE SKIP LOCKED
@@ -1293,9 +1352,9 @@ async fn handle_process_fail(
             END,
             last_error = $2,
             retry_count = retry_count + 1,
-            scheduled_at = CASE 
-                WHEN $1 = TRUE AND retry_count < max_retries 
-                THEN NOW() + (POWER(2, retry_count) || ' minutes')::INTERVAL
+            scheduled_at = CASE
+                WHEN $1 = TRUE AND retry_count < max_retries
+                THEN NOW() + (LEAST(POWER(2, LEAST(retry_count, 6)), 60) || ' seconds')::INTERVAL
                 ELSE scheduled_at
             END,
             assigned_worker_id = NULL,

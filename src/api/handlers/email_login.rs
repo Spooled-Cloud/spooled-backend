@@ -128,11 +128,12 @@ pub async fn check_email(
     }
 
     // Check if email is associated with any organization
-    let exists: Option<(String,)> =
-        sqlx::query_as("SELECT id FROM organizations WHERE billing_email = $1")
-            .bind(&email)
-            .fetch_optional(state.db.pool())
-            .await?;
+    let exists: Option<(String,)> = sqlx::query_as(
+        "SELECT id FROM organizations WHERE billing_email = $1 AND plan_tier <> 'deleted'",
+    )
+    .bind(&email)
+    .fetch_optional(state.db.pool())
+    .await?;
 
     Ok(Json(CheckEmailResponse {
         available: exists.is_none(),
@@ -212,11 +213,12 @@ pub async fn start(
     }
 
     // Check if email is associated with an organization
-    let org: Option<(String,)> =
-        sqlx::query_as("SELECT id FROM organizations WHERE billing_email = $1")
-            .bind(&email)
-            .fetch_optional(state.db.pool())
-            .await?;
+    let org: Option<(String,)> = sqlx::query_as(
+        "SELECT id FROM organizations WHERE billing_email = $1 AND plan_tier <> 'deleted'",
+    )
+    .bind(&email)
+    .fetch_optional(state.db.pool())
+    .await?;
 
     let org_id = org.map(|(id,)| id);
 
@@ -545,6 +547,21 @@ pub async fn complete_signup(
     State(state): State<AppState>,
     ValidatedJson(request): ValidatedJson<CompleteSignupRequest>,
 ) -> AppResult<(axum::http::StatusCode, Json<CompleteSignupResponse>)> {
+    // Registration gate: self-serve email signup creates a brand-new org + API key, so
+    // it must honor the same registration controls as POST /organizations (which the
+    // email path previously ignored — `email_signup_enabled` was defined but never
+    // enforced). Reject when email signup is disabled or registration is not open.
+    if !state.settings.registration.email_signup_enabled
+        || !matches!(
+            state.settings.registration.mode,
+            crate::config::RegistrationMode::Open
+        )
+    {
+        return Err(AppError::Authorization(
+            "Email signup is currently disabled".to_string(),
+        ));
+    }
+
     // Validate signup token
     let token_code = format!("signup:{}", request.signup_token);
 
@@ -588,11 +605,12 @@ pub async fn complete_signup(
     }
 
     // Check for duplicate email (race condition guard)
-    let existing_email: Option<(String,)> =
-        sqlx::query_as("SELECT id FROM organizations WHERE billing_email = $1")
-            .bind(&email)
-            .fetch_optional(state.db.pool())
-            .await?;
+    let existing_email: Option<(String,)> = sqlx::query_as(
+        "SELECT id FROM organizations WHERE billing_email = $1 AND plan_tier <> 'deleted'",
+    )
+    .bind(&email)
+    .fetch_optional(state.db.pool())
+    .await?;
 
     if existing_email.is_some() {
         return Err(AppError::Conflict(
