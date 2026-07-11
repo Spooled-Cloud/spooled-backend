@@ -58,16 +58,25 @@ clippy clean.
 
 ## Remaining work (priority order)
 
-1. **Verify v0.1.93 + v0.1.94 live on prod after the redeploy** (blocked until the
-   operator redeploys). With a throwaway org against `https://api.spooled.cloud`:
-   - v0.1.93 scoped-key containment: mint-wildcard → 403; read/cancel/workflow/schedule/
-     pause a different queue → 403/404; realtime + gRPC scope.
-   - v0.1.94 lease fencing: claim returns `lease_id`; complete/heartbeat/fail with a
-     wrong `lease_id` → 409 LEASE_EXPIRED; correct token and token-omitted both succeed.
-   Confirm `uptime_seconds` is small first.
+1. **Prod verification of v0.1.93 + v0.1.94 — DONE 2026-07-11.** Redeploy confirmed
+   (pod log `Starting Spooled Backend v0.1.94`, uptime small). Throwaway orgs (zz-*)
+   created and hard-deleted. Results, all PASS:
+   - v0.1.93 containment (9 checks): scoped key 403 on wildcard/out-of-scope key mint,
+     404 on out-of-scope job read/cancel, zero-leak list, 403 on workflow/schedule
+     indirect enqueue + queue pause, allowed queue fully functional; gRPC Dequeue on
+     out-of-scope queue → PermissionDenied; SSE `/events/queues/<out-of-scope>` closes
+     after the initial comment in ~0.35s with zero events while the in-scope stream
+     emits QueueStats (the 200-then-close is by design — SSE can't 403 from the
+     stream); WS 101 handshake OK. (NB: plain `/events` is a health-poll stream only —
+     job events flow via /ws and the per-job/queue SSE streams.)
+   - v0.1.94 fencing (10 checks incl. the audit scenario): claim returns `lease_id`;
+     wrong token → 409 LEASE_EXPIRED on complete/heartbeat/fail (REST) and
+     FAILED_PRECONDITION (gRPC); correct + omitted tokens succeed; expired-lease
+     reclaim → re-claim by the SAME worker gets a new lease_id and the stale token
+     loses; published npm SDK 1.0.34 smoke vs prod: captures + echoes lease_id, bogus
+     token rejected.
 
-2. **F9 SDK side — DONE** (all four SDKs released, see Current state). Post-redeploy,
-   smoke one published SDK against prod as part of item 1.
+2. **F9 SDK side — DONE** (all four SDKs released, see Current state).
 
 3. **Push the frontend F10 copy fix.** `spooled-frontend` commit `3ecb591`
    (`docs(security,privacy): correct overstated DB-TLS and RBAC claims`) is committed
