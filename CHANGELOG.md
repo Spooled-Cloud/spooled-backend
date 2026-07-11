@@ -7,6 +7,21 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.96] - 2026-07-11
+
+Dependency + toolchain catch-up (all open Dependabot PRs landed).
+
+### Changed
+
+- **Rust deps (Dependabot #39):** sqlx 0.8 → 0.9, hmac 0.12 → 0.13, plus the
+  rest of the grouped cargo bump. Compatibility fixes:
+  - wrap audited dynamic `ORDER BY` admin list queries in `sqlx::AssertSqlSafe`
+    (sqlx 0.9 rejects raw `String` SQL);
+  - import `hmac::KeyInit` wherever `Hmac::new_from_slice` is used (hmac 0.13).
+- **Docker builder (Dependabot #34):** `rust:1.94-bookworm` → `1.96-bookworm`.
+- **CI actions (Dependabot #37 / #27):** `actions/checkout` 6 → 7;
+  `softprops/action-gh-release` 2 → 3.
+
 ## [0.1.95] - 2026-07-11
 
 Security hardening from the post-F9 adversarial pass (billing, soft-delete, gRPC streams).

@@ -5,10 +5,11 @@ for the next agent. Read `AGENTS.md`, `ROOT_DOCS.md`, and `CHANGELOG.md` first.
 
 ## Current state
 
-- **Backend: `v0.1.95` is LIVE on prod** (redeployed + live-smoked 2026-07-11;
-  uptime small after operator redeploy). Image build
-  https://github.com/Spooled-Cloud/spooled-backend/actions/runs/29170162531
-  (`6a7a8d9`).
+- **Backend: `v0.1.96` on `main`** (Dependabot catch-up: sqlx 0.9, hmac 0.13,
+  rustc 1.96 image, checkout@7, gh-release@3). Needs operator redeploy after
+  `:latest` build finishes. Prior **`v0.1.95` was LIVE-smoked** on prod
+  (soft-delete + portal allowlist). Confirm roll via small `uptime_seconds`.
+  Image builds from main push (no open PRs / unmerged branches remain).
 - F9 lease fencing + queue-scope containment remain live on v0.1.94 (see below).
 - **SDKs published WITH F9 lease_id support**: npm `@spooled/sdk` 1.0.34, go v1.0.19,
   PyPI `spooled` 1.0.20, Packagist `spooled-cloud/spooled` v1.0.16.
