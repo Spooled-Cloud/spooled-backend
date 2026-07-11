@@ -7,6 +7,39 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.94] - 2026-07-11
+
+Closes the last open external-audit finding (F9): lease fencing by `lease_id`.
+
+### Added
+
+- **Lease fencing tokens (audit F9).** Claim/dequeue responses now return the job's
+  `lease_id` on every path (REST `POST /jobs/claim` → `ClaimedJob.lease_id`; gRPC
+  `Job.lease_id` field 19 on `Dequeue`/`StreamJobs`/`ProcessJobs`). Complete, fail,
+  and heartbeat/renew-lease accept an optional `lease_id` (REST body field; gRPC
+  `CompleteRequest.lease_id = 4`, `FailRequest.lease_id = 5`,
+  `RenewLeaseRequest.lease_id = 4`). When the token is provided, the operation
+  succeeds only if it matches the job's *current* lease — a stale completion from a
+  superseded lease (even by the same worker, e.g. after a reclaim + re-claim) now
+  gets `409 LEASE_EXPIRED` / gRPC `FAILED_PRECONDITION` instead of silently winning.
+  Omitting the token preserves the legacy `worker_id` + expiry fence, so existing
+  SDKs and workers keep working unchanged; SDK releases that echo the token close
+  the gap end-to-end.
+
+### Fixed
+
+- **Latent prepared-statement type collision between the REST and gRPC job-complete
+  SQL.** The two paths use a byte-identical SQL string but previously bound the
+  `result` parameter with different wire types (TEXT JSON string vs binary JSONB).
+  sqlx caches prepared statements per connection keyed by the SQL text, so once one
+  path prepared the statement on a pooled connection, the other path's completions
+  on that connection failed with `invalid input syntax for type json`. Both gRPC
+  complete paths now bind the result as a TEXT JSON string, matching REST.
+- Integration-test seed helper inserted organizations with nonexistent
+  `plan`/`status` columns and swallowed the error, so the lease-enforcement suite
+  silently never seeded (FK failures). Fixed the columns and made seeding failures
+  panic; the suite (now 12 tests incl. 3 lease_id-fencing tests) runs for real.
+
 ## [0.1.93] - 2026-07-11
 
 Remediation of an external audit (all 10 findings verified against the code first).

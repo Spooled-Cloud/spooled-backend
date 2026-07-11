@@ -600,6 +600,10 @@ impl QueueManager {
     ///
     /// On `Ok` this also unblocks child jobs whose only remaining parent is
     /// this one (same transaction as [`Self::complete_with_worker_and_org`]).
+    /// `lease_id` is the fencing token returned by the claim; when `Some`
+    /// the UPDATE additionally requires `lease_id` to match, so a stale
+    /// completion from a superseded lease (even by the same worker) loses.
+    /// `None` preserves the legacy worker+expiry fence for old clients.
     #[instrument(
         name = "queue.complete_by_worker",
         skip(self, result),
@@ -610,6 +614,7 @@ impl QueueManager {
         job_id: &str,
         worker_id: &str,
         org_id: &str,
+        lease_id: Option<&str>,
         result: Option<serde_json::Value>,
     ) -> Result<WorkerOpOutcome> {
         let mut tx = self.db.begin().await?;
@@ -629,18 +634,22 @@ impl QueueManager {
               AND status = 'processing'
               AND lease_expires_at IS NOT NULL
               AND lease_expires_at > NOW()
+              AND ($5::TEXT IS NULL OR lease_id = $5)
             "#,
         )
         .bind(&result_json)
         .bind(job_id)
         .bind(worker_id)
         .bind(org_id)
+        .bind(lease_id)
         .execute(&mut *tx)
         .await?;
 
         if query_result.rows_affected() == 0 {
             tx.rollback().await?;
-            return self.classify_worker_miss(job_id, worker_id, org_id).await;
+            return self
+                .classify_worker_miss(job_id, worker_id, org_id, lease_id)
+                .await;
         }
 
         // Unblock child jobs whose only remaining parent just completed.
@@ -687,15 +696,19 @@ impl QueueManager {
     ///
     /// Called after complete/fail/renew_lease when `rows_affected == 0`,
     /// so handlers can return `LEASE_EXPIRED` (409) vs `NOT_FOUND` (404).
+    /// When the caller presented a `lease_id` fencing token that no longer
+    /// matches the job's current lease, the caller's lease was superseded —
+    /// that is `LeaseExpired`, not `NotOwned`.
     async fn classify_worker_miss(
         &self,
         job_id: &str,
         worker_id: &str,
         org_id: &str,
+        lease_id: Option<&str>,
     ) -> Result<WorkerOpOutcome> {
-        let row: Option<(String, Option<DateTime<Utc>>)> = sqlx::query_as(
+        let row: Option<(String, Option<DateTime<Utc>>, Option<String>)> = sqlx::query_as(
             r#"
-            SELECT status, lease_expires_at
+            SELECT status, lease_expires_at, lease_id
             FROM jobs
             WHERE id = $1
               AND organization_id = $2
@@ -709,9 +722,13 @@ impl QueueManager {
         .await?;
 
         match row {
-            Some((status, lease)) if status == "processing" => {
+            Some((status, lease, current_lease_id)) if status == "processing" => {
                 let expired = lease.map(|t| t <= Utc::now()).unwrap_or(true);
-                if expired {
+                let fenced_out = match lease_id {
+                    Some(presented) => current_lease_id.as_deref() != Some(presented),
+                    None => false,
+                };
+                if expired || fenced_out {
                     Ok(WorkerOpOutcome::LeaseExpired)
                 } else {
                     // Row exists, is processing, lease still valid — but the
@@ -752,6 +769,7 @@ impl QueueManager {
         job_id: &str,
         worker_id: &str,
         org_id: &str,
+        lease_id: Option<&str>,
         error: &str,
     ) -> Result<FailByWorkerOutcome> {
         // Load current retry_count under (worker, org, processing, lease>now).
@@ -768,17 +786,21 @@ impl QueueManager {
               AND status = 'processing'
               AND lease_expires_at IS NOT NULL
               AND lease_expires_at > NOW()
+              AND ($4::TEXT IS NULL OR lease_id = $4)
             "#,
         )
         .bind(job_id)
         .bind(org_id)
         .bind(worker_id)
+        .bind(lease_id)
         .fetch_optional(&*self.db)
         .await?;
 
         let Some((retry_count, max_retries)) = row else {
             return Ok(FailByWorkerOutcome {
-                outcome: self.classify_worker_miss(job_id, worker_id, org_id).await?,
+                outcome: self
+                    .classify_worker_miss(job_id, worker_id, org_id, lease_id)
+                    .await?,
                 will_retry: false,
                 new_status: None,
             });
@@ -812,6 +834,7 @@ impl QueueManager {
                   AND status = 'processing'
                   AND lease_expires_at IS NOT NULL
                   AND lease_expires_at > NOW()
+                  AND ($7::TEXT IS NULL OR lease_id = $7)
                 "#,
             )
             .bind(retry_count + 1)
@@ -820,12 +843,15 @@ impl QueueManager {
             .bind(job_id)
             .bind(org_id)
             .bind(worker_id)
+            .bind(lease_id)
             .execute(&*self.db)
             .await?;
 
             if updated.rows_affected() == 0 {
                 return Ok(FailByWorkerOutcome {
-                    outcome: self.classify_worker_miss(job_id, worker_id, org_id).await?,
+                    outcome: self
+                        .classify_worker_miss(job_id, worker_id, org_id, lease_id)
+                        .await?,
                     will_retry: false,
                     new_status: None,
                 });
@@ -872,18 +898,22 @@ impl QueueManager {
                   AND status = 'processing'
                   AND lease_expires_at IS NOT NULL
                   AND lease_expires_at > NOW()
+                  AND ($5::TEXT IS NULL OR lease_id = $5)
                 "#,
             )
             .bind(error)
             .bind(job_id)
             .bind(org_id)
             .bind(worker_id)
+            .bind(lease_id)
             .execute(&*self.db)
             .await?;
 
             if updated.rows_affected() == 0 {
                 return Ok(FailByWorkerOutcome {
-                    outcome: self.classify_worker_miss(job_id, worker_id, org_id).await?,
+                    outcome: self
+                        .classify_worker_miss(job_id, worker_id, org_id, lease_id)
+                        .await?,
                     will_retry: false,
                     new_status: None,
                 });
@@ -1102,6 +1132,7 @@ impl QueueManager {
         job_id: &str,
         worker_id: &str,
         organization_id: &str,
+        lease_id: Option<&str>,
         lease_duration_secs: i64,
     ) -> Result<WorkerOpOutcome> {
         let lease_expires = Utc::now() + Duration::seconds(lease_duration_secs);
@@ -1116,19 +1147,21 @@ impl QueueManager {
               AND status = 'processing'
               AND lease_expires_at IS NOT NULL
               AND lease_expires_at > NOW()
+              AND ($5::TEXT IS NULL OR lease_id = $5)
             "#,
         )
         .bind(lease_expires)
         .bind(job_id)
         .bind(worker_id)
         .bind(organization_id)
+        .bind(lease_id)
         .execute(&*self.db)
         .await?;
 
         if result.rows_affected() > 0 {
             Ok(WorkerOpOutcome::Ok)
         } else {
-            self.classify_worker_miss(job_id, worker_id, organization_id)
+            self.classify_worker_miss(job_id, worker_id, organization_id, lease_id)
                 .await
         }
     }

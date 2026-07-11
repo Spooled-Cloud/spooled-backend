@@ -2117,33 +2117,48 @@ async fn seed_processing_job(
     org_id: &str,
     lease_expires_at: chrono::DateTime<chrono::Utc>,
 ) {
-    let _ = sqlx::query(
+    seed_processing_job_with_lease(pool, job_id, worker_id, org_id, lease_expires_at, None).await;
+}
+
+/// Like [`seed_processing_job`] but also sets the job's `lease_id` fencing
+/// token, for the lease_id-fencing tests.
+async fn seed_processing_job_with_lease(
+    pool: &sqlx::PgPool,
+    job_id: &str,
+    worker_id: &str,
+    org_id: &str,
+    lease_expires_at: chrono::DateTime<chrono::Utc>,
+    lease_id: Option<&str>,
+) {
+    sqlx::query(
         r#"
-        INSERT INTO organizations (id, name, slug, billing_email, plan, status, created_at, updated_at)
-        VALUES ($1, $1, $1, $2, 'starter', 'active', NOW(), NOW())
+        INSERT INTO organizations (id, name, slug, plan_tier, billing_email, created_at, updated_at)
+        VALUES ($1, $1, $1, 'starter', $2, NOW(), NOW())
         ON CONFLICT (id) DO NOTHING
         "#,
     )
     .bind(org_id)
     .bind(format!("{}@example.test", org_id))
     .execute(pool)
-    .await;
+    .await
+    .expect("Failed to seed organization");
 
     sqlx::query(
         r#"
         INSERT INTO jobs (
             id, organization_id, queue_name, status, payload, priority,
             max_retries, retry_count, timeout_seconds,
-            assigned_worker_id, lease_expires_at,
+            assigned_worker_id, lease_expires_at, lease_id,
             created_at, updated_at
         )
-        VALUES ($1, $2, 'lease-test', 'processing', '{}'::JSONB, 0, 3, 0, 300, $3, $4, NOW(), NOW())
+        VALUES ($1, $2, 'lease-test', 'processing', '{}'::JSONB, 0, 3, 0, 300, $3, $4, $5, NOW(), NOW())
         "#,
     )
     .bind(job_id)
     .bind(org_id)
     .bind(worker_id)
     .bind(lease_expires_at)
+    .bind(lease_id)
     .execute(pool)
     .await
     .expect("Failed to seed processing job");
@@ -2169,7 +2184,7 @@ async fn test_complete_by_worker_rejects_expired_lease() {
     .await;
 
     let outcome = queue
-        .complete_by_worker(&job_id, &worker_id, org_id, None)
+        .complete_by_worker(&job_id, &worker_id, org_id, None, None)
         .await
         .expect("complete_by_worker should not fail on expired lease");
 
@@ -2210,6 +2225,7 @@ async fn test_complete_by_worker_ok_with_valid_lease() {
             &job_id,
             &worker_id,
             org_id,
+            None,
             Some(serde_json::json!({"ok": true})),
         )
         .await
@@ -2245,7 +2261,7 @@ async fn test_complete_by_worker_not_owned_when_worker_mismatch() {
     .await;
 
     let outcome = queue
-        .complete_by_worker(&job_id, &other_worker, org_id, None)
+        .complete_by_worker(&job_id, &other_worker, org_id, None, None)
         .await
         .expect("complete_by_worker should not error on mismatch");
     assert_eq!(outcome, WorkerOpOutcome::NotOwned);
@@ -2271,7 +2287,7 @@ async fn test_fail_by_worker_rejects_expired_lease() {
     .await;
 
     let outcome = queue
-        .fail_by_worker(&job_id, &worker_id, org_id, "handler crash")
+        .fail_by_worker(&job_id, &worker_id, org_id, None, "handler crash")
         .await
         .expect("fail_by_worker should not error");
     assert_eq!(outcome.outcome, WorkerOpOutcome::LeaseExpired);
@@ -2304,7 +2320,7 @@ async fn test_fail_by_worker_reschedules_with_valid_lease() {
     .await;
 
     let outcome = queue
-        .fail_by_worker(&job_id, &worker_id, org_id, "boom")
+        .fail_by_worker(&job_id, &worker_id, org_id, None, "boom")
         .await
         .expect("fail_by_worker should succeed");
     assert_eq!(outcome.outcome, WorkerOpOutcome::Ok);
@@ -2339,7 +2355,7 @@ async fn test_renew_lease_rejects_expired() {
     seed_processing_job(db.pool(), &job_id, &worker_id, org_id, old_lease).await;
 
     let outcome = queue
-        .renew_lease(&job_id, &worker_id, org_id, 60)
+        .renew_lease(&job_id, &worker_id, org_id, None, 60)
         .await
         .expect("renew_lease should not error");
     assert_eq!(outcome, WorkerOpOutcome::LeaseExpired);
@@ -2372,7 +2388,7 @@ async fn test_renew_lease_extends_when_still_valid() {
     seed_processing_job(db.pool(), &job_id, &worker_id, org_id, initial).await;
 
     let outcome = queue
-        .renew_lease(&job_id, &worker_id, org_id, 120)
+        .renew_lease(&job_id, &worker_id, org_id, None, 120)
         .await
         .expect("renew_lease should succeed for a valid lease");
     assert_eq!(outcome, WorkerOpOutcome::Ok);
@@ -2432,4 +2448,147 @@ async fn test_recover_expired_leases_reclaims_within_ticker_budget() {
         assigned.is_none(),
         "Reclaimed job should have assigned_worker_id cleared"
     );
+}
+
+// ---------------------------------------------------------------------------
+// lease_id fencing (audit F9)
+//
+// A job reclaimed and re-leased — even to the SAME worker — gets a new
+// lease_id. A worker still holding the OLD token must not be able to
+// complete/fail/renew the new lease; presenting a stale token classifies as
+// LeaseExpired (→ HTTP 409), and omitting the token preserves the legacy
+// worker+expiry fence for old SDKs.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_complete_by_worker_rejects_stale_lease_id() {
+    use spooled_backend::queue::{QueueManager, WorkerOpOutcome};
+
+    let db = TestDatabase::new().await;
+    let queue = QueueManager::new(db.pool.clone(), None);
+
+    let org_id = "lease-org-9";
+    let worker_id = uuid::Uuid::new_v4().to_string();
+    let job_id = uuid::Uuid::new_v4().to_string();
+    // Job currently leased under "lease-new" (fresh expiry, same worker).
+    seed_processing_job_with_lease(
+        db.pool(),
+        &job_id,
+        &worker_id,
+        org_id,
+        chrono::Utc::now() + chrono::Duration::seconds(30),
+        Some("lease-new"),
+    )
+    .await;
+
+    // A stale completion presenting the superseded token must lose...
+    let outcome = queue
+        .complete_by_worker(&job_id, &worker_id, org_id, Some("lease-old"), None)
+        .await
+        .expect("complete_by_worker should not error on stale lease_id");
+    assert_eq!(outcome, WorkerOpOutcome::LeaseExpired);
+
+    let (status,): (String,) = sqlx::query_as("SELECT status FROM jobs WHERE id = $1")
+        .bind(&job_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("Failed to query job status");
+    assert_eq!(status, "processing", "Stale lease_id must not complete job");
+
+    // ...while the holder of the current token succeeds.
+    let outcome = queue
+        .complete_by_worker(&job_id, &worker_id, org_id, Some("lease-new"), None)
+        .await
+        .expect("complete_by_worker with current lease_id should succeed");
+    assert_eq!(outcome, WorkerOpOutcome::Ok);
+}
+
+#[tokio::test]
+async fn test_fail_by_worker_rejects_stale_lease_id() {
+    use spooled_backend::queue::{QueueManager, WorkerOpOutcome};
+
+    let db = TestDatabase::new().await;
+    let queue = QueueManager::new(db.pool.clone(), None);
+
+    let org_id = "lease-org-10";
+    let worker_id = uuid::Uuid::new_v4().to_string();
+    let job_id = uuid::Uuid::new_v4().to_string();
+    seed_processing_job_with_lease(
+        db.pool(),
+        &job_id,
+        &worker_id,
+        org_id,
+        chrono::Utc::now() + chrono::Duration::seconds(30),
+        Some("lease-new"),
+    )
+    .await;
+
+    let outcome = queue
+        .fail_by_worker(&job_id, &worker_id, org_id, Some("lease-old"), "stale")
+        .await
+        .expect("fail_by_worker should not error on stale lease_id");
+    assert_eq!(outcome.outcome, WorkerOpOutcome::LeaseExpired);
+    assert!(!outcome.will_retry);
+
+    let (status, retries): (String, i32) =
+        sqlx::query_as("SELECT status, retry_count FROM jobs WHERE id = $1")
+            .bind(&job_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("Failed to query job");
+    assert_eq!(status, "processing", "Stale lease_id must not fail job");
+    assert_eq!(retries, 0, "Stale lease_id must not consume a retry");
+}
+
+#[tokio::test]
+async fn test_renew_lease_rejects_stale_lease_id_and_legacy_none_still_works() {
+    use spooled_backend::queue::{QueueManager, WorkerOpOutcome};
+
+    let db = TestDatabase::new().await;
+    let queue = QueueManager::new(db.pool.clone(), None);
+
+    let org_id = "lease-org-11";
+    let worker_id = uuid::Uuid::new_v4().to_string();
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let initial = chrono::Utc::now() + chrono::Duration::seconds(10);
+    seed_processing_job_with_lease(
+        db.pool(),
+        &job_id,
+        &worker_id,
+        org_id,
+        initial,
+        Some("lease-new"),
+    )
+    .await;
+
+    // Stale token → LeaseExpired, expiry unchanged.
+    let outcome = queue
+        .renew_lease(&job_id, &worker_id, org_id, Some("lease-old"), 120)
+        .await
+        .expect("renew_lease should not error on stale lease_id");
+    assert_eq!(outcome, WorkerOpOutcome::LeaseExpired);
+    let stored: (chrono::DateTime<chrono::Utc>,) =
+        sqlx::query_as("SELECT lease_expires_at FROM jobs WHERE id = $1")
+            .bind(&job_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("Failed to query lease");
+    assert!(
+        (stored.0 - initial).num_seconds().abs() < 2,
+        "Stale lease_id must not extend the lease"
+    );
+
+    // Legacy client (no token) → still renews on worker+expiry fence.
+    let outcome = queue
+        .renew_lease(&job_id, &worker_id, org_id, None, 120)
+        .await
+        .expect("legacy renew_lease should succeed");
+    assert_eq!(outcome, WorkerOpOutcome::Ok);
+
+    // Current token → renews too.
+    let outcome = queue
+        .renew_lease(&job_id, &worker_id, org_id, Some("lease-new"), 120)
+        .await
+        .expect("renew_lease with current lease_id should succeed");
+    assert_eq!(outcome, WorkerOpOutcome::Ok);
 }

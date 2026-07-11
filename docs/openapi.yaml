@@ -4283,6 +4283,11 @@ components:
         lease_expires_at:
           type: string
           format: date-time
+        lease_id:
+          type: string
+          description: >-
+            Fencing token for this lease. Echo it back in complete/fail/heartbeat
+            so the operation applies only to the lease this worker actually holds.
         created_at:
           type: string
           format: date-time
@@ -4295,6 +4300,12 @@ components:
           description: Optional result data to store with the job
         worker_id:
           type: string
+        lease_id:
+          type: string
+          description: >-
+            Lease fencing token from the claim response. When provided, the
+            completion succeeds only if it matches the job's current lease
+            (409 LEASE_EXPIRED otherwise).
 
     FailJobRequest:
       type: object
@@ -4310,6 +4321,12 @@ components:
           type: boolean
           default: false
           description: Skip retries and go directly to DLQ
+        lease_id:
+          type: string
+          description: >-
+            Lease fencing token from the claim response. When provided, the
+            failure succeeds only if it matches the job's current lease
+            (409 LEASE_EXPIRED otherwise).
 
     HeartbeatJobRequest:
       type: object
@@ -4322,6 +4339,12 @@ components:
           description: Extend lease by this many seconds
         worker_id:
           type: string
+        lease_id:
+          type: string
+          description: >-
+            Lease fencing token from the claim response. When provided, the
+            renewal succeeds only if it matches the job's current lease
+            (409 LEASE_EXPIRED otherwise).
 
     # Email Authentication Schemas
     CheckEmailRequest:

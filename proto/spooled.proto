@@ -86,6 +86,10 @@ message Job {
     google.protobuf.Timestamp lease_expires_at = 16;
     string assigned_worker_id = 17;
     string idempotency_key = 18;
+    // Fencing token for the current lease. Returned on dequeue; echo it back
+    // in Complete/Fail/RenewLease to guarantee the operation applies only to
+    // the lease this worker actually holds (empty = legacy worker_id fence).
+    string lease_id = 19;
 }
 
 // Enqueue Request
@@ -124,6 +128,9 @@ message CompleteRequest {
     string job_id = 1;
     string worker_id = 2;
     google.protobuf.Struct result = 3;
+    // Lease fencing token from the dequeued Job. When set, the completion
+    // succeeds only if it matches the job's current lease.
+    string lease_id = 4;
 }
 
 // Complete Response
@@ -137,6 +144,9 @@ message FailRequest {
     string worker_id = 2;
     string error = 3;
     bool retry = 4; // Whether to retry or move to DLQ
+    // Lease fencing token from the dequeued Job. When set, the failure
+    // succeeds only if it matches the job's current lease.
+    string lease_id = 5;
 }
 
 // Fail Response
@@ -151,6 +161,9 @@ message RenewLeaseRequest {
     string job_id = 1;
     string worker_id = 2;
     int32 extension_secs = 3;
+    // Lease fencing token from the dequeued Job. When set, the renewal
+    // succeeds only if it matches the job's current lease.
+    string lease_id = 4;
 }
 
 // Renew Lease Response

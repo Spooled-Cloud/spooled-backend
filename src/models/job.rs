@@ -293,6 +293,9 @@ pub struct ClaimedJob {
     pub max_retries: i32,
     pub timeout_seconds: i32,
     pub lease_expires_at: Option<DateTime<Utc>>,
+    /// Fencing token for this lease. Echo it back in complete/fail/heartbeat
+    /// so the operation applies only to the lease this worker actually holds.
+    pub lease_id: Option<String>,
 }
 
 impl From<Job> for ClaimedJob {
@@ -305,6 +308,7 @@ impl From<Job> for ClaimedJob {
             max_retries: j.max_retries,
             timeout_seconds: j.timeout_seconds,
             lease_expires_at: j.lease_expires_at,
+            lease_id: j.lease_id,
         }
     }
 }
@@ -324,6 +328,11 @@ pub struct CompleteJobRequest {
 
     /// Optional result payload
     pub result: Option<serde_json::Value>,
+
+    /// Lease fencing token from the claim response. When provided, the
+    /// completion succeeds only if it matches the job's current lease.
+    #[validate(length(min = 1, max = 255, message = "Lease ID must be 1-255 characters"))]
+    pub lease_id: Option<String>,
 }
 
 /// Request to fail a job (triggers retry or DLQ based on retry_count/max_retries)
@@ -336,6 +345,11 @@ pub struct FailJobRequest {
     /// Error message (required)
     #[validate(length(min = 1, max = 2048, message = "Error must be 1-2048 characters"))]
     pub error: String,
+
+    /// Lease fencing token from the claim response. When provided, the
+    /// failure succeeds only if it matches the job's current lease.
+    #[validate(length(min = 1, max = 255, message = "Lease ID must be 1-255 characters"))]
+    pub lease_id: Option<String>,
 }
 
 /// Request to extend a job lease (heartbeat)
@@ -352,6 +366,11 @@ pub struct HeartbeatJobRequest {
         message = "Lease duration must be between 5 and 3600 seconds"
     ))]
     pub lease_duration_secs: i64,
+
+    /// Lease fencing token from the claim response. When provided, the
+    /// renewal succeeds only if it matches the job's current lease.
+    #[validate(length(min = 1, max = 255, message = "Lease ID must be 1-255 characters"))]
+    pub lease_id: Option<String>,
 }
 
 /// Job summary for list responses

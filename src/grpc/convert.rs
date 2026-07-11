@@ -184,6 +184,7 @@ pub fn job_to_proto(job: &Job) -> proto::Job {
         lease_expires_at: datetime_to_timestamp_opt(job.lease_expires_at),
         assigned_worker_id: job.assigned_worker_id.clone().unwrap_or_default(),
         idempotency_key: job.idempotency_key.clone().unwrap_or_default(),
+        lease_id: job.lease_id.clone().unwrap_or_default(),
     }
 }
 

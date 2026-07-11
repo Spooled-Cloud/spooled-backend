@@ -186,6 +186,17 @@ impl QueueServiceImpl {
         Ok(())
     }
 
+    /// Proto3 strings default to "" — treat an empty `lease_id` as "not
+    /// provided" so legacy clients keep the worker+expiry fence while
+    /// clients that echo the token get strict lease fencing.
+    fn opt_lease_id(lease_id: &str) -> Option<&str> {
+        if lease_id.is_empty() {
+            None
+        } else {
+            Some(lease_id)
+        }
+    }
+
     /// Validate and clamp lease duration
     fn safe_lease_duration(secs: i32) -> i32 {
         if secs <= 0 {
@@ -520,26 +531,34 @@ impl QueueService for QueueServiceImpl {
             )));
         }
 
+        // NOTE: this SQL is byte-identical to QueueManager::complete_by_worker's.
+        // sqlx caches prepared statements per connection KEYED BY THE SQL STRING,
+        // so $1 must be bound with the same wire type as the REST path (a TEXT
+        // JSON string cast by ::JSONB) — binding serde_json::Value (JSONB oid)
+        // here poisons whichever path prepares second on a shared pool
+        // connection ("invalid input syntax for type json").
         let db_result = sqlx::query(
             r#"
             UPDATE jobs
-            SET 
+            SET
                 status = 'completed',
                 result = $1::JSONB,
                 completed_at = NOW(),
                 updated_at = NOW()
-            WHERE id = $2 
-              AND assigned_worker_id = $3 
+            WHERE id = $2
+              AND assigned_worker_id = $3
               AND organization_id = $4
               AND status = 'processing'
               AND lease_expires_at IS NOT NULL
               AND lease_expires_at > NOW()
+              AND ($5::TEXT IS NULL OR lease_id = $5)
             "#,
         )
-        .bind(&result_json)
+        .bind(&result_str)
         .bind(&req.job_id)
         .bind(&req.worker_id)
         .bind(&auth.organization_id)
+        .bind(Self::opt_lease_id(&req.lease_id))
         .execute(self.pool.as_ref())
         .await
         .map_err(|e| {
@@ -553,6 +572,7 @@ impl QueueService for QueueServiceImpl {
                 &req.job_id,
                 &req.worker_id,
                 &auth.organization_id,
+                Self::opt_lease_id(&req.lease_id),
             )
             .await);
         }
@@ -615,17 +635,18 @@ impl QueueService for QueueServiceImpl {
                 lease_id = NULL,
                 lease_expires_at = NULL,
                 updated_at = NOW()
-            WHERE id = $3 
+            WHERE id = $3
               AND assigned_worker_id = $4
               AND organization_id = $5
               AND status = 'processing'
               AND lease_expires_at IS NOT NULL
               AND lease_expires_at > NOW()
-            RETURNING 
+              AND ($6::TEXT IS NULL OR lease_id = $6)
+            RETURNING
                 status as new_status,
                 retry_count as new_retry_count,
-                CASE 
-                    WHEN status = 'pending' 
+                CASE
+                    WHEN status = 'pending'
                     THEN EXTRACT(EPOCH FROM (scheduled_at - NOW()))::BIGINT
                     ELSE NULL
                 END as retry_delay_secs
@@ -636,6 +657,7 @@ impl QueueService for QueueServiceImpl {
         .bind(&req.job_id)
         .bind(&req.worker_id)
         .bind(&auth.organization_id)
+        .bind(Self::opt_lease_id(&req.lease_id))
         .fetch_optional(self.pool.as_ref())
         .await
         .map_err(|e| {
@@ -651,6 +673,7 @@ impl QueueService for QueueServiceImpl {
                     &req.job_id,
                     &req.worker_id,
                     &auth.organization_id,
+                    Self::opt_lease_id(&req.lease_id),
                 )
                 .await);
             }
@@ -734,18 +757,20 @@ impl QueueService for QueueServiceImpl {
             r#"
             UPDATE jobs
             SET lease_expires_at = $1, updated_at = NOW()
-            WHERE id = $2 
-              AND assigned_worker_id = $3 
-              AND organization_id = $4 
+            WHERE id = $2
+              AND assigned_worker_id = $3
+              AND organization_id = $4
               AND status = 'processing'
               AND lease_expires_at IS NOT NULL
               AND lease_expires_at > NOW()
+              AND ($5::TEXT IS NULL OR lease_id = $5)
             "#,
         )
         .bind(new_expires_at)
         .bind(&req.job_id)
         .bind(&req.worker_id)
         .bind(&auth.organization_id)
+        .bind(Self::opt_lease_id(&req.lease_id))
         .execute(self.pool.as_ref())
         .await
         .map_err(|e| {
@@ -759,6 +784,7 @@ impl QueueService for QueueServiceImpl {
                 &req.job_id,
                 &req.worker_id,
                 &auth.organization_id,
+                Self::opt_lease_id(&req.lease_id),
             )
             .await);
         }
@@ -1168,14 +1194,15 @@ async fn classify_worker_miss_status(
     job_id: &str,
     worker_id: &str,
     org_id: &str,
+    lease_id: Option<&str>,
 ) -> Status {
     /// Same shape as the ProcessJobs helper below — factored to a type alias
     /// to appease clippy's `type_complexity` lint.
-    type WorkerMissRow = (String, Option<chrono::DateTime<Utc>>);
+    type WorkerMissRow = (String, Option<chrono::DateTime<Utc>>, Option<String>);
 
     let row: Result<Option<WorkerMissRow>, _> = sqlx::query_as(
         r#"
-        SELECT status, lease_expires_at
+        SELECT status, lease_expires_at, lease_id
         FROM jobs
         WHERE id = $1
           AND organization_id = $2
@@ -1189,9 +1216,15 @@ async fn classify_worker_miss_status(
     .await;
 
     match row {
-        Ok(Some((status, lease))) if status == "processing" => {
+        Ok(Some((status, lease, current_lease_id))) if status == "processing" => {
             let expired = lease.map(|t| t <= Utc::now()).unwrap_or(true);
-            if expired {
+            // A presented fencing token that no longer matches means the
+            // caller's lease was superseded — report it as expired.
+            let fenced_out = match lease_id {
+                Some(presented) => current_lease_id.as_deref() != Some(presented),
+                None => false,
+            };
+            if expired || fenced_out {
                 Status::failed_precondition("Lease expired")
             } else {
                 Status::not_found("Job not found or not authorized")
@@ -1214,15 +1247,16 @@ async fn classify_worker_miss_process_response(
     job_id: &str,
     worker_id: &str,
     org_id: &str,
+    lease_id: Option<&str>,
 ) -> ProcessResponse {
-    /// Row returned by the worker-miss classifier: current `status` and the
-    /// job's `lease_expires_at` (nullable). Factored out to keep clippy's
-    /// `type_complexity` lint happy at the call site.
-    type WorkerMissRow = (String, Option<chrono::DateTime<Utc>>);
+    /// Row returned by the worker-miss classifier: current `status`, the
+    /// job's `lease_expires_at` (nullable), and its current `lease_id`.
+    /// Factored out to keep clippy's `type_complexity` lint happy.
+    type WorkerMissRow = (String, Option<chrono::DateTime<Utc>>, Option<String>);
 
     let (code, message) = match sqlx::query_as::<_, WorkerMissRow>(
         r#"
-        SELECT status, lease_expires_at
+        SELECT status, lease_expires_at, lease_id
         FROM jobs
         WHERE id = $1
           AND organization_id = $2
@@ -1235,9 +1269,15 @@ async fn classify_worker_miss_process_response(
     .fetch_optional(pool)
     .await
     {
-        Ok(Some((status, lease))) if status == "processing" => {
+        Ok(Some((status, lease, current_lease_id))) if status == "processing" => {
             let expired = lease.map(|t| t <= Utc::now()).unwrap_or(true);
-            if expired {
+            // A presented fencing token that no longer matches means the
+            // caller's lease was superseded — report it as expired.
+            let fenced_out = match lease_id {
+                Some(presented) => current_lease_id.as_deref() != Some(presented),
+                None => false,
+            };
+            if expired || fenced_out {
                 ("LEASE_EXPIRED", "Lease expired")
             } else {
                 ("NOT_FOUND", "Job not found or not authorized")
@@ -1267,28 +1307,34 @@ async fn handle_process_complete(
     org_id: &str,
     req: CompleteRequest,
 ) -> ProcessResponse {
+    // Bind the result as a TEXT JSON string (matching the REST/unary paths)
+    // so an identical SQL string can never be prepared with conflicting
+    // parameter types on a shared pool connection (see unary `complete`).
     let result_json = struct_to_json_opt(req.result.as_ref());
+    let result_str = serde_json::to_string(&result_json).unwrap_or_default();
 
     let db_result = sqlx::query(
         r#"
         UPDATE jobs
-        SET 
+        SET
             status = 'completed',
             result = $1::JSONB,
             completed_at = NOW(),
             updated_at = NOW()
-        WHERE id = $2 
-          AND assigned_worker_id = $3 
+        WHERE id = $2
+          AND assigned_worker_id = $3
           AND organization_id = $4
           AND status = 'processing'
           AND lease_expires_at IS NOT NULL
           AND lease_expires_at > NOW()
+          AND ($5::TEXT IS NULL OR lease_id = $5)
         "#,
     )
-    .bind(&result_json)
+    .bind(&result_str)
     .bind(&req.job_id)
     .bind(&req.worker_id)
     .bind(org_id)
+    .bind(QueueServiceImpl::opt_lease_id(&req.lease_id))
     .execute(pool)
     .await;
 
@@ -1303,7 +1349,14 @@ async fn handle_process_complete(
             }
         }
         Ok(_) => {
-            classify_worker_miss_process_response(pool, &req.job_id, &req.worker_id, org_id).await
+            classify_worker_miss_process_response(
+                pool,
+                &req.job_id,
+                &req.worker_id,
+                org_id,
+                QueueServiceImpl::opt_lease_id(&req.lease_id),
+            )
+            .await
         }
         Err(e) => {
             error!(error = %e, "Failed to complete in ProcessJobs");
@@ -1361,17 +1414,18 @@ async fn handle_process_fail(
             lease_id = NULL,
             lease_expires_at = NULL,
             updated_at = NOW()
-        WHERE id = $3 
+        WHERE id = $3
           AND assigned_worker_id = $4
           AND organization_id = $5
           AND status = 'processing'
           AND lease_expires_at IS NOT NULL
           AND lease_expires_at > NOW()
-        RETURNING 
+          AND ($6::TEXT IS NULL OR lease_id = $6)
+        RETURNING
             status as new_status,
             retry_count as new_retry_count,
-            CASE 
-                WHEN status = 'pending' 
+            CASE
+                WHEN status = 'pending'
                 THEN EXTRACT(EPOCH FROM (scheduled_at - NOW()))::BIGINT
                 ELSE NULL
             END as retry_delay_secs
@@ -1382,6 +1436,7 @@ async fn handle_process_fail(
     .bind(&req.job_id)
     .bind(&req.worker_id)
     .bind(org_id)
+    .bind(QueueServiceImpl::opt_lease_id(&req.lease_id))
     .fetch_optional(pool)
     .await;
 
@@ -1433,7 +1488,14 @@ async fn handle_process_fail(
             }
         }
         Ok(None) => {
-            classify_worker_miss_process_response(pool, &req.job_id, &req.worker_id, org_id).await
+            classify_worker_miss_process_response(
+                pool,
+                &req.job_id,
+                &req.worker_id,
+                org_id,
+                QueueServiceImpl::opt_lease_id(&req.lease_id),
+            )
+            .await
         }
         Err(e) => {
             error!(error = %e, "Failed to fail in ProcessJobs");
@@ -1462,18 +1524,20 @@ async fn handle_process_renew(
         r#"
         UPDATE jobs
         SET lease_expires_at = $1, updated_at = NOW()
-        WHERE id = $2 
-          AND assigned_worker_id = $3 
-          AND organization_id = $4 
+        WHERE id = $2
+          AND assigned_worker_id = $3
+          AND organization_id = $4
           AND status = 'processing'
           AND lease_expires_at IS NOT NULL
           AND lease_expires_at > NOW()
+          AND ($5::TEXT IS NULL OR lease_id = $5)
         "#,
     )
     .bind(new_expires_at)
     .bind(&req.job_id)
     .bind(&req.worker_id)
     .bind(org_id)
+    .bind(QueueServiceImpl::opt_lease_id(&req.lease_id))
     .execute(pool)
     .await;
 
@@ -1487,7 +1551,14 @@ async fn handle_process_renew(
             )),
         },
         Ok(_) => {
-            classify_worker_miss_process_response(pool, &req.job_id, &req.worker_id, org_id).await
+            classify_worker_miss_process_response(
+                pool,
+                &req.job_id,
+                &req.worker_id,
+                org_id,
+                QueueServiceImpl::opt_lease_id(&req.lease_id),
+            )
+            .await
         }
         Err(e) => {
             error!(error = %e, "Failed to renew lease in ProcessJobs");

@@ -475,6 +475,7 @@ pub async fn complete(
             &id,
             &request.worker_id,
             &ctx.organization_id,
+            request.lease_id.as_deref(),
             request.result,
         )
         .await
@@ -555,6 +556,7 @@ pub async fn fail(
             &id,
             &request.worker_id,
             &ctx.organization_id,
+            request.lease_id.as_deref(),
             &request.error,
         )
         .await
@@ -629,6 +631,7 @@ pub async fn heartbeat(
             &id,
             &request.worker_id,
             &ctx.organization_id,
+            request.lease_id.as_deref(),
             request.lease_duration_secs,
         )
         .await
