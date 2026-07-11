@@ -7,6 +7,31 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.92] - 2026-07-10
+
+Fixes from a second independent audit of the running service.
+
+### Security
+
+- **`/auth/login` no longer bcrypt-scans every prefix-matching key.** The v0.1.90
+  `lookup_hash` fast-path was applied to the auth middleware and gRPC but missed the
+  login handler, so `POST /api/v1/auth/login` still did `WHERE key_prefix = $1 ...
+  LIMIT 100` and bcrypt-verified each candidate — an *unauthenticated* endpoint that
+  cost ~seconds of CPU per bogus `sp_live_*` key (a cheap amplification/DoS vector,
+  and the per-full-key-hash rate limit doesn't stop an attacker rotating keys). Login
+  now resolves via the indexed `lookup_hash` (single row + one bcrypt), with the same
+  bounded legacy fallback + lazy backfill as the middleware. Bogus login dropped from
+  ~3.3s to ~ms.
+- **WebSocket `/ws` no longer re-implements auth, closing a refresh-token bypass.**
+  The handler decoded `?token=` itself with `Validation::default()` and no
+  token-type check, so it accepted **refresh tokens** (which must never grant data
+  access) and scoped the event stream by that token's org instead of the
+  `authenticate_api_key` middleware's authenticated `ApiKeyContext` — letting a Bearer
+  identity and a `?token` identity disagree (a confused-deputy). `/ws` now scopes to
+  the middleware's `ApiKeyContext`, exactly like the SSE handlers. The middleware
+  already rejects refresh tokens, blacklisted tokens, and inactive keys, so it is the
+  single source of truth; `/ws` also now accepts a plain Bearer API key like SSE.
+
 ## [0.1.91] - 2026-07-09
 
 Fixes from an independent third-party audit of the running service.

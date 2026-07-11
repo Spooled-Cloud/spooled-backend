@@ -186,33 +186,74 @@ pub async fn login(
             .await;
     }
 
-    // Look up keys with matching prefix (much smaller set)
-    let api_keys: Vec<ApiKeyRecord> = sqlx::query_as(
-        r#"
-        SELECT id, organization_id, key_hash, queues, is_active, expires_at
-        FROM api_keys
-        WHERE is_active = TRUE 
-          AND (key_prefix = $1 OR key_prefix IS NULL)
-        LIMIT 100
-        "#,
-    )
-    .bind(&key_prefix)
-    .fetch_all(state.db.pool())
-    .await
-    .map_err(|e| {
+    // Resolve the key by its indexed lookup_hash first — a single row read plus one
+    // bcrypt verify — mirroring the auth middleware (v0.1.90). The middleware and gRPC
+    // were ported to lookup_hash but /auth/login was missed, so it kept prefix-scanning
+    // up to 100 sp_live_ keys and bcrypt-verifying each: an UNAUTHENTICATED endpoint
+    // that cost ~seconds of CPU per bogus key (a cheap amplification/DoS vector).
+    let db_err = |e: sqlx::Error| {
         error!(error = %e, "Database error during login");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse::internal()),
         )
-    })?;
+    };
+    let lookup_hash = crate::models::api_key_lookup_hash(&req.api_key);
 
-    // Find the matching key by verifying bcrypt hash (now only a few candidates)
-    let mut matched_key: Option<ApiKeyRecord> = None;
-    for key in api_keys {
-        if bcrypt::verify(&req.api_key, &key.key_hash).unwrap_or(false) {
-            matched_key = Some(key);
-            break;
+    let by_lookup: Option<ApiKeyRecord> = sqlx::query_as(
+        r#"
+        SELECT id, organization_id, key_hash, queues, is_active, expires_at
+        FROM api_keys
+        WHERE lookup_hash = $1 AND is_active = TRUE
+        LIMIT 1
+        "#,
+    )
+    .bind(&lookup_hash)
+    .fetch_optional(state.db.pool())
+    .await
+    .map_err(db_err)?;
+
+    let mut matched_key: Option<ApiKeyRecord> = match by_lookup {
+        Some(key) if bcrypt::verify(&req.api_key, &key.key_hash).unwrap_or(false) => Some(key),
+        _ => None,
+    };
+
+    // Legacy fallback: keys created before lookup_hash existed have it NULL. Scan only
+    // those (the set shrinks to empty as keys re-authenticate) and backfill on a match.
+    if matched_key.is_none() {
+        let candidates: Vec<ApiKeyRecord> = sqlx::query_as(
+            r#"
+            SELECT id, organization_id, key_hash, queues, is_active, expires_at
+            FROM api_keys
+            WHERE is_active = TRUE
+              AND lookup_hash IS NULL
+              AND (key_prefix = $1 OR key_prefix IS NULL)
+            LIMIT 100
+            "#,
+        )
+        .bind(&key_prefix)
+        .fetch_all(state.db.pool())
+        .await
+        .map_err(db_err)?;
+
+        for key in candidates {
+            if bcrypt::verify(&req.api_key, &key.key_hash).unwrap_or(false) {
+                // Backfill lookup_hash so subsequent logins for this key are O(1).
+                let db = state.db.pool_arc();
+                let key_id = key.id.clone();
+                let lh = lookup_hash.clone();
+                tokio::spawn(async move {
+                    let _ = sqlx::query(
+                        "UPDATE api_keys SET lookup_hash = $1 WHERE id = $2 AND lookup_hash IS NULL",
+                    )
+                    .bind(&lh)
+                    .bind(&key_id)
+                    .execute(&*db)
+                    .await;
+                });
+                matched_key = Some(key);
+                break;
+            }
         }
     }
 

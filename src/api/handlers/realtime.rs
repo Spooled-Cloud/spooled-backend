@@ -241,40 +241,20 @@ pub struct SubscribeQuery {
 /// WebSocket cannot use headers for auth, so token must be in query string.
 pub async fn websocket_handler(
     ws: WebSocketUpgrade,
+    Extension(ctx): Extension<crate::models::ApiKeyContext>,
     Query(query): Query<SubscribeQuery>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, &'static str)> {
-    // Validate authentication token
-    let org_id = match &query.token {
-        Some(token) => {
-            // Decode and validate JWT token
-            use crate::api::handlers::auth::Claims;
-            use jsonwebtoken::{decode, DecodingKey, Validation};
-
-            let token_data = decode::<Claims>(
-                token,
-                &DecodingKey::from_secret(state.settings.jwt.secret.as_bytes()),
-                &Validation::default(),
-            )
-            .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid or expired token"))?;
-
-            // Check blacklist
-            if let Some(ref cache) = state.cache {
-                let blacklist_key = format!("token_blacklist:{}", token_data.claims.jti);
-                if let Ok(Some(_)) = cache.get(&blacklist_key).await {
-                    return Err((StatusCode::UNAUTHORIZED, "Token has been revoked"));
-                }
-            }
-
-            Some(token_data.claims.org_id)
-        }
-        None => {
-            return Err((StatusCode::UNAUTHORIZED, "Missing authentication token"));
-        }
-    };
-
-    // Org_id is now guaranteed to be Some after successful auth
-    let org_id = org_id.expect("org_id must be set after authentication");
+    // Scope the stream to the organization the `authenticate_api_key` middleware already
+    // authenticated (Bearer API key, or an ACCESS JWT / api_key supplied via query). Do
+    // NOT re-decode `?token=` here: the previous in-handler decode used
+    // `Validation::default()` with no token-type check, so it accepted REFRESH tokens
+    // (which must never grant data access), and it scoped by the token's org instead of
+    // the authenticated principal — letting a Bearer identity and a `?token` identity
+    // disagree. The middleware already rejects refresh tokens, revoked/blacklisted
+    // tokens, and inactive keys, so trusting its context (as the SSE handlers do) is the
+    // single source of truth.
+    let org_id = ctx.organization_id.clone();
 
     // Validate queue filter
     if let Err(e) = validate_queue_filter(&query.queue) {
