@@ -54,10 +54,10 @@ jobs:
           tool: cargo-nextest
 
       - name: Build
-        run: cargo build --all-targets
+        run: cargo build --all-targets --all-features
 
       - name: Test (nextest)
-        run: cargo nextest run --no-fail-fast
+        run: cargo nextest run --all-features --no-fail-fast
 
       - name: Clippy
         # Lint production code only (lib + bins). Tests are exercised by nextest,
@@ -71,7 +71,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: taiki-e/install-action@cargo-audit
-      - run: cargo audit || true
+      # jsonwebtoken's RustCrypto backend includes RSA, but this service only
+      # signs and verifies HMAC JWTs, so the RSA private-key attack is unreachable.
+      - run: cargo audit --ignore RUSTSEC-2023-0071
 
   # Docker build after tests pass
   docker:

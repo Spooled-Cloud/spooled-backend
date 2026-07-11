@@ -112,8 +112,8 @@ docker-tests = []
 [dev-dependencies]
 # Testing
 tokio-test = "0.4"
-testcontainers = "0.24"
-testcontainers-modules = { version = "0.12", features = ["postgres", "redis"] }
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["postgres", "redis"] }
 pretty_assertions = "1.4"
 fake = { version = "5.1", features = ["derive", "chrono", "uuid"] }
 wiremock = "0.6"

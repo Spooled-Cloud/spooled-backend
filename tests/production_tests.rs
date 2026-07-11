@@ -366,25 +366,20 @@ async fn test_scheduled_job_ordering() {
     let org_id = setup_org(&db, "scheduled-order").await;
 
     // Create jobs scheduled at different times
-    let times = vec![
-        ("job-3", "NOW() + INTERVAL '3 hours'"),
-        ("job-1", "NOW() + INTERVAL '1 hour'"),
-        ("job-2", "NOW() + INTERVAL '2 hours'"),
-        ("job-now", "NOW()"),
-    ];
+    let times = vec![("job-3", 3), ("job-1", 1), ("job-2", 2), ("job-now", 0)];
 
-    for (name, scheduled) in &times {
+    for (name, hours_until_scheduled) in &times {
         let job_id = uuid::Uuid::new_v4().to_string();
-        sqlx::query(&format!(
+        sqlx::query(
             r#"
             INSERT INTO jobs (id, organization_id, queue_name, status, payload, priority, max_retries, timeout_seconds, scheduled_at, created_at, updated_at)
-            VALUES ($1, $2, 'scheduled-queue', 'scheduled', $3::JSONB, 0, 3, 300, {}, NOW(), NOW())
+            VALUES ($1, $2, 'scheduled-queue', 'scheduled', $3::JSONB, 0, 3, 300, NOW() + $4 * INTERVAL '1 hour', NOW(), NOW())
             "#,
-            scheduled
-        ))
+        )
         .bind(&job_id)
         .bind(&org_id)
         .bind(json!({"name": name}).to_string())
+        .bind(hours_until_scheduled)
         .execute(db.pool())
         .await
         .unwrap();

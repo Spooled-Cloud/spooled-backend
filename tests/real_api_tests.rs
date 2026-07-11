@@ -2419,34 +2419,23 @@ async fn test_comprehensive_job_statistics() {
 
     for (status, priority, worker, duration_ms) in scenarios {
         let job_id = uuid::Uuid::new_v4().to_string();
-        let started_at = if status == "processing" || status == "completed" {
-            "NOW() - INTERVAL '1 minute'"
-        } else {
-            "NULL"
-        };
-        let completed_at = if status == "completed" {
-            format!(
-                "NOW() - INTERVAL '{} milliseconds'",
-                duration_ms.unwrap_or(0)
-            )
-        } else {
-            "NULL".to_string()
-        };
-
-        sqlx::query(&format!(
+        sqlx::query(
             r#"
             INSERT INTO jobs (id, organization_id, queue_name, status, payload, priority, max_retries, timeout_seconds, 
                              assigned_worker_id, started_at, completed_at, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, '{{}}'::JSONB, $5, 3, 300, $6, {}, {}, NOW(), NOW())
+            VALUES ($1, $2, $3, $4, '{}'::JSONB, $5, 3, 300, $6,
+                    CASE WHEN $4 IN ('processing', 'completed') THEN NOW() - INTERVAL '1 minute' END,
+                    CASE WHEN $4 = 'completed' THEN NOW() - $7 * INTERVAL '1 millisecond' END,
+                    NOW(), NOW())
             "#,
-            started_at, completed_at
-        ))
+        )
         .bind(&job_id)
         .bind(&org_id)
         .bind(queue_name)
         .bind(status)
         .bind(priority)
         .bind(worker)
+        .bind(duration_ms.unwrap_or(0))
         .execute(db.pool())
         .await
         .expect("Should create job");
