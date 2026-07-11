@@ -298,7 +298,7 @@ impl WebhookService {
 
     /// Generate HMAC-SHA256 signature for webhook payload
     fn generate_signature(&self, payload: &str, timestamp: i64) -> String {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         type HmacSha256 = Hmac<Sha256>;
 
         let message = format!("{}.{}", timestamp, payload);
@@ -355,7 +355,7 @@ mod tests {
         // Create a mock service (we can't actually create one without a DB pool)
         // Instead, test the signature algorithm directly
 
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         type HmacSha256 = Hmac<Sha256>;
 
         let secret = "test-secret";

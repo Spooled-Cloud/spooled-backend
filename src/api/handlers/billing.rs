@@ -12,7 +12,7 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tracing::{error, info, warn};
@@ -1177,7 +1177,7 @@ mod tests {
 
     #[test]
     fn test_stripe_signature_accepts_any_v1_during_rotation() {
-        use hmac::Mac;
+        use hmac::{KeyInit, Mac};
 
         let secret = "whsec_test_secret";
         let body = b"{\"id\":\"evt_1\"}";
