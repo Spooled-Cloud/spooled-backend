@@ -160,10 +160,10 @@ pub async fn list_organizations(
             .bind(&search_pattern)
             .fetch_one(state.db.pool())
             .await?;
-            let orgs = sqlx::query_as::<_, Organization>(&format!(
+            let orgs = sqlx::query_as::<_, Organization>(sqlx::AssertSqlSafe(format!(
                 "SELECT * FROM organizations WHERE plan_tier = $1 AND (name ILIKE $2 OR slug ILIKE $2) {} LIMIT $3 OFFSET $4",
                 order_clause
-            ))
+            )))
             .bind(plan)
             .bind(&search_pattern)
             .bind(limit)
@@ -178,10 +178,10 @@ pub async fn list_organizations(
                     .bind(plan)
                     .fetch_one(state.db.pool())
                     .await?;
-            let orgs = sqlx::query_as::<_, Organization>(&format!(
+            let orgs = sqlx::query_as::<_, Organization>(sqlx::AssertSqlSafe(format!(
                 "SELECT * FROM organizations WHERE plan_tier = $1 {} LIMIT $2 OFFSET $3",
                 order_clause
-            ))
+            )))
             .bind(plan)
             .bind(limit)
             .bind(offset)
@@ -197,10 +197,10 @@ pub async fn list_organizations(
             .bind(&search_pattern)
             .fetch_one(state.db.pool())
             .await?;
-            let orgs = sqlx::query_as::<_, Organization>(&format!(
+            let orgs = sqlx::query_as::<_, Organization>(sqlx::AssertSqlSafe(format!(
                 "SELECT * FROM organizations WHERE name ILIKE $1 OR slug ILIKE $1 {} LIMIT $2 OFFSET $3",
                 order_clause
-            ))
+            )))
             .bind(&search_pattern)
             .bind(limit)
             .bind(offset)
@@ -212,10 +212,10 @@ pub async fn list_organizations(
             let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM organizations")
                 .fetch_one(state.db.pool())
                 .await?;
-            let orgs = sqlx::query_as::<_, Organization>(&format!(
+            let orgs = sqlx::query_as::<_, Organization>(sqlx::AssertSqlSafe(format!(
                 "SELECT * FROM organizations {} LIMIT $1 OFFSET $2",
                 order_clause
-            ))
+            )))
             .bind(limit)
             .bind(offset)
             .fetch_all(state.db.pool())
