@@ -5,11 +5,10 @@ for the next agent. Read `AGENTS.md`, `ROOT_DOCS.md`, and `CHANGELOG.md` first.
 
 ## Current state
 
-- **Backend: `v0.1.94` is LIVE on prod** (verified earlier 2026-07-11). **`v0.1.95`
-  is committed locally** (billing / soft-delete / gRPC-stream hardening) and needs
-  tag + `git push origin main` + `git push origin v0.1.95` so `:latest` rebuilds.
-  Confirm redeploy via `GET /api/v1/admin/stats` → `system.uptime_seconds` (small ==
-  fresh pod) and pod log `Starting Spooled Backend v0.1.95`.
+- **Backend: `v0.1.95` is LIVE on prod** (redeployed + live-smoked 2026-07-11;
+  uptime small after operator redeploy). Image build
+  https://github.com/Spooled-Cloud/spooled-backend/actions/runs/29170162531
+  (`6a7a8d9`).
 - F9 lease fencing + queue-scope containment remain live on v0.1.94 (see below).
 - **SDKs published WITH F9 lease_id support**: npm `@spooled/sdk` 1.0.34, go v1.0.19,
   PyPI `spooled` 1.0.20, Packagist `spooled-cloud/spooled` v1.0.16.
@@ -35,11 +34,11 @@ Queue scope + F9 lease fencing. Details in CHANGELOG. Prod-smoked 2026-07-11
 
 ## Remaining work (priority order)
 
-1. **Ship v0.1.95** — tag + push main + tag; wait for `:latest`; live-verify:
-   - Soft-delete: create zz-* org, start email code, soft-delete, verify → reject;
-     admin mint key on deleted → 400; surviving key (if any) → 401.
-   - Portal: `POST /billing/portal` with `return_url=https://evil.example/` → 400.
-   - (Stripe cancel race needs Stripe test-mode or fixture; covered by unit tests.)
+1. **v0.1.95 prod smoke — DONE 2026-07-11** (zz-* org hard-deleted after):
+   - portal evil `return_url` → 400 allowlist; allowlisted origin → non-allowlist error
+   - soft-delete → admin mint key → 400 "deleted"; revoked key → 401
+   - email `start` after soft-delete correctly skips deleted org (`org_id=NULL` signup path)
+   - Stripe cancel race: unit-only (no Stripe test-mode this round)
 2. **Keep auditing.** Next highest-value unexplored:
    - Outgoing webhooks SSRF/signing
    - Dashboard API surface (spooled-dashboard → backend)
@@ -71,8 +70,6 @@ Queue scope + F9 lease fencing. Details in CHANGELOG. Prod-smoked 2026-07-11
 - **Rotate + secret-mount `certs/grpc-key.pem`** — a self-signed origin gRPC key is
   tracked in git and baked into the image (`Dockerfile: COPY certs /certs`,
   `docker-compose.prod.yml` references it). Add a `.dockerignore`.
-- **Redeploy / push v0.1.95** if the agent committed but did not push (or if CI
-  needs a manual nudge).
 
 ## How to build / test / release (backend)
 - Local DB: the `.env` `DATABASE_URL` points at `:5433` which is usually DOWN. Use a
