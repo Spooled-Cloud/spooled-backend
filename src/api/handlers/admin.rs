@@ -998,6 +998,12 @@ pub async fn create_api_key(
 
     let org = org.ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
 
+    if org.plan_tier == "deleted" {
+        return Err(AppError::BadRequest(
+            "Cannot create API keys for a deleted organization".to_string(),
+        ));
+    }
+
     // Validate name
     if request.name.is_empty() || request.name.len() > 100 {
         return Err(AppError::Validation(

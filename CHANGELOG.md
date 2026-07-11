@@ -7,6 +7,44 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.95] - 2026-07-11
+
+Security hardening from the post-F9 adversarial pass (billing, soft-delete, gRPC streams).
+
+### Security
+
+- **Canceled Stripe subscriptions can no longer restore a paid `plan_tier`.**
+  `customer.subscription.updated` (and admin/checkout reconcile) mapped tier from
+  price alone. After `subscription.deleted` set `plan_tier=free`, a same-or-later
+  `updated` with `status=canceled` re-applied the price-mapped paid tier via
+  `COALESCE`. Terminal statuses (`canceled` / `unpaid` / `incomplete_expired`)
+  now force `free`; `past_due` / `active` / `trialing` still use the price map.
+- **Billing portal `return_url` is origin-allowlisted.** Any API-key holder could
+  mint a Stripe portal session that redirected the victim to an attacker URL after
+  exit. `return_url` must match `CORS_ALLOWED_ORIGINS` (https; http localhost only
+  outside production).
+- **Soft-deleted orgs stay dead.** Three revival paths closed:
+  - email `verify` rejected a pre-delete login code that still carried
+    `organization_id` and would mint a fresh Email Login key;
+  - admin `POST .../api-keys` refused `plan_tier=deleted` orgs;
+  - REST + gRPC auth join `organizations` and reject `plan_tier='deleted'`
+    (JWT path checks org status explicitly).
+- **gRPC stream auth no longer lasts forever.** `StreamJobs` re-checks
+  key active/expiry + org not-deleted ~every 30s and rate-limits every poll;
+  `ProcessJobs` re-checks every 32 messages. Revoke now ends open streams.
+- **`ProcessJobs` matches unary validation** for empty `worker_id` and 1 MiB
+  result size (was unbounded / empty-worker-accepting).
+
+### Known follow-ups (deferred)
+
+- `StreamJobs` claim-then-send on disconnect still leaves the job leased until
+  expiry (scheduler reclaim); no eager release.
+- No per-org gRPC stream cap (only HTTP/2 `MAX_CONCURRENT_STREAMS`).
+- Staging still uses permissive CORS (`RUST_ENV=staging`); only Production
+  restricts origins.
+- `EMAIL_SIGNUP_ENABLED=false` does not block `POST /organizations` when
+  `REGISTRATION_MODE=open`.
+
 ## [0.1.94] - 2026-07-11
 
 Closes the last open external-audit finding (F9): lease fencing by `lease_id`.

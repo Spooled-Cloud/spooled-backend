@@ -909,7 +909,10 @@ impl QueueService for QueueServiceImpl {
         let lease_duration = Self::safe_lease_duration(req.lease_duration_secs);
         let pool = self.pool.clone();
         let metrics = self.metrics.clone();
+        let this = self.clone();
         let org_id = auth.organization_id.clone();
+        let api_key_id = auth.api_key_id.clone();
+        let api_key_rate_limit = auth.rate_limit;
         let queue_name = req.queue_name.clone();
         let worker_id = req.worker_id.clone();
 
@@ -917,11 +920,60 @@ impl QueueService for QueueServiceImpl {
 
         // Spawn background task to poll for jobs
         tokio::spawn(async move {
+            let mut polls_since_auth_check: u32 = 0;
             loop {
                 // Check if receiver is closed
                 if tx.is_closed() {
                     debug!(worker = %worker_id, "Stream closed by client");
                     break;
+                }
+
+                // Re-check key + org every ~30s (and rate-limit every poll). Auth was
+                // only snapshot at stream open; without this a revoked/expired key or
+                // soft-deleted org keeps claiming for the life of the stream.
+                polls_since_auth_check += 1;
+                if polls_since_auth_check >= 30 {
+                    polls_since_auth_check = 0;
+                    let still_valid: Option<(bool,)> = sqlx::query_as(
+                        r#"
+                        SELECT k.is_active
+                        FROM api_keys k
+                        INNER JOIN organizations o ON o.id = k.organization_id
+                        WHERE k.id = $1
+                          AND k.is_active = TRUE
+                          AND (k.expires_at IS NULL OR k.expires_at > NOW())
+                          AND o.plan_tier <> 'deleted'
+                        "#,
+                    )
+                    .bind(&api_key_id)
+                    .fetch_optional(pool.as_ref())
+                    .await
+                    .ok()
+                    .flatten();
+                    if !matches!(still_valid, Some((true,))) {
+                        warn!(
+                            worker = %worker_id,
+                            api_key_id = %api_key_id,
+                            "Closing StreamJobs: API key revoked/expired or org deleted"
+                        );
+                        let _ = tx
+                            .send(Err(Status::unauthenticated(
+                                "API key revoked, expired, or organization unavailable",
+                            )))
+                            .await;
+                        break;
+                    }
+                }
+
+                if let Err(status) = this
+                    .enforce_rate_limits(&org_id, &api_key_id, api_key_rate_limit)
+                    .await
+                {
+                    if tx.send(Err(status)).await.is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(STREAM_POLL_INTERVAL_MS)).await;
+                    continue;
                 }
 
                 // Try to claim a job
@@ -1024,7 +1076,49 @@ impl QueueService for QueueServiceImpl {
 
         // Spawn background task to handle incoming requests
         tokio::spawn(async move {
+            let mut messages_since_auth_check: u32 = 0;
             while let Ok(Some(req)) = stream.message().await {
+                // Re-check key + org periodically. Auth is snapshotted at stream
+                // open; without this a revoked key keeps completing/claiming.
+                messages_since_auth_check += 1;
+                if messages_since_auth_check >= 32 {
+                    messages_since_auth_check = 0;
+                    let still_valid: Option<(bool,)> = sqlx::query_as(
+                        r#"
+                        SELECT k.is_active
+                        FROM api_keys k
+                        INNER JOIN organizations o ON o.id = k.organization_id
+                        WHERE k.id = $1
+                          AND k.is_active = TRUE
+                          AND (k.expires_at IS NULL OR k.expires_at > NOW())
+                          AND o.plan_tier <> 'deleted'
+                        "#,
+                    )
+                    .bind(&api_key_id)
+                    .fetch_optional(pool.as_ref())
+                    .await
+                    .ok()
+                    .flatten();
+                    if !matches!(still_valid, Some((true,))) {
+                        warn!(
+                            api_key_id = %api_key_id,
+                            "Closing ProcessJobs: API key revoked/expired or org deleted"
+                        );
+                        let response = ProcessResponse {
+                            response: Some(crate::grpc::proto::process_response::Response::Error(
+                                crate::grpc::proto::ErrorResponse {
+                                    code: "UNAUTHENTICATED".to_string(),
+                                    message:
+                                        "API key revoked, expired, or organization unavailable"
+                                            .to_string(),
+                                },
+                            )),
+                        };
+                        let _ = tx.send(Ok(response)).await;
+                        break;
+                    }
+                }
+
                 // IMPORTANT: enforce rate limits per message, otherwise the stream can bypass limits.
                 if let Err(status) = this
                     .enforce_rate_limits(&org_id, &api_key_id, api_key_rate_limit)
@@ -1106,6 +1200,17 @@ async fn handle_process_dequeue(
                         "API key does not have permission for queue '{}'",
                         req.queue_name
                     ),
+                },
+            )),
+        };
+    }
+
+    if req.worker_id.is_empty() {
+        return ProcessResponse {
+            response: Some(crate::grpc::proto::process_response::Response::Error(
+                crate::grpc::proto::ErrorResponse {
+                    code: "INVALID_ARGUMENT".to_string(),
+                    message: "Worker ID is required".to_string(),
                 },
             )),
         };
@@ -1312,6 +1417,20 @@ async fn handle_process_complete(
     // parameter types on a shared pool connection (see unary `complete`).
     let result_json = struct_to_json_opt(req.result.as_ref());
     let result_str = serde_json::to_string(&result_json).unwrap_or_default();
+    if result_str.len() > MAX_RESULT_SIZE {
+        return ProcessResponse {
+            response: Some(crate::grpc::proto::process_response::Response::Error(
+                crate::grpc::proto::ErrorResponse {
+                    code: "INVALID_ARGUMENT".to_string(),
+                    message: format!(
+                        "Result too large: {} bytes (max: {} bytes)",
+                        result_str.len(),
+                        MAX_RESULT_SIZE
+                    ),
+                },
+            )),
+        };
+    }
 
     let db_result = sqlx::query(
         r#"

@@ -146,14 +146,16 @@ async fn validate_api_key(pool: &PgPool, token: &str) -> Result<GrpcAuthContext,
     let lookup_hash = crate::models::api_key_lookup_hash(token);
 
     // Fast path: unique indexed lookup. is_active + expiry are filtered in SQL because
-    // the gRPC record does not carry those columns.
+    // the gRPC record does not carry those columns. Soft-deleted orgs are excluded.
     let candidate: Option<ApiKeyRecord> = sqlx::query_as(
         r#"
-        SELECT id, organization_id, key_hash, queues, rate_limit
-        FROM api_keys
-        WHERE lookup_hash = $1
-          AND is_active = TRUE
-          AND (expires_at IS NULL OR expires_at > NOW())
+        SELECT k.id, k.organization_id, k.key_hash, k.queues, k.rate_limit
+        FROM api_keys k
+        INNER JOIN organizations o ON o.id = k.organization_id
+        WHERE k.lookup_hash = $1
+          AND k.is_active = TRUE
+          AND (k.expires_at IS NULL OR k.expires_at > NOW())
+          AND o.plan_tier <> 'deleted'
         LIMIT 1
         "#,
     )
@@ -173,12 +175,14 @@ async fn validate_api_key(pool: &PgPool, token: &str) -> Result<GrpcAuthContext,
     let key_prefix: String = token.chars().take(8).collect();
     let records: Vec<ApiKeyRecord> = sqlx::query_as(
         r#"
-        SELECT id, organization_id, key_hash, queues, rate_limit
-        FROM api_keys
-        WHERE is_active = TRUE
-          AND lookup_hash IS NULL
-          AND (key_prefix = $1 OR key_prefix IS NULL)
-          AND (expires_at IS NULL OR expires_at > NOW())
+        SELECT k.id, k.organization_id, k.key_hash, k.queues, k.rate_limit
+        FROM api_keys k
+        INNER JOIN organizations o ON o.id = k.organization_id
+        WHERE k.is_active = TRUE
+          AND k.lookup_hash IS NULL
+          AND (k.key_prefix = $1 OR k.key_prefix IS NULL)
+          AND (k.expires_at IS NULL OR k.expires_at > NOW())
+          AND o.plan_tier <> 'deleted'
         LIMIT 100
         "#,
     )

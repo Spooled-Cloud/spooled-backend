@@ -197,6 +197,26 @@ async fn authenticate_jwt_token(
                     return Err((StatusCode::UNAUTHORIZED, "API key has expired".to_string()));
                 }
             }
+            // Soft-deleted orgs must not authenticate via a leftover JWT, even if the
+            // key row was somehow reactivated (email-verify / admin mint revival paths).
+            let org_tier: Option<(String,)> =
+                sqlx::query_as("SELECT plan_tier FROM organizations WHERE id = $1")
+                    .bind(&token_data.claims.org_id)
+                    .fetch_optional(state.db.pool())
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(error = %e, "Failed to check organization status");
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Database error".to_string(),
+                        )
+                    })?;
+            if !matches!(org_tier.as_ref().map(|(t,)| t.as_str()), Some(t) if t != "deleted") {
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    "Organization is not available".to_string(),
+                ));
+            }
             // Build context from the CURRENT DB scope, not the (possibly stale) token.
             Ok(ApiKeyContext {
                 api_key_id: token_data.claims.api_key_id,
@@ -303,10 +323,13 @@ async fn fetch_api_key(
 
     // Fast path: exactly one row (or none). Mirrors the old scan's `is_active = TRUE`
     // filter; expiry is checked by the caller from the returned `expires_at`.
+    // Soft-deleted orgs (`plan_tier = 'deleted'`) are excluded so a leftover or
+    // revived key cannot authenticate after soft-delete.
     let by_lookup: Option<ApiKeyRecord> = sqlx::query_as(
-        "SELECT id, organization_id, key_hash, queues, rate_limit, is_active, expires_at
-         FROM api_keys
-         WHERE lookup_hash = $1 AND is_active = TRUE
+        "SELECT k.id, k.organization_id, k.key_hash, k.queues, k.rate_limit, k.is_active, k.expires_at
+         FROM api_keys k
+         INNER JOIN organizations o ON o.id = k.organization_id
+         WHERE k.lookup_hash = $1 AND k.is_active = TRUE AND o.plan_tier <> 'deleted'
          LIMIT 1",
     )
     .bind(&lookup_hash)
@@ -327,11 +350,13 @@ async fn fetch_api_key(
     // Legacy fallback: only keys not yet carrying a lookup_hash.
     let key_prefix: String = token.chars().take(8).collect();
     let records: Vec<ApiKeyRecord> = sqlx::query_as(
-        "SELECT id, organization_id, key_hash, queues, rate_limit, is_active, expires_at
-         FROM api_keys
-         WHERE is_active = TRUE
-           AND lookup_hash IS NULL
-           AND (key_prefix = $1 OR key_prefix IS NULL)
+        "SELECT k.id, k.organization_id, k.key_hash, k.queues, k.rate_limit, k.is_active, k.expires_at
+         FROM api_keys k
+         INNER JOIN organizations o ON o.id = k.organization_id
+         WHERE k.is_active = TRUE
+           AND k.lookup_hash IS NULL
+           AND (k.key_prefix = $1 OR k.key_prefix IS NULL)
+           AND o.plan_tier <> 'deleted'
          LIMIT 100",
     )
     .bind(&key_prefix)

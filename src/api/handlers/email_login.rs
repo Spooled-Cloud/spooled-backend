@@ -399,6 +399,29 @@ pub async fn verify(
     // Check if organization exists
     match org_id {
         Some(existing_org_id) => {
+            // Soft-deleted orgs must not be revived via a pre-delete login code.
+            // `start()` refuses new codes for deleted orgs, but a code issued before
+            // soft-delete still carries organization_id; without this check,
+            // get_or_create_email_api_key would mint a fresh active key and restore access.
+            let org_tier: Option<(String,)> =
+                sqlx::query_as("SELECT plan_tier FROM organizations WHERE id = $1")
+                    .bind(&existing_org_id)
+                    .fetch_optional(state.db.pool())
+                    .await?;
+            match org_tier.as_ref().map(|(t,)| t.as_str()) {
+                Some("deleted") | None => {
+                    warn!(
+                        email = %mask_email(&email),
+                        org_id = %existing_org_id,
+                        "Rejecting email verify for missing or soft-deleted organization"
+                    );
+                    return Err(AppError::Authentication(
+                        "Invalid or expired code. Please request a new one.".to_string(),
+                    ));
+                }
+                Some(_) => {}
+            }
+
             // Existing user - return login tokens
             let api_key_id = get_or_create_email_api_key(&state, &existing_org_id, &email).await?;
 

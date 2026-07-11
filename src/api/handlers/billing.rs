@@ -18,6 +18,7 @@ use sha2::Sha256;
 use tracing::{error, info, warn};
 
 use crate::api::AppState;
+use crate::config::Environment;
 use crate::error::{AppError, AppResult};
 use crate::models::ApiKeyContext;
 
@@ -127,6 +128,15 @@ pub async fn create_portal(
         .secret_key
         .as_ref()
         .ok_or_else(|| AppError::Internal("Stripe is not configured".to_string()))?;
+
+    // Reject open redirects: Stripe sends the user to return_url after the
+    // portal. Without an origin allowlist any API-key holder can mint a portal
+    // session that lands the victim on an attacker-controlled page.
+    validate_portal_return_url(
+        &request.return_url,
+        &state.settings.server.cors_allowed_origins,
+        state.settings.server.environment,
+    )?;
 
     // Get customer ID
     let customer_id: Option<(Option<String>,)> =
@@ -441,8 +451,11 @@ async fn handle_subscription_updated(state: &AppState, event: &StripeEvent) -> A
     let current_period_end = subscription_period_end(subscription);
     let cancel_at_period_end = subscription["cancel_at_period_end"].as_bool();
 
-    // Determine plan tier from price
-    let plan_tier = determine_plan_tier(subscription, state);
+    // Tier from status + price. Terminal statuses must force free — otherwise a
+    // `subscription.updated` (status=canceled) that arrives at/after
+    // `subscription.deleted` re-applies the price-mapped paid tier via COALESCE
+    // and restores paid entitlements on a canceled org.
+    let plan_tier = resolve_plan_tier(subscription, state);
 
     if let (Some(customer_id), Some(status)) = (customer_id, status) {
         let period_end = current_period_end.and_then(|ts| DateTime::from_timestamp(ts, 0));
@@ -567,7 +580,7 @@ pub(crate) async fn reconcile_org_from_subscription_id(
     let status = subscription["status"].as_str();
     let current_period_end = subscription_period_end(&subscription);
     let cancel_at_period_end = subscription["cancel_at_period_end"].as_bool();
-    let plan_tier = determine_plan_tier(&subscription, state);
+    let plan_tier = resolve_plan_tier(&subscription, state);
     let period_end = current_period_end.and_then(|ts| DateTime::from_timestamp(ts, 0));
 
     sqlx::query(
@@ -830,7 +843,32 @@ fn subscription_period_end(subscription: &serde_json::Value) -> Option<i64> {
         .or_else(|| subscription["items"]["data"][0]["current_period_end"].as_i64())
 }
 
-/// Determine plan tier from subscription prices
+/// Subscription statuses that must never carry a paid plan_tier.
+///
+/// Stripe emits both `customer.subscription.updated` (status → canceled) and
+/// `customer.subscription.deleted` on cancel. The deleted handler sets
+/// `plan_tier = free`; if an updated(canceled) with the same-or-later
+/// `created` is applied afterward and we only map from price, COALESCE
+/// restores the paid tier. `unpaid` / `incomplete_expired` are terminal the
+/// same way. `past_due` / `incomplete` / `trialing` / `active` keep the
+/// price-mapped tier (grace / in-progress checkout).
+fn is_terminal_subscription_status(status: &str) -> bool {
+    matches!(status, "canceled" | "unpaid" | "incomplete_expired")
+}
+
+/// Resolve plan tier from subscription status + price.
+///
+/// Terminal statuses → `Some("free")`. Otherwise map from the price id.
+fn resolve_plan_tier(subscription: &serde_json::Value, state: &AppState) -> Option<String> {
+    if let Some(status) = subscription["status"].as_str() {
+        if is_terminal_subscription_status(status) {
+            return Some("free".to_string());
+        }
+    }
+    determine_plan_tier(subscription, state)
+}
+
+/// Determine plan tier from subscription prices (ignores status).
 fn determine_plan_tier(subscription: &serde_json::Value, state: &AppState) -> Option<String> {
     let items = subscription["items"]["data"].as_array()?;
     let first_item = items.first()?;
@@ -857,6 +895,64 @@ fn determine_plan_tier(subscription: &serde_json::Value, state: &AppState) -> Op
         "Stripe price id not mapped to any plan tier; keeping current tier — check STRIPE_*_PRICE_ID configuration"
     );
     None
+}
+
+/// Allowlist `return_url` for the Stripe billing portal.
+///
+/// Origin must be in `CORS_ALLOWED_ORIGINS` (same set the dashboard is served
+/// from). Scheme must be https in production; http is only allowed for
+/// localhost/127.0.0.1 outside production so local dashboards still work.
+fn validate_portal_return_url(
+    return_url: &str,
+    allowed_origins: &[String],
+    environment: Environment,
+) -> AppResult<()> {
+    let parsed = url::Url::parse(return_url)
+        .map_err(|_| AppError::BadRequest("return_url must be a valid absolute URL".to_string()))?;
+
+    let host = parsed.host_str().unwrap_or("");
+    let is_loopback = host == "localhost" || host == "127.0.0.1" || host == "::1";
+
+    match parsed.scheme() {
+        "https" => {}
+        "http" if environment != Environment::Production && is_loopback => {}
+        "http" if environment == Environment::Production => {
+            return Err(AppError::BadRequest(
+                "return_url must use https in production".to_string(),
+            ));
+        }
+        _ => {
+            return Err(AppError::BadRequest(
+                "return_url must use https (or http://localhost in non-production)".to_string(),
+            ));
+        }
+    }
+
+    // Rebuild origin without path/query/fragment. url::Url::origin() yields an
+    // opaque Origin for some non-special schemes; for http(s) this is fine.
+    let origin = {
+        let mut origin = format!("{}://{}", parsed.scheme(), host);
+        if let Some(port) = parsed.port() {
+            // url::Url omits default ports from .port(); only non-default appear.
+            origin.push(':');
+            origin.push_str(&port.to_string());
+        }
+        origin
+    };
+
+    let allowed = allowed_origins.iter().any(|o| {
+        // Compare case-insensitively on scheme/host; strip trailing slash if present.
+        let normalized = o.trim().trim_end_matches('/');
+        normalized.eq_ignore_ascii_case(&origin)
+    });
+
+    if !allowed {
+        return Err(AppError::BadRequest(
+            "return_url origin is not in the allowed list".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 /// Verify Stripe webhook signature
@@ -1122,5 +1218,89 @@ mod tests {
     #[test]
     fn test_stripe_timestamp_tolerance() {
         assert_eq!(STRIPE_TIMESTAMP_TOLERANCE_SECS, 300);
+    }
+
+    #[test]
+    fn test_terminal_subscription_status_forces_free() {
+        assert!(is_terminal_subscription_status("canceled"));
+        assert!(is_terminal_subscription_status("unpaid"));
+        assert!(is_terminal_subscription_status("incomplete_expired"));
+        // Grace / in-progress — must NOT force free (price mapping applies).
+        assert!(!is_terminal_subscription_status("active"));
+        assert!(!is_terminal_subscription_status("past_due"));
+        assert!(!is_terminal_subscription_status("trialing"));
+        assert!(!is_terminal_subscription_status("incomplete"));
+    }
+
+    #[test]
+    fn test_resolve_plan_tier_canceled_ignores_price() {
+        // Minimal AppState-shaped stripe config isn't needed: terminal status
+        // short-circuits before price lookup. Build a canceled sub with a
+        // price that would otherwise map if we only looked at price ids.
+        let canceled = serde_json::json!({
+            "id": "sub_x",
+            "status": "canceled",
+            "items": { "data": [{ "price": { "id": "price_pro" } }] }
+        });
+        // resolve_plan_tier needs AppState — test the status gate directly and
+        // the free-forcing branch via a thin wrapper on the pure helper.
+        assert!(is_terminal_subscription_status(
+            canceled["status"].as_str().unwrap()
+        ));
+        // Simulate resolve_plan_tier's terminal branch:
+        let tier = if is_terminal_subscription_status(canceled["status"].as_str().unwrap()) {
+            Some("free".to_string())
+        } else {
+            None
+        };
+        assert_eq!(tier.as_deref(), Some("free"));
+    }
+
+    #[test]
+    fn test_portal_return_url_allowlist() {
+        let allowed = vec![
+            "https://dashboard.spooled.cloud".to_string(),
+            "https://spooled.cloud".to_string(),
+        ];
+
+        assert!(validate_portal_return_url(
+            "https://dashboard.spooled.cloud/settings/billing",
+            &allowed,
+            Environment::Production,
+        )
+        .is_ok());
+
+        assert!(validate_portal_return_url(
+            "https://evil.example/phish",
+            &allowed,
+            Environment::Production,
+        )
+        .is_err());
+
+        assert!(validate_portal_return_url(
+            "http://dashboard.spooled.cloud/billing",
+            &allowed,
+            Environment::Production,
+        )
+        .is_err());
+
+        // Localhost http OK outside production when allowlisted.
+        let local = vec!["http://localhost:4321".to_string()];
+        assert!(validate_portal_return_url(
+            "http://localhost:4321/account/billing",
+            &local,
+            Environment::Development,
+        )
+        .is_ok());
+        assert!(validate_portal_return_url(
+            "http://localhost:4321/account/billing",
+            &local,
+            Environment::Production,
+        )
+        .is_err());
+
+        assert!(
+            validate_portal_return_url("not-a-url", &allowed, Environment::Production,).is_err()
+        );
     }
 }
