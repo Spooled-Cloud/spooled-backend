@@ -16,10 +16,14 @@ for the next agent. Read `AGENTS.md`, `ROOT_DOCS.md`, and `CHANGELOG.md` first.
   FAILED_PRECONDITION; omitted token → legacy worker+expiry fence (old SDKs unaffected).
   Locally verified end-to-end (REST + gRPC unary + ProcessJobs + stale-same-worker
   re-lease scenario) on a real Postgres.
-- SDKs published: npm `@spooled/sdk` 1.0.33, go v1.0.18, PyPI `spooled` 1.0.19,
-  Packagist `spooled-cloud/spooled` v1.0.15. (python publishes on GitHub Release, not tag.)
-  **None of them send `lease_id` yet** — SDK-side F9 (capture from claim, echo on
-  complete/fail/heartbeat, gRPC stub regen) is the in-flight work.
+- **SDKs published WITH F9 lease_id support**: npm `@spooled/sdk` 1.0.34, go v1.0.19,
+  PyPI `spooled` 1.0.20, Packagist `spooled-cloud/spooled` v1.0.16 — all capture
+  `lease_id` from claim and echo it on complete/fail/heartbeat (REST + gRPC stubs
+  regenerated). All publish pipelines green; registry versions confirmed; the published
+  npm artifact was smoke-tested E2E against a local v0.1.94 (tampered token → 409).
+  Safe against the not-yet-redeployed prod: v0.1.92 source has zero
+  `deny_unknown_fields` (verified) and unknown REST body fields / proto fields are
+  ignored, so the extra `lease_id` is a no-op until v0.1.94 rolls.
 
 ## What v0.1.93 fixed (external audit — all 10 findings were verified REAL first)
 
@@ -62,15 +66,8 @@ clippy clean.
      wrong `lease_id` → 409 LEASE_EXPIRED; correct token and token-omitted both succeed.
    Confirm `uptime_seconds` is small first.
 
-2. **F9 SDK side — capture + echo `lease_id` in all 4 SDKs, then release.** Backend
-   (v0.1.94) is done and backward compatible. Per-SDK: add `lease_id` to the claimed-job
-   type, send it in complete/fail/heartbeat bodies (REST) and Complete/Fail/RenewLease
-   (gRPC — regenerate stubs from `spooled-backend/proto/spooled.proto`: python
-   `spooled_pb2*`, php `scripts/generate-grpc.php`, go `make generate-proto`, node loads
-   the .proto dynamically — copy the updated file), thread it through the worker loops
-   (go workers pass only jobID — stash lease on the activeJob struct), bump versions +
-   changelogs, release (node/go/php: tag push; python: GitHub Release). Registries are
-   immutable — new bug = new version; never re-tag.
+2. **F9 SDK side — DONE** (all four SDKs released, see Current state). Post-redeploy,
+   smoke one published SDK against prod as part of item 1.
 
 3. **Push the frontend F10 copy fix.** `spooled-frontend` commit `3ecb591`
    (`docs(security,privacy): correct overstated DB-TLS and RBAC claims`) is committed
