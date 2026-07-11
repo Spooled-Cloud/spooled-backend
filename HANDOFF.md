@@ -5,11 +5,11 @@ for the next agent. Read `AGENTS.md`, `ROOT_DOCS.md`, and `CHANGELOG.md` first.
 
 ## Current state
 
-- **Backend: `v0.1.94`** (audit F9 — lease_id fencing, backward compatible) supersedes
-  `v0.1.93`; both are **awaiting a production redeploy**. Prod runs
-  `docker-compose.prod.yml` pulling `:latest`. `:latest` is rebuilt **only on a push to
-  `main`** (the release.yml manifest job), NOT on tag push. Confirm any redeploy actually
-  rolled via `GET /api/v1/admin/stats` → `system.uptime_seconds` (small == fresh pod).
+- **Backend: `v0.1.94` is LIVE on prod** (redeployed + live-verified 2026-07-11; pod
+  log shows `Starting Spooled Backend v0.1.94`). Prod runs `docker-compose.prod.yml`
+  pulling `:latest`. `:latest` is rebuilt **only on a push to `main`** (the release.yml
+  manifest job), NOT on tag push. Confirm any redeploy actually rolled via
+  `GET /api/v1/admin/stats` → `system.uptime_seconds` (small == fresh pod).
 - F9 backend surface: claim/dequeue return `lease_id` (REST ClaimedJob + proto Job=19);
   complete/fail/heartbeat/renew take optional `lease_id` (REST body; proto Complete=4,
   Fail=5, RenewLease=4). Provided-but-stale token → 409 LEASE_EXPIRED / gRPC
@@ -78,12 +78,8 @@ clippy clean.
 
 2. **F9 SDK side — DONE** (all four SDKs released, see Current state).
 
-3. **Push the frontend F10 copy fix.** `spooled-frontend` commit `3ecb591`
-   (`docs(security,privacy): correct overstated DB-TLS and RBAC claims`) is committed
-   locally but NOT pushed, to avoid a non-fast-forward against the in-progress homepage
-   redesign in the same repo. `spooled-frontend` has a large **uncommitted homepage
-   redesign** (Hero/HeroConsole/home components + global.css); do not disturb it. Push
-   `3ecb591` when the redesign lands (or coordinate), so both go up together.
+3. **Frontend F10 copy fix — DONE** (`3ecb591` reached origin/main when the homepage
+   redesign landed; a site-wide dark-mode contrast pass followed on 2026-07-11).
 
 4. **Keep auditing.** Each deeper pass in this project has found more real bugs. Continue
    adversarial review (realtime, billing/Stripe, gRPC lifecycle, cron/DST, config matrix)
@@ -99,8 +95,8 @@ clippy clean.
 - Hard 1 MiB payload cap returns 400 VALIDATION_ERROR, not 413 (taxonomy).
 
 ## Operator actions (agent CANNOT do these — tell the user)
-- **Redeploy `v0.1.93`** to prod (pull the new `:latest`).
-- **Rotate `ADMIN_API_KEY`** — exposed in a prior chat transcript.
+- **Rotate `ADMIN_API_KEY`** — exposed in a prior chat transcript (also stored in the
+  workspace-root `.env`, which is outside any git repo; rotate + update both).
 - **Rotate + secret-mount `certs/grpc-key.pem`** — a self-signed origin gRPC key is
   tracked in git and baked into the image (`Dockerfile: COPY certs /certs`,
   `docker-compose.prod.yml` references it). Add a `.dockerignore`.
