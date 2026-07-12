@@ -50,7 +50,7 @@ spec:
       containers:
         # Main application container
         - name: spooled-backend
-          image: spooled/backend:latest
+          image: ghcr.io/spooled-cloud/spooled-backend:latest
           imagePullPolicy: IfNotPresent
           ports:
             - name: http

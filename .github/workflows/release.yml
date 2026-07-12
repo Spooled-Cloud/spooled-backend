@@ -3,7 +3,7 @@ name: Build and Push Docker Images
 on:
   push:
     branches: [main]
-    tags: ['v*']
+    tags: ["v*"]
   release:
     types: [published]
   workflow_dispatch:
@@ -34,6 +34,45 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      - name: Verify release tag matches version sources
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          expected = os.environ["RELEASE_TAG"].removeprefix("v")
+          manifest = tomllib.loads(Path("Cargo.toml").read_text())["package"]["version"]
+          lock = tomllib.loads(Path("Cargo.lock").read_text())
+          matches = [
+              package["version"]
+              for package in lock["package"]
+              if package["name"] == "spooled-backend"
+          ]
+
+          if len(matches) != 1:
+              raise SystemExit(
+                  f"expected one spooled-backend package in Cargo.lock, found {len(matches)}"
+              )
+
+          lock_version = matches[0]
+          changelog = Path("CHANGELOG.md").read_text()
+          heading = re.compile(rf"^## \[{re.escape(expected)}\] - \d{{4}}-\d{{2}}-\d{{2}}$")
+          if not any(heading.fullmatch(line) for line in changelog.splitlines()):
+              raise SystemExit(f"CHANGELOG.md has no dated release heading for {expected}")
+          if expected != manifest or expected != lock_version:
+              raise SystemExit(
+                  "release version mismatch: "
+                  f"tag={expected}, Cargo.toml={manifest}, Cargo.lock={lock_version}"
+              )
+
+          print(f"release version verified: {expected}")
+          PY
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4

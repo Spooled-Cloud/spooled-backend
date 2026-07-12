@@ -655,6 +655,8 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317 ./target/release/spooled-backend
 4. Push to branch (`git push origin feature/amazing`)
 5. Open a Pull Request
 
+Release contributors must keep the version in `Cargo.toml`, the root `spooled-backend` entry in `Cargo.lock`, and the matching `CHANGELOG.md` entry synchronized. Before tagging or deploying, follow the advisory [release and deployment evidence checklist](docs/guides/deployment.md#release-and-deployment-evidence-checklist). Exceptions may be recorded with an owner and rationale, but a Git tag, manifest, or lockfile version mismatch for the same artifact is a release error and must not be published.
+
 ## 📄 License
 
 Apache License 2.0 - see [LICENSE](LICENSE) for details.

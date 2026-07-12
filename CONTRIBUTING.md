@@ -208,17 +208,17 @@ cargo test --test '*'
 
 ## Release Process
 
-Releases are automated via GitHub Actions when a tag is pushed:
+Before tagging, update `Cargo.toml`, the root `spooled-backend` entry in `Cargo.lock`, and `CHANGELOG.md`, then follow the [release and deployment evidence checklist](docs/guides/deployment.md#release-and-deployment-evidence-checklist). The release tag must be `v` plus the Cargo version.
 
 ```bash
-git tag v1.0.0
-git push origin v1.0.0
+RELEASE_VERSION=0.1.98
+RELEASE_TAG="v${RELEASE_VERSION}"
+# Commit the synchronized manifest, lockfile, changelog, and intended release changes first.
+git tag "${RELEASE_TAG}"
+git push origin "${RELEASE_TAG}"
 ```
 
-This triggers:
-1. Full test suite
-2. Docker image build and push to GHCR
-3. GitHub Release creation
+The tag-triggered workflow verifies Cargo manifest/lock identity, builds and publishes multi-architecture GHCR images, and creates a GitHub Release. The normal CI workflow remains separate; verify its required checks on the release commit before tagging. Artifact publication is not production deployment.
 
 ## Getting Help
 

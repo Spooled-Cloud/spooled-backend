@@ -16,12 +16,16 @@ resources:
   - pgbouncer.yaml
   - redis.yaml
 
-commonLabels:
-  app.kubernetes.io/name: spooled-backend
-  app.kubernetes.io/part-of: spooled-cloud
-  app.kubernetes.io/managed-by: kustomize
-  app.kubernetes.io/version: "1.0.0"
+labels:
+  - pairs:
+      app.kubernetes.io/name: spooled-backend
+      app.kubernetes.io/part-of: spooled-cloud
+      app.kubernetes.io/managed-by: kustomize
+    includeSelectors: true
+  - pairs:
+      app.kubernetes.io/version: "0.1.97"
+    includeSelectors: false
 
 images:
-  - name: spooled/backend
+  - name: ghcr.io/spooled-cloud/spooled-backend
     newTag: latest

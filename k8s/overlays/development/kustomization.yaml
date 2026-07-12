@@ -126,5 +126,5 @@ configMapGenerator:
       # - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
 
 images:
-  - name: spooled/backend
+  - name: ghcr.io/spooled-cloud/spooled-backend
     newTag: dev

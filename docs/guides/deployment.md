@@ -10,10 +10,11 @@ This guide covers deploying Spooled Cloud in various environments.
 4. [Local Development](#local-development)
 5. [Docker Deployment](#docker-deployment)
 6. [Kubernetes Deployment](#kubernetes-deployment)
-7. [Production Checklist](#production-checklist)
-8. [Monitoring & Observability](#monitoring--observability)
-9. [Scaling Guidelines](#scaling-guidelines)
-10. [Troubleshooting](#troubleshooting)
+7. [Release and Deployment Evidence Checklist](#release-and-deployment-evidence-checklist)
+8. [Production Checklist](#production-checklist)
+9. [Monitoring & Observability](#monitoring--observability)
+10. [Scaling Guidelines](#scaling-guidelines)
+11. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -165,8 +166,8 @@ cd spooled-backend
 # Build production image
 docker build -t spooled-backend:latest .
 
-# Or with specific tag
-docker build -t spooled-backend:v1.0.0 .
+# Or with the selected release tag
+docker build -t spooled-backend:${RELEASE_TAG} .
 ```
 
 ### Run with Docker
@@ -307,6 +308,56 @@ helm install redis bitnami/redis \
 ```
 
 ---
+
+## Release and Deployment Evidence Checklist
+
+This checklist is advisory evidence tracking: an operator may mark an item `N/A` or record an exception, owner, and reason without treating the checklist itself as release authorization. A mismatch among version values that describe the **same artifact**, however, is a release error and must be corrected before publishing that artifact.
+
+### Select and synchronize the release
+
+- [ ] Record `RELEASE_VERSION`, `RELEASE_TAG=v${RELEASE_VERSION}`, the intended branch, and the release commit.
+- [ ] Confirm the tag is unused locally and on `origin`, and that the release commit is clean and synced.
+- [ ] Set `[package].version` in `Cargo.toml`; this is the authoritative source version and supplies Rust's compile-time `CARGO_PKG_VERSION`.
+- [ ] Regenerate or update the root `spooled-backend` package entry in `Cargo.lock` so its version exactly matches `Cargo.toml`.
+- [ ] Add the matching release entry to `CHANGELOG.md`.
+- [ ] Update the version-bearing `app.kubernetes.io/version` label in `k8s/base/kustomization.yaml` when it is intended to identify this release.
+- [ ] Search deployment and user documentation for stale hard-coded release/image examples.
+- [ ] Confirm the tag without its `v` prefix, `Cargo.toml`, and the root `Cargo.lock` package version are identical. The tag workflow enforces this for tag builds before publishing images.
+
+### Validate the release commit
+
+- [ ] Run the repository's format, build, test, Clippy, and security-audit checks, recording commands and CI run URLs.
+- [ ] Render the production Kustomize overlay and confirm it selects `ghcr.io/spooled-cloud/spooled-backend` with the intended immutable release tag or digest.
+- [ ] Confirm no secrets, populated `.env` files, or local generated artifacts are staged.
+- [ ] Record any advisory-check exception with its owner and rationale. Do not waive a same-artifact version mismatch.
+
+### Publish and identify the artifact
+
+- [ ] Create the tag on the validated release commit and confirm `git rev-parse "${RELEASE_TAG}^{}"` equals that commit.
+- [ ] Record the tag workflow run and confirm the expected amd64/arm64 images and multi-architecture manifest exist.
+- [ ] Record the immutable GHCR digest for `ghcr.io/spooled-cloud/spooled-backend:${RELEASE_TAG}`. Do not use `latest` as release identity.
+- [ ] Confirm the GitHub Release, Git tag, image tag, image digest, and source commit describe the same artifact.
+
+### Deploy separately
+
+- [ ] Record the environment, operator/provider deployment ID, start time, selected immutable tag or digest, and previous rollback digest.
+- [ ] Confirm publication did not get mistaken for deployment: a Git tag, GitHub Release, or GHCR image does not prove a host was updated.
+- [ ] Verify rollout status and deployment history in the actual target environment.
+
+### Verify production
+
+- [ ] Confirm deployment/provider provenance resolves to the intended GHCR digest and source commit.
+- [ ] Check public `/health`, `/health/live`, and `/health/ready` for service health only; these endpoints do not prove the running release version.
+- [ ] Using an isolated authorized API key, call authenticated `GET /api/v1/dashboard` and require `system.version == RELEASE_VERSION`.
+- [ ] Require fresh/small `system.uptime_seconds` after a rollout; mature uptime can indicate that the old process is still serving.
+- [ ] Record the observation time and keep source, tag, artifact, deployment, and live-production evidence as separate facts.
+- [ ] Recheck REST, realtime, and gRPC paths relevant to the release; record any externally blocked path rather than claiming it passed.
+
+### Close out
+
+- [ ] Exercise or verify the rollback target and instructions.
+- [ ] Update dated operational-boundary documentation only from recorded evidence.
+- [ ] Preserve unresolved checks as explicit exceptions; never convert an unverified item into a production claim.
 
 ## Production Checklist
 
