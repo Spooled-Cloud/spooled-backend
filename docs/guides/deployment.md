@@ -253,20 +253,38 @@ volumes:
 ### 1. Create Namespace
 
 ```bash
-kubectl create namespace spooled-cloud
+kubectl create namespace spooled
 ```
 
 ### 2. Create Secrets
 
 ```bash
 kubectl create secret generic spooled-secrets \
-  --namespace spooled-cloud \
-  --from-literal=database-url='postgres://user:pass@postgres:5432/spooled' \
+  --namespace spooled \
+  --from-literal=database-url='postgres://user:pass@postgres:5432/spooled'
   --from-literal=redis-url='redis://redis:6379' \
   --from-literal=jwt-secret='your-production-secret'
 ```
 
 ### 3. Deploy with Kustomize
+
+The current manifests keep `app.kubernetes.io/version` out of workload selectors so future version changes can roll out in place. Releases before `v0.1.97` used `commonLabels`, which placed version `1.0.0` in immutable Deployment selectors. Before upgrading a cluster originally created from those manifests, inspect the live selector:
+
+```bash
+kubectl get deployment prod-spooled-backend \
+  --namespace spooled \
+  --output jsonpath='{.spec.selector.matchLabels.app\.kubernetes\.io/version}{"\n"}'
+```
+
+If this prints `1.0.0`, a normal apply will fail because Kubernetes cannot remove an immutable selector. Record the current rollback manifest/image, schedule the brief backend interruption, then recreate only that Deployment before applying the complete overlay:
+
+```bash
+kubectl delete deployment prod-spooled-backend --namespace spooled
+kubectl apply -k k8s/overlays/production
+kubectl rollout status deployment/prod-spooled-backend --namespace spooled
+```
+
+Do not delete PostgreSQL, Redis, Services, Secrets, ConfigMaps, or persistent volumes for this migration. Clusters whose live Deployment selector has no version label can use an ordinary apply:
 
 ```bash
 # Development
@@ -280,16 +298,16 @@ kubectl apply -k k8s/overlays/production
 
 ```bash
 # Check pods
-kubectl get pods -n spooled-cloud
+kubectl get pods -n spooled
 
 # Check services
-kubectl get svc -n spooled-cloud
+kubectl get svc -n spooled
 
 # View logs
-kubectl logs -f deployment/spooled-backend -n spooled-cloud
+kubectl logs -f deployment/prod-spooled-backend -n spooled
 
 # Port forward for testing
-kubectl port-forward svc/spooled-backend 8080:80 -n spooled-cloud
+kubectl port-forward svc/prod-spooled-backend 8080:80 -n spooled
 ```
 
 ### Helm Chart (External Dependencies)
@@ -297,13 +315,13 @@ kubectl port-forward svc/spooled-backend 8080:80 -n spooled-cloud
 ```bash
 # PostgreSQL
 helm install postgres bitnami/postgresql \
-  --namespace spooled-cloud \
+  --namespace spooled \
   --set auth.postgresPassword=your-password \
   --set auth.database=spooled
 
 # Redis
 helm install redis bitnami/redis \
-  --namespace spooled-cloud \
+  --namespace spooled \
   --set auth.enabled=false
 ```
 
@@ -328,6 +346,7 @@ This checklist is advisory evidence tracking: an operator may mark an item `N/A`
 
 - [ ] Run the repository's format, build, test, Clippy, and security-audit checks, recording commands and CI run URLs.
 - [ ] Render the production Kustomize overlay and confirm it selects `ghcr.io/spooled-cloud/spooled-backend` with the intended immutable release tag or digest.
+- [ ] Inspect the live Deployment selector before applying. If it still contains legacy `app.kubernetes.io/version=1.0.0`, use the documented one-time controlled Deployment recreation; an ordinary apply cannot mutate that selector.
 - [ ] Confirm no secrets, populated `.env` files, or local generated artifacts are staged.
 - [ ] Record any advisory-check exception with its owner and rationale. Do not waive a same-artifact version mismatch.
 
@@ -645,13 +664,13 @@ Error: Invalid API key
 
 ```bash
 # Check pod status
-kubectl describe pod <pod-name> -n spooled-cloud
+kubectl describe pod <pod-name> -n spooled
 
-# View recent logs
-kubectl logs --tail=100 -f deployment/spooled-backend -n spooled-cloud
+# View recent production logs
+kubectl logs --tail=100 -f deployment/prod-spooled-backend -n spooled
 
-# Execute into container
-kubectl exec -it deployment/spooled-backend -n spooled-cloud -- /bin/sh
+# Execute into a production backend container
+kubectl exec -it deployment/prod-spooled-backend -n spooled -- /bin/sh
 
 # Check database connectivity
 kubectl run pg-test --rm -it --image=postgres:16 -- psql $DATABASE_URL
