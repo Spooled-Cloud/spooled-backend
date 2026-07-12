@@ -30,6 +30,41 @@ use crate::{
     },
 };
 
+async fn require_workflow_access<'e, E>(
+    executor: E,
+    ctx: &ApiKeyContext,
+    workflow_id: &str,
+) -> AppResult<()>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let visible: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS(
+            SELECT 1 FROM workflows w
+            WHERE w.id = $1
+              AND w.organization_id = $2
+              AND NOT EXISTS (
+                  SELECT 1 FROM jobs j
+                  WHERE j.workflow_id = w.id
+                    AND ($3::TEXT[] IS NOT NULL AND NOT (j.queue_name = ANY($3)))
+              )
+        )
+        "#,
+    )
+    .bind(workflow_id)
+    .bind(&ctx.organization_id)
+    .bind(ctx.queue_scope_filter())
+    .fetch_one(executor)
+    .await?;
+
+    if visible {
+        Ok(())
+    } else {
+        Err(AppError::NotFound("Workflow not found".to_string()))
+    }
+}
+
 /// List workflows for organization
 ///
 pub async fn list(
@@ -47,6 +82,11 @@ pub async fn list(
             r#"
             SELECT * FROM workflows
             WHERE organization_id = $1 AND status = $2
+              AND NOT EXISTS (
+                  SELECT 1 FROM jobs j
+                  WHERE j.workflow_id = workflows.id
+                    AND ($5::TEXT[] IS NOT NULL AND NOT (j.queue_name = ANY($5)))
+              )
             ORDER BY created_at DESC
             LIMIT $3 OFFSET $4
             "#,
@@ -55,6 +95,7 @@ pub async fn list(
         .bind(status)
         .bind(limit)
         .bind(offset)
+        .bind(ctx.queue_scope_filter())
         .fetch_all(state.db.pool())
         .await?
     } else {
@@ -62,6 +103,11 @@ pub async fn list(
             r#"
             SELECT * FROM workflows
             WHERE organization_id = $1
+              AND NOT EXISTS (
+                  SELECT 1 FROM jobs j
+                  WHERE j.workflow_id = workflows.id
+                    AND ($4::TEXT[] IS NOT NULL AND NOT (j.queue_name = ANY($4)))
+              )
             ORDER BY created_at DESC
             LIMIT $2 OFFSET $3
             "#,
@@ -69,6 +115,7 @@ pub async fn list(
         .bind(&ctx.organization_id)
         .bind(limit)
         .bind(offset)
+        .bind(ctx.queue_scope_filter())
         .fetch_all(state.db.pool())
         .await?
     };
@@ -83,6 +130,8 @@ pub async fn get(
     Extension(ctx): Extension<ApiKeyContext>,
     Path(workflow_id): Path<String>,
 ) -> AppResult<Json<WorkflowDetailResponse>> {
+    require_workflow_access(state.db.pool(), &ctx, &workflow_id).await?;
+
     // Fetch the workflow
     let workflow: Workflow =
         sqlx::query_as("SELECT * FROM workflows WHERE id = $1 AND organization_id = $2")
@@ -95,7 +144,7 @@ pub async fn get(
     // Fetch all jobs belonging to this workflow
     let jobs: Vec<Job> = sqlx::query_as(
         r#"
-        SELECT * FROM jobs 
+        SELECT * FROM jobs
         WHERE workflow_id = $1 AND organization_id = $2
         ORDER BY workflow_step ASC, created_at ASC
         "#,
@@ -459,6 +508,7 @@ pub async fn retry(
     // UPDATE failed the jobs were already reset to pending while the workflow
     // stayed 'failed' — a divergent state the reset jobs could never recover from.
     let mut tx = state.db.pool().begin().await?;
+    require_workflow_access(&mut *tx, &ctx, &workflow_id).await?;
 
     // Verify + lock the workflow row inside the transaction. `FOR UPDATE` serializes
     // concurrent retries of the same workflow: the second caller blocks here until the
@@ -569,8 +619,8 @@ pub async fn retry(
         // Also notify queue channels that jobs are ready
         let queues: Vec<(String,)> = sqlx::query_as(
             r#"
-            SELECT DISTINCT queue_name 
-            FROM jobs 
+            SELECT DISTINCT queue_name
+            FROM jobs
             WHERE workflow_id = $1 AND status = 'pending' AND dependencies_met = TRUE
             "#,
         )
@@ -608,14 +658,18 @@ pub async fn cancel(
     Extension(ctx): Extension<ApiKeyContext>,
     Path(workflow_id): Path<String>,
 ) -> AppResult<Json<WorkflowResponse>> {
-    // First verify workflow belongs to this organization
-    let workflow_exists: Option<(String,)> =
-        sqlx::query_as("SELECT id FROM workflows WHERE id = $1 AND organization_id = $2")
-            .bind(&workflow_id)
-            .bind(&ctx.organization_id)
-            .fetch_optional(state.db.pool())
-            .await?;
+    let mut tx = state.db.pool().begin().await?;
+    require_workflow_access(&mut *tx, &ctx, &workflow_id).await?;
 
+    // Lock the workflow row so cancellation serializes with retry and other workflow
+    // state transitions. All workflow/job changes below commit or roll back together.
+    let workflow_exists: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM workflows WHERE id = $1 AND organization_id = $2 FOR UPDATE",
+    )
+    .bind(&workflow_id)
+    .bind(&ctx.organization_id)
+    .fetch_optional(&mut *tx)
+    .await?;
     if workflow_exists.is_none() {
         return Err(AppError::NotFound(format!(
             "Workflow {} not found",
@@ -623,17 +677,15 @@ pub async fn cancel(
         )));
     }
 
-    // Update workflow status
     sqlx::query(
         "UPDATE workflows SET status = 'cancelled', completed_at = NOW() WHERE id = $1 AND organization_id = $2",
     )
     .bind(&workflow_id)
     .bind(&ctx.organization_id)
-    .execute(state.db.pool())
+    .execute(&mut *tx)
     .await?;
 
-    // Cancel only jobs belonging to this org's workflow
-    // Cancel all pending/scheduled jobs in the workflow
+    // Cancel only pending/scheduled jobs belonging to this organization's workflow.
     sqlx::query(
         r#"
         UPDATE jobs
@@ -643,17 +695,19 @@ pub async fn cancel(
     )
     .bind(&workflow_id)
     .bind(&ctx.organization_id)
-    .execute(state.db.pool())
+    .execute(&mut *tx)
     .await?;
 
-    // Fetch and return the updated workflow
+    // Fetch the response inside the transaction so it reflects the committed state.
     let workflow: Workflow =
         sqlx::query_as("SELECT * FROM workflows WHERE id = $1 AND organization_id = $2")
             .bind(&workflow_id)
             .bind(&ctx.organization_id)
-            .fetch_optional(state.db.pool())
+            .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("Workflow {} not found", workflow_id)))?;
+
+    tx.commit().await?;
 
     info!(workflow_id = %workflow_id, org_id = %ctx.organization_id, "Cancelled workflow");
 
@@ -677,11 +731,13 @@ pub async fn get_job_dependencies(
     Extension(ctx): Extension<ApiKeyContext>,
     Path(job_id): Path<String>,
 ) -> AppResult<Json<JobWithDependencies>> {
-    // First verify job belongs to this organization
-    let job_exists: Option<(String,)> =
-        sqlx::query_as("SELECT id FROM jobs WHERE id = $1 AND organization_id = $2")
+    // First verify the target job belongs to this organization and queue scope.
+    let job_exists: Option<(String,)> = sqlx::query_as(
+        "SELECT id FROM jobs WHERE id = $1 AND organization_id = $2 AND ($3::TEXT[] IS NULL OR queue_name = ANY($3))",
+    )
             .bind(&job_id)
             .bind(&ctx.organization_id)
+            .bind(ctx.queue_scope_filter())
             .fetch_optional(state.db.pool())
             .await?;
 
@@ -702,6 +758,12 @@ pub async fn get_job_dependencies(
     .bind(&ctx.organization_id)
     .fetch_all(state.db.pool())
     .await?;
+    if dependencies
+        .iter()
+        .any(|job| !ctx.can_access_queue(&job.queue_name))
+    {
+        return Err(AppError::NotFound("Job not found".to_string()));
+    }
 
     // Get job's dependents - filter by org
     let dependents: Vec<DependencyInfo> = sqlx::query_as(
@@ -716,6 +778,12 @@ pub async fn get_job_dependencies(
     .bind(&ctx.organization_id)
     .fetch_all(state.db.pool())
     .await?;
+    if dependents
+        .iter()
+        .any(|job| !ctx.can_access_queue(&job.queue_name))
+    {
+        return Err(AppError::NotFound("Job not found".to_string()));
+    }
 
     // Get dependencies_met status - already verified org ownership above
     let (dependencies_met,): (bool,) = sqlx::query_as(
@@ -743,37 +811,6 @@ pub async fn add_dependencies(
     Path(job_id): Path<String>,
     ValidatedJson(request): ValidatedJson<AddDependenciesRequest>,
 ) -> AppResult<Json<AddDependenciesResponse>> {
-    // Verify job exists AND belongs to this organization
-    let exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM jobs WHERE id = $1 AND organization_id = $2)",
-    )
-    .bind(&job_id)
-    .bind(&ctx.organization_id)
-    .fetch_one(state.db.pool())
-    .await?;
-
-    if !exists {
-        return Err(AppError::NotFound(format!("Job {} not found", job_id)));
-    }
-
-    // Verify all dependency jobs belong to the same organization
-    for dep_job_id in &request.depends_on {
-        let dep_exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM jobs WHERE id = $1 AND organization_id = $2)",
-        )
-        .bind(dep_job_id)
-        .bind(&ctx.organization_id)
-        .fetch_one(state.db.pool())
-        .await?;
-
-        if !dep_exists {
-            return Err(AppError::NotFound(format!(
-                "Dependency job {} not found in your organization",
-                dep_job_id
-            )));
-        }
-    }
-
     // Serialize dependency-graph mutations per org in a transaction guarded by an
     // advisory lock. would_create_cycle + the edge INSERT were separate statements, so
     // two concurrent calls (A->B and B->A) could each pass the cycle check before either
@@ -785,6 +822,37 @@ pub async fn add_dependencies(
         .bind(format!("job_deps:{}", ctx.organization_id))
         .execute(&mut *tx)
         .await?;
+
+    // Authorize every involved job after acquiring the graph lock, so the checks and
+    // mutation observe one serialized database state.
+    let target_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM jobs WHERE id = $1 AND organization_id = $2 AND ($3::TEXT[] IS NULL OR queue_name = ANY($3)))",
+    )
+    .bind(&job_id)
+    .bind(&ctx.organization_id)
+    .bind(ctx.queue_scope_filter())
+    .fetch_one(&mut *tx)
+    .await?;
+    if !target_exists {
+        return Err(AppError::NotFound(format!("Job {} not found", job_id)));
+    }
+
+    for dep_job_id in &request.depends_on {
+        let dep_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE id = $1 AND organization_id = $2 AND ($3::TEXT[] IS NULL OR queue_name = ANY($3)))",
+        )
+        .bind(dep_job_id)
+        .bind(&ctx.organization_id)
+        .bind(ctx.queue_scope_filter())
+        .fetch_one(&mut *tx)
+        .await?;
+        if !dep_exists {
+            return Err(AppError::NotFound(format!(
+                "Dependency job {} not found in your organization",
+                dep_job_id
+            )));
+        }
+    }
 
     // Update dependency mode
     // SECURITY: Include organization_id for defense-in-depth
@@ -805,7 +873,7 @@ pub async fn add_dependencies(
         }
 
         // Check for circular dependency
-        if would_create_cycle(state.db.pool(), &job_id, dep_job_id).await? {
+        if would_create_cycle(&mut *tx, &job_id, dep_job_id).await? {
             warn!(
                 job_id = %job_id,
                 depends_on = %dep_job_id,
@@ -890,11 +958,14 @@ impl ListWorkflowsQuery {
 }
 
 /// Check if adding a dependency would create a cycle
-async fn would_create_cycle(
-    pool: &sqlx::PgPool,
+async fn would_create_cycle<'e, E>(
+    executor: E,
     job_id: &str,
     depends_on_job_id: &str,
-) -> Result<bool, AppError> {
+) -> Result<bool, AppError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     // Check if depends_on_job_id transitively depends on job_id
     let has_cycle: bool = sqlx::query_scalar(
         r#"
@@ -902,9 +973,9 @@ async fn would_create_cycle(
             SELECT depends_on_job_id
             FROM job_dependencies
             WHERE job_id = $1
-            
+
             UNION
-            
+
             SELECT jd.depends_on_job_id
             FROM job_dependencies jd
             JOIN dep_chain dc ON dc.depends_on_job_id = jd.job_id
@@ -914,7 +985,7 @@ async fn would_create_cycle(
     )
     .bind(depends_on_job_id)
     .bind(job_id)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
 
     Ok(has_cycle)

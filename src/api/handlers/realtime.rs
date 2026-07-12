@@ -19,6 +19,7 @@ use futures::{
     SinkExt, StreamExt,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
@@ -122,6 +123,39 @@ pub enum RealtimeEvent {
 }
 
 impl RealtimeEvent {
+    fn queue_name(&self) -> Option<&str> {
+        match self {
+            Self::JobStatusChange { queue_name, .. }
+            | Self::JobCreated { queue_name, .. }
+            | Self::JobCompleted { queue_name, .. }
+            | Self::JobFailed { queue_name, .. }
+            | Self::QueueStats { queue_name, .. }
+            | Self::WorkerRegistered { queue_name, .. } => Some(queue_name),
+            _ => None,
+        }
+    }
+
+    fn job_id(&self) -> Option<&str> {
+        match self {
+            Self::JobStatusChange { job_id, .. }
+            | Self::JobCreated { job_id, .. }
+            | Self::JobCompleted { job_id, .. }
+            | Self::JobFailed { job_id, .. } => Some(job_id),
+            Self::WorkerHeartbeat {
+                current_job_id: Some(job_id),
+                ..
+            } => Some(job_id),
+            _ => None,
+        }
+    }
+
+    fn unverifiable_for_scoped_key(&self) -> bool {
+        matches!(
+            self,
+            Self::WorkerHeartbeat { .. } | Self::WorkerDeregistered { .. }
+        )
+    }
+
     /// Get the event type as a string (for SSE event type)
     pub fn event_type(&self) -> &'static str {
         match self {
@@ -219,8 +253,73 @@ fn validate_queue_filter(queue: &Option<String>) -> Result<(), &'static str> {
 /// Maximum WebSocket connections per organization
 const MAX_WEBSOCKET_CONNECTIONS_PER_ORG: usize = 100;
 
+type CurrentJobAuthRow = (String, String, Vec<String>);
+type QueueAuthStatRow = (Vec<String>, Option<String>, i64);
+
+/// Reload current realtime authorization, including organization lifecycle state.
+/// Missing rows represent revoked/expired keys or soft-deleted organizations.
+pub async fn load_current_realtime_scope(
+    pool: &sqlx::PgPool,
+    api_key_id: &str,
+    organization_id: &str,
+) -> Result<Option<Vec<String>>, sqlx::Error> {
+    sqlx::query_scalar(
+        r#"
+        SELECT k.queues
+        FROM api_keys k
+        INNER JOIN organizations o ON o.id = k.organization_id
+        WHERE k.id = $1
+          AND k.organization_id = $2
+          AND k.is_active = TRUE
+          AND (k.expires_at IS NULL OR k.expires_at > NOW())
+          AND o.plan_tier <> 'deleted'
+        "#,
+    )
+    .bind(api_key_id)
+    .bind(organization_id)
+    .fetch_optional(pool)
+    .await
+}
+
 /// Query parameters for WebSocket subscription
 ///
+#[derive(Debug, Clone)]
+struct SubscriptionFilter {
+    queue: Option<String>,
+    job_id: Option<String>,
+}
+
+fn event_matches_subscription(
+    event: &RealtimeEvent,
+    filter: &SubscriptionFilter,
+    key_queues: &[String],
+) -> bool {
+    let unrestricted = key_queues.is_empty() || key_queues.iter().any(|queue| queue == "*");
+    if !unrestricted && event.unverifiable_for_scoped_key() {
+        return false;
+    }
+    if let Some(queue) = event.queue_name() {
+        if !unrestricted && !key_queues.iter().any(|allowed| allowed == queue) {
+            return false;
+        }
+        if filter
+            .queue
+            .as_deref()
+            .is_some_and(|wanted| wanted != queue)
+        {
+            return false;
+        }
+    } else if filter.queue.is_some() {
+        return false;
+    }
+
+    match (filter.job_id.as_deref(), event.job_id()) {
+        (Some(wanted), Some(actual)) => wanted == actual,
+        (Some(_), None) => false,
+        _ => true,
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SubscribeQuery {
     /// Filter by queue name (optional, validated for safe chars)
@@ -255,6 +354,14 @@ pub async fn websocket_handler(
     // tokens, and inactive keys, so trusting its context (as the SSE handlers do) is the
     // single source of truth.
     let org_id = ctx.organization_id.clone();
+
+    if query
+        .queue
+        .as_deref()
+        .is_some_and(|queue| !ctx.can_access_queue(queue))
+    {
+        return Err((StatusCode::FORBIDDEN, "Queue is outside API key scope"));
+    }
 
     // Validate queue filter
     if let Err(e) = validate_queue_filter(&query.queue) {
@@ -292,7 +399,10 @@ pub async fn websocket_handler(
     // Pass the key's queue scope so the event fan-out can enforce it (a scoped key
     // must never receive events for queues outside its scope).
     let key_queues = ctx.queues.clone();
-    Ok(ws.on_upgrade(move |socket| handle_websocket(socket, query, org_id, key_queues, state)))
+    let api_key_id = ctx.api_key_id.clone();
+    Ok(ws.on_upgrade(move |socket| {
+        handle_websocket(socket, query, org_id, api_key_id, key_queues, state)
+    }))
 }
 
 /// Handle WebSocket connection
@@ -303,12 +413,11 @@ async fn handle_websocket(
     socket: WebSocket,
     query: SubscribeQuery,
     org_id: String,
+    api_key_id: String,
     key_queues: Vec<String>,
     state: AppState,
 ) {
     let (mut sender, mut receiver) = socket.split();
-    let key_unrestricted = key_queues.is_empty() || key_queues.iter().any(|q| q == "*");
-
     // Increment the per-org connection counter now that the upgrade succeeded (the limit
     // was checked read-only before the upgrade). Paired with the decrement in cleanup.
     if let Some(ref cache) = state.cache {
@@ -321,7 +430,10 @@ async fn handle_websocket(
         .events
         .map(|e| e.split(',').map(|s| s.trim().to_lowercase()).collect());
 
-    // Clone queue filter for use in event matching
+    let subscription = Arc::new(tokio::sync::RwLock::new(SubscriptionFilter {
+        queue: query.queue.clone(),
+        job_id: query.job_id.clone(),
+    }));
     let queue_filter = query.queue.clone();
     let job_filter = query.job_id.clone();
 
@@ -340,10 +452,10 @@ async fn handle_websocket(
     let pubsub_task = if let Some(ref cache) = state.cache {
         let cache_clone = cache.clone();
         let org_id_clone = org_id.clone();
-        let queue_filter_clone = queue_filter.clone();
         let event_tx_clone = event_tx.clone();
-        let scope_queues = key_queues.clone();
-        let scope_unrestricted = key_unrestricted;
+        let api_key_id_clone = api_key_id.clone();
+        let subscription_clone = subscription.clone();
+        let auth_pool = state.db.pool().clone();
 
         // Spawn task to listen for Redis pub/sub messages
         Some(tokio::spawn(async move {
@@ -357,39 +469,21 @@ async fn handle_websocket(
                         if let Ok(payload) = msg.get_payload::<String>() {
                             // Try to parse as RealtimeEvent
                             if let Ok(event) = serde_json::from_str::<RealtimeEvent>(&payload) {
-                                // The queue this event pertains to (if any).
-                                let event_queue: Option<&str> = match &event {
-                                    RealtimeEvent::JobStatusChange { queue_name, .. }
-                                    | RealtimeEvent::JobCreated { queue_name, .. }
-                                    | RealtimeEvent::JobCompleted { queue_name, .. }
-                                    | RealtimeEvent::JobFailed { queue_name, .. }
-                                    | RealtimeEvent::QueueStats { queue_name, .. }
-                                    | RealtimeEvent::WorkerRegistered { queue_name, .. } => {
-                                        Some(queue_name.as_str())
-                                    }
-                                    _ => None,
+                                let current_scope = load_current_realtime_scope(
+                                    &auth_pool,
+                                    &api_key_id_clone,
+                                    &org_id_clone,
+                                )
+                                .await
+                                .unwrap_or(None);
+                                let Some(scope) = current_scope.as_deref() else {
+                                    break;
                                 };
+                                let filter = subscription_clone.read().await.clone();
 
-                                // SECURITY: a queue-scoped key must never receive events for
-                                // queues outside its scope, regardless of any client filter.
-                                // Unrestricted keys receive everything; queue-less events
-                                // (ping/system/worker lifecycle) are always allowed.
-                                let scope_ok = match event_queue {
-                                    Some(q) => {
-                                        scope_unrestricted || scope_queues.iter().any(|kq| kq == q)
-                                    }
-                                    None => true,
-                                };
-
-                                // Client-chosen display filter (queue-less events pass).
-                                let filter_ok = match (&queue_filter_clone, event_queue) {
-                                    (Some(f), Some(eq)) => eq == f,
-                                    _ => true,
-                                };
-
-                                let should_send = scope_ok && filter_ok;
-
-                                if should_send && event_tx_clone.send(event).await.is_err() {
+                                if event_matches_subscription(&event, &filter, scope)
+                                    && event_tx_clone.send(event).await.is_err()
+                                {
                                     break; // Channel closed
                                 }
                             }
@@ -446,10 +540,29 @@ async fn handle_websocket(
                         if let Ok(cmd) = serde_json::from_str::<ClientCommand>(&text) {
                             match cmd {
                                 ClientCommand::Subscribe { queue, job_id } => {
-                                    info!("Client subscribing to queue: {:?}, job: {:?}", queue, job_id);
+                                    if queue
+                                        .as_deref()
+                                        .is_some_and(|requested| !key_queues.is_empty()
+                                            && !key_queues.iter().any(|allowed| allowed == "*" || allowed == requested))
+                                    {
+                                        continue;
+                                    }
+                                    let mut filter = subscription.write().await;
+                                    if queue.is_some() {
+                                        filter.queue = queue;
+                                    }
+                                    if job_id.is_some() {
+                                        filter.job_id = job_id;
+                                    }
                                 }
                                 ClientCommand::Unsubscribe { queue, job_id } => {
-                                    info!("Client unsubscribing from queue: {:?}, job: {:?}", queue, job_id);
+                                    let mut filter = subscription.write().await;
+                                    if queue.is_none() || filter.queue == queue {
+                                        filter.queue = None;
+                                    }
+                                    if job_id.is_none() || filter.job_id == job_id {
+                                        filter.job_id = None;
+                                    }
                                 }
                                 ClientCommand::Ping => {
                                     let pong = RealtimeEvent::Ping {
@@ -560,7 +673,7 @@ pub async fn sse_job_handler(
     Path(job_id): Path<String>,
     Extension(ctx): Extension<crate::models::ApiKeyContext>,
     State(state): State<AppState>,
-) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+) -> crate::error::AppResult<Sse<impl Stream<Item = Result<Event, std::io::Error>>>> {
     let org_id = ctx.organization_id.clone();
     info!(job_id = %job_id, org_id = %org_id, "SSE connection for job");
 
@@ -571,29 +684,20 @@ pub async fn sse_job_handler(
     // chunk flush right away. Without this, proxies (Cloudflare in particular)
     // buffer the response until the first poll cycle (2s), which makes the
     // connection look dead to clients with short timeouts.
-    let initial = stream::once(async {
-        Ok::<_, std::convert::Infallible>(Event::default().comment("connected"))
-    });
+    let initial =
+        stream::once(async { Ok::<_, std::io::Error>(Event::default().comment("connected")) });
 
-    // Queue-scope guard (upfront): a restricted key must not stream a job in a queue
-    // outside its scope. If denied, the stream sends only the initial comment and
-    // closes — no status data, and existence is not confirmed. Unrestricted keys pass.
-    let deny = if ctx.is_unrestricted() {
-        false
-    } else {
-        let q: Option<(String,)> =
-            sqlx::query_as("SELECT queue_name FROM jobs WHERE id = $1 AND organization_id = $2")
-                .bind(&job_id)
-                .bind(&org_id)
-                .fetch_optional(state.db.pool())
-                .await
-                .ok()
-                .flatten();
-        match q {
-            Some((qn,)) => !ctx.can_access_queue(&qn),
-            None => false,
-        }
-    };
+    // Fail closed if the authorization lookup fails. A missing/out-of-scope job uses
+    // the same closed stream behavior so its existence is not revealed.
+    let queue_name: Option<String> =
+        sqlx::query_scalar("SELECT queue_name FROM jobs WHERE id = $1 AND organization_id = $2")
+            .bind(&job_id)
+            .bind(&org_id)
+            .fetch_optional(state.db.pool())
+            .await?;
+    let deny = queue_name
+        .as_deref()
+        .is_none_or(|queue| !ctx.can_access_queue(queue));
 
     // Create a stream that polls for job status changes (filtered by org)
     let body = stream::unfold(
@@ -601,11 +705,12 @@ pub async fn sse_job_handler(
             job_id.clone(),
             org_id.clone(),
             state.clone(),
+            ctx.api_key_id.clone(),
             None::<String>,
             deny,
             start_time,
         ),
-        |(job_id, org_id, state, last_status, should_close, start_time)| async move {
+        |(job_id, org_id, state, api_key_id, last_status, should_close, start_time)| async move {
             // Stop polling if we should close
             if should_close {
                 return None;
@@ -621,16 +726,31 @@ pub async fn sse_job_handler(
             tokio::time::sleep(std::time::Duration::from_secs(SSE_JOB_POLL_INTERVAL_SECS)).await;
 
             // Query current job status with organization filter
-            let result: Result<Option<(String, String)>, sqlx::Error> = sqlx::query_as(
-                "SELECT status, queue_name FROM jobs WHERE id = $1 AND organization_id = $2",
+            let result: Result<Option<CurrentJobAuthRow>, sqlx::Error> = sqlx::query_as(
+                r#"
+                    SELECT j.status, j.queue_name, k.queues
+                    FROM jobs j
+                    INNER JOIN api_keys k ON k.id = $3 AND k.organization_id = j.organization_id
+                    INNER JOIN organizations o ON o.id = k.organization_id
+                    WHERE j.id = $1
+                      AND j.organization_id = $2
+                      AND k.is_active = TRUE
+                      AND (k.expires_at IS NULL OR k.expires_at > NOW())
+                      AND o.plan_tier <> 'deleted'
+                    "#,
             )
             .bind(&job_id)
             .bind(&org_id)
+            .bind(&api_key_id)
             .fetch_optional(state.db.pool())
             .await;
 
             match result {
-                Ok(Some((status, queue_name))) => {
+                Ok(Some((status, queue_name, queues))) => {
+                    let unrestricted = queues.is_empty() || queues.iter().any(|q| q == "*");
+                    if !unrestricted && !queues.iter().any(|q| q == &queue_name) {
+                        return None;
+                    }
                     // Check if job reached terminal status
                     let is_terminal = TERMINAL_STATUSES.contains(&status.as_str());
 
@@ -646,7 +766,15 @@ pub async fn sse_job_handler(
                         let json = serde_json::to_string(&event).unwrap_or_default();
                         Some((
                             Ok(Event::default().event("job.status").data(json)),
-                            (job_id, org_id, state, Some(status), is_terminal, start_time),
+                            (
+                                job_id,
+                                org_id,
+                                state,
+                                api_key_id,
+                                Some(status),
+                                is_terminal,
+                                start_time,
+                            ),
                         ))
                     } else if is_terminal {
                         // Job is terminal but status didn't change - close stream
@@ -655,7 +783,15 @@ pub async fn sse_job_handler(
                         // No change, send keepalive comment
                         Some((
                             Ok(Event::default().comment("keepalive")),
-                            (job_id, org_id, state, last_status, false, start_time),
+                            (
+                                job_id,
+                                org_id,
+                                state,
+                                api_key_id,
+                                last_status,
+                                false,
+                                start_time,
+                            ),
                         ))
                     }
                 }
@@ -668,30 +804,41 @@ pub async fn sse_job_handler(
                     let json = serde_json::to_string(&event).unwrap_or_default();
                     Some((
                         Ok(Event::default().event("error").data(json)),
-                        (job_id, org_id, state, last_status, true, start_time), // Close on not found
+                        (
+                            job_id,
+                            org_id,
+                            state,
+                            api_key_id,
+                            last_status,
+                            true,
+                            start_time,
+                        ), // Close on not found
                     ))
                 }
                 Err(e) => {
-                    error!("Database error in SSE stream: {}", e);
-                    let event = RealtimeEvent::Error {
-                        message: "Database error".to_string(),
-                        timestamp: chrono::Utc::now(),
-                    };
-                    let json = serde_json::to_string(&event).unwrap_or_default();
+                    error!(error = %e, job_id = %job_id, "Database error in SSE authorization poll");
                     Some((
-                        Ok(Event::default().event("error").data(json)),
-                        (job_id, org_id, state, last_status, false, start_time), // Keep trying on transient errors
+                        Err(std::io::Error::other("SSE authorization check failed")),
+                        (
+                            job_id,
+                            org_id,
+                            state,
+                            api_key_id,
+                            last_status,
+                            true,
+                            start_time,
+                        ),
                     ))
                 }
             }
         },
     );
 
-    Sse::new(initial.chain(body)).keep_alive(
+    Ok(Sse::new(initial.chain(body)).keep_alive(
         axum::response::sse::KeepAlive::new()
             .interval(std::time::Duration::from_secs(15))
             .text("ping"),
-    )
+    ))
 }
 
 /// SSE stream for queue updates
@@ -702,8 +849,9 @@ pub async fn sse_queue_handler(
     Path(queue_name): Path<String>,
     Extension(ctx): Extension<crate::models::ApiKeyContext>,
     State(state): State<AppState>,
-) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+) -> Sse<impl Stream<Item = Result<Event, std::io::Error>>> {
     let org_id = ctx.organization_id.clone();
+    let api_key_id = ctx.api_key_id.clone();
     info!(queue_name = %queue_name, org_id = %org_id, "SSE connection for queue");
 
     // Track connection start time for timeout
@@ -711,9 +859,8 @@ pub async fn sse_queue_handler(
 
     // Flush an initial SSE comment so headers/first chunk make it past
     // proxies before the first 5s poll cycle. See sse_job_handler for context.
-    let initial = stream::once(async {
-        Ok::<_, std::convert::Infallible>(Event::default().comment("connected"))
-    });
+    let initial =
+        stream::once(async { Ok::<_, std::io::Error>(Event::default().comment("connected")) });
 
     // Queue-scope guard: a restricted key must not stream stats for a queue outside
     // its scope. If denied, the stream sends only the initial comment and closes.
@@ -725,10 +872,11 @@ pub async fn sse_queue_handler(
             queue_name.clone(),
             org_id.clone(),
             state.clone(),
+            api_key_id,
             start_time,
             deny,
         ),
-        |(queue_name, org_id, state, start_time, deny)| async move {
+        |(queue_name, org_id, state, api_key_id, start_time, deny)| async move {
             // Deny out-of-scope queues (close immediately after the initial comment).
             if deny {
                 return None;
@@ -742,33 +890,51 @@ pub async fn sse_queue_handler(
             // Poll interval
             tokio::time::sleep(std::time::Duration::from_secs(SSE_QUEUE_POLL_INTERVAL_SECS)).await;
 
-            // Query queue stats - now filtered by organization
-            let stats: Result<Vec<(String, i64)>, sqlx::Error> = sqlx::query_as(
+            // Reload the key and aggregate stats in one statement so revocation,
+            // expiry, and scope narrowing take effect before this protected poll.
+            let stats: Result<Vec<QueueAuthStatRow>, sqlx::Error> = sqlx::query_as(
                 r#"
-                SELECT status, COUNT(*) as count
-                FROM jobs
-                WHERE queue_name = $1 AND organization_id = $2
-                GROUP BY status
-                "#,
+                    SELECT k.queues, j.status, COUNT(j.id)
+                    FROM api_keys k
+                    INNER JOIN organizations o ON o.id = k.organization_id
+                    LEFT JOIN jobs j
+                      ON j.organization_id = k.organization_id
+                     AND j.queue_name = $1
+                    WHERE k.id = $2
+                      AND k.organization_id = $3
+                      AND k.is_active = TRUE
+                      AND (k.expires_at IS NULL OR k.expires_at > NOW())
+                      AND o.plan_tier <> 'deleted'
+                    GROUP BY k.queues, j.status
+                    "#,
             )
             .bind(&queue_name)
+            .bind(&api_key_id)
             .bind(&org_id)
             .fetch_all(state.db.pool())
             .await;
 
             match stats {
-                Ok(rows) => {
+                Ok(rows) if !rows.is_empty() => {
+                    let current_queues = &rows[0].0;
+                    let unrestricted = current_queues.is_empty()
+                        || current_queues.iter().any(|allowed| allowed == "*");
+                    if !unrestricted && !current_queues.iter().any(|allowed| allowed == &queue_name)
+                    {
+                        return None;
+                    }
+
                     let mut pending = 0;
                     let mut processing = 0;
                     let mut completed = 0;
                     let mut failed = 0;
 
-                    for (status, count) in rows {
-                        match status.as_str() {
-                            "pending" | "scheduled" => pending += count,
-                            "processing" => processing += count,
-                            "completed" => completed += count,
-                            "failed" | "deadletter" => failed += count,
+                    for (_, status, count) in rows {
+                        match status.as_deref() {
+                            Some("pending" | "scheduled") => pending += count,
+                            Some("processing") => processing += count,
+                            Some("completed") => completed += count,
+                            Some("failed" | "deadletter") => failed += count,
                             _ => {}
                         }
                     }
@@ -784,19 +950,15 @@ pub async fn sse_queue_handler(
                     let json = serde_json::to_string(&event).unwrap_or_default();
                     Some((
                         Ok(Event::default().event("queue.stats").data(json)),
-                        (queue_name, org_id, state, start_time, deny),
+                        (queue_name, org_id, state, api_key_id, start_time, deny),
                     ))
                 }
+                Ok(_) => None,
                 Err(e) => {
-                    error!("Database error in SSE stream: {}", e);
-                    let event = RealtimeEvent::Error {
-                        message: "Database error".to_string(),
-                        timestamp: chrono::Utc::now(),
-                    };
-                    let json = serde_json::to_string(&event).unwrap_or_default();
+                    error!(error = %e, queue = %queue_name, "Database error in SSE authorization poll");
                     Some((
-                        Ok(Event::default().event("error").data(json)),
-                        (queue_name, org_id, state, start_time, deny),
+                        Err(std::io::Error::other("SSE authorization check failed")),
+                        (queue_name, org_id, state, api_key_id, start_time, true),
                     ))
                 }
             }
@@ -819,6 +981,7 @@ pub async fn sse_events_handler(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
     let org_id = ctx.organization_id.clone();
+    let api_key_id = ctx.api_key_id.clone();
     info!(org_id = %org_id, "SSE connection for all events (authenticated)");
 
     // Parse event filter
@@ -841,10 +1004,11 @@ pub async fn sse_events_handler(
             state.clone(),
             event_filter,
             org_id.clone(),
+            api_key_id,
             0u64,
             start_time,
         ),
-        |(state, event_filter, org_id, counter, start_time)| async move {
+        |(state, event_filter, org_id, api_key_id, counter, start_time)| async move {
             // Close connection after max duration
             if start_time.elapsed().as_secs() > MAX_SSE_DURATION_SECS {
                 tracing::debug!(org_id = %org_id, "SSE events stream timeout - closing");
@@ -852,6 +1016,16 @@ pub async fn sse_events_handler(
             }
             // Poll interval
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+
+            // Revalidate the key and organization before revealing system health.
+            match load_current_realtime_scope(state.db.pool(), &api_key_id, &org_id).await {
+                Ok(Some(_)) => {}
+                Ok(None) => return None,
+                Err(e) => {
+                    error!(error = %e, org_id = %org_id, "SSE events authorization lookup failed");
+                    return None;
+                }
+            }
 
             // Query system health
             let db_ok = sqlx::query("SELECT 1")
@@ -880,13 +1054,27 @@ pub async fn sse_events_handler(
                 let json = serde_json::to_string(&event).unwrap_or_default();
                 Some((
                     Ok(Event::default().event("system.health").data(json)),
-                    (state, event_filter, org_id, counter + 1, start_time),
+                    (
+                        state,
+                        event_filter,
+                        org_id,
+                        api_key_id,
+                        counter + 1,
+                        start_time,
+                    ),
                 ))
             } else {
                 // Send keepalive
                 Some((
                     Ok(Event::default().comment("keepalive")),
-                    (state, event_filter, org_id, counter + 1, start_time),
+                    (
+                        state,
+                        event_filter,
+                        org_id,
+                        api_key_id,
+                        counter + 1,
+                        start_time,
+                    ),
                 ))
             }
         },
@@ -975,6 +1163,46 @@ mod tests {
             }
             _ => panic!("Wrong event type"),
         }
+    }
+
+    #[test]
+    fn test_scoped_subscription_filters_queue_job_and_worker_events() {
+        let scope = vec!["allowed".to_string()];
+        let filter = SubscriptionFilter {
+            queue: Some("allowed".to_string()),
+            job_id: Some("job-1".to_string()),
+        };
+        let allowed = RealtimeEvent::JobCreated {
+            job_id: "job-1".to_string(),
+            queue_name: "allowed".to_string(),
+            priority: 0,
+            timestamp: chrono::Utc::now(),
+        };
+        let wrong_job = RealtimeEvent::JobCreated {
+            job_id: "job-2".to_string(),
+            queue_name: "allowed".to_string(),
+            priority: 0,
+            timestamp: chrono::Utc::now(),
+        };
+        let heartbeat = RealtimeEvent::WorkerHeartbeat {
+            worker_id: "worker".to_string(),
+            status: "healthy".to_string(),
+            current_job_id: Some("job-1".to_string()),
+            timestamp: chrono::Utc::now(),
+        };
+
+        assert!(event_matches_subscription(&allowed, &filter, &scope));
+        assert!(!event_matches_subscription(&wrong_job, &filter, &scope));
+        assert!(!event_matches_subscription(&heartbeat, &filter, &scope));
+        let job_only_filter = SubscriptionFilter {
+            queue: None,
+            job_id: Some("job-1".to_string()),
+        };
+        assert!(event_matches_subscription(
+            &heartbeat,
+            &job_only_filter,
+            &[]
+        ));
     }
 
     #[test]

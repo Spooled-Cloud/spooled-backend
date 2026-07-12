@@ -214,6 +214,49 @@ async fn validate_api_key(pool: &PgPool, token: &str) -> Result<GrpcAuthContext,
     Err(Status::unauthenticated("Invalid API key"))
 }
 
+/// Reload an established stream's current authorization state without re-running
+/// bcrypt. The key ID was authenticated when the stream opened; this lookup makes
+/// revocation, expiry, organization deletion, rate-limit changes, and queue-scope
+/// narrowing effective before the next protected stream operation.
+pub async fn reload_api_key_context(
+    pool: &PgPool,
+    api_key_id: &str,
+) -> Result<GrpcAuthContext, Status> {
+    let record: Option<ApiKeyRecord> = sqlx::query_as(
+        r#"
+        SELECT k.id, k.organization_id, k.key_hash, k.queues, k.rate_limit
+        FROM api_keys k
+        INNER JOIN organizations o ON o.id = k.organization_id
+        WHERE k.id = $1
+          AND k.is_active = TRUE
+          AND (k.expires_at IS NULL OR k.expires_at > NOW())
+          AND o.plan_tier <> 'deleted'
+        "#,
+    )
+    .bind(api_key_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, api_key_id = %api_key_id, "Failed to revalidate gRPC stream authorization");
+        Status::internal("Authentication revalidation failed")
+    })?;
+
+    record.map(GrpcAuthContext::from).ok_or_else(|| {
+        Status::unauthenticated("API key revoked, expired, or organization unavailable")
+    })
+}
+
+impl From<ApiKeyRecord> for GrpcAuthContext {
+    fn from(record: ApiKeyRecord) -> Self {
+        Self {
+            organization_id: record.organization_id,
+            api_key_id: record.id,
+            queues: record.queues,
+            rate_limit: record.rate_limit,
+        }
+    }
+}
+
 /// Build the gRPC auth context for a verified key and refresh its `last_used`
 /// timestamp asynchronously (fire-and-forget).
 fn authenticated_context(pool: &PgPool, record: ApiKeyRecord) -> GrpcAuthContext {
@@ -232,12 +275,7 @@ fn authenticated_context(pool: &PgPool, record: ApiKeyRecord) -> GrpcAuthContext
             .await;
     });
 
-    GrpcAuthContext {
-        organization_id: record.organization_id,
-        api_key_id: record.id,
-        queues: record.queues,
-        rate_limit: record.rate_limit,
-    }
+    record.into()
 }
 
 /// Extension trait for accessing auth context from request

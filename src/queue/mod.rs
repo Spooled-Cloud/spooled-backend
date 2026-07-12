@@ -111,9 +111,9 @@ impl QueueManager {
                 idempotency_key, updated_at
             )
             VALUES ($1, $2, $3, $4, $5::JSONB, $6, $7, $8, $9, $10, $11, $9)
-            ON CONFLICT (organization_id, idempotency_key) 
+            ON CONFLICT (organization_id, idempotency_key)
             WHERE idempotency_key IS NOT NULL
-            DO UPDATE SET updated_at = NOW() 
+            DO UPDATE SET updated_at = NOW()
             RETURNING id
             "#,
         )
@@ -221,8 +221,8 @@ impl QueueManager {
             WITH eligible_jobs AS (
                 SELECT id
                 FROM jobs
-                WHERE 
-                    organization_id = $5 
+                WHERE
+                    organization_id = $5
                     AND queue_name = $6
                     AND status IN ('pending', 'scheduled')
                     AND (scheduled_at IS NULL OR scheduled_at <= $4)
@@ -233,7 +233,7 @@ impl QueueManager {
                 FOR UPDATE SKIP LOCKED
             )
             UPDATE jobs
-            SET 
+            SET
                 status = 'processing',
                 assigned_worker_id = $1,
                 lease_id = $2 || '-' || jobs.id,
@@ -339,7 +339,7 @@ impl QueueManager {
         let job = sqlx::query_as::<_, Job>(
             r#"
             UPDATE jobs
-            SET 
+            SET
                 status = 'processing',
                 assigned_worker_id = $1,
                 lease_id = $2,
@@ -348,8 +348,8 @@ impl QueueManager {
                 updated_at = $4
             WHERE id = (
                 SELECT id FROM jobs
-                WHERE 
-                    organization_id = $5 
+                WHERE
+                    organization_id = $5
                     AND queue_name = $6
                     AND status IN ('pending', 'scheduled')
                     AND (scheduled_at IS NULL OR scheduled_at <= $4)
@@ -443,12 +443,12 @@ impl QueueManager {
                 sqlx::query(
                     r#"
                     UPDATE jobs
-                    SET 
+                    SET
                         status = 'completed',
                         result = $1::JSONB,
                         completed_at = NOW(),
                         updated_at = NOW()
-                    WHERE id = $2 
+                    WHERE id = $2
                       AND assigned_worker_id = $3
                       AND organization_id = $4
                       AND status = 'processing'
@@ -468,12 +468,12 @@ impl QueueManager {
                 sqlx::query(
                     r#"
                     UPDATE jobs
-                    SET 
+                    SET
                         status = 'completed',
                         result = $1::JSONB,
                         completed_at = NOW(),
                         updated_at = NOW()
-                    WHERE id = $2 
+                    WHERE id = $2
                       AND assigned_worker_id = $3
                       AND status = 'processing'
                       AND lease_expires_at IS NOT NULL
@@ -491,7 +491,7 @@ impl QueueManager {
                 sqlx::query(
                     r#"
                     UPDATE jobs
-                    SET 
+                    SET
                         status = 'completed',
                         result = $1::JSONB,
                         completed_at = NOW(),
@@ -522,7 +522,7 @@ impl QueueManager {
             sqlx::query(
                 r#"
                 UPDATE jobs
-                SET 
+                SET
                     dependencies_met = TRUE,
                     updated_at = NOW()
                 WHERE parent_job_id = $1
@@ -550,7 +550,7 @@ impl QueueManager {
             sqlx::query(
                 r#"
                 UPDATE jobs
-                SET 
+                SET
                     dependencies_met = TRUE,
                     updated_at = NOW()
                 WHERE parent_job_id = $1
@@ -615,6 +615,7 @@ impl QueueManager {
         worker_id: &str,
         org_id: &str,
         lease_id: Option<&str>,
+        allowed_queues: Option<&[String]>,
         result: Option<serde_json::Value>,
     ) -> Result<WorkerOpOutcome> {
         let mut tx = self.db.begin().await?;
@@ -635,6 +636,7 @@ impl QueueManager {
               AND lease_expires_at IS NOT NULL
               AND lease_expires_at > NOW()
               AND ($5::TEXT IS NULL OR lease_id = $5)
+              AND ($6::TEXT[] IS NULL OR queue_name = ANY($6))
             "#,
         )
         .bind(&result_json)
@@ -642,13 +644,14 @@ impl QueueManager {
         .bind(worker_id)
         .bind(org_id)
         .bind(lease_id)
+        .bind(allowed_queues)
         .execute(&mut *tx)
         .await?;
 
         if query_result.rows_affected() == 0 {
             tx.rollback().await?;
             return self
-                .classify_worker_miss(job_id, worker_id, org_id, lease_id)
+                .classify_worker_miss(job_id, worker_id, org_id, lease_id, allowed_queues)
                 .await;
         }
 
@@ -705,6 +708,7 @@ impl QueueManager {
         worker_id: &str,
         org_id: &str,
         lease_id: Option<&str>,
+        allowed_queues: Option<&[String]>,
     ) -> Result<WorkerOpOutcome> {
         let row: Option<(String, Option<DateTime<Utc>>, Option<String>)> = sqlx::query_as(
             r#"
@@ -713,11 +717,13 @@ impl QueueManager {
             WHERE id = $1
               AND organization_id = $2
               AND assigned_worker_id = $3
+              AND ($4::TEXT[] IS NULL OR queue_name = ANY($4))
             "#,
         )
         .bind(job_id)
         .bind(org_id)
         .bind(worker_id)
+        .bind(allowed_queues)
         .fetch_optional(&*self.db)
         .await?;
 
@@ -770,6 +776,7 @@ impl QueueManager {
         worker_id: &str,
         org_id: &str,
         lease_id: Option<&str>,
+        allowed_queues: Option<&[String]>,
         error: &str,
     ) -> Result<FailByWorkerOutcome> {
         // Load current retry_count under (worker, org, processing, lease>now).
@@ -787,19 +794,21 @@ impl QueueManager {
               AND lease_expires_at IS NOT NULL
               AND lease_expires_at > NOW()
               AND ($4::TEXT IS NULL OR lease_id = $4)
+              AND ($5::TEXT[] IS NULL OR queue_name = ANY($5))
             "#,
         )
         .bind(job_id)
         .bind(org_id)
         .bind(worker_id)
         .bind(lease_id)
+        .bind(allowed_queues)
         .fetch_optional(&*self.db)
         .await?;
 
         let Some((retry_count, max_retries)) = row else {
             return Ok(FailByWorkerOutcome {
                 outcome: self
-                    .classify_worker_miss(job_id, worker_id, org_id, lease_id)
+                    .classify_worker_miss(job_id, worker_id, org_id, lease_id, allowed_queues)
                     .await?,
                 will_retry: false,
                 new_status: None,
@@ -835,6 +844,7 @@ impl QueueManager {
                   AND lease_expires_at IS NOT NULL
                   AND lease_expires_at > NOW()
                   AND ($7::TEXT IS NULL OR lease_id = $7)
+                  AND ($8::TEXT[] IS NULL OR queue_name = ANY($8))
                 "#,
             )
             .bind(retry_count + 1)
@@ -844,13 +854,14 @@ impl QueueManager {
             .bind(org_id)
             .bind(worker_id)
             .bind(lease_id)
+            .bind(allowed_queues)
             .execute(&*self.db)
             .await?;
 
             if updated.rows_affected() == 0 {
                 return Ok(FailByWorkerOutcome {
                     outcome: self
-                        .classify_worker_miss(job_id, worker_id, org_id, lease_id)
+                        .classify_worker_miss(job_id, worker_id, org_id, lease_id, allowed_queues)
                         .await?,
                     will_retry: false,
                     new_status: None,
@@ -899,6 +910,7 @@ impl QueueManager {
                   AND lease_expires_at IS NOT NULL
                   AND lease_expires_at > NOW()
                   AND ($5::TEXT IS NULL OR lease_id = $5)
+                  AND ($6::TEXT[] IS NULL OR queue_name = ANY($6))
                 "#,
             )
             .bind(error)
@@ -906,13 +918,14 @@ impl QueueManager {
             .bind(org_id)
             .bind(worker_id)
             .bind(lease_id)
+            .bind(allowed_queues)
             .execute(&*self.db)
             .await?;
 
             if updated.rows_affected() == 0 {
                 return Ok(FailByWorkerOutcome {
                     outcome: self
-                        .classify_worker_miss(job_id, worker_id, org_id, lease_id)
+                        .classify_worker_miss(job_id, worker_id, org_id, lease_id, allowed_queues)
                         .await?,
                     will_retry: false,
                     new_status: None,
@@ -1013,7 +1026,7 @@ impl QueueManager {
             sqlx::query(
                 r#"
                 UPDATE jobs
-                SET 
+                SET
                     status = 'pending',
                     retry_count = $1,
                     scheduled_at = $2,
@@ -1057,7 +1070,7 @@ impl QueueManager {
             sqlx::query(
                 r#"
                 UPDATE jobs
-                SET 
+                SET
                     status = 'deadletter',
                     last_error = $1,
                     assigned_worker_id = NULL,
@@ -1076,7 +1089,7 @@ impl QueueManager {
             sqlx::query(
                 r#"
                 INSERT INTO dead_letter_queue (id, job_id, organization_id, queue_name, reason, original_payload, error_details, created_at)
-                SELECT 
+                SELECT
                     gen_random_uuid()::TEXT,
                     id,
                     organization_id,
@@ -1133,6 +1146,7 @@ impl QueueManager {
         worker_id: &str,
         organization_id: &str,
         lease_id: Option<&str>,
+        allowed_queues: Option<&[String]>,
         lease_duration_secs: i64,
     ) -> Result<WorkerOpOutcome> {
         let lease_expires = Utc::now() + Duration::seconds(lease_duration_secs);
@@ -1148,6 +1162,7 @@ impl QueueManager {
               AND lease_expires_at IS NOT NULL
               AND lease_expires_at > NOW()
               AND ($5::TEXT IS NULL OR lease_id = $5)
+              AND ($6::TEXT[] IS NULL OR queue_name = ANY($6))
             "#,
         )
         .bind(lease_expires)
@@ -1155,13 +1170,14 @@ impl QueueManager {
         .bind(worker_id)
         .bind(organization_id)
         .bind(lease_id)
+        .bind(allowed_queues)
         .execute(&*self.db)
         .await?;
 
         if result.rows_affected() > 0 {
             Ok(WorkerOpOutcome::Ok)
         } else {
-            self.classify_worker_miss(job_id, worker_id, organization_id, lease_id)
+            self.classify_worker_miss(job_id, worker_id, organization_id, lease_id, allowed_queues)
                 .await
         }
     }
@@ -1171,13 +1187,13 @@ impl QueueManager {
         let result = sqlx::query(
             r#"
             UPDATE jobs
-            SET 
+            SET
                 status = 'pending',
                 assigned_worker_id = NULL,
                 lease_id = NULL,
                 lease_expires_at = NULL,
                 updated_at = NOW()
-            WHERE 
+            WHERE
                 status = 'processing'
                 AND lease_expires_at < NOW()
             "#,
@@ -1209,10 +1225,10 @@ impl QueueManager {
         let result = sqlx::query(
             r#"
             INSERT INTO job_history (id, job_id, event_type, details, created_at)
-            SELECT 
-                gen_random_uuid()::TEXT, 
-                $1, 
-                $2, 
+            SELECT
+                gen_random_uuid()::TEXT,
+                $1,
+                $2,
                 jsonb_set($3::jsonb, '{organization_id}', to_jsonb(j.organization_id)),
                 NOW()
             FROM jobs j WHERE j.id = $1
@@ -1241,10 +1257,10 @@ impl QueueManager {
     pub async fn get_queue_depth(&self, org_id: &str, queue_name: &str) -> Result<i64> {
         let (count,): (i64,) = sqlx::query_as(
             r#"
-            SELECT COUNT(*) 
-            FROM jobs 
-            WHERE organization_id = $1 
-              AND queue_name = $2 
+            SELECT COUNT(*)
+            FROM jobs
+            WHERE organization_id = $1
+              AND queue_name = $2
               AND status IN ('pending', 'scheduled')
             "#,
         )
@@ -1261,9 +1277,9 @@ impl QueueManager {
         let result: Option<(Option<i64>,)> = sqlx::query_as(
             r#"
             SELECT EXTRACT(EPOCH FROM (NOW() - MIN(created_at)))::BIGINT
-            FROM jobs 
-            WHERE organization_id = $1 
-              AND queue_name = $2 
+            FROM jobs
+            WHERE organization_id = $1
+              AND queue_name = $2
               AND status IN ('pending', 'scheduled')
             "#,
         )

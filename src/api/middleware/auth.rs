@@ -23,6 +23,13 @@ use crate::api::AppState;
 use crate::error::ErrorResponse;
 use crate::models::ApiKeyContext;
 
+type ApiKeyAuthorizationRow = (
+    bool,
+    Option<i32>,
+    Option<chrono::DateTime<Utc>>,
+    Vec<String>,
+);
+
 /// Map an `(StatusCode, String)` auth failure into a JSON error response so
 /// SDKs and the dashboard get the same `{code, message}` shape they get for
 /// every other API error. Without this, 401s leaked back as `text/plain`,
@@ -170,13 +177,7 @@ async fn authenticate_jwt_token(
     // narrowed (e.g. `["*"]` -> `["emails"]`) keep its old wildcard scope for the JWT's
     // lifetime; and omitting `expires_at` let a JWT outlive the key's expiry (the direct
     // API-key path already rejects expired keys).
-    #[allow(clippy::type_complexity)]
-    let api_key_row: Option<(
-        bool,
-        Option<i32>,
-        Option<chrono::DateTime<Utc>>,
-        Vec<String>,
-    )> = sqlx::query_as(
+    let api_key_row: Option<ApiKeyAuthorizationRow> = sqlx::query_as(
         "SELECT is_active, rate_limit, expires_at, queues FROM api_keys WHERE id = $1",
     )
     .bind(&token_data.claims.api_key_id)

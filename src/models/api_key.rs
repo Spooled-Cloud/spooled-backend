@@ -229,7 +229,9 @@ impl ApiKeyContext {
         if self.is_unrestricted() {
             return true;
         }
-        !requested.iter().any(|q| q == "*") && requested.iter().all(|q| self.can_access_queue(q))
+        !requested.is_empty()
+            && !requested.iter().any(|q| q == "*")
+            && requested.iter().all(|q| self.can_access_queue(q))
     }
 
     /// The allowed-queue list to use as a SQL filter, or `None` when the key is
@@ -307,8 +309,9 @@ mod tests {
         assert!(unrestricted_empty.can_grant_queues(&["*".into()]));
         assert!(unrestricted_star.can_grant_queues(&["payroll".into()]));
 
-        // Grant: a scoped key may only grant a subset of its own queues, never `*`
-        // (this is the privilege-escalation guard for /api-keys create+update).
+        // Grant: omitted and explicit empty request scopes both reach this helper as
+        // an empty slice and must be rejected for scoped create/update callers.
+        assert!(!scoped.can_grant_queues(&[]));
         assert!(scoped.can_grant_queues(&["emails".into()]));
         assert!(scoped.can_grant_queues(&["emails".into(), "billing".into()]));
         assert!(!scoped.can_grant_queues(&["*".into()]));

@@ -16,8 +16,8 @@ async fn test_database_migrations() {
     // Verify tables exist
     let tables: Vec<(String,)> = sqlx::query_as(
         r#"
-        SELECT tablename::TEXT 
-        FROM pg_tables 
+        SELECT tablename::TEXT
+        FROM pg_tables
         WHERE schemaname = 'public'
         ORDER BY tablename
         "#,
@@ -330,7 +330,7 @@ async fn test_for_update_skip_locked() {
     let dequeued: Option<(String, i32)> = sqlx::query_as(
         r#"
         UPDATE jobs
-        SET 
+        SET
             status = 'processing',
             assigned_worker_id = $1,
             started_at = NOW()
@@ -903,8 +903,8 @@ async fn test_job_lease_expiration() {
     // Query for expired leases
     let expired_jobs: Vec<(String,)> = sqlx::query_as(
         r#"
-        SELECT id FROM jobs 
-        WHERE status = 'processing' 
+        SELECT id FROM jobs
+        WHERE status = 'processing'
         AND lease_expires_at < NOW()
         "#,
     )
@@ -1229,7 +1229,7 @@ async fn test_dlq_retry() {
             max_retries, retry_count, timeout_seconds, last_error,
             created_at, updated_at
         )
-        VALUES ($1, $2, 'test-queue', 'deadletter', '{}'::JSONB, 0, 3, 3, 300, 
+        VALUES ($1, $2, 'test-queue', 'deadletter', '{}'::JSONB, 0, 3, 3, 300,
                 'Max retries exceeded', NOW(), NOW())
         "#,
     )
@@ -1399,7 +1399,7 @@ async fn test_data_retention_cleanup() {
             id, organization_id, queue_name, status, payload, priority,
             max_retries, timeout_seconds, created_at, completed_at, updated_at
         )
-        VALUES ($1, $2, 'test-queue', 'completed', '{}'::JSONB, 0, 3, 300, 
+        VALUES ($1, $2, 'test-queue', 'completed', '{}'::JSONB, 0, 3, 300,
                 NOW() - INTERVAL '31 days', NOW() - INTERVAL '31 days', NOW())
         "#,
     )
@@ -1417,7 +1417,7 @@ async fn test_data_retention_cleanup() {
             id, organization_id, queue_name, status, payload, priority,
             max_retries, timeout_seconds, created_at, completed_at, updated_at
         )
-        VALUES ($1, $2, 'test-queue', 'completed', '{}'::JSONB, 0, 3, 300, 
+        VALUES ($1, $2, 'test-queue', 'completed', '{}'::JSONB, 0, 3, 300,
                 NOW() - INTERVAL '1 day', NOW() - INTERVAL '1 day', NOW())
         "#,
     )
@@ -1478,7 +1478,7 @@ async fn test_job_expiration() {
             id, organization_id, queue_name, status, payload, priority,
             max_retries, timeout_seconds, expires_at, created_at, updated_at
         )
-        VALUES ($1, $2, 'test-queue', 'pending', '{}'::JSONB, 0, 3, 300, 
+        VALUES ($1, $2, 'test-queue', 'pending', '{}'::JSONB, 0, 3, 300,
                 NOW() - INTERVAL '1 hour', NOW(), NOW())
         "#,
     )
@@ -1491,7 +1491,7 @@ async fn test_job_expiration() {
     // Query for expired jobs
     let expired_jobs: Vec<(String,)> = sqlx::query_as(
         r#"
-        SELECT id FROM jobs 
+        SELECT id FROM jobs
         WHERE expires_at IS NOT NULL AND expires_at < NOW()
         AND status = 'pending'
         "#,
@@ -1543,15 +1543,15 @@ async fn test_concurrent_dequeue_safety() {
             let result: Option<(String,)> = sqlx::query_as(
                 r#"
                 UPDATE jobs
-                SET 
+                SET
                     status = 'processing',
                     assigned_worker_id = $1,
                     lease_expires_at = NOW() + INTERVAL '30 seconds',
                     updated_at = NOW()
                 WHERE id = (
                     SELECT id FROM jobs
-                    WHERE 
-                        organization_id = $2 
+                    WHERE
+                        organization_id = $2
                         AND queue_name = 'concurrent-queue'
                         AND status = 'pending'
                     ORDER BY priority DESC, created_at ASC
@@ -1632,9 +1632,9 @@ async fn test_webhook_delivery_attempts() {
     // Verify we can query by signature (attempt tracking)
     let (signature,): (Option<String>,) = sqlx::query_as(
         r#"
-        SELECT signature FROM webhook_deliveries 
-        WHERE organization_id = $1 
-        ORDER BY created_at DESC 
+        SELECT signature FROM webhook_deliveries
+        WHERE organization_id = $1
+        ORDER BY created_at DESC
         LIMIT 1
         "#,
     )
@@ -1958,8 +1958,8 @@ async fn test_minimal_job() {
 
     let result: JobOptionalFields = sqlx::query_as(
         r#"
-        SELECT 
-            result::TEXT, last_error, tags::TEXT, 
+        SELECT
+            result::TEXT, last_error, tags::TEXT,
             parent_job_id, completion_webhook, idempotency_key
         FROM jobs WHERE id = $1
         "#,
@@ -2165,6 +2165,251 @@ async fn seed_processing_job_with_lease(
 }
 
 #[tokio::test]
+async fn test_realtime_authorization_rejects_soft_deleted_organization() {
+    use spooled_backend::api::handlers::realtime::load_current_realtime_scope;
+
+    let db = TestDatabase::new().await;
+    let org_id = "realtime-soft-delete-org";
+    let key_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO organizations (id, name, slug, plan_tier, billing_email, created_at, updated_at) VALUES ($1, $1, $1, 'starter', $2, NOW(), NOW())",
+    )
+    .bind(org_id)
+    .bind("realtime-soft-delete@example.test")
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO api_keys (id, organization_id, name, key_hash, queues, is_active, created_at) VALUES ($1, $2, 'realtime', 'unused', ARRAY['one'], TRUE, NOW())",
+    )
+    .bind(&key_id)
+    .bind(org_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    assert_eq!(
+        load_current_realtime_scope(db.pool(), &key_id, org_id)
+            .await
+            .unwrap(),
+        Some(vec!["one".to_string()])
+    );
+
+    sqlx::query("UPDATE organizations SET plan_tier = 'deleted' WHERE id = $1")
+        .bind(org_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        load_current_realtime_scope(db.pool(), &key_id, org_id)
+            .await
+            .unwrap(),
+        None,
+        "active keys must not authorize realtime access for soft-deleted organizations"
+    );
+}
+
+#[tokio::test]
+async fn test_grpc_stream_revalidation_observes_scope_narrowing_and_revocation() {
+    use spooled_backend::grpc::auth::reload_api_key_context;
+
+    let db = TestDatabase::new().await;
+    let org_id = "stream-auth-org";
+    let key_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO organizations (id, name, slug, plan_tier, billing_email, created_at, updated_at) VALUES ($1, $1, $1, 'starter', $2, NOW(), NOW())",
+    )
+    .bind(org_id)
+    .bind("stream-auth@example.test")
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO api_keys (id, organization_id, name, key_hash, queues, is_active, created_at) VALUES ($1, $2, 'stream', 'unused', ARRAY['one', 'two'], TRUE, NOW())",
+    )
+    .bind(&key_id)
+    .bind(org_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let initial = reload_api_key_context(db.pool(), &key_id).await.unwrap();
+    assert!(initial.can_access_queue("two"));
+
+    sqlx::query("UPDATE api_keys SET queues = ARRAY['one'] WHERE id = $1")
+        .bind(&key_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let narrowed = reload_api_key_context(db.pool(), &key_id).await.unwrap();
+    assert!(!narrowed.can_access_queue("two"));
+
+    sqlx::query("UPDATE api_keys SET is_active = FALSE WHERE id = $1")
+        .bind(&key_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(reload_api_key_context(db.pool(), &key_id).await.is_err());
+}
+
+#[tokio::test]
+async fn test_grpc_unary_transport_rejects_out_of_scope_settlement() {
+    use std::sync::Arc;
+
+    use spooled_backend::grpc::proto::queue_service_server::QueueService;
+    use spooled_backend::grpc::proto::{CompleteRequest, FailRequest, RenewLeaseRequest};
+    use spooled_backend::grpc::services::QueueServiceImpl;
+    use spooled_backend::observability::Metrics;
+    use tonic::{Code, Request};
+
+    fn authenticated_request<T>(raw_key: &str, body: T) -> Request<T> {
+        let mut request = Request::new(body);
+        request
+            .metadata_mut()
+            .insert("x-api-key", raw_key.parse().unwrap());
+        request
+    }
+
+    let db = TestDatabase::new().await;
+    let org_id = "grpc-transport-scope-org";
+    let worker_id = uuid::Uuid::new_v4().to_string();
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let key_id = uuid::Uuid::new_v4().to_string();
+    let raw_key = "sp_test_transport_scope_key";
+
+    seed_processing_job_with_lease(
+        db.pool(),
+        &job_id,
+        &worker_id,
+        org_id,
+        chrono::Utc::now() + chrono::Duration::minutes(5),
+        Some("transport-lease"),
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO api_keys (id, organization_id, name, key_hash, queues, is_active, created_at) VALUES ($1, $2, 'transport', $3, ARRAY['allowed-queue'], TRUE, NOW())",
+    )
+    .bind(&key_id)
+    .bind(org_id)
+    .bind(bcrypt::hash(raw_key, 4).unwrap())
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let service = QueueServiceImpl::new(db.pool.clone(), Arc::new(Metrics::new()), None);
+
+    let complete = service
+        .complete(authenticated_request(
+            raw_key,
+            CompleteRequest {
+                job_id: job_id.clone(),
+                worker_id: worker_id.clone(),
+                result: None,
+                lease_id: "transport-lease".to_string(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(complete.code(), Code::NotFound);
+
+    let fail = service
+        .fail(authenticated_request(
+            raw_key,
+            FailRequest {
+                job_id: job_id.clone(),
+                worker_id: worker_id.clone(),
+                error: "hidden".to_string(),
+                retry: false,
+                lease_id: "transport-lease".to_string(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(fail.code(), Code::NotFound);
+
+    let renew = service
+        .renew_lease(authenticated_request(
+            raw_key,
+            RenewLeaseRequest {
+                job_id: job_id.clone(),
+                worker_id: worker_id.clone(),
+                extension_secs: 120,
+                lease_id: "transport-lease".to_string(),
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(renew.code(), Code::NotFound);
+
+    let (status, lease_id): (String, Option<String>) =
+        sqlx::query_as("SELECT status, lease_id FROM jobs WHERE id = $1")
+            .bind(&job_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(status, "processing");
+    assert_eq!(lease_id.as_deref(), Some("transport-lease"));
+}
+
+#[tokio::test]
+async fn test_worker_mutations_reject_out_of_scope_queue_atomically() {
+    use spooled_backend::queue::{QueueManager, WorkerOpOutcome};
+
+    let db = TestDatabase::new().await;
+    let queue = QueueManager::new(db.pool.clone(), None);
+    let org_id = "scope-worker-org";
+    let worker_id = uuid::Uuid::new_v4().to_string();
+    let allowed = vec!["allowed-queue".to_string()];
+
+    for operation in ["complete", "fail", "renew"] {
+        let job_id = uuid::Uuid::new_v4().to_string();
+        seed_processing_job(
+            db.pool(),
+            &job_id,
+            &worker_id,
+            org_id,
+            chrono::Utc::now() + chrono::Duration::minutes(5),
+        )
+        .await;
+
+        let outcome = match operation {
+            "complete" => queue
+                .complete_by_worker(&job_id, &worker_id, org_id, None, Some(&allowed), None)
+                .await
+                .unwrap(),
+            "fail" => {
+                queue
+                    .fail_by_worker(
+                        &job_id,
+                        &worker_id,
+                        org_id,
+                        None,
+                        Some(&allowed),
+                        "no access",
+                    )
+                    .await
+                    .unwrap()
+                    .outcome
+            }
+            "renew" => queue
+                .renew_lease(&job_id, &worker_id, org_id, None, Some(&allowed), 120)
+                .await
+                .unwrap(),
+            _ => unreachable!(),
+        };
+        assert_eq!(outcome, WorkerOpOutcome::NotOwned, "{operation}");
+
+        let status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = $1")
+            .bind(&job_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(status, "processing");
+    }
+}
+
+#[tokio::test]
 async fn test_complete_by_worker_rejects_expired_lease() {
     use spooled_backend::queue::{QueueManager, WorkerOpOutcome};
 
@@ -2184,7 +2429,7 @@ async fn test_complete_by_worker_rejects_expired_lease() {
     .await;
 
     let outcome = queue
-        .complete_by_worker(&job_id, &worker_id, org_id, None, None)
+        .complete_by_worker(&job_id, &worker_id, org_id, None, None, None)
         .await
         .expect("complete_by_worker should not fail on expired lease");
 
@@ -2226,6 +2471,7 @@ async fn test_complete_by_worker_ok_with_valid_lease() {
             &worker_id,
             org_id,
             None,
+            None,
             Some(serde_json::json!({"ok": true})),
         )
         .await
@@ -2261,7 +2507,7 @@ async fn test_complete_by_worker_not_owned_when_worker_mismatch() {
     .await;
 
     let outcome = queue
-        .complete_by_worker(&job_id, &other_worker, org_id, None, None)
+        .complete_by_worker(&job_id, &other_worker, org_id, None, None, None)
         .await
         .expect("complete_by_worker should not error on mismatch");
     assert_eq!(outcome, WorkerOpOutcome::NotOwned);
@@ -2287,7 +2533,7 @@ async fn test_fail_by_worker_rejects_expired_lease() {
     .await;
 
     let outcome = queue
-        .fail_by_worker(&job_id, &worker_id, org_id, None, "handler crash")
+        .fail_by_worker(&job_id, &worker_id, org_id, None, None, "handler crash")
         .await
         .expect("fail_by_worker should not error");
     assert_eq!(outcome.outcome, WorkerOpOutcome::LeaseExpired);
@@ -2320,7 +2566,7 @@ async fn test_fail_by_worker_reschedules_with_valid_lease() {
     .await;
 
     let outcome = queue
-        .fail_by_worker(&job_id, &worker_id, org_id, None, "boom")
+        .fail_by_worker(&job_id, &worker_id, org_id, None, None, "boom")
         .await
         .expect("fail_by_worker should succeed");
     assert_eq!(outcome.outcome, WorkerOpOutcome::Ok);
@@ -2355,7 +2601,7 @@ async fn test_renew_lease_rejects_expired() {
     seed_processing_job(db.pool(), &job_id, &worker_id, org_id, old_lease).await;
 
     let outcome = queue
-        .renew_lease(&job_id, &worker_id, org_id, None, 60)
+        .renew_lease(&job_id, &worker_id, org_id, None, None, 60)
         .await
         .expect("renew_lease should not error");
     assert_eq!(outcome, WorkerOpOutcome::LeaseExpired);
@@ -2388,9 +2634,9 @@ async fn test_renew_lease_extends_when_still_valid() {
     seed_processing_job(db.pool(), &job_id, &worker_id, org_id, initial).await;
 
     let outcome = queue
-        .renew_lease(&job_id, &worker_id, org_id, None, 120)
+        .renew_lease(&job_id, &worker_id, org_id, None, None, 120)
         .await
-        .expect("renew_lease should succeed for a valid lease");
+        .expect("renew_lease should extend valid lease");
     assert_eq!(outcome, WorkerOpOutcome::Ok);
 
     let stored: (chrono::DateTime<chrono::Utc>,) =
@@ -2483,7 +2729,7 @@ async fn test_complete_by_worker_rejects_stale_lease_id() {
 
     // A stale completion presenting the superseded token must lose...
     let outcome = queue
-        .complete_by_worker(&job_id, &worker_id, org_id, Some("lease-old"), None)
+        .complete_by_worker(&job_id, &worker_id, org_id, Some("lease-old"), None, None)
         .await
         .expect("complete_by_worker should not error on stale lease_id");
     assert_eq!(outcome, WorkerOpOutcome::LeaseExpired);
@@ -2497,7 +2743,7 @@ async fn test_complete_by_worker_rejects_stale_lease_id() {
 
     // ...while the holder of the current token succeeds.
     let outcome = queue
-        .complete_by_worker(&job_id, &worker_id, org_id, Some("lease-new"), None)
+        .complete_by_worker(&job_id, &worker_id, org_id, Some("lease-new"), None, None)
         .await
         .expect("complete_by_worker with current lease_id should succeed");
     assert_eq!(outcome, WorkerOpOutcome::Ok);
@@ -2524,7 +2770,14 @@ async fn test_fail_by_worker_rejects_stale_lease_id() {
     .await;
 
     let outcome = queue
-        .fail_by_worker(&job_id, &worker_id, org_id, Some("lease-old"), "stale")
+        .fail_by_worker(
+            &job_id,
+            &worker_id,
+            org_id,
+            Some("lease-old"),
+            None,
+            "stale",
+        )
         .await
         .expect("fail_by_worker should not error on stale lease_id");
     assert_eq!(outcome.outcome, WorkerOpOutcome::LeaseExpired);
@@ -2563,7 +2816,7 @@ async fn test_renew_lease_rejects_stale_lease_id_and_legacy_none_still_works() {
 
     // Stale token → LeaseExpired, expiry unchanged.
     let outcome = queue
-        .renew_lease(&job_id, &worker_id, org_id, Some("lease-old"), 120)
+        .renew_lease(&job_id, &worker_id, org_id, Some("lease-old"), None, 120)
         .await
         .expect("renew_lease should not error on stale lease_id");
     assert_eq!(outcome, WorkerOpOutcome::LeaseExpired);
@@ -2580,14 +2833,14 @@ async fn test_renew_lease_rejects_stale_lease_id_and_legacy_none_still_works() {
 
     // Legacy client (no token) → still renews on worker+expiry fence.
     let outcome = queue
-        .renew_lease(&job_id, &worker_id, org_id, None, 120)
+        .renew_lease(&job_id, &worker_id, org_id, None, None, 120)
         .await
-        .expect("legacy renew_lease should succeed");
+        .expect("renew_lease should succeed");
     assert_eq!(outcome, WorkerOpOutcome::Ok);
 
     // Current token → renews too.
     let outcome = queue
-        .renew_lease(&job_id, &worker_id, org_id, Some("lease-new"), 120)
+        .renew_lease(&job_id, &worker_id, org_id, Some("lease-new"), None, 120)
         .await
         .expect("renew_lease with current lease_id should succeed");
     assert_eq!(outcome, WorkerOpOutcome::Ok);

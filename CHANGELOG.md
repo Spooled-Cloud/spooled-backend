@@ -7,6 +7,24 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.97] - 2026-07-12
+
+Security authorization and realtime containment fixes.
+
+### Security
+
+- **Queue-scoped authorization is applied consistently across more operations.**
+  Restricted API keys can no longer preserve or grant broader key scopes through
+  omitted queue updates, and queue scope is enforced for worker mutations plus
+  schedule and workflow visibility and lifecycle operations.
+- **Realtime connections now track current authorization more closely.** WebSocket
+  and SSE paths revalidate key, organization, expiry, and queue scope during
+  protected polling or event delivery; subscription filters are enforced for queue
+  and job events, and failures close or suppress streams rather than exposing data.
+- **gRPC queue operations use current key state and queue scope.** Streaming and
+  worker mutation paths re-check authorization and apply queue restrictions before
+  returning or changing jobs.
+
 ## [0.1.96] - 2026-07-11
 
 Dependency + toolchain catch-up (all open Dependabot PRs landed).

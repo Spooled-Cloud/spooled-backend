@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use futures::Stream;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
@@ -24,7 +24,9 @@ use crate::api::middleware::limits::{
 };
 use crate::cache::RedisCache;
 use crate::config::PlanLimits;
-use crate::grpc::auth::{authenticate_from_metadata, authenticate_request};
+use crate::grpc::auth::{
+    authenticate_from_metadata, authenticate_request, reload_api_key_context, GrpcAuthContext,
+};
 use crate::grpc::convert::{
     datetime_to_timestamp, job_to_proto, jobs_to_proto, struct_to_json_opt,
     timestamp_to_datetime_opt,
@@ -46,6 +48,7 @@ const MAX_RESULT_SIZE: usize = 1024 * 1024;
 
 /// Maximum error message length
 const MAX_ERROR_MESSAGE_LENGTH: usize = 4096;
+const TRUNCATION_SUFFIX: &str = "... [truncated]";
 
 /// Minimum lease duration in seconds
 const MIN_LEASE_DURATION_SECS: i32 = 5;
@@ -163,6 +166,17 @@ impl QueueServiceImpl {
         Ok(())
     }
 
+    fn require_queue_access(auth: &GrpcAuthContext, queue_name: &str) -> Result<(), Status> {
+        if auth.can_access_queue(queue_name) {
+            Ok(())
+        } else {
+            Err(Status::permission_denied(format!(
+                "API key does not have permission for queue '{}'",
+                queue_name
+            )))
+        }
+    }
+
     /// Validate queue name format
     fn validate_queue_name(name: &str) -> Result<(), Status> {
         if name.is_empty() || name.len() > 255 {
@@ -220,7 +234,7 @@ impl QueueServiceImpl {
         let job: Option<DbJob> = sqlx::query_as(
             r#"
             UPDATE jobs
-            SET 
+            SET
                 status = 'processing',
                 started_at = COALESCE(started_at, NOW()),
                 assigned_worker_id = $1,
@@ -520,6 +534,8 @@ impl QueueService for QueueServiceImpl {
             return Err(Status::invalid_argument("Worker ID is required"));
         }
 
+        let allowed_queues = queue_scope_filter(&auth);
+
         // Validate result size
         let result_json = struct_to_json_opt(req.result.as_ref());
         let result_str = serde_json::to_string(&result_json).unwrap_or_default();
@@ -552,6 +568,7 @@ impl QueueService for QueueServiceImpl {
               AND lease_expires_at IS NOT NULL
               AND lease_expires_at > NOW()
               AND ($5::TEXT IS NULL OR lease_id = $5)
+              AND ($6::TEXT[] IS NULL OR queue_name = ANY($6))
             "#,
         )
         .bind(&result_str)
@@ -559,6 +576,7 @@ impl QueueService for QueueServiceImpl {
         .bind(&req.worker_id)
         .bind(&auth.organization_id)
         .bind(Self::opt_lease_id(&req.lease_id))
+        .bind(allowed_queues)
         .execute(self.pool.as_ref())
         .await
         .map_err(|e| {
@@ -573,6 +591,7 @@ impl QueueService for QueueServiceImpl {
                 &req.worker_id,
                 &auth.organization_id,
                 Self::opt_lease_id(&req.lease_id),
+                allowed_queues,
             )
             .await);
         }
@@ -599,15 +618,8 @@ impl QueueService for QueueServiceImpl {
             return Err(Status::invalid_argument("Worker ID is required"));
         }
 
-        // Truncate error message if too long
-        let error_message = if req.error.len() > MAX_ERROR_MESSAGE_LENGTH {
-            format!(
-                "{}... [truncated]",
-                &req.error[..MAX_ERROR_MESSAGE_LENGTH - 15]
-            )
-        } else {
-            req.error.clone()
-        };
+        let allowed_queues = queue_scope_filter(&auth);
+        let error_message = truncate_error_message(&req.error);
 
         #[derive(sqlx::FromRow)]
         struct UpdateResult {
@@ -619,15 +631,15 @@ impl QueueService for QueueServiceImpl {
         let result: Option<UpdateResult> = sqlx::query_as(
             r#"
             UPDATE jobs
-            SET 
-                status = CASE 
+            SET
+                status = CASE
                     WHEN $1 = FALSE OR retry_count >= max_retries THEN 'deadletter'
                     ELSE 'pending'
                 END,
                 last_error = $2,
                 retry_count = retry_count + 1,
-                scheduled_at = CASE 
-                    WHEN $1 = TRUE AND retry_count < max_retries 
+                scheduled_at = CASE
+                    WHEN $1 = TRUE AND retry_count < max_retries
                     THEN NOW() + (LEAST(POWER(2, LEAST(retry_count, 6)), 60) || ' seconds')::INTERVAL
                     ELSE scheduled_at
                 END,
@@ -642,6 +654,7 @@ impl QueueService for QueueServiceImpl {
               AND lease_expires_at IS NOT NULL
               AND lease_expires_at > NOW()
               AND ($6::TEXT IS NULL OR lease_id = $6)
+              AND ($7::TEXT[] IS NULL OR queue_name = ANY($7))
             RETURNING
                 status as new_status,
                 retry_count as new_retry_count,
@@ -658,6 +671,7 @@ impl QueueService for QueueServiceImpl {
         .bind(&req.worker_id)
         .bind(&auth.organization_id)
         .bind(Self::opt_lease_id(&req.lease_id))
+        .bind(allowed_queues)
         .fetch_optional(self.pool.as_ref())
         .await
         .map_err(|e| {
@@ -674,6 +688,7 @@ impl QueueService for QueueServiceImpl {
                     &req.worker_id,
                     &auth.organization_id,
                     Self::opt_lease_id(&req.lease_id),
+                    allowed_queues,
                 )
                 .await);
             }
@@ -750,6 +765,7 @@ impl QueueService for QueueServiceImpl {
             return Err(Status::invalid_argument("Worker ID is required"));
         }
 
+        let allowed_queues = queue_scope_filter(&auth);
         let extension_secs = Self::safe_lease_duration(req.extension_secs);
         let new_expires_at = Utc::now() + chrono::Duration::seconds(extension_secs as i64);
 
@@ -764,6 +780,7 @@ impl QueueService for QueueServiceImpl {
               AND lease_expires_at IS NOT NULL
               AND lease_expires_at > NOW()
               AND ($5::TEXT IS NULL OR lease_id = $5)
+              AND ($6::TEXT[] IS NULL OR queue_name = ANY($6))
             "#,
         )
         .bind(new_expires_at)
@@ -771,6 +788,7 @@ impl QueueService for QueueServiceImpl {
         .bind(&req.worker_id)
         .bind(&auth.organization_id)
         .bind(Self::opt_lease_id(&req.lease_id))
+        .bind(allowed_queues)
         .execute(self.pool.as_ref())
         .await
         .map_err(|e| {
@@ -785,6 +803,7 @@ impl QueueService for QueueServiceImpl {
                 &req.worker_id,
                 &auth.organization_id,
                 Self::opt_lease_id(&req.lease_id),
+                allowed_queues,
             )
             .await);
         }
@@ -814,10 +833,13 @@ impl QueueService for QueueServiceImpl {
             return Err(Status::invalid_argument("Job ID is required"));
         }
 
-        let job: Option<DbJob> =
-            sqlx::query_as("SELECT * FROM jobs WHERE id = $1 AND organization_id = $2")
+        let allowed_queues = queue_scope_filter(&auth);
+        let job: Option<DbJob> = sqlx::query_as(
+            "SELECT * FROM jobs WHERE id = $1 AND organization_id = $2 AND ($3::TEXT[] IS NULL OR queue_name = ANY($3))",
+        )
                 .bind(&req.job_id)
                 .bind(&auth.organization_id)
+                .bind(allowed_queues)
                 .fetch_optional(self.pool.as_ref())
                 .await
                 .map_err(|e| {
@@ -841,10 +863,11 @@ impl QueueService for QueueServiceImpl {
         let req = request.into_inner();
 
         Self::validate_queue_name(&req.queue_name)?;
+        Self::require_queue_access(&auth, &req.queue_name)?;
 
         let stats: (i64, i64, i64, i64, i64, i64, i64, Option<i64>) = sqlx::query_as(
             r#"
-            SELECT 
+            SELECT
                 COUNT(*) FILTER (WHERE status = 'pending') as pending,
                 COUNT(*) FILTER (WHERE status = 'scheduled') as scheduled,
                 COUNT(*) FILTER (WHERE status = 'processing') as processing,
@@ -920,7 +943,6 @@ impl QueueService for QueueServiceImpl {
 
         // Spawn background task to poll for jobs
         tokio::spawn(async move {
-            let mut polls_since_auth_check: u32 = 0;
             loop {
                 // Check if receiver is closed
                 if tx.is_closed() {
@@ -928,45 +950,29 @@ impl QueueService for QueueServiceImpl {
                     break;
                 }
 
-                // Re-check key + org every ~30s (and rate-limit every poll). Auth was
-                // only snapshot at stream open; without this a revoked/expired key or
-                // soft-deleted org keeps claiming for the life of the stream.
-                polls_since_auth_check += 1;
-                if polls_since_auth_check >= 30 {
-                    polls_since_auth_check = 0;
-                    let still_valid: Option<(bool,)> = sqlx::query_as(
-                        r#"
-                        SELECT k.is_active
-                        FROM api_keys k
-                        INNER JOIN organizations o ON o.id = k.organization_id
-                        WHERE k.id = $1
-                          AND k.is_active = TRUE
-                          AND (k.expires_at IS NULL OR k.expires_at > NOW())
-                          AND o.plan_tier <> 'deleted'
-                        "#,
-                    )
-                    .bind(&api_key_id)
-                    .fetch_optional(pool.as_ref())
-                    .await
-                    .ok()
-                    .flatten();
-                    if !matches!(still_valid, Some((true,))) {
-                        warn!(
-                            worker = %worker_id,
-                            api_key_id = %api_key_id,
-                            "Closing StreamJobs: API key revoked/expired or org deleted"
-                        );
+                let current_auth = match reload_api_key_context(pool.as_ref(), &api_key_id).await {
+                    Ok(auth) if auth.can_access_queue(&queue_name) => auth,
+                    Ok(_) => {
                         let _ = tx
-                            .send(Err(Status::unauthenticated(
-                                "API key revoked, expired, or organization unavailable",
-                            )))
+                            .send(Err(Status::permission_denied(format!(
+                                "API key does not have permission for queue '{}'",
+                                queue_name
+                            ))))
                             .await;
                         break;
                     }
-                }
+                    Err(status) => {
+                        let _ = tx.send(Err(status)).await;
+                        break;
+                    }
+                };
 
                 if let Err(status) = this
-                    .enforce_rate_limits(&org_id, &api_key_id, api_key_rate_limit)
+                    .enforce_rate_limits(
+                        &org_id,
+                        &api_key_id,
+                        current_auth.rate_limit.or(api_key_rate_limit),
+                    )
                     .await
                 {
                     if tx.send(Err(status)).await.is_err() {
@@ -976,12 +982,29 @@ impl QueueService for QueueServiceImpl {
                     continue;
                 }
 
+                // Lock the current key authorization through claim commit so a concurrent
+                // revocation or scope narrowing cannot race this protected operation.
+                let mut operation_tx = match begin_stream_operation(
+                    pool.as_ref(),
+                    &api_key_id,
+                    &org_id,
+                    Some(&queue_name),
+                )
+                .await
+                {
+                    Ok(tx) => tx,
+                    Err(status) => {
+                        let _ = tx.send(Err(status)).await;
+                        break;
+                    }
+                };
+
                 // Try to claim a job
                 let lease_id = uuid::Uuid::new_v4().to_string();
                 let job_result: Result<Option<DbJob>, _> = sqlx::query_as(
                     r#"
                     UPDATE jobs
-                    SET 
+                    SET
                         status = 'processing',
                         assigned_worker_id = $1,
                         lease_id = $2,
@@ -992,6 +1015,21 @@ impl QueueService for QueueServiceImpl {
                         SELECT id FROM jobs
                         WHERE organization_id = $4
                           AND queue_name = $5
+                          AND EXISTS (
+                              SELECT 1
+                              FROM api_keys k
+                              INNER JOIN organizations o ON o.id = k.organization_id
+                              WHERE k.id = $6
+                                AND k.organization_id = jobs.organization_id
+                                AND k.is_active = TRUE
+                                AND (k.expires_at IS NULL OR k.expires_at > NOW())
+                                AND o.plan_tier <> 'deleted'
+                                AND (
+                                    cardinality(k.queues) = 0
+                                    OR '*' = ANY(k.queues)
+                                    OR jobs.queue_name = ANY(k.queues)
+                                )
+                          )
                           AND status IN ('pending', 'scheduled')
                           AND (scheduled_at IS NULL OR scheduled_at <= NOW())
                           AND (expires_at IS NULL OR expires_at > NOW())
@@ -1016,11 +1054,19 @@ impl QueueService for QueueServiceImpl {
                 .bind(lease_duration)
                 .bind(&org_id)
                 .bind(&queue_name)
-                .fetch_optional(pool.as_ref())
+                .bind(&api_key_id)
+                .fetch_optional(&mut *operation_tx)
                 .await;
 
                 match job_result {
                     Ok(Some(job)) => {
+                        if let Err(e) = operation_tx.commit().await {
+                            error!(error = %e, "Failed to commit streamed job claim");
+                            let _ = tx
+                                .send(Err(Status::internal("Error polling for jobs")))
+                                .await;
+                            break;
+                        }
                         metrics.jobs_processing.inc();
                         debug!(job_id = %job.id, queue = %queue_name, "Streaming job to worker");
 
@@ -1029,6 +1075,13 @@ impl QueueService for QueueServiceImpl {
                         }
                     }
                     Ok(None) => {
+                        if let Err(e) = operation_tx.commit().await {
+                            error!(error = %e, "Failed to commit empty streamed job claim");
+                            let _ = tx
+                                .send(Err(Status::internal("Error polling for jobs")))
+                                .await;
+                            break;
+                        }
                         // No jobs available, wait before polling again
                         tokio::time::sleep(Duration::from_millis(STREAM_POLL_INTERVAL_MS)).await;
                     }
@@ -1068,60 +1121,29 @@ impl QueueService for QueueServiceImpl {
         let org_id = auth.organization_id.clone();
         let api_key_id = auth.api_key_id.clone();
         let api_key_rate_limit = auth.rate_limit;
-        // The key's queue scope, enforced per-message on dequeue below.
-        let allowed_queues = auth.queues.clone();
         let this = self.clone();
 
         let (tx, rx) = mpsc::channel(16);
 
         // Spawn background task to handle incoming requests
         tokio::spawn(async move {
-            let mut messages_since_auth_check: u32 = 0;
             while let Ok(Some(req)) = stream.message().await {
-                // Re-check key + org periodically. Auth is snapshotted at stream
-                // open; without this a revoked key keeps completing/claiming.
-                messages_since_auth_check += 1;
-                if messages_since_auth_check >= 32 {
-                    messages_since_auth_check = 0;
-                    let still_valid: Option<(bool,)> = sqlx::query_as(
-                        r#"
-                        SELECT k.is_active
-                        FROM api_keys k
-                        INNER JOIN organizations o ON o.id = k.organization_id
-                        WHERE k.id = $1
-                          AND k.is_active = TRUE
-                          AND (k.expires_at IS NULL OR k.expires_at > NOW())
-                          AND o.plan_tier <> 'deleted'
-                        "#,
-                    )
-                    .bind(&api_key_id)
-                    .fetch_optional(pool.as_ref())
-                    .await
-                    .ok()
-                    .flatten();
-                    if !matches!(still_valid, Some((true,))) {
-                        warn!(
-                            api_key_id = %api_key_id,
-                            "Closing ProcessJobs: API key revoked/expired or org deleted"
-                        );
-                        let response = ProcessResponse {
-                            response: Some(crate::grpc::proto::process_response::Response::Error(
-                                crate::grpc::proto::ErrorResponse {
-                                    code: "UNAUTHENTICATED".to_string(),
-                                    message:
-                                        "API key revoked, expired, or organization unavailable"
-                                            .to_string(),
-                                },
-                            )),
-                        };
+                let current_auth = match reload_api_key_context(pool.as_ref(), &api_key_id).await {
+                    Ok(auth) => auth,
+                    Err(status) => {
+                        let response = process_error("UNAUTHENTICATED", status.message());
                         let _ = tx.send(Ok(response)).await;
                         break;
                     }
-                }
+                };
 
                 // IMPORTANT: enforce rate limits per message, otherwise the stream can bypass limits.
                 if let Err(status) = this
-                    .enforce_rate_limits(&org_id, &api_key_id, api_key_rate_limit)
+                    .enforce_rate_limits(
+                        &org_id,
+                        &api_key_id,
+                        current_auth.rate_limit.or(api_key_rate_limit),
+                    )
                     .await
                 {
                     let response = ProcessResponse {
@@ -1140,23 +1162,18 @@ impl QueueService for QueueServiceImpl {
 
                 let response = match req.request {
                     Some(crate::grpc::proto::process_request::Request::Dequeue(dequeue_req)) => {
-                        handle_process_dequeue(
-                            &pool,
-                            &metrics,
-                            &org_id,
-                            &allowed_queues,
-                            dequeue_req,
-                        )
-                        .await
+                        handle_process_dequeue(&pool, &metrics, &org_id, &api_key_id, dequeue_req)
+                            .await
                     }
                     Some(crate::grpc::proto::process_request::Request::Complete(complete_req)) => {
-                        handle_process_complete(&pool, &metrics, &org_id, complete_req).await
+                        handle_process_complete(&pool, &metrics, &org_id, &api_key_id, complete_req)
+                            .await
                     }
                     Some(crate::grpc::proto::process_request::Request::Fail(fail_req)) => {
-                        handle_process_fail(&pool, &metrics, &org_id, fail_req).await
+                        handle_process_fail(&pool, &metrics, &org_id, &api_key_id, fail_req).await
                     }
                     Some(crate::grpc::proto::process_request::Request::RenewLease(renew_req)) => {
-                        handle_process_renew(&pool, &org_id, renew_req).await
+                        handle_process_renew(&pool, &org_id, &api_key_id, renew_req).await
                     }
                     None => ProcessResponse {
                         response: Some(crate::grpc::proto::process_response::Response::Error(
@@ -1179,32 +1196,112 @@ impl QueueService for QueueServiceImpl {
     }
 }
 
+fn queue_scope_filter(auth: &GrpcAuthContext) -> Option<&[String]> {
+    queue_scope_filter_from_queues(&auth.queues)
+}
+
+fn queue_scope_filter_from_queues(queues: &[String]) -> Option<&[String]> {
+    if queues.is_empty() || queues.iter().any(|queue| queue == "*") {
+        None
+    } else {
+        Some(queues)
+    }
+}
+
+async fn begin_stream_operation<'a>(
+    pool: &'a PgPool,
+    api_key_id: &str,
+    org_id: &str,
+    queue_name: Option<&str>,
+) -> Result<Transaction<'a, Postgres>, Status> {
+    let mut tx = pool.begin().await.map_err(|e| {
+        error!(error = %e, "Failed to begin stream operation");
+        Status::internal("Failed to begin stream operation")
+    })?;
+
+    let queues: Option<Vec<String>> = sqlx::query_scalar(
+        r#"
+        SELECT k.queues
+        FROM api_keys k
+        INNER JOIN organizations o ON o.id = k.organization_id
+        WHERE k.id = $1
+          AND k.organization_id = $2
+          AND k.is_active = TRUE
+          AND (k.expires_at IS NULL OR k.expires_at > NOW())
+          AND o.plan_tier <> 'deleted'
+        FOR SHARE OF k
+        "#,
+    )
+    .bind(api_key_id)
+    .bind(org_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| {
+        error!(error = %e, api_key_id = %api_key_id, "Failed to lock stream authorization");
+        Status::internal("Authentication revalidation failed")
+    })?;
+
+    let queues = queues.ok_or_else(|| Status::unauthenticated("API key revoked or expired"))?;
+    if let Some(queue_name) = queue_name {
+        let allowed = queues.is_empty()
+            || queues
+                .iter()
+                .any(|allowed| allowed == "*" || allowed == queue_name);
+        if !allowed {
+            return Err(Status::permission_denied(format!(
+                "API key does not have permission for queue '{}'",
+                queue_name
+            )));
+        }
+    }
+
+    Ok(tx)
+}
+
+fn process_status_error(status: &Status) -> ProcessResponse {
+    let code = match status.code() {
+        tonic::Code::Unauthenticated => "UNAUTHENTICATED",
+        tonic::Code::PermissionDenied => "PERMISSION_DENIED",
+        tonic::Code::InvalidArgument => "INVALID_ARGUMENT",
+        _ => "INTERNAL",
+    };
+    process_error(code, status.message())
+}
+
+fn process_error(code: &str, message: &str) -> ProcessResponse {
+    ProcessResponse {
+        response: Some(crate::grpc::proto::process_response::Response::Error(
+            crate::grpc::proto::ErrorResponse {
+                code: code.to_string(),
+                message: message.to_string(),
+            },
+        )),
+    }
+}
+
+fn truncate_error_message(message: &str) -> String {
+    if message.len() <= MAX_ERROR_MESSAGE_LENGTH {
+        return message.to_string();
+    }
+
+    let max_prefix_len = MAX_ERROR_MESSAGE_LENGTH - TRUNCATION_SUFFIX.len();
+    let boundary = message
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= max_prefix_len)
+        .last()
+        .unwrap_or(0);
+    format!("{}{}", &message[..boundary], TRUNCATION_SUFFIX)
+}
+
 /// Handle dequeue request in ProcessJobs stream
 async fn handle_process_dequeue(
     pool: &PgPool,
     metrics: &Metrics,
     org_id: &str,
-    allowed_queues: &[String],
+    api_key_id: &str,
     req: DequeueRequest,
 ) -> ProcessResponse {
-    // Queue scope (per-message): a restricted key cannot dequeue from a queue outside
-    // its scope. The streaming path bound only org_id + queue_name in SQL, never the
-    // key's scope, so it bypassed the check the unary Dequeue enforces.
-    let unrestricted = allowed_queues.is_empty() || allowed_queues.iter().any(|q| q == "*");
-    if !unrestricted && !allowed_queues.iter().any(|q| q == &req.queue_name) {
-        return ProcessResponse {
-            response: Some(crate::grpc::proto::process_response::Response::Error(
-                crate::grpc::proto::ErrorResponse {
-                    code: "PERMISSION_DENIED".to_string(),
-                    message: format!(
-                        "API key does not have permission for queue '{}'",
-                        req.queue_name
-                    ),
-                },
-            )),
-        };
-    }
-
     if req.worker_id.is_empty() {
         return ProcessResponse {
             response: Some(crate::grpc::proto::process_response::Response::Error(
@@ -1216,6 +1313,11 @@ async fn handle_process_dequeue(
         };
     }
 
+    let mut tx = match begin_stream_operation(pool, api_key_id, org_id, Some(&req.queue_name)).await
+    {
+        Ok(tx) => tx,
+        Err(status) => return process_status_error(&status),
+    };
     let lease_id = uuid::Uuid::new_v4().to_string();
     let lease_duration = QueueServiceImpl::safe_lease_duration(req.lease_duration_secs);
 
@@ -1256,11 +1358,15 @@ async fn handle_process_dequeue(
     .bind(lease_duration)
     .bind(org_id)
     .bind(&req.queue_name)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await;
 
     match job {
         Ok(Some(job)) => {
+            if let Err(e) = tx.commit().await {
+                error!(error = %e, "Failed to commit ProcessJobs dequeue");
+                return process_error("INTERNAL", "Failed to dequeue job");
+            }
             metrics.jobs_processing.inc();
             ProcessResponse {
                 response: Some(crate::grpc::proto::process_response::Response::Job(
@@ -1268,14 +1374,20 @@ async fn handle_process_dequeue(
                 )),
             }
         }
-        Ok(None) => ProcessResponse {
-            response: Some(crate::grpc::proto::process_response::Response::Error(
-                crate::grpc::proto::ErrorResponse {
-                    code: "NO_JOBS".to_string(),
-                    message: "No jobs available".to_string(),
-                },
-            )),
-        },
+        Ok(None) => {
+            if let Err(e) = tx.commit().await {
+                error!(error = %e, "Failed to commit empty ProcessJobs dequeue");
+                return process_error("INTERNAL", "Failed to dequeue job");
+            }
+            ProcessResponse {
+                response: Some(crate::grpc::proto::process_response::Response::Error(
+                    crate::grpc::proto::ErrorResponse {
+                        code: "NO_JOBS".to_string(),
+                        message: "No jobs available".to_string(),
+                    },
+                )),
+            }
+        }
         Err(e) => {
             error!(error = %e, "Failed to dequeue in ProcessJobs");
             ProcessResponse {
@@ -1300,6 +1412,7 @@ async fn classify_worker_miss_status(
     worker_id: &str,
     org_id: &str,
     lease_id: Option<&str>,
+    allowed_queues: Option<&[String]>,
 ) -> Status {
     /// Same shape as the ProcessJobs helper below — factored to a type alias
     /// to appease clippy's `type_complexity` lint.
@@ -1312,11 +1425,13 @@ async fn classify_worker_miss_status(
         WHERE id = $1
           AND organization_id = $2
           AND assigned_worker_id = $3
+          AND ($4::TEXT[] IS NULL OR queue_name = ANY($4))
         "#,
     )
     .bind(job_id)
     .bind(org_id)
     .bind(worker_id)
+    .bind(allowed_queues)
     .fetch_optional(pool)
     .await;
 
@@ -1348,10 +1463,11 @@ async fn classify_worker_miss_status(
 /// `LEASE_EXPIRED` (mirrors REST) so clients can distinguish it from
 /// generic `NOT_FOUND`.
 async fn classify_worker_miss_process_response(
-    pool: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     job_id: &str,
     worker_id: &str,
     org_id: &str,
+    api_key_id: &str,
     lease_id: Option<&str>,
 ) -> ProcessResponse {
     /// Row returned by the worker-miss classifier: current `status`, the
@@ -1366,12 +1482,23 @@ async fn classify_worker_miss_process_response(
         WHERE id = $1
           AND organization_id = $2
           AND assigned_worker_id = $3
+          AND EXISTS (
+              SELECT 1 FROM api_keys k
+              WHERE k.id = $4
+                AND k.organization_id = jobs.organization_id
+                AND (
+                    cardinality(k.queues) = 0
+                    OR '*' = ANY(k.queues)
+                    OR jobs.queue_name = ANY(k.queues)
+                )
+          )
         "#,
     )
     .bind(job_id)
     .bind(org_id)
     .bind(worker_id)
-    .fetch_optional(pool)
+    .bind(api_key_id)
+    .fetch_optional(&mut **tx)
     .await
     {
         Ok(Some((status, lease, current_lease_id))) if status == "processing" => {
@@ -1410,6 +1537,7 @@ async fn handle_process_complete(
     pool: &PgPool,
     metrics: &Metrics,
     org_id: &str,
+    api_key_id: &str,
     req: CompleteRequest,
 ) -> ProcessResponse {
     // Bind the result as a TEXT JSON string (matching the REST/unary paths)
@@ -1432,6 +1560,11 @@ async fn handle_process_complete(
         };
     }
 
+    let mut tx = match begin_stream_operation(pool, api_key_id, org_id, None).await {
+        Ok(tx) => tx,
+        Err(status) => return process_status_error(&status),
+    };
+
     let db_result = sqlx::query(
         r#"
         UPDATE jobs
@@ -1447,6 +1580,16 @@ async fn handle_process_complete(
           AND lease_expires_at IS NOT NULL
           AND lease_expires_at > NOW()
           AND ($5::TEXT IS NULL OR lease_id = $5)
+          AND EXISTS (
+              SELECT 1 FROM api_keys k
+              WHERE k.id = $6
+                AND k.organization_id = jobs.organization_id
+                AND (
+                    cardinality(k.queues) = 0
+                    OR '*' = ANY(k.queues)
+                    OR jobs.queue_name = ANY(k.queues)
+                )
+          )
         "#,
     )
     .bind(&result_str)
@@ -1454,11 +1597,16 @@ async fn handle_process_complete(
     .bind(&req.worker_id)
     .bind(org_id)
     .bind(QueueServiceImpl::opt_lease_id(&req.lease_id))
-    .execute(pool)
+    .bind(api_key_id)
+    .execute(&mut *tx)
     .await;
 
     match db_result {
         Ok(result) if result.rows_affected() > 0 => {
+            if let Err(e) = tx.commit().await {
+                error!(error = %e, "Failed to commit ProcessJobs completion");
+                return process_error("INTERNAL", "Failed to complete job");
+            }
             metrics.jobs_completed.inc();
             metrics.jobs_processing.dec();
             ProcessResponse {
@@ -1468,14 +1616,20 @@ async fn handle_process_complete(
             }
         }
         Ok(_) => {
-            classify_worker_miss_process_response(
-                pool,
+            let response = classify_worker_miss_process_response(
+                &mut tx,
                 &req.job_id,
                 &req.worker_id,
                 org_id,
+                api_key_id,
                 QueueServiceImpl::opt_lease_id(&req.lease_id),
             )
-            .await
+            .await;
+            if let Err(e) = tx.commit().await {
+                error!(error = %e, "Failed to commit ProcessJobs completion miss");
+                return process_error("INTERNAL", "Failed to complete job");
+            }
+            response
         }
         Err(e) => {
             error!(error = %e, "Failed to complete in ProcessJobs");
@@ -1496,15 +1650,13 @@ async fn handle_process_fail(
     pool: &PgPool,
     metrics: &Metrics,
     org_id: &str,
+    api_key_id: &str,
     req: FailRequest,
 ) -> ProcessResponse {
-    let error_message = if req.error.len() > MAX_ERROR_MESSAGE_LENGTH {
-        format!(
-            "{}... [truncated]",
-            &req.error[..MAX_ERROR_MESSAGE_LENGTH - 15]
-        )
-    } else {
-        req.error.clone()
+    let error_message = truncate_error_message(&req.error);
+    let mut tx = match begin_stream_operation(pool, api_key_id, org_id, None).await {
+        Ok(tx) => tx,
+        Err(status) => return process_status_error(&status),
     };
 
     #[derive(sqlx::FromRow)]
@@ -1517,8 +1669,8 @@ async fn handle_process_fail(
     let result: Result<Option<UpdateResult>, _> = sqlx::query_as(
         r#"
         UPDATE jobs
-        SET 
-            status = CASE 
+        SET
+            status = CASE
                 WHEN $1 = FALSE OR retry_count >= max_retries THEN 'deadletter'
                 ELSE 'pending'
             END,
@@ -1540,6 +1692,16 @@ async fn handle_process_fail(
           AND lease_expires_at IS NOT NULL
           AND lease_expires_at > NOW()
           AND ($6::TEXT IS NULL OR lease_id = $6)
+          AND EXISTS (
+              SELECT 1 FROM api_keys k
+              WHERE k.id = $7
+                AND k.organization_id = jobs.organization_id
+                AND (
+                    cardinality(k.queues) = 0
+                    OR '*' = ANY(k.queues)
+                    OR jobs.queue_name = ANY(k.queues)
+                )
+          )
         RETURNING
             status as new_status,
             retry_count as new_retry_count,
@@ -1556,17 +1718,14 @@ async fn handle_process_fail(
     .bind(&req.worker_id)
     .bind(org_id)
     .bind(QueueServiceImpl::opt_lease_id(&req.lease_id))
-    .fetch_optional(pool)
+    .bind(api_key_id)
+    .fetch_optional(&mut *tx)
     .await;
 
     match result {
         Ok(Some(update_result)) => {
-            metrics.jobs_failed.inc();
-            metrics.jobs_processing.dec();
             let will_retry = update_result.new_status == "pending";
             if update_result.new_status == "deadletter" {
-                metrics.jobs_deadlettered.inc();
-
                 // Parity with REST: insert into dead_letter_queue.
                 if let Err(e) = sqlx::query(
                     r#"
@@ -1590,11 +1749,20 @@ async fn handle_process_fail(
                 }))
                 .bind(&req.job_id)
                 .bind(org_id)
-                .execute(pool)
+                .execute(&mut *tx)
                 .await
                 {
                     error!(error = %e, job_id = %req.job_id, "Failed to insert dead_letter_queue row in ProcessJobs");
                 }
+            }
+            if let Err(e) = tx.commit().await {
+                error!(error = %e, "Failed to commit ProcessJobs failure");
+                return process_error("INTERNAL", "Failed to update job");
+            }
+            metrics.jobs_failed.inc();
+            metrics.jobs_processing.dec();
+            if update_result.new_status == "deadletter" {
+                metrics.jobs_deadlettered.inc();
             }
             ProcessResponse {
                 response: Some(crate::grpc::proto::process_response::Response::Fail(
@@ -1607,14 +1775,20 @@ async fn handle_process_fail(
             }
         }
         Ok(None) => {
-            classify_worker_miss_process_response(
-                pool,
+            let response = classify_worker_miss_process_response(
+                &mut tx,
                 &req.job_id,
                 &req.worker_id,
                 org_id,
+                api_key_id,
                 QueueServiceImpl::opt_lease_id(&req.lease_id),
             )
-            .await
+            .await;
+            if let Err(e) = tx.commit().await {
+                error!(error = %e, "Failed to commit ProcessJobs failure miss");
+                return process_error("INTERNAL", "Failed to update job");
+            }
+            response
         }
         Err(e) => {
             error!(error = %e, "Failed to fail in ProcessJobs");
@@ -1634,10 +1808,15 @@ async fn handle_process_fail(
 async fn handle_process_renew(
     pool: &PgPool,
     org_id: &str,
+    api_key_id: &str,
     req: RenewLeaseRequest,
 ) -> ProcessResponse {
     let extension_secs = QueueServiceImpl::safe_lease_duration(req.extension_secs);
     let new_expires_at = Utc::now() + chrono::Duration::seconds(extension_secs as i64);
+    let mut tx = match begin_stream_operation(pool, api_key_id, org_id, None).await {
+        Ok(tx) => tx,
+        Err(status) => return process_status_error(&status),
+    };
 
     let result = sqlx::query(
         r#"
@@ -1650,6 +1829,16 @@ async fn handle_process_renew(
           AND lease_expires_at IS NOT NULL
           AND lease_expires_at > NOW()
           AND ($5::TEXT IS NULL OR lease_id = $5)
+          AND EXISTS (
+              SELECT 1 FROM api_keys k
+              WHERE k.id = $6
+                AND k.organization_id = jobs.organization_id
+                AND (
+                    cardinality(k.queues) = 0
+                    OR '*' = ANY(k.queues)
+                    OR jobs.queue_name = ANY(k.queues)
+                )
+          )
         "#,
     )
     .bind(new_expires_at)
@@ -1657,27 +1846,40 @@ async fn handle_process_renew(
     .bind(&req.worker_id)
     .bind(org_id)
     .bind(QueueServiceImpl::opt_lease_id(&req.lease_id))
-    .execute(pool)
+    .bind(api_key_id)
+    .execute(&mut *tx)
     .await;
 
     match result {
-        Ok(res) if res.rows_affected() > 0 => ProcessResponse {
-            response: Some(crate::grpc::proto::process_response::Response::RenewLease(
-                RenewLeaseResponse {
-                    success: true,
-                    new_expires_at: Some(datetime_to_timestamp(new_expires_at)),
-                },
-            )),
-        },
+        Ok(res) if res.rows_affected() > 0 => {
+            if let Err(e) = tx.commit().await {
+                error!(error = %e, "Failed to commit ProcessJobs lease renewal");
+                return process_error("INTERNAL", "Failed to renew lease");
+            }
+            ProcessResponse {
+                response: Some(crate::grpc::proto::process_response::Response::RenewLease(
+                    RenewLeaseResponse {
+                        success: true,
+                        new_expires_at: Some(datetime_to_timestamp(new_expires_at)),
+                    },
+                )),
+            }
+        }
         Ok(_) => {
-            classify_worker_miss_process_response(
-                pool,
+            let response = classify_worker_miss_process_response(
+                &mut tx,
                 &req.job_id,
                 &req.worker_id,
                 org_id,
+                api_key_id,
                 QueueServiceImpl::opt_lease_id(&req.lease_id),
             )
-            .await
+            .await;
+            if let Err(e) = tx.commit().await {
+                error!(error = %e, "Failed to commit ProcessJobs lease renewal miss");
+                return process_error("INTERNAL", "Failed to renew lease");
+            }
+            response
         }
         Err(e) => {
             error!(error = %e, "Failed to renew lease in ProcessJobs");
@@ -1696,6 +1898,82 @@ async fn handle_process_renew(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message;
+
+    fn round_trip<T>(message: &T) -> T
+    where
+        T: Message + Default,
+    {
+        T::decode(message.encode_to_vec().as_slice()).expect("protobuf round trip")
+    }
+
+    #[test]
+    fn test_public_settlement_requests_preserve_lease_ids_on_wire() {
+        let complete = round_trip(&CompleteRequest {
+            job_id: "job".to_string(),
+            worker_id: "worker".to_string(),
+            result: None,
+            lease_id: "complete-lease".to_string(),
+        });
+        assert_eq!(complete.lease_id, "complete-lease");
+
+        let fail = round_trip(&FailRequest {
+            job_id: "job".to_string(),
+            worker_id: "worker".to_string(),
+            error: "boom".to_string(),
+            retry: true,
+            lease_id: "fail-lease".to_string(),
+        });
+        assert_eq!(fail.lease_id, "fail-lease");
+
+        let renew = round_trip(&RenewLeaseRequest {
+            job_id: "job".to_string(),
+            worker_id: "worker".to_string(),
+            extension_secs: 120,
+            lease_id: "renew-lease".to_string(),
+        });
+        assert_eq!(renew.extension_secs, 120);
+        assert_eq!(renew.lease_id, "renew-lease");
+    }
+
+    #[test]
+    fn test_process_requests_preserve_settlement_variants_on_wire() {
+        use crate::grpc::proto::process_request::Request as Operation;
+
+        let operations = [
+            Operation::Complete(CompleteRequest {
+                job_id: "complete".to_string(),
+                worker_id: "worker".to_string(),
+                result: None,
+                lease_id: "lease-c".to_string(),
+            }),
+            Operation::Fail(FailRequest {
+                job_id: "fail".to_string(),
+                worker_id: "worker".to_string(),
+                error: "boom".to_string(),
+                retry: false,
+                lease_id: "lease-f".to_string(),
+            }),
+            Operation::RenewLease(RenewLeaseRequest {
+                job_id: "renew".to_string(),
+                worker_id: "worker".to_string(),
+                extension_secs: 60,
+                lease_id: "lease-r".to_string(),
+            }),
+        ];
+
+        for operation in operations {
+            let decoded = round_trip(&ProcessRequest {
+                request: Some(operation),
+            });
+            match decoded.request.expect("operation") {
+                Operation::Complete(req) => assert_eq!(req.lease_id, "lease-c"),
+                Operation::Fail(req) => assert_eq!(req.lease_id, "lease-f"),
+                Operation::RenewLease(req) => assert_eq!(req.lease_id, "lease-r"),
+                Operation::Dequeue(_) => panic!("unexpected dequeue"),
+            }
+        }
+    }
 
     #[test]
     fn test_validate_queue_name() {
@@ -1708,6 +1986,30 @@ mod tests {
         assert!(QueueServiceImpl::validate_queue_name("-invalid").is_err());
         assert!(QueueServiceImpl::validate_queue_name(".invalid").is_err());
         assert!(QueueServiceImpl::validate_queue_name("invalid@chars").is_err());
+    }
+
+    #[test]
+    fn test_truncate_error_message_preserves_utf8_boundaries() {
+        let message = format!("{}é", "a".repeat(MAX_ERROR_MESSAGE_LENGTH - 1));
+        let truncated = truncate_error_message(&message);
+
+        assert!(truncated.is_char_boundary(truncated.len()));
+        assert!(truncated.ends_with(TRUNCATION_SUFFIX));
+        assert!(truncated.len() <= MAX_ERROR_MESSAGE_LENGTH);
+        assert_eq!(
+            truncated,
+            format!(
+                "{}{}",
+                "a".repeat(MAX_ERROR_MESSAGE_LENGTH - TRUNCATION_SUFFIX.len()),
+                TRUNCATION_SUFFIX
+            )
+        );
+    }
+
+    #[test]
+    fn test_truncate_error_message_leaves_short_multibyte_text_unchanged() {
+        let message = "помилка 🚨";
+        assert_eq!(truncate_error_message(message), message);
     }
 
     #[test]

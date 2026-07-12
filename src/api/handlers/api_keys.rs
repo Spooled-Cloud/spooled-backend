@@ -20,6 +20,14 @@ use crate::models::{
 /// Maximum API keys per page
 const MAX_API_KEYS_PER_PAGE: i64 = 100;
 
+fn can_create_with_queues(ctx: &ApiKeyContext, requested: Option<&[String]>) -> bool {
+    ctx.can_grant_queues(requested.unwrap_or_default())
+}
+
+fn can_update_with_queues(ctx: &ApiKeyContext, requested: Option<&[String]>) -> bool {
+    ctx.is_unrestricted() || requested.is_some_and(|queues| ctx.can_grant_queues(queues))
+}
+
 /// List all API keys (without sensitive data)
 ///
 /// Now filters by authenticated organization
@@ -65,8 +73,7 @@ pub async fn create(
     // Privilege-escalation guard: a queue-scoped key must not be able to mint a
     // broader key. It may only grant a subset of its own queues, and never `*`.
     // Unrestricted keys (empty list or `*`) may grant anything.
-    let requested_queues = request.queues.clone().unwrap_or_default();
-    if !ctx.can_grant_queues(&requested_queues) {
+    if !can_create_with_queues(&ctx, request.queues.as_deref()) {
         return Err(AppError::Authorization(
             "API key cannot grant queues outside its own scope".to_string(),
         ));
@@ -184,21 +191,23 @@ pub async fn update(
     .await?
     .ok_or_else(|| AppError::NotFound(format!("API key {} not found", id)))?;
 
-    let name = request.name.unwrap_or(existing.name);
-    let queues = request.queues.unwrap_or(existing.queues);
-    let is_active = request.is_active.unwrap_or(existing.is_active);
-
     // Privilege-escalation guard: a queue-scoped key must not broaden any key's
-    // scope beyond its own (nor grant `*`). Unrestricted keys may set anything.
-    if !ctx.can_grant_queues(&queues) {
+    // scope beyond its own (nor grant `*`). Restricted callers must explicitly
+    // provide a non-empty permitted subset; omission would otherwise preserve a
+    // potentially unrestricted target key.
+    if !can_update_with_queues(&ctx, request.queues.as_deref()) {
         return Err(AppError::Authorization(
             "API key cannot grant queues outside its own scope".to_string(),
         ));
     }
 
+    let name = request.name.unwrap_or(existing.name);
+    let queues = request.queues.unwrap_or(existing.queues);
+    let is_active = request.is_active.unwrap_or(existing.is_active);
+
     let key = sqlx::query_as::<_, ApiKey>(
         r#"
-        UPDATE api_keys 
+        UPDATE api_keys
         SET name = $1, queues = $2, rate_limit = $3, is_active = $4
         WHERE id = $5 AND organization_id = $6
         RETURNING *
@@ -332,6 +341,44 @@ mod tests {
 
         assert_ne!(key1, key2);
         assert!(key1.len() >= 32);
+    }
+
+    fn scoped_context() -> ApiKeyContext {
+        ApiKeyContext {
+            organization_id: "org".to_string(),
+            api_key_id: "key".to_string(),
+            queues: vec!["one".to_string(), "two".to_string()],
+            rate_limit: None,
+        }
+    }
+
+    #[test]
+    fn test_scoped_create_queue_grants() {
+        let ctx = scoped_context();
+        let empty: Vec<String> = vec![];
+        let allowed = vec!["one".to_string()];
+        let forbidden = vec!["three".to_string()];
+
+        assert!(
+            !can_create_with_queues(&ctx, None),
+            "omitted is unrestricted"
+        );
+        assert!(!can_create_with_queues(&ctx, Some(&empty)));
+        assert!(can_create_with_queues(&ctx, Some(&allowed)));
+        assert!(!can_create_with_queues(&ctx, Some(&forbidden)));
+    }
+
+    #[test]
+    fn test_scoped_update_queue_grants() {
+        let ctx = scoped_context();
+        let empty: Vec<String> = vec![];
+        let allowed = vec!["one".to_string()];
+        let forbidden = vec!["three".to_string()];
+
+        assert!(!can_update_with_queues(&ctx, None));
+        assert!(!can_update_with_queues(&ctx, Some(&empty)));
+        assert!(can_update_with_queues(&ctx, Some(&allowed)));
+        assert!(!can_update_with_queues(&ctx, Some(&forbidden)));
     }
 
     #[test]

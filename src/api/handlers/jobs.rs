@@ -476,6 +476,7 @@ pub async fn complete(
             &request.worker_id,
             &ctx.organization_id,
             request.lease_id.as_deref(),
+            ctx.queue_scope_filter(),
             request.result,
         )
         .await
@@ -557,6 +558,7 @@ pub async fn fail(
             &request.worker_id,
             &ctx.organization_id,
             request.lease_id.as_deref(),
+            ctx.queue_scope_filter(),
             &request.error,
         )
         .await
@@ -632,6 +634,7 @@ pub async fn heartbeat(
             &request.worker_id,
             &ctx.organization_id,
             request.lease_id.as_deref(),
+            ctx.queue_scope_filter(),
             request.lease_duration_secs,
         )
         .await
@@ -789,8 +792,8 @@ pub async fn retry(
 
     let job = sqlx::query_as::<_, Job>(
         r#"
-        UPDATE jobs 
-        SET 
+        UPDATE jobs
+        SET
             status = 'pending',
             retry_count = retry_count + 1,
             last_error = NULL,
@@ -850,7 +853,7 @@ pub async fn stats(
 ) -> AppResult<Json<JobStats>> {
     let stats = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64, i64)>(
         r#"
-        SELECT 
+        SELECT
             COUNT(*) FILTER (WHERE status = 'pending') as pending,
             COUNT(*) FILTER (WHERE status = 'scheduled') as scheduled,
             COUNT(*) FILTER (WHERE status = 'processing') as processing,
@@ -993,7 +996,7 @@ pub async fn bulk_enqueue(
     let results: Result<Vec<(i32, String, String)>, sqlx::Error> = sqlx::query_as(
         r#"
         WITH input_jobs AS (
-            SELECT 
+            SELECT
                 idx,
                 jid,
                 stat,
@@ -1045,7 +1048,7 @@ pub async fn bulk_enqueue(
             DO UPDATE SET updated_at = NOW()
             RETURNING id, idempotency_key
         )
-        SELECT 
+        SELECT
             ij.idx,
             COALESCE(ins.id, ij.jid) as returned_id,
             ij.jid as input_id
@@ -1394,7 +1397,7 @@ pub async fn retry_dlq(
         sqlx::query_as(
             r#"
             UPDATE jobs
-            SET 
+            SET
                 status = 'pending',
                 retry_count = 0,
                 last_error = NULL,
@@ -1412,13 +1415,13 @@ pub async fn retry_dlq(
         sqlx::query_as(
             r#"
             UPDATE jobs
-            SET 
+            SET
                 status = 'pending',
                 retry_count = 0,
                 last_error = NULL,
                 updated_at = NOW()
             WHERE id IN (
-                SELECT id FROM jobs 
+                SELECT id FROM jobs
                 WHERE status = 'deadletter' AND organization_id = $1 AND queue_name = $2
                 ORDER BY created_at ASC
                 LIMIT $3
@@ -1436,13 +1439,13 @@ pub async fn retry_dlq(
         sqlx::query_as(
             r#"
             UPDATE jobs
-            SET 
+            SET
                 status = 'pending',
                 retry_count = 0,
                 last_error = NULL,
                 updated_at = NOW()
             WHERE id IN (
-                SELECT id FROM jobs 
+                SELECT id FROM jobs
                 WHERE status = 'deadletter' AND organization_id = $1
                 ORDER BY created_at ASC
                 LIMIT $2
@@ -1553,7 +1556,7 @@ pub async fn purge_dlq(
         (Some(queue), Some(older_than)) => {
             sqlx::query(
                 r#"DELETE FROM jobs WHERE id IN (
-                    SELECT id FROM jobs 
+                    SELECT id FROM jobs
                     WHERE status = 'deadletter' AND organization_id = $1 AND queue_name = $2 AND created_at < $3
                     LIMIT $4
                 )"#
@@ -1568,7 +1571,7 @@ pub async fn purge_dlq(
         (Some(queue), None) => {
             sqlx::query(
                 r#"DELETE FROM jobs WHERE id IN (
-                    SELECT id FROM jobs 
+                    SELECT id FROM jobs
                     WHERE status = 'deadletter' AND organization_id = $1 AND queue_name = $2
                     LIMIT $3
                 )"#
@@ -1582,7 +1585,7 @@ pub async fn purge_dlq(
         (None, Some(older_than)) => {
             sqlx::query(
                 r#"DELETE FROM jobs WHERE id IN (
-                    SELECT id FROM jobs 
+                    SELECT id FROM jobs
                     WHERE status = 'deadletter' AND organization_id = $1 AND created_at < $2
                     LIMIT $3
                 )"#
@@ -1596,7 +1599,7 @@ pub async fn purge_dlq(
         (None, None) => {
             sqlx::query(
                 r#"DELETE FROM jobs WHERE id IN (
-                    SELECT id FROM jobs 
+                    SELECT id FROM jobs
                     WHERE status = 'deadletter' AND organization_id = $1
                     LIMIT $2
                 )"#

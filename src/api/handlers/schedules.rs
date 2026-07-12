@@ -24,6 +24,32 @@ use crate::models::{
     UpdateScheduleRequest,
 };
 
+async fn require_schedule_access(
+    state: &AppState,
+    ctx: &ApiKeyContext,
+    schedule_id: &str,
+) -> Result<(), (StatusCode, String)> {
+    let queue_name: Option<String> = sqlx::query_scalar(
+        "SELECT queue_name FROM schedules WHERE id = $1 AND organization_id = $2",
+    )
+    .bind(schedule_id)
+    .bind(&ctx.organization_id)
+    .fetch_optional(state.db.pool())
+    .await
+    .map_err(|e| {
+        error!(error = %e, "Failed to authorize schedule");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to authorize schedule".to_string(),
+        )
+    })?;
+
+    match queue_name {
+        Some(queue) if ctx.can_access_queue(&queue) => Ok(()),
+        _ => Err((StatusCode::NOT_FOUND, "Schedule not found".to_string())),
+    }
+}
+
 /// List all schedules
 ///
 /// GET /api/v1/schedules
@@ -43,12 +69,14 @@ pub async fn list(
         SELECT *
         FROM schedules
         WHERE organization_id = $1
+          AND ($3::TEXT[] IS NULL OR queue_name = ANY($3))
         ORDER BY created_at DESC
         LIMIT $2
         "#,
     )
     .bind(org_id)
     .bind(params.safe_limit()) // Use bounded limit
+    .bind(ctx.queue_scope_filter())
     .fetch_all(state.db.pool())
     .await
     // Don't leak database error details
@@ -73,6 +101,7 @@ pub async fn get(
     Extension(ctx): Extension<ApiKeyContext>,
     Path(id): Path<String>,
 ) -> Result<Json<Schedule>, (StatusCode, String)> {
+    require_schedule_access(&state, &ctx, &id).await?;
     let schedule: Option<Schedule> =
         sqlx::query_as("SELECT * FROM schedules WHERE id = $1 AND organization_id = $2")
             .bind(&id)
@@ -235,6 +264,7 @@ pub async fn update(
     ValidatedJson(req): ValidatedJson<UpdateScheduleRequest>,
 ) -> Result<Json<Schedule>, (StatusCode, String)> {
     let org_id = &ctx.organization_id;
+    require_schedule_access(&state, &ctx, &id).await?;
 
     // Recompute next_run_at when the cron expression OR the timezone changes —
     // both alter the next fire time. The effective values are the incoming ones
@@ -332,6 +362,7 @@ pub async fn delete(
     Extension(ctx): Extension<ApiKeyContext>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    require_schedule_access(&state, &ctx, &id).await?;
     let result = sqlx::query("DELETE FROM schedules WHERE id = $1 AND organization_id = $2")
         .bind(&id)
         .bind(&ctx.organization_id)
@@ -363,6 +394,7 @@ pub async fn pause(
     Extension(ctx): Extension<ApiKeyContext>,
     Path(id): Path<String>,
 ) -> Result<Json<Schedule>, (StatusCode, String)> {
+    require_schedule_access(&state, &ctx, &id).await?;
     let schedule: Option<Schedule> = sqlx::query_as(
         r#"
         UPDATE schedules
@@ -398,6 +430,7 @@ pub async fn resume(
     Extension(ctx): Extension<ApiKeyContext>,
     Path(id): Path<String>,
 ) -> Result<Json<Schedule>, (StatusCode, String)> {
+    require_schedule_access(&state, &ctx, &id).await?;
     // Get current cron expression to calculate next run
     let current: Option<Schedule> =
         sqlx::query_as("SELECT * FROM schedules WHERE id = $1 AND organization_id = $2")
@@ -582,6 +615,7 @@ pub async fn history(
     Path(id): Path<String>,
     Query(params): Query<HistoryQuery>,
 ) -> Result<Json<Vec<ScheduleRunRecord>>, (StatusCode, String)> {
+    require_schedule_access(&state, &ctx, &id).await?;
     // First verify the schedule belongs to this organization
     let schedule_exists: Option<(String,)> =
         sqlx::query_as("SELECT id FROM schedules WHERE id = $1 AND organization_id = $2")
