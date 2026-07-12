@@ -10,7 +10,7 @@ Complete guide to building and running workers with Spooled Cloud.
 4. [Worker Registration](#worker-registration)
 5. [Processing Jobs](#processing-jobs)
 6. [Concurrency](#concurrency)
-7. [Health & Heartbeats](#health--heartbeats)
+7. [Health & Heartbeats](#health-heartbeats)
 8. [Graceful Shutdown](#graceful-shutdown)
 9. [gRPC Workers](#grpc-workers)
 10. [Best Practices](#best-practices)

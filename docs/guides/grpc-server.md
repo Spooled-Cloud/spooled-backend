@@ -144,10 +144,10 @@ Standard gRPC health checking protocol.
 
 All `QueueService` and `WorkerService` methods require authentication via one of:
 
-- **API Key Header**: `x-api-key: <your-api-key>`
-- **Authorization Header**: `Authorization: Bearer <jwt-token>`
+- **API key credential**: send the API key value in the `x-api-key` gRPC metadata field, for example `x-api-key: sp_live_...`. The metadata field name is not the credential.
+- **JWT credential**: send the JWT in the `authorization` gRPC metadata field as `authorization: Bearer <jwt-token>`.
 
-The health service does NOT require authentication.
+Although tools often call metadata entries “headers,” these names are HTTP/2/gRPC metadata. The health service does NOT require authentication.
 
 ### Example with API Key
 
@@ -317,6 +317,8 @@ If you see `launchd` using the port, use `GRPC_PORT=50052` instead.
 
 **Symptom**: `Unauthenticated: Missing x-api-key or authorization header`
 
+Here `x-api-key` and `authorization` are metadata field names. The credential is the API key value placed in `x-api-key`, or the JWT placed after `Bearer` in `authorization`.
+
 **Solutions**:
 1. Include the API key header: `-H "x-api-key: sp_live_..."` (or legacy `sk_live_...`)
 2. Or use JWT token: `-H "Authorization: Bearer <token>"`
@@ -347,11 +349,9 @@ The server automatically applies:
 
 ### Throughput vs Latency
 
-| Deployment | Throughput | Latency (p99) | Notes |
-|------------|------------|---------------|-------|
-| Local (no TLS) | ~10k req/s | < 5ms | Fastest for development |
-| Cloudflare (TLS) | ~2k req/s | ~50ms | Production through Cloudflare Tunnel |
-| Direct (with TLS) | ~5k req/s | ~10ms | Direct connection, no proxy |
+Performance depends on payload size, database capacity, TLS termination, and network
+path. Benchmark the target deployment with the checked-in `loadtest/` tools rather
+than relying on environment-independent throughput or latency figures.
 
 ### Cloudflare Tunnel Configuration
 
@@ -404,7 +404,7 @@ const { jobId } = await grpcClient.queue.enqueue({
 
 ## Related Documentation
 
-- [API Integration Guide](./API_INTEGRATION.md) - REST API documentation
-- [Getting Started](./GETTING_STARTED.md) - Quick start guide
-- [Deployment Guide](./DEPLOYMENT.md) - Production deployment
-- [Security Guide](./SECURITY.md) - Security best practices
+- [API Usage Guide](./api-usage.md) - REST API documentation
+- [Quickstart](./quickstart.md) - Cloud and self-hosted setup
+- [Deployment Guide](./deployment.md) - Production deployment
+- [Security Policy](../../SECURITY.md) - Reporting and deployment best practices

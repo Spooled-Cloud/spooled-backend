@@ -8,12 +8,12 @@ This guide covers deploying Spooled Cloud in various environments.
 2. [Managed Cloud](#managed-cloud)
 3. [Prerequisites](#prerequisites)
 4. [Local Development](#local-development)
-3. [Docker Deployment](#docker-deployment)
-4. [Kubernetes Deployment](#kubernetes-deployment)
-5. [Production Checklist](#production-checklist)
-6. [Monitoring & Observability](#monitoring--observability)
-7. [Scaling Guidelines](#scaling-guidelines)
-8. [Troubleshooting](#troubleshooting)
+5. [Docker Deployment](#docker-deployment)
+6. [Kubernetes Deployment](#kubernetes-deployment)
+7. [Production Checklist](#production-checklist)
+8. [Monitoring & Observability](#monitoring--observability)
+9. [Scaling Guidelines](#scaling-guidelines)
+10. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -70,38 +70,40 @@ For teams that need self-hosting (air-gapped, data residency, etc.), continue to
 ### 1. Start Dependencies
 
 ```bash
-# Start the full stack
-cd spooled-backend/docker
-docker-compose up -d
+# From the spooled-backend repository root, start the local stack
+docker compose up -d
 
 # Verify services
-docker-compose ps
+docker compose ps
 ```
 
 This starts:
-- **PostgreSQL 16** - Primary database (port 5432)
-- **PgBouncer** - Connection pooler (port 6432)
+- **PostgreSQL 16** - Primary database (host port 5433)
+- **PgBouncer** - Connection pooler (host port 6432)
 - **Redis 7** - Cache and Pub/Sub (port 6379)
 - **Prometheus** - Metrics collection (port 9091)
 - **Grafana** - Dashboards (port 3000)
-- **Jaeger** - Distributed tracing (port 16686)
+
 
 ### 2. Configure Environment
 
 ```bash
-# Copy example env file
-cp .env.example .env
-
-# Edit configuration
-vim .env
+# Configure the local backend process
+cat > .env <<'EOF'
+DATABASE_URL=postgres://spooled:spooled_password@localhost:5433/spooled
+DATABASE_DIRECT_URL=postgres://spooled:spooled_password@localhost:5433/spooled
+REDIS_URL=redis://localhost:6379
+RUST_ENV=development
+JWT_SECRET=development-secret-change-in-production
+EOF
 ```
 
 Required environment variables:
 
 ```env
-# Database (use PgBouncer for app, direct for migrations)
-DATABASE_URL=postgres://spooled:spooled_dev_password@localhost:6432/spooled
-DATABASE_DIRECT_URL=postgres://spooled:spooled_dev_password@localhost:5432/spooled
+# Database (the local backend process connects directly to the mapped PostgreSQL port)
+DATABASE_URL=postgres://spooled:spooled_password@localhost:5433/spooled
+DATABASE_DIRECT_URL=postgres://spooled:spooled_password@localhost:5433/spooled
 
 # Redis
 REDIS_URL=redis://localhost:6379
@@ -145,7 +147,10 @@ cargo run
 
 ```bash
 curl http://localhost:8080/health
-# {"status":"healthy","version":"0.1.87","database":true,"cache":true}
+# {"status":"healthy","database":true,"cache":true}
+
+# Public /health intentionally omits the version. Verify a rollout through the
+# authenticated GET /api/v1/dashboard response (system.version and uptime_seconds).
 ```
 
 ---

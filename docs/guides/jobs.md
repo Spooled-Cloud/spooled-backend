@@ -393,7 +393,7 @@ curl -X POST https://api.spooled.cloud/api/v1/schedules \
   }'
 ```
 
-See [Schedules Guide](./schedules.md) for more details.
+See the [Schedules section of the API Usage Guide](./api-usage.md#schedules) for lifecycle operations.
 
 ---
 
@@ -474,6 +474,6 @@ Get notified when jobs complete:
 
 - [Retries & DLQ](./retries.md) — Configure retry behavior
 - [Workers](./workers.md) — Build production workers
-- [Schedules](./schedules.md) — Recurring jobs
-- [Workflows](./workflows.md) — Job dependencies
+- [Schedules](./api-usage.md#schedules) — Recurring jobs
+- [Workflows](./api-usage.md#workflows) — Job dependencies
 - [API Reference](./api-usage.md) — Complete API documentation

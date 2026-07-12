@@ -50,6 +50,16 @@ When deploying Spooled Backend, please follow these security guidelines:
 - **Database Passwords**: Use strong, unique passwords
 - **RUST_ENV**: Set to `production` in production environments
 
+### Unresolved Operator Actions
+
+The following credential-remediation work remains open. Do not place current or replacement secret values in this repository, documentation, tickets, logs, or chat transcripts.
+
+- **Rotate `ADMIN_API_KEY`.** Treat the existing credential as exposed because it appeared in a prior chat transcript. Generate a new high-entropy value in the deployment secret manager, update the production service and the authorized workspace-root `.env` copy, restart or roll the backend, verify old-key rejection and new-key access, then revoke/remove the old value.
+- **Rotate the tracked gRPC origin private key.** Treat `certs/grpc-key.pem` and its certificate as compromised because the private key is tracked and copied into container images. Generate a replacement keypair outside Git, update the Cloudflare/origin configuration, deploy it through the platform secret manager, and revoke/remove the old pair.
+- **Stop tracking and baking the gRPC private key.** Remove the private key from Git in a dedicated remediation change, exclude it from the Docker build context, and mount the replacement read-only at runtime. Update `GRPC_TLS_CERT_PATH` and `GRPC_TLS_KEY_PATH` to the mounted paths. Removing the file from the latest tree does not erase Git or image history, so rotation is still required.
+
+These are current actions, not instructions to expose either credential. Coordinate rotation to avoid locking out the admin portal or interrupting hosted gRPC.
+
 ### Network Security
 
 - Run behind a reverse proxy with TLS for REST API (:8080)
@@ -76,7 +86,8 @@ When deploying Spooled Backend, please follow these security guidelines:
 - Use short-lived JWT tokens
 - Implement proper rate limiting
 - Validate and sanitize all inputs
-- gRPC uses the same API key authentication (`x-api-key` or `authorization` metadata)
+- For gRPC API-key authentication, send the API key credential as the value of the `x-api-key` metadata field; `x-api-key` is the metadata name, not a separate credential
+- Alternatively, send a JWT credential as `authorization: Bearer <jwt-token>` metadata
 - gRPC health and reflection services are public by default (disable in production if needed)
 
 ### Container Security
@@ -98,6 +109,8 @@ Spooled Backend includes several security features:
 - **Input validation** on all endpoints (REST and gRPC)
 - **Constant-time comparison** for sensitive data
 - **Security headers** via middleware
+- **Queue-scoped authorization** across REST, realtime, and gRPC operations
+- **Stream revalidation** so key revocation, expiry, organization deletion, and scope narrowing take effect on active realtime/gRPC streams
 - **gRPC interceptors** for authentication and authorization
 - **gRPC health service** for load balancer health checks
 - **SSRF protection** for outgoing webhook URLs
@@ -118,7 +131,9 @@ DNS resolution is also validated to prevent DNS rebinding attacks.
 
 ## Vulnerability History
 
-No known vulnerabilities at this time.
+Security fixes are documented in [`CHANGELOG.md`](CHANGELOG.md). Deploy the latest
+release and review GitHub security advisories before operating an internet-facing
+instance.
 
 ---
 

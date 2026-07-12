@@ -374,5 +374,5 @@ Common cron expressions and their meanings:
 
 ## Related Documentation
 
-- [Schedules Guide](../../../spooled-frontend/src/pages/docs/jobs.astro) (scheduled jobs section)
+- [Schedules API Guide](../api-usage.md#schedules)
 - [Operations Guide](../operations.md)

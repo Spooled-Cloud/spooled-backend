@@ -5,13 +5,13 @@ This guide covers operational configuration, tuning, and best practices for runn
 ## Table of Contents
 
 1. [Connection Pooling (PgBouncer)](#connection-pooling-pgbouncer)
-2. [Rate Limiting & Backpressure](#rate-limiting--backpressure)
+2. [Rate Limiting & Backpressure](#rate-limiting-backpressure)
 3. [Redis Configuration](#redis-configuration)
 4. [Queue Partitioning](#queue-partitioning)
 5. [Autovacuum Tuning](#autovacuum-tuning)
-6. [Monitoring & Alerting](#monitoring--alerting)
+6. [Monitoring & Alerting](#monitoring-alerting)
 7. [Security Configuration](#security-configuration)
-8. [Backup & Disaster Recovery](#backup--disaster-recovery)
+8. [Backup & Disaster Recovery](#backup-disaster-recovery)
 
 ---
 

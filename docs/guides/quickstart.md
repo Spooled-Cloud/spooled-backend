@@ -77,7 +77,7 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs/job_xyz123/fail \
 ### Prerequisites
 
 - Docker & Docker Compose
-- Rust 1.85+ (for local development)
+- Rust 1.96+ (for local development)
 - curl or httpie
 
 ### Step 1: Start the Services
@@ -86,16 +86,16 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs/job_xyz123/fail \
 cd spooled-backend
 
 # Start PostgreSQL, Redis, PgBouncer, and monitoring
-docker-compose up -d
+docker compose up -d
 
 # Verify services are running
-docker-compose ps
+docker compose ps
 ```
 
 Expected output:
 ```
 NAME                 STATUS              PORTS
-spooled-postgres     running (healthy)   5432/tcp
+spooled-postgres     running (healthy)   0.0.0.0:5433->5432/tcp
 spooled-pgbouncer    running (healthy)   6432/tcp
 spooled-redis        running (healthy)   6379/tcp
 spooled-prometheus   running             9091/tcp
@@ -105,11 +105,14 @@ spooled-grafana      running             3000/tcp
 ### Step 2: Configure Environment
 
 ```bash
-# Copy the example environment file
-cp .env.example .env
-
-# The defaults work for local development
-# For production, you MUST change JWT_SECRET and passwords
+# Configure the local backend process
+cat > .env <<'EOF'
+DATABASE_URL=postgres://spooled:spooled_password@localhost:5433/spooled
+DATABASE_DIRECT_URL=postgres://spooled:spooled_password@localhost:5433/spooled
+REDIS_URL=redis://localhost:6379
+RUST_ENV=development
+JWT_SECRET=development-secret-change-in-production
+EOF
 ```
 
 ### Step 3: Run the Backend
@@ -121,7 +124,7 @@ cargo run
 
 You should see:
 ```
-INFO spooled_backend: Starting Spooled Backend v0.1.87
+INFO spooled_backend: Starting Spooled Backend v0.1.97
 INFO spooled_backend: Database connection pool established
 INFO spooled_backend: Database migrations completed
 INFO spooled_backend: Redis cache connected
@@ -146,8 +149,10 @@ curl http://localhost:8080/health
 
 Expected response:
 ```json
-{"status":"healthy","version":"0.1.87","database":true,"cache":true}
+{"status":"healthy","database":true,"cache":true}
 ```
+
+The public health endpoint intentionally omits build version information. Operators should use authenticated `GET /api/v1/dashboard` and inspect `system.version` plus `system.uptime_seconds` when verifying a rollout.
 
 ### Step 5: Create Your Organization
 

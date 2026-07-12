@@ -1,7 +1,7 @@
 # Spooled Backend
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Rust](https://img.shields.io/badge/rust-1.94%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.96%2B-orange.svg)](https://www.rust-lang.org/)
 [![Docker](https://img.shields.io/badge/docker-ghcr.io-blue.svg)](https://ghcr.io)
 
 **Job queue + worker coordination service built with Rust**
@@ -12,8 +12,8 @@ Spooled is a high-performance, multi-tenant job queue system designed for reliab
 
 ## ✨ Features
 
-- **High Performance**: Built on Rust + Tokio + PostgreSQL with Redis caching (~28x faster auth)
-- **Optimized gRPC**: HTTP/2 keepalive, TCP optimizations, and connection pooling for ~3x faster throughput
+- **High Performance**: Built on Rust + Tokio + PostgreSQL with Redis-backed caching
+- **Optimized gRPC**: HTTP/2 keepalive, TCP optimizations, connection pooling, and streaming
 - **Multi-Tenant**: explicit per-organization scoping on every query
 - **Observable**: Prometheus metrics, Grafana dashboards, optional OpenTelemetry export (`--features otel`)
 - **Reliable**: At-least-once processing with leases + retries (use idempotency keys for exactly-once effects)
@@ -32,26 +32,34 @@ Spooled is a high-performance, multi-tenant job queue system designed for reliab
 
 ### Pull and Run
 
+> **Production security blocker:** the current image still copies the tracked `certs/grpc-key.pem` into `/certs`. Treat that keypair as compromised. Do not use the baked key for a production gRPC deployment; first complete the rotation and runtime read-only secret-mount work in [SECURITY.md](SECURITY.md#unresolved-operator-actions). The commands below are suitable for local evaluation or for a deployment override that supplies a rotated external keypair.
+
 ```bash
 # Pull the multi-arch image (supports amd64 and arm64)
 docker pull ghcr.io/spooled-cloud/spooled-backend:latest
 
 # Run with Docker Compose
 curl -O https://raw.githubusercontent.com/spooled-cloud/spooled-backend/main/docker-compose.prod.yml
-curl -O https://raw.githubusercontent.com/spooled-cloud/spooled-backend/main/.env.example
-cp .env.example .env
+# Create the required environment file
+cat > .env << EOF
+POSTGRES_PASSWORD=$(openssl rand -base64 16)
+JWT_SECRET=$(openssl rand -base64 32)
+RUST_ENV=production
+# Required because docker-compose.prod.yml starts the cloudflared service.
+# Set this to a real tunnel token from your secret manager; do not commit it.
+CLOUDFLARE_TUNNEL_TOKEN=replace-with-cloudflare-tunnel-token
+EOF
 
-# Generate secure secrets
-export JWT_SECRET=$(openssl rand -base64 32)
-export POSTGRES_PASSWORD=$(openssl rand -base64 16)
-sed -i "s/your-jwt-secret-minimum-32-characters-long/$JWT_SECRET/" .env
-sed -i "s/your_secure_password/$POSTGRES_PASSWORD/g" .env
+# Without Cloudflare Tunnel, start only the application services and expose
+# REST/gRPC through your own ingress or compose override:
+docker compose -f docker-compose.prod.yml up -d db redis backend prometheus grafana
 
-# Start services
-docker compose -f docker-compose.prod.yml up -d
+# To use Cloudflare Tunnel, first replace the token placeholder and configure the
+# routes documented in docker-compose.prod.yml, then start the full stack instead:
+# docker compose -f docker-compose.prod.yml up -d
 
-# Verify
-curl http://localhost:8080/health
+# Verify from inside the backend container (the production stack exposes REST via Cloudflare)
+docker compose -f docker-compose.prod.yml exec backend curl -fsS http://localhost:8080/health
 ```
 
 ### Environment Variables
@@ -62,13 +70,13 @@ curl http://localhost:8080/health
 | `JWT_SECRET` | ✅ | - | 32+ char secret for JWT signing |
 | `ADMIN_API_KEY` | ❌ | - | Key for admin portal access |
 | `REDIS_URL` | ❌ | `redis://localhost:6379` | Redis for pub/sub & caching |
-| `RUST_ENV` | ❌ | `development` | `development`/`staging`/`production` |
+| `RUST_ENV` | ❌ | `production` | `development`/`staging`/`production` (unset/unknown values fail safe to production) |
 | `REGISTRATION_MODE` | ❌ | `open` | `open`/`closed` - controls public registration |
 | `PORT` | ❌ | `8080` | REST API server port |
 | `GRPC_PORT` | ❌ | `50051` | gRPC API server port |
 | `GRPC_TLS_ENABLED` | ❌ | `true` (prod) | Enable TLS for gRPC (required for Cloudflare Tunnel) |
 | `GRPC_TLS_CERT_PATH` | ❌ | `/certs/grpc-cert.pem` | Path to TLS certificate (PEM) |
-| `GRPC_TLS_KEY_PATH` | ❌ | `/certs/grpc-key.pem` | Path to TLS private key (PEM) |
+| `GRPC_TLS_KEY_PATH` | ❌ | `/certs/grpc-key.pem` | Path to TLS private key (PEM); production must override this with the rotated read-only secret mount described in `SECURITY.md` |
 | `METRICS_PORT` | ❌ | `9090` | Prometheus metrics port |
 | `METRICS_TOKEN` | ❌ | - | If set, requires `Authorization: Bearer <token>` for `/metrics` |
 
@@ -128,7 +136,7 @@ Where `<TIER>` is one of: `FREE`, `STARTER`, `PRO`, `ENTERPRISE`.
 
 ### Prerequisites
 
-- Rust 1.85+
+- Rust 1.96+
 - Docker & Docker Compose
 - PostgreSQL 16+ (or use Docker)
 - Redis 7+ (optional, for pub/sub)
@@ -387,7 +395,7 @@ service WorkerService {
 
 ### gRPC Features
 
-- ⚡ **~28x faster** than HTTP (with Redis cache: ~50ms vs 1400ms per operation)
+- ⚡ **Efficient transport** with Protobuf, HTTP/2 multiplexing, and streaming
 - 🛡️ **Automatic plan limit enforcement** on enqueue operations
 - 📦 **Batch operations** for higher throughput
 - 🔄 **Streaming support** for real-time job processing
@@ -493,15 +501,9 @@ For gRPC, the status code is `RESOURCE_EXHAUSTED` with a descriptive message.
 
 ### Performance Characteristics
 
-**HTTP API** (with Redis caching enabled):
-- First request (cache miss): ~100ms (includes bcrypt)
-- Subsequent requests (cache hit): ~50ms (Redis lookup + DB operation)
-- **~28x faster** with cache compared to bcrypt-only
-
-**gRPC API**:
-- Batch operations: ~50ms per batch
-- Streaming: Real-time job delivery with minimal latency
-- Recommended for high-throughput workers
+Actual latency and throughput depend on payload size, database capacity, network path,
+and worker behavior. Use the checked-in `loadtest/` scenarios to establish a baseline
+for your deployment. Prefer gRPC streaming for long-lived, high-throughput workers.
 
 ### Custom Limits
 
@@ -529,28 +531,28 @@ RUST_ENV=production
 JSON_LOGS=true
 EOF
 
-# Deploy
-docker compose -f docker-compose.prod.yml up -d
+# Deploy without the optional Cloudflare Tunnel sidecar
+docker compose -f docker-compose.prod.yml up -d db pgbouncer redis backend prometheus grafana
 
-# Enable monitoring (optional)
-docker compose -f docker-compose.prod.yml --profile monitoring up -d
+# To start cloudflared too, add CLOUDFLARE_TUNNEL_TOKEN from your secret manager,
+# configure the documented routes, and run the full-stack command instead.
+# Prometheus and Grafana are included in the production stack
 ```
 
 ### Kubernetes
 
 ```bash
-# Create namespace and secrets
-kubectl create namespace spooled
+# Create the namespace and secret expected by the manifests
+kubectl create namespace spooled --dry-run=client -o yaml | kubectl apply -f -
 kubectl create secret generic spooled-secrets \
   --namespace spooled \
   --from-literal=database-url='postgres://user:pass@postgres:5432/spooled' \
   --from-literal=jwt-secret="$(openssl rand -base64 32)"
 
-# Deploy with Kustomize
+# Review the image tag and environment-specific values in the overlay, then deploy
 kubectl apply -k k8s/overlays/production
 
-# Or with Helm (coming soon)
-# helm install spooled ./charts/spooled -n spooled
+# This repository currently ships Kustomize manifests; no Helm chart is included.
 ```
 
 ### ARM64 / Raspberry Pi / AWS Graviton
@@ -597,6 +599,7 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317 ./target/release/spooled-backend
 ## 🔒 Security
 
 - **Authentication**: API keys (bcrypt hashed) or JWT tokens
+- **Least privilege**: queue-scoped keys are enforced across REST, realtime, and gRPC operations; active streams revalidate current key state
 - **Multi-tenancy**: explicit per-organization scoping on every query
 - **Rate Limiting**: Per-key limits with Redis (fails closed when configured)
 - **Webhooks**: HMAC-SHA256 signature verification

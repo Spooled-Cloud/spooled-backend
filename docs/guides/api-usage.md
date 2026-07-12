@@ -89,12 +89,9 @@ Response:
 
 ### Performance
 
-With Redis caching enabled:
-- **First request** (cache miss): ~100ms
-- **Cached requests**: ~50ms
-- **gRPC operations**: ~50ms (batch)
-
-For high-throughput workloads, use the gRPC API which provides ~28x better performance compared to HTTP without caching.
+Latency and throughput depend on payload size, database capacity, cache state, and
+network path. Use the checked-in `loadtest/` scenarios to benchmark your deployment.
+For long-lived, high-throughput workers, prefer the gRPC streaming APIs.
 
 ---
 
@@ -115,6 +112,13 @@ convenient.
 
 > The `X-API-Key` header is **gRPC-only** and returns `401` on REST endpoints.
 > Use `Authorization: Bearer` (or the query parameters above) for the REST API.
+
+API keys may be restricted to specific queues. Restricted keys can only grant a
+subset of their own queues when creating or updating keys; omitting or emptying the
+queue list would mean unrestricted access and is rejected. Queue scope is enforced
+across jobs, workers, schedules, workflows, realtime subscriptions, and gRPC calls.
+Active realtime and gRPC streams periodically revalidate revocation, expiry,
+organization status, and current queue scope.
 
 ### JWT Authentication
 
@@ -1117,7 +1121,8 @@ Redirect the user to this URL to manage their subscription, payment methods, and
 Connect to receive real-time updates. WebSocket auth requires a JWT in the
 `?token=` query parameter (headers aren't available on the handshake). Get a JWT
 from `POST /api/v1/auth/login` using your API key, then pass it as `token`. API
-keys are **not** accepted here:
+keys are **not** accepted here. Requested subscriptions are intersected with the
+JWT's current queue scope, and authorization is revalidated while connected:
 
 ```javascript
 // token is a JWT from POST /api/v1/auth/login (starts with "eyJ..."), not an API key

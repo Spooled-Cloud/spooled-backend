@@ -24,7 +24,7 @@ By participating in this project, you agree to abide by our [Code of Conduct](CO
 
 #### Prerequisites
 
-- Rust 1.85 or later
+- Rust 1.96 or later
 - Docker and Docker Compose
 - PostgreSQL 16+ (via Docker)
 - Redis 7+ (via Docker)
@@ -37,12 +37,15 @@ git clone https://github.com/spooled-cloud/spooled-backend.git
 cd spooled-backend
 
 # Start dependencies
-docker-compose up -d postgres redis pgbouncer
+docker compose up -d postgres redis pgbouncer
 
-# Copy environment file
-cp .env.example .env
+# Configure the local process (PostgreSQL is published on host port 5433)
+export DATABASE_URL=postgres://spooled:spooled_password@localhost:5433/spooled
+export REDIS_URL=redis://localhost:6379
+export RUST_ENV=development
+export JWT_SECRET=development-secret-change-in-production
 
-# Run the server
+# Run the server (migrations apply automatically)
 cargo run
 
 # Run tests
@@ -62,9 +65,9 @@ cargo test
 4. **Write tests** for new functionality
 5. **Run the test suite**:
    ```bash
-   cargo test
-   cargo clippy -- -D warnings
-   cargo fmt --check
+   cargo nextest run --all-features --no-fail-fast
+   cargo clippy --lib --bins -- -D warnings -A dead_code -A unused_imports
+   cargo fmt --all -- --check
    ```
 6. **Commit** with a clear message:
    ```bash
@@ -163,7 +166,10 @@ When modifying the gRPC API:
 - Aim for meaningful coverage, not just high numbers
 
 ```bash
-# Run all tests
+# Run the CI-equivalent suite (requires cargo-nextest)
+cargo nextest run --all-features --no-fail-fast
+
+# Or run tests with Cargo
 cargo test
 
 # Run specific test
