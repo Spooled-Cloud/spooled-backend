@@ -261,7 +261,7 @@ kubectl create namespace spooled
 ```bash
 kubectl create secret generic spooled-secrets \
   --namespace spooled \
-  --from-literal=database-url='postgres://user:pass@postgres:5432/spooled'
+  --from-literal=database-url='postgres://user:pass@postgres:5432/spooled' \
   --from-literal=redis-url='redis://redis:6379' \
   --from-literal=jwt-secret='your-production-secret'
 ```
