@@ -28,6 +28,16 @@ fn can_update_with_queues(ctx: &ApiKeyContext, requested: Option<&[String]>) -> 
     ctx.is_unrestricted() || requested.is_some_and(|queues| ctx.can_grant_queues(queues))
 }
 
+fn require_unrestricted_key(ctx: &ApiKeyContext) -> AppResult<()> {
+    if ctx.is_unrestricted() {
+        Ok(())
+    } else {
+        Err(AppError::Authorization(
+            "Queue-scoped API keys cannot administer API keys".to_string(),
+        ))
+    }
+}
+
 /// List all API keys (without sensitive data)
 ///
 /// Now filters by authenticated organization
@@ -36,6 +46,8 @@ pub async fn list(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
 ) -> AppResult<Json<Vec<ApiKeySummary>>> {
+    require_unrestricted_key(&ctx)?;
+
     tracing::debug!(
         organization_id = %ctx.organization_id,
         api_key_id = %ctx.api_key_id,
@@ -70,6 +82,8 @@ pub async fn create(
     Extension(ctx): Extension<ApiKeyContext>,
     ValidatedJson(request): ValidatedJson<CreateApiKeyRequest>,
 ) -> AppResult<(StatusCode, Json<CreateApiKeyResponse>)> {
+    require_unrestricted_key(&ctx)?;
+
     // Privilege-escalation guard: a queue-scoped key must not be able to mint a
     // broader key. It may only grant a subset of its own queues, and never `*`.
     // Unrestricted keys (empty list or `*`) may grant anything.
@@ -161,6 +175,8 @@ pub async fn get(
     Extension(ctx): Extension<ApiKeyContext>,
     Path(id): Path<String>,
 ) -> AppResult<Json<ApiKeySummary>> {
+    require_unrestricted_key(&ctx)?;
+
     let key = sqlx::query_as::<_, ApiKey>(
         "SELECT * FROM api_keys WHERE id = $1 AND organization_id = $2",
     )
@@ -179,8 +195,10 @@ pub async fn update(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
     Path(id): Path<String>,
-    Json(request): Json<UpdateApiKeyRequest>,
+    ValidatedJson(request): ValidatedJson<UpdateApiKeyRequest>,
 ) -> AppResult<Json<ApiKeySummary>> {
+    require_unrestricted_key(&ctx)?;
+
     // Check if key exists (with org check)
     let existing = sqlx::query_as::<_, ApiKey>(
         "SELECT * FROM api_keys WHERE id = $1 AND organization_id = $2",
@@ -238,6 +256,8 @@ pub async fn revoke(
     Extension(ctx): Extension<ApiKeyContext>,
     Path(id): Path<String>,
 ) -> AppResult<StatusCode> {
+    require_unrestricted_key(&ctx)?;
+
     // Get the key first to get its hash for cache invalidation (with org check)
     let existing = sqlx::query_as::<_, ApiKey>(
         "SELECT * FROM api_keys WHERE id = $1 AND organization_id = $2",

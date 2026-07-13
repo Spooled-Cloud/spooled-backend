@@ -600,10 +600,9 @@ impl QueueManager {
     ///
     /// On `Ok` this also unblocks child jobs whose only remaining parent is
     /// this one (same transaction as [`Self::complete_with_worker_and_org`]).
-    /// `lease_id` is the fencing token returned by the claim; when `Some`
-    /// the UPDATE additionally requires `lease_id` to match, so a stale
-    /// completion from a superseded lease (even by the same worker) loses.
-    /// `None` preserves the legacy worker+expiry fence for old clients.
+    /// `lease_id` is the fencing token returned by the claim. It is required
+    /// for leased jobs so stale work from a superseded lease cannot settle a
+    /// replacement execution owned by the same stable worker id.
     #[instrument(
         name = "queue.complete_by_worker",
         skip(self, result),
@@ -635,7 +634,7 @@ impl QueueManager {
               AND status = 'processing'
               AND lease_expires_at IS NOT NULL
               AND lease_expires_at > NOW()
-              AND ($5::TEXT IS NULL OR lease_id = $5)
+              AND lease_id = $5
               AND ($6::TEXT[] IS NULL OR queue_name = ANY($6))
             "#,
         )
@@ -730,10 +729,7 @@ impl QueueManager {
         match row {
             Some((status, lease, current_lease_id)) if status == "processing" => {
                 let expired = lease.map(|t| t <= Utc::now()).unwrap_or(true);
-                let fenced_out = match lease_id {
-                    Some(presented) => current_lease_id.as_deref() != Some(presented),
-                    None => false,
-                };
+                let fenced_out = current_lease_id.as_deref() != lease_id;
                 if expired || fenced_out {
                     Ok(WorkerOpOutcome::LeaseExpired)
                 } else {
@@ -793,7 +789,7 @@ impl QueueManager {
               AND status = 'processing'
               AND lease_expires_at IS NOT NULL
               AND lease_expires_at > NOW()
-              AND ($4::TEXT IS NULL OR lease_id = $4)
+              AND lease_id = $4
               AND ($5::TEXT[] IS NULL OR queue_name = ANY($5))
             "#,
         )
@@ -843,7 +839,7 @@ impl QueueManager {
                   AND status = 'processing'
                   AND lease_expires_at IS NOT NULL
                   AND lease_expires_at > NOW()
-                  AND ($7::TEXT IS NULL OR lease_id = $7)
+                  AND lease_id = $7
                   AND ($8::TEXT[] IS NULL OR queue_name = ANY($8))
                 "#,
             )
@@ -909,7 +905,7 @@ impl QueueManager {
                   AND status = 'processing'
                   AND lease_expires_at IS NOT NULL
                   AND lease_expires_at > NOW()
-                  AND ($5::TEXT IS NULL OR lease_id = $5)
+                  AND lease_id = $5
                   AND ($6::TEXT[] IS NULL OR queue_name = ANY($6))
                 "#,
             )
@@ -1161,7 +1157,7 @@ impl QueueManager {
               AND status = 'processing'
               AND lease_expires_at IS NOT NULL
               AND lease_expires_at > NOW()
-              AND ($5::TEXT IS NULL OR lease_id = $5)
+              AND lease_id = $5
               AND ($6::TEXT[] IS NULL OR queue_name = ANY($6))
             "#,
         )

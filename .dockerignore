@@ -1,0 +1,7 @@
+certs/
+.env
+.env.*
+*.pem
+*.key
+target/
+.git/

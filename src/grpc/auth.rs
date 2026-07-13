@@ -32,6 +32,15 @@ impl GrpcAuthContext {
     pub fn can_access_queue(&self, queue_name: &str) -> bool {
         self.queues.is_empty() || self.queues.iter().any(|q| q == "*" || q == queue_name)
     }
+
+    /// Worker lifecycle actions affect every queue a worker can process. A
+    /// scoped key must be authorized for the whole worker queue set.
+    pub fn can_access_all_queues(&self, queues: &[String]) -> bool {
+        if self.queues.is_empty() || self.queues.iter().any(|q| q == "*") {
+            return true;
+        }
+        !queues.is_empty() && queues.iter().all(|queue| self.can_access_queue(queue))
+    }
 }
 
 /// Extract authentication context from gRPC request metadata

@@ -204,6 +204,14 @@ impl WorkerServiceImpl {
     fn should_drain_from_status(status: Option<&str>) -> bool {
         matches!(status, Some("draining"))
     }
+
+    fn effective_worker_queues(queue_name: String, queue_names: Vec<String>) -> Vec<String> {
+        if queue_names.is_empty() {
+            vec![queue_name]
+        } else {
+            queue_names
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -386,6 +394,43 @@ impl WorkerService for WorkerServiceImpl {
 
         let safe_status = Self::validate_status(&req.status);
 
+        let worker_queues: Option<(String, Vec<String>)> = sqlx::query_as(
+            "SELECT queue_name, queue_names FROM workers WHERE id = $1 AND organization_id = $2",
+        )
+        .bind(&req.worker_id)
+        .bind(&auth.organization_id)
+        .fetch_optional(self.pool.as_ref())
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to authorize worker heartbeat");
+            Status::internal("Heartbeat failed")
+        })?;
+
+        let Some((queue_name, queue_names)) = worker_queues else {
+            warn!(
+                worker_id = %req.worker_id,
+                org_id = %auth.organization_id,
+                "Heartbeat for unknown or unauthorized worker"
+            );
+            return Ok(Response::new(HeartbeatResponse {
+                acknowledged: false,
+                should_drain: false,
+            }));
+        };
+
+        let queues = Self::effective_worker_queues(queue_name, queue_names);
+        if !auth.can_access_all_queues(&queues) {
+            warn!(
+                worker_id = %req.worker_id,
+                org_id = %auth.organization_id,
+                "Heartbeat for unknown or unauthorized worker"
+            );
+            return Ok(Response::new(HeartbeatResponse {
+                acknowledged: false,
+                should_drain: false,
+            }));
+        }
+
         // Convert metadata to JSON
         let metadata_json: serde_json::Value = req
             .metadata
@@ -454,6 +499,37 @@ impl WorkerService for WorkerServiceImpl {
 
         if req.worker_id.is_empty() {
             return Err(Status::invalid_argument("Worker ID is required"));
+        }
+
+        let worker_queues: Option<(String, Vec<String>)> = sqlx::query_as(
+            "SELECT queue_name, queue_names FROM workers WHERE id = $1 AND organization_id = $2",
+        )
+        .bind(&req.worker_id)
+        .bind(&auth.organization_id)
+        .fetch_optional(self.pool.as_ref())
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to authorize worker deregistration");
+            Status::internal("Failed to deregister worker")
+        })?;
+
+        let Some((queue_name, queue_names)) = worker_queues else {
+            warn!(
+                worker_id = %req.worker_id,
+                org_id = %auth.organization_id,
+                "Deregister for unknown or unauthorized worker"
+            );
+            return Ok(Response::new(DeregisterResponse { success: false }));
+        };
+
+        let queues = Self::effective_worker_queues(queue_name, queue_names);
+        if !auth.can_access_all_queues(&queues) {
+            warn!(
+                worker_id = %req.worker_id,
+                org_id = %auth.organization_id,
+                "Deregister for unknown or unauthorized worker"
+            );
+            return Ok(Response::new(DeregisterResponse { success: false }));
         }
 
         // First, release any jobs assigned to this worker (with org isolation)

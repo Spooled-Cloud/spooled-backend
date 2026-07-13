@@ -21,9 +21,10 @@
 #   JWT_SECRET              - 32+ character secret for JWT signing
 #   CLOUDFLARE_TUNNEL_TOKEN - Cloudflare tunnel token (for cloudflared)
 #
-# gRPC TLS (for Cloudflare Tunnel HTTPS origin):
-#   Enabled by default with self-signed certs embedded in Docker image
-#   Cloudflare Tunnel should have "No TLS Verify" ON to accept self-signed certs
+# gRPC TLS:
+#   Provide certificate/key files through Docker/Portainer secrets or bind-mounted files.
+#   Never bake private keys into the application image.
+#   Cloudflare Tunnel public-hostname gRPC is currently blocked; prefer a supported HTTP/2 ingress.
 #
 # Registration Mode (for SaaS vs Self-hosted):
 #   REGISTRATION_MODE    - "open" (default, anyone can create orgs)
@@ -51,11 +52,10 @@
 #
 # Cloudflare Tunnel Routes (configure in Zero Trust dashboard):
 #   - api.spooled.cloud     -> http://backend:8080
-#   - grpc.spooled.cloud    -> https://backend:50051 (HTTP2 origin ON, No TLS Verify ON)
+#   - grpc.spooled.cloud    -> use a supported end-to-end HTTP/2 ingress instead of Tunnel public hostname
 #   - grafana.spooled.cloud -> http://grafana:3000
 #
-# Note: gRPC uses self-signed TLS certs (embedded in Docker image). Cloudflare Tunnel
-# must have "No TLS Verify" enabled to accept self-signed certificates.
+# Note: the old image-baked self-signed gRPC key is compromised and must not be reused.
 
 services:
   # ===========================================
@@ -144,11 +144,11 @@ services:
       
       # =====================
       # gRPC TLS (for Cloudflare Tunnel)
-      # Self-signed certs embedded in Docker image - Cloudflare Tunnel has "No TLS Verify" enabled
+      # Certificate/key are supplied as runtime secrets, never image contents.
       # =====================
       GRPC_TLS_ENABLED: "true"
-      GRPC_TLS_CERT_PATH: /certs/grpc-cert.pem
-      GRPC_TLS_KEY_PATH: /certs/grpc-key.pem
+      GRPC_TLS_CERT_PATH: /run/secrets/grpc_cert
+      GRPC_TLS_KEY_PATH: /run/secrets/grpc_key
       
       # =====================
       # Rate Limiting
@@ -216,8 +216,9 @@ services:
       # =====================
       METRICS_TOKEN: ${METRICS_TOKEN:-}
 
-    # Note: TLS certificates are embedded in the Docker image (see Dockerfile)
-    # No volume mount needed - Portainer Git deployments don't preserve bind mount sources
+    secrets:
+      - grpc_cert
+      - grpc_key
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
       interval: 30s
@@ -410,6 +411,17 @@ volumes:
     driver: local
   pgadmin_data:
     driver: local
+
+# ===========================================
+# Secrets
+# ===========================================
+# For local Compose, set GRPC_TLS_CERT_FILE and GRPC_TLS_KEY_FILE to files outside Git.
+# In Portainer, create equivalent stack secrets and keep private keys out of repository history.
+secrets:
+  grpc_cert:
+    file: ${GRPC_TLS_CERT_FILE:?set GRPC_TLS_CERT_FILE to the rotated public certificate path}
+  grpc_key:
+    file: ${GRPC_TLS_KEY_FILE:?set GRPC_TLS_KEY_FILE to the rotated private key path}
 
 # ===========================================
 # Networks

@@ -20,6 +20,23 @@ use crate::models::{
 /// Maximum workers per page
 const MAX_WORKERS_PER_PAGE: i64 = 100;
 
+fn effective_worker_queues(worker: &Worker) -> Vec<String> {
+    if worker.queue_names.is_empty() {
+        vec![worker.queue_name.clone()]
+    } else {
+        worker.queue_names.clone()
+    }
+}
+
+fn ensure_worker_in_scope(ctx: &ApiKeyContext, worker: &Worker) -> AppResult<()> {
+    let queues = effective_worker_queues(worker);
+    if ctx.can_access_all_queues(&queues) {
+        Ok(())
+    } else {
+        Err(AppError::NotFound("Worker not found".to_string()))
+    }
+}
+
 /// List all workers
 ///
 /// Now filters by authenticated organization
@@ -29,13 +46,31 @@ pub async fn list(
     Extension(ctx): Extension<ApiKeyContext>,
 ) -> AppResult<Json<Vec<WorkerSummary>>> {
     // Use constant instead of hardcoded value
-    let workers = sqlx::query_as::<_, Worker>(
-        "SELECT * FROM workers WHERE organization_id = $1 ORDER BY last_heartbeat DESC LIMIT $2",
-    )
-    .bind(&ctx.organization_id)
-    .bind(MAX_WORKERS_PER_PAGE)
-    .fetch_all(state.db.pool())
-    .await?;
+    let workers = if ctx.is_unrestricted() {
+        sqlx::query_as::<_, Worker>(
+            "SELECT * FROM workers WHERE organization_id = $1 ORDER BY last_heartbeat DESC LIMIT $2",
+        )
+        .bind(&ctx.organization_id)
+        .bind(MAX_WORKERS_PER_PAGE)
+        .fetch_all(state.db.pool())
+        .await?
+    } else {
+        sqlx::query_as::<_, Worker>(
+            r#"
+            SELECT * FROM workers
+            WHERE organization_id = $1
+              AND COALESCE(queue_names, ARRAY[]::TEXT[]) <@ $2::TEXT[]
+              AND (COALESCE(cardinality(queue_names), 0) > 0 OR queue_name = ANY($2::TEXT[]))
+            ORDER BY last_heartbeat DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(&ctx.organization_id)
+        .bind(&ctx.queues)
+        .bind(MAX_WORKERS_PER_PAGE)
+        .fetch_all(state.db.pool())
+        .await?
+    };
 
     let summaries: Vec<WorkerSummary> = workers.into_iter().map(Into::into).collect();
     Ok(Json(summaries))
@@ -172,6 +207,8 @@ pub async fn get(
             // Don't expose worker ID in error message
             .ok_or_else(|| AppError::NotFound("Worker not found".to_string()))?;
 
+    ensure_worker_in_scope(&ctx, &worker)?;
+
     Ok(Json(worker))
 }
 
@@ -195,6 +232,15 @@ pub async fn heartbeat(
         tracing::warn!(status = %status, worker_id = %id, "Invalid worker status, defaulting to healthy");
         "healthy".to_string()
     };
+
+    let worker =
+        sqlx::query_as::<_, Worker>("SELECT * FROM workers WHERE id = $1 AND organization_id = $2")
+            .bind(&id)
+            .bind(&ctx.organization_id)
+            .fetch_optional(state.db.pool())
+            .await?
+            .ok_or_else(|| AppError::NotFound("Worker not found".to_string()))?;
+    ensure_worker_in_scope(&ctx, &worker)?;
 
     // Use validated status
     let result = sqlx::query(
@@ -232,17 +278,15 @@ pub async fn deregister(
     Path(id): Path<String>,
 ) -> AppResult<StatusCode> {
     // Get worker's current status before updating (with org check)
-    let worker_status: Option<(String,)> =
-        sqlx::query_as("SELECT status FROM workers WHERE id = $1 AND organization_id = $2")
+    let worker =
+        sqlx::query_as::<_, Worker>("SELECT * FROM workers WHERE id = $1 AND organization_id = $2")
             .bind(&id)
             .bind(&ctx.organization_id)
             .fetch_optional(state.db.pool())
-            .await?;
-
-    let Some((previous_status,)) = worker_status else {
-        // Don't expose worker ID in error message
-        return Err(AppError::NotFound("Worker not found".to_string()));
-    };
+            .await?
+            .ok_or_else(|| AppError::NotFound("Worker not found".to_string()))?;
+    ensure_worker_in_scope(&ctx, &worker)?;
+    let previous_status = worker.status;
 
     // Release any jobs assigned to this worker (with org isolation)
     sqlx::query(

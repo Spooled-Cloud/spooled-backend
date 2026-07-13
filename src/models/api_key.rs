@@ -213,6 +213,16 @@ impl ApiKeyContext {
         self.queues.is_empty() || self.queues.iter().any(|q| q == "*" || q == queue_name)
     }
 
+    /// Whether this key may operate on a worker that can process the supplied
+    /// queue set. Worker lifecycle actions affect every queue the worker can
+    /// process, so a scoped key must be authorized for all of them.
+    pub fn can_access_all_queues(&self, queues: &[String]) -> bool {
+        if self.is_unrestricted() {
+            return true;
+        }
+        !queues.is_empty() && queues.iter().all(|queue| self.can_access_queue(queue))
+    }
+
     /// Whether this key has unrestricted (all-queue) access — an empty list or a
     /// `*` entry. Restricted keys must have every operation constrained to their
     /// listed queues.
@@ -301,6 +311,10 @@ mod tests {
         assert!(unrestricted_star.can_access_queue("anything"));
         assert!(scoped.can_access_queue("emails"));
         assert!(!scoped.can_access_queue("payroll"));
+        assert!(scoped.can_access_all_queues(&["emails".to_string()]));
+        assert!(scoped.can_access_all_queues(&["emails".to_string(), "billing".to_string()]));
+        assert!(!scoped.can_access_all_queues(&[]));
+        assert!(!scoped.can_access_all_queues(&["emails".to_string(), "payroll".to_string()]));
         assert!(unrestricted_empty.is_unrestricted());
         assert!(unrestricted_star.is_unrestricted());
         assert!(!scoped.is_unrestricted());
