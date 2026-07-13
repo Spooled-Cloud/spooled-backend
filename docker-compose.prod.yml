@@ -45,8 +45,8 @@
 #
 # Optional Environment Variables:
 #   BACKEND_IMAGE        - Docker image (default: ghcr.io/spooled-cloud/spooled-backend:latest)
-#   GRPC_TLS_CERT_SECRET - Docker/Portainer secret name for the rotated gRPC certificate (default: spooled_grpc_cert)
-#   GRPC_TLS_KEY_SECRET  - Docker/Portainer secret name for the rotated gRPC private key (default: spooled_grpc_key)
+#   GRPC_TLS_CERT_FILE   - Host path to rotated gRPC certificate PEM
+#   GRPC_TLS_KEY_FILE    - Host path to rotated gRPC private key PEM
 #   REDIS_PASSWORD       - Redis password (recommended for production)
 #   GRAFANA_USER         - Grafana admin username (default: admin)
 #   GRAFANA_PASSWORD     - Grafana admin password (default: admin) - CHANGE THIS!
@@ -218,9 +218,9 @@ services:
       # =====================
       METRICS_TOKEN: ${METRICS_TOKEN:-}
 
-    secrets:
-      - grpc_cert
-      - grpc_key
+    volumes:
+      - ${GRPC_TLS_CERT_FILE:-/opt/spooled/secrets/grpc-cert.pem}:/run/secrets/grpc_cert:ro
+      - ${GRPC_TLS_KEY_FILE:-/opt/spooled/secrets/grpc-key.pem}:/run/secrets/grpc_key:ro
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
       interval: 30s
@@ -413,20 +413,6 @@ volumes:
     driver: local
   pgadmin_data:
     driver: local
-
-# ===========================================
-# Secrets
-# ===========================================
-# Create these secrets in Docker/Portainer from rotated files outside Git before
-# starting the backend. The defaults are names only, so compose pull/config can run
-# before the secret values exist, but the backend will not start until they do.
-secrets:
-  grpc_cert:
-    external: true
-    name: ${GRPC_TLS_CERT_SECRET:-spooled_grpc_cert}
-  grpc_key:
-    external: true
-    name: ${GRPC_TLS_KEY_SECRET:-spooled_grpc_key}
 
 # ===========================================
 # Networks
