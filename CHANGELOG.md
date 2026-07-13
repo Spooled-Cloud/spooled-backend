@@ -7,6 +7,14 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.99] - 2026-07-13
+
+Release-validation follow-up for `0.1.98`.
+
+### Tests
+
+- Update integration tests to assert that leased worker operations require the current lease token.
+
 ## [0.1.98] - 2026-07-13
 
 Security hardening for worker queue scope, lease fencing, and image secret handling.

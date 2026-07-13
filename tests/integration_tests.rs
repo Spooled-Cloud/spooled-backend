@@ -2456,12 +2456,13 @@ async fn test_complete_by_worker_ok_with_valid_lease() {
     let org_id = "lease-org-2";
     let worker_id = uuid::Uuid::new_v4().to_string();
     let job_id = uuid::Uuid::new_v4().to_string();
-    seed_processing_job(
+    seed_processing_job_with_lease(
         db.pool(),
         &job_id,
         &worker_id,
         org_id,
         chrono::Utc::now() + chrono::Duration::seconds(30),
+        Some("lease-current"),
     )
     .await;
 
@@ -2470,7 +2471,7 @@ async fn test_complete_by_worker_ok_with_valid_lease() {
             &job_id,
             &worker_id,
             org_id,
-            None,
+            Some("lease-current"),
             None,
             Some(serde_json::json!({"ok": true})),
         )
@@ -2556,17 +2557,25 @@ async fn test_fail_by_worker_reschedules_with_valid_lease() {
     let org_id = "lease-org-5";
     let worker_id = uuid::Uuid::new_v4().to_string();
     let job_id = uuid::Uuid::new_v4().to_string();
-    seed_processing_job(
+    seed_processing_job_with_lease(
         db.pool(),
         &job_id,
         &worker_id,
         org_id,
         chrono::Utc::now() + chrono::Duration::seconds(30),
+        Some("lease-current"),
     )
     .await;
 
     let outcome = queue
-        .fail_by_worker(&job_id, &worker_id, org_id, None, None, "boom")
+        .fail_by_worker(
+            &job_id,
+            &worker_id,
+            org_id,
+            Some("lease-current"),
+            None,
+            "boom",
+        )
         .await
         .expect("fail_by_worker should succeed");
     assert_eq!(outcome.outcome, WorkerOpOutcome::Ok);
@@ -2631,10 +2640,25 @@ async fn test_renew_lease_extends_when_still_valid() {
     let worker_id = uuid::Uuid::new_v4().to_string();
     let job_id = uuid::Uuid::new_v4().to_string();
     let initial = chrono::Utc::now() + chrono::Duration::seconds(5);
-    seed_processing_job(db.pool(), &job_id, &worker_id, org_id, initial).await;
+    seed_processing_job_with_lease(
+        db.pool(),
+        &job_id,
+        &worker_id,
+        org_id,
+        initial,
+        Some("lease-current"),
+    )
+    .await;
 
     let outcome = queue
-        .renew_lease(&job_id, &worker_id, org_id, None, None, 120)
+        .renew_lease(
+            &job_id,
+            &worker_id,
+            org_id,
+            Some("lease-current"),
+            None,
+            120,
+        )
         .await
         .expect("renew_lease should extend valid lease");
     assert_eq!(outcome, WorkerOpOutcome::Ok);
@@ -2702,8 +2726,8 @@ async fn test_recover_expired_leases_reclaims_within_ticker_budget() {
 // A job reclaimed and re-leased — even to the SAME worker — gets a new
 // lease_id. A worker still holding the OLD token must not be able to
 // complete/fail/renew the new lease; presenting a stale token classifies as
-// LeaseExpired (→ HTTP 409), and omitting the token preserves the legacy
-// worker+expiry fence for old SDKs.
+// LeaseExpired (→ HTTP 409), and omitting the token is rejected for modern
+// leased jobs so old handlers cannot settle a replacement lease.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -2794,7 +2818,7 @@ async fn test_fail_by_worker_rejects_stale_lease_id() {
 }
 
 #[tokio::test]
-async fn test_renew_lease_rejects_stale_lease_id_and_legacy_none_still_works() {
+async fn test_renew_lease_rejects_stale_or_missing_lease_id() {
     use spooled_backend::queue::{QueueManager, WorkerOpOutcome};
 
     let db = TestDatabase::new().await;
@@ -2831,12 +2855,13 @@ async fn test_renew_lease_rejects_stale_lease_id_and_legacy_none_still_works() {
         "Stale lease_id must not extend the lease"
     );
 
-    // Legacy client (no token) → still renews on worker+expiry fence.
+    // Missing token must lose too. Otherwise a stale execution using the same
+    // stable worker id can renew the replacement lease.
     let outcome = queue
         .renew_lease(&job_id, &worker_id, org_id, None, None, 120)
         .await
-        .expect("renew_lease should succeed");
-    assert_eq!(outcome, WorkerOpOutcome::Ok);
+        .expect("renew_lease should not error on missing lease_id");
+    assert_eq!(outcome, WorkerOpOutcome::LeaseExpired);
 
     // Current token → renews too.
     let outcome = queue
