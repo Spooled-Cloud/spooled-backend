@@ -32,7 +32,7 @@ Spooled is a high-performance, multi-tenant job queue system designed for reliab
 
 ### Pull and Run
 
-> **Production security blocker:** the current image still copies the tracked `certs/grpc-key.pem` into `/certs`. Treat that keypair as compromised. Do not use the baked key for a production gRPC deployment; first complete the rotation and runtime read-only secret-mount work in [SECURITY.md](SECURITY.md#unresolved-operator-actions). The commands below are suitable for local evaluation or for a deployment override that supplies a rotated external keypair.
+> **Production gRPC TLS requirement:** images from `v0.1.99` onward do not bake the tracked `certs/grpc-key.pem` into `/certs`. Treat that historical keypair as compromised. Before enabling production gRPC, generate a rotated keypair outside Git and provide it through runtime secrets (`GRPC_TLS_CERT_FILE` and `GRPC_TLS_KEY_FILE` for Docker Compose, or the target platform secret manager). See [SECURITY.md](SECURITY.md#unresolved-operator-actions).
 
 ```bash
 # Pull the multi-arch image (supports amd64 and arm64)
@@ -48,6 +48,10 @@ RUST_ENV=production
 # Required because docker-compose.prod.yml starts the cloudflared service.
 # Set this to a real tunnel token from your secret manager; do not commit it.
 CLOUDFLARE_TUNNEL_TOKEN=replace-with-cloudflare-tunnel-token
+# Required when GRPC_TLS_ENABLED=true (default in docker-compose.prod.yml).
+# Paths must point to rotated files outside Git.
+GRPC_TLS_CERT_FILE=/secure/path/grpc-cert.pem
+GRPC_TLS_KEY_FILE=/secure/path/grpc-key.pem
 EOF
 
 # Without Cloudflare Tunnel, start only the application services and expose
