@@ -385,6 +385,27 @@ async fn fetch_api_key(
         }
     }
 
+    // A concurrent legacy-key backfill can commit after the fast lookup but before
+    // the fallback query, moving the row between both snapshots. Retry the indexed
+    // lookup once before rejecting the key.
+    let by_lookup: Option<ApiKeyRecord> = sqlx::query_as(
+        "SELECT k.id, k.organization_id, k.key_hash, k.queues, k.rate_limit, k.is_active, k.expires_at
+         FROM api_keys k
+         INNER JOIN organizations o ON o.id = k.organization_id
+         WHERE k.lookup_hash = $1 AND k.is_active = TRUE AND o.plan_tier <> 'deleted'
+         LIMIT 1",
+    )
+    .bind(&lookup_hash)
+    .fetch_optional(state.db.pool())
+    .await
+    .map_err(db_err)?;
+
+    if let Some(record) = by_lookup {
+        if bcrypt::verify(token, &record.key_hash).unwrap_or(false) {
+            return Ok(record);
+        }
+    }
+
     Err((StatusCode::UNAUTHORIZED, "Invalid API key".to_string()))
 }
 

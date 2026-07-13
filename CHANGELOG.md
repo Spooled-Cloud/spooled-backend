@@ -7,6 +7,12 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- Prevent transient REST and gRPC authentication failures while legacy API keys are being backfilled with indexed lookup hashes.
+
 ## [0.1.99] - 2026-07-13
 
 Release-validation follow-up for `0.1.98`.

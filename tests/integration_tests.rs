@@ -2288,11 +2288,12 @@ async fn test_grpc_unary_transport_rejects_out_of_scope_settlement() {
     )
     .await;
     sqlx::query(
-        "INSERT INTO api_keys (id, organization_id, name, key_hash, queues, is_active, created_at) VALUES ($1, $2, 'transport', $3, ARRAY['allowed-queue'], TRUE, NOW())",
+        "INSERT INTO api_keys (id, organization_id, name, key_hash, lookup_hash, queues, is_active, created_at) VALUES ($1, $2, 'transport', $3, $4, ARRAY['allowed-queue'], TRUE, NOW())",
     )
     .bind(&key_id)
     .bind(org_id)
     .bind(bcrypt::hash(raw_key, 4).unwrap())
+    .bind(spooled_backend::models::api_key_lookup_hash(raw_key))
     .execute(db.pool())
     .await
     .unwrap();
@@ -2350,6 +2351,59 @@ async fn test_grpc_unary_transport_rejects_out_of_scope_settlement() {
             .unwrap();
     assert_eq!(status, "processing");
     assert_eq!(lease_id.as_deref(), Some("transport-lease"));
+}
+
+#[tokio::test]
+async fn test_grpc_legacy_lookup_hash_backfill_is_race_safe() {
+    use spooled_backend::grpc::auth::authenticate_request;
+    use tonic::Request;
+
+    let db = TestDatabase::new().await;
+    let org_id = uuid::Uuid::new_v4().to_string();
+    let key_id = uuid::Uuid::new_v4().to_string();
+    let raw_key = "sp_test_legacy_backfill_race";
+
+    sqlx::query(
+        "INSERT INTO organizations (id, name, slug, plan_tier, created_at, updated_at) VALUES ($1, $1, $1, 'free', NOW(), NOW())",
+    )
+    .bind(&org_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO api_keys (id, organization_id, name, key_hash, queues, is_active, created_at) VALUES ($1, $2, 'legacy', $3, ARRAY[]::TEXT[], TRUE, NOW())",
+    )
+    .bind(&key_id)
+    .bind(&org_id)
+    .bind(bcrypt::hash(raw_key, 4).unwrap())
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let mut first_request = Request::new(());
+    first_request
+        .metadata_mut()
+        .insert("x-api-key", raw_key.parse().unwrap());
+    authenticate_request(db.pool(), &first_request)
+        .await
+        .unwrap();
+
+    let results = futures::future::join_all((0..32).map(|_| {
+        let pool = db.pool.clone();
+        async move {
+            let mut request = Request::new(());
+            request
+                .metadata_mut()
+                .insert("x-api-key", raw_key.parse().unwrap());
+            authenticate_request(&pool, &request).await
+        }
+    }))
+    .await;
+
+    assert!(
+        results.iter().all(Result::is_ok),
+        "concurrent authentication failed during legacy lookup-hash backfill"
+    );
 }
 
 #[tokio::test]

@@ -219,6 +219,32 @@ async fn validate_api_key(pool: &PgPool, token: &str) -> Result<GrpcAuthContext,
         }
     }
 
+    // A concurrent legacy-key backfill can commit after the fast lookup but before
+    // the fallback query, moving the row between both snapshots. Retry the indexed
+    // lookup once before rejecting the key.
+    let candidate: Option<ApiKeyRecord> = sqlx::query_as(
+        r#"
+        SELECT k.id, k.organization_id, k.key_hash, k.queues, k.rate_limit
+        FROM api_keys k
+        INNER JOIN organizations o ON o.id = k.organization_id
+        WHERE k.lookup_hash = $1
+          AND k.is_active = TRUE
+          AND (k.expires_at IS NULL OR k.expires_at > NOW())
+          AND o.plan_tier <> 'deleted'
+        LIMIT 1
+        "#,
+    )
+    .bind(&lookup_hash)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_err)?;
+
+    if let Some(record) = candidate {
+        if bcrypt::verify(token, &record.key_hash).unwrap_or(false) {
+            return Ok(authenticated_context(pool, record));
+        }
+    }
+
     warn!("Invalid API key provided for gRPC request");
     Err(Status::unauthenticated("Invalid API key"))
 }
