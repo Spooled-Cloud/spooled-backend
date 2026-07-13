@@ -53,35 +53,21 @@ cargo run --release --bin spooled-backend
 
 ### TLS Configuration
 
-gRPC TLS is **required** when using Cloudflare Tunnel (or similar proxies) with HTTPS origin, because HTTP/2 over HTTPS requires TLS at the origin.
+gRPC TLS is required when an HTTPS ingress connects to the gRPC origin. Cloudflare Tunnel's public-hostname path is currently unsuitable for Spooled's production gRPC traffic because unary RPCs time out; use an ingress with working end-to-end HTTP/2 support.
 
-#### Using Self-Signed Certificates (Recommended for Cloudflare Tunnel)
+#### Automatic Self-Signed Certificate (Production Compose)
 
-The production docker-compose includes pre-generated self-signed certificates in the `certs/` directory. These work with Cloudflare Tunnel when "No TLS Verify" is enabled.
+The production Compose stack generates a private self-signed origin certificate on first deployment. The certificate and key persist in the `grpc_tls` Docker volume, and the init service renews them during a deployment when less than 30 days remain. The backend mounts the volume read-only. No PEM files, host paths, or Docker Swarm secrets are required.
 
 **Default setup (docker-compose.prod.yml):**
 - TLS is enabled by default
-- Certificates are mounted from `./certs/grpc-cert.pem` and `./certs/grpc-key.pem`
-- Valid for 10 years
+- Certificate generation and renewal are automatic
+- The private key is stored outside Git and container images
+- `BACKEND_IMAGE` is optional; the stack follows `latest` by default
 
-**Cloudflare Tunnel configuration:**
-- Service Type: `HTTPS`
-- URL: `backend:50051`
-- HTTP2 connection: `ON`
-- No TLS Verify: `ON` (required for self-signed certs)
+#### Supplying Your Own Certificate
 
-#### Generating New Certificates
-
-To generate fresh self-signed certificates:
-
-```bash
-# Generate 10-year self-signed certificate
-openssl req -x509 -newkey rsa:2048 \
-  -keyout certs/grpc-key.pem \
-  -out certs/grpc-cert.pem \
-  -days 3650 -nodes \
-  -subj "/CN=backend"
-```
+Deployments that require a CA-issued certificate can replace the `grpc_tls` volume through a platform-specific Compose override or orchestrator manifest. Mount the certificate and key read-only, keep them outside Git and container images, and set `GRPC_TLS_CERT_PATH` and `GRPC_TLS_KEY_PATH` to their in-container paths.
 
 #### Disabling TLS
 
@@ -98,7 +84,7 @@ services:
       GRPC_TLS_ENABLED: "false"
 ```
 
-**Warning:** Without TLS, gRPC cannot be used through Cloudflare Tunnel with HTTPS origin type. Use HTTP origin type instead (which may not support HTTP/2 properly).
+**Warning:** Without origin TLS, use an ingress that explicitly supports cleartext HTTP/2 (`h2c`) to the backend. Do not assume an HTTP/1 reverse proxy can carry gRPC.
 
 ## Available Services
 

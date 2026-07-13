@@ -32,7 +32,7 @@ Spooled is a high-performance, multi-tenant job queue system designed for reliab
 
 ### Pull and Run
 
-> **Production gRPC TLS requirement:** images from `v0.1.99` onward do not bake the tracked `certs/grpc-key.pem` into `/certs`. Treat that historical keypair as compromised. Before enabling production gRPC, generate a rotated keypair outside Git and provide it through read-only bind mounts using `GRPC_TLS_CERT_FILE` and `GRPC_TLS_KEY_FILE`. See [SECURITY.md](SECURITY.md#unresolved-operator-actions).
+> **Production gRPC TLS:** images from `v0.1.99` onward do not bake the historical `certs/grpc-key.pem` into the image. The production Compose stack automatically generates a private self-signed origin certificate in a Docker volume and renews it before expiration. No certificate setup is required. See [SECURITY.md](SECURITY.md#unresolved-operator-actions).
 
 ```bash
 # Pull the multi-arch image (supports amd64 and arm64)
@@ -48,10 +48,6 @@ RUST_ENV=production
 # Required because docker-compose.prod.yml starts the cloudflared service.
 # Set this to a real tunnel token from your secret manager; do not commit it.
 CLOUDFLARE_TUNNEL_TOKEN=replace-with-cloudflare-tunnel-token
-# Required when GRPC_TLS_ENABLED=true (default). These files must exist on the
-# Docker/Portainer host and must be rotated files outside Git.
-GRPC_TLS_CERT_FILE=/opt/spooled/secrets/grpc-cert.pem
-GRPC_TLS_KEY_FILE=/opt/spooled/secrets/grpc-key.pem
 EOF
 
 # Without Cloudflare Tunnel, start only the application services and expose
@@ -66,6 +62,12 @@ docker compose -f docker-compose.prod.yml up -d db redis backend prometheus graf
 docker compose -f docker-compose.prod.yml exec backend curl -fsS http://localhost:8080/health
 ```
 
+### Portainer
+
+Create a Git stack from this repository and set the required environment variables listed in `docker-compose.prod.yml`. The stack generates and stores its gRPC origin certificate automatically; no host shell access, PEM upload, Docker Swarm secret, or image-version variable is required. The backend follows `ghcr.io/spooled-cloud/spooled-backend:latest` and pulls it on each stack deployment by default.
+
+Set `BACKEND_IMAGE` only when you intentionally need an immutable release tag or digest for a controlled rollout or rollback.
+
 ### Environment Variables
 
 | Variable | Required | Default | Description |
@@ -79,8 +81,8 @@ docker compose -f docker-compose.prod.yml exec backend curl -fsS http://localhos
 | `PORT` | ❌ | `8080` | REST API server port |
 | `GRPC_PORT` | ❌ | `50051` | gRPC API server port |
 | `GRPC_TLS_ENABLED` | ❌ | `true` (prod) | Enable TLS for gRPC (required for Cloudflare Tunnel) |
-| `GRPC_TLS_CERT_PATH` | ❌ | `/certs/grpc-cert.pem` | Path to TLS certificate (PEM) |
-| `GRPC_TLS_KEY_PATH` | ❌ | `/certs/grpc-key.pem` | Path to TLS private key (PEM); production must override this with the rotated read-only secret mount described in `SECURITY.md` |
+| `GRPC_TLS_CERT_PATH` | ❌ | `/certs/grpc-cert.pem` | Path to TLS certificate (PEM); production Compose configures its generated volume automatically |
+| `GRPC_TLS_KEY_PATH` | ❌ | `/certs/grpc-key.pem` | Path to TLS private key (PEM); production Compose configures its generated read-only volume automatically |
 | `METRICS_PORT` | ❌ | `9090` | Prometheus metrics port |
 | `METRICS_TOKEN` | ❌ | - | If set, requires `Authorization: Bearer <token>` for `/metrics` |
 

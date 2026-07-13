@@ -22,8 +22,8 @@
 #   CLOUDFLARE_TUNNEL_TOKEN - Cloudflare tunnel token (for cloudflared)
 #
 # gRPC TLS:
-#   Provide certificate/key files through Docker/Portainer secrets or bind-mounted files.
-#   Never bake private keys into the application image.
+#   A private self-signed origin certificate is generated automatically and persisted
+#   in a Docker volume. No certificate files or environment variables are required.
 #   Cloudflare Tunnel public-hostname gRPC is currently blocked; prefer a supported HTTP/2 ingress.
 #
 # Registration Mode (for SaaS vs Self-hosted):
@@ -45,8 +45,6 @@
 #
 # Optional Environment Variables:
 #   BACKEND_IMAGE        - Docker image (default: ghcr.io/spooled-cloud/spooled-backend:latest)
-#   GRPC_TLS_CERT_FILE   - Host path to rotated gRPC certificate PEM
-#   GRPC_TLS_KEY_FILE    - Host path to rotated gRPC private key PEM
 #   REDIS_PASSWORD       - Redis password (recommended for production)
 #   GRAFANA_USER         - Grafana admin username (default: admin)
 #   GRAFANA_PASSWORD     - Grafana admin password (default: admin) - CHANGE THIS!
@@ -100,11 +98,40 @@ services:
     networks:
       - spooled-network
 
+  # Generates a private origin certificate on first deploy and renews it when less
+  # than 30 days remain. The key stays in the Docker volume and is never in Git or
+  # an image. This works with standalone Docker Compose and Portainer stacks.
+  grpc-tls-init:
+    image: alpine/openssl:3.5.7
+    container_name: spooled_grpc_tls_init
+    user: root
+    restart: "no"
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        umask 077
+        if [ ! -s /tls/grpc-cert.pem ] || [ ! -s /tls/grpc-key.pem ] || ! openssl x509 -checkend 2592000 -noout -in /tls/grpc-cert.pem >/dev/null 2>&1; then
+          openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
+            -keyout /tls/grpc-key.pem.new \
+            -out /tls/grpc-cert.pem.new \
+            -days 397 \
+            -subj "/CN=backend" \
+            -addext "subjectAltName=DNS:backend"
+          mv /tls/grpc-key.pem.new /tls/grpc-key.pem
+          mv /tls/grpc-cert.pem.new /tls/grpc-cert.pem
+        fi
+        chown 1000:1000 /tls/grpc-cert.pem /tls/grpc-key.pem
+        chmod 0444 /tls/grpc-cert.pem
+        chmod 0400 /tls/grpc-key.pem
+    volumes:
+      - grpc_tls:/tls
+
   # ===========================================
   # Spooled Backend API
   # ===========================================
   backend:
     image: ${BACKEND_IMAGE:-ghcr.io/spooled-cloud/spooled-backend:latest}
+    pull_policy: always
     # platform: linux/arm64  # Uncomment if you need to force ARM64
     container_name: spooled_backend
     restart: unless-stopped
@@ -113,6 +140,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      grpc-tls-init:
+        condition: service_completed_successfully
     environment:
       # =====================
       # Database
@@ -145,12 +174,12 @@ services:
       JWT_EXPIRATION_HOURS: ${JWT_EXPIRATION_HOURS:-24}
       
       # =====================
-      # gRPC TLS (for Cloudflare Tunnel)
-      # Certificate/key are supplied as runtime secrets, never image contents.
+      # gRPC origin TLS
+      # Certificate/key are generated into a private volume, never image contents.
       # =====================
       GRPC_TLS_ENABLED: "true"
-      GRPC_TLS_CERT_PATH: /run/secrets/grpc_cert
-      GRPC_TLS_KEY_PATH: /run/secrets/grpc_key
+      GRPC_TLS_CERT_PATH: /run/secrets/grpc-cert.pem
+      GRPC_TLS_KEY_PATH: /run/secrets/grpc-key.pem
       
       # =====================
       # Rate Limiting
@@ -219,8 +248,7 @@ services:
       METRICS_TOKEN: ${METRICS_TOKEN:-}
 
     volumes:
-      - ${GRPC_TLS_CERT_FILE:-/opt/spooled/secrets/grpc-cert.pem}:/run/secrets/grpc_cert:ro
-      - ${GRPC_TLS_KEY_FILE:-/opt/spooled/secrets/grpc-key.pem}:/run/secrets/grpc_key:ro
+      - grpc_tls:/run/secrets:ro
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
       interval: 30s
@@ -402,6 +430,8 @@ volumes:
   db_data:
     driver: local
   redis_data:
+    driver: local
+  grpc_tls:
     driver: local
   prometheus_data:
     driver: local

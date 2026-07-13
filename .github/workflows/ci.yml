@@ -16,6 +16,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  compose:
+    name: Production Compose
+    runs-on: ubuntu-latest
+    env:
+      POSTGRES_PASSWORD: test-password
+      JWT_SECRET: test-jwt-secret-at-least-32-characters
+      CLOUDFLARE_TUNNEL_TOKEN: test-token
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate Compose configuration
+        run: docker compose -f docker-compose.prod.yml config --quiet
+      - name: Verify automatic gRPC TLS provisioning
+        run: |
+          docker compose -p spooled-compose-test -f docker-compose.prod.yml run --rm grpc-tls-init
+          docker run --rm --user 1000:1000 --entrypoint /bin/sh \
+            -v spooled-compose-test_grpc_tls:/tls:ro alpine/openssl:3.5.7 \
+            -ec 'test -s /tls/grpc-cert.pem && test -r /tls/grpc-key.pem && openssl x509 -checkend 2592000 -noout -in /tls/grpc-cert.pem'
+
   # Fast formatting check - runs in parallel, fails fast
   fmt:
     name: Format
