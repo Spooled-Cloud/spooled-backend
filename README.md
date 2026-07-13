@@ -32,7 +32,7 @@ Spooled is a high-performance, multi-tenant job queue system designed for reliab
 
 ### Pull and Run
 
-> **Production gRPC TLS requirement:** images from `v0.1.99` onward do not bake the tracked `certs/grpc-key.pem` into `/certs`. Treat that historical keypair as compromised. Before enabling production gRPC, generate a rotated keypair outside Git and provide it through runtime secrets (`GRPC_TLS_CERT_FILE` and `GRPC_TLS_KEY_FILE` for Docker Compose, or the target platform secret manager). See [SECURITY.md](SECURITY.md#unresolved-operator-actions).
+> **Production gRPC TLS requirement:** images from `v0.1.99` onward do not bake the tracked `certs/grpc-key.pem` into `/certs`. Treat that historical keypair as compromised. Before enabling production gRPC, generate a rotated keypair outside Git and provide it through runtime secrets named `spooled_grpc_cert` and `spooled_grpc_key` by default, or override the names with `GRPC_TLS_CERT_SECRET` and `GRPC_TLS_KEY_SECRET`. See [SECURITY.md](SECURITY.md#unresolved-operator-actions).
 
 ```bash
 # Pull the multi-arch image (supports amd64 and arm64)
@@ -48,10 +48,11 @@ RUST_ENV=production
 # Required because docker-compose.prod.yml starts the cloudflared service.
 # Set this to a real tunnel token from your secret manager; do not commit it.
 CLOUDFLARE_TUNNEL_TOKEN=replace-with-cloudflare-tunnel-token
-# Required when GRPC_TLS_ENABLED=true (default in docker-compose.prod.yml).
-# Paths must point to rotated files outside Git.
-GRPC_TLS_CERT_FILE=/secure/path/grpc-cert.pem
-GRPC_TLS_KEY_FILE=/secure/path/grpc-key.pem
+# Required Docker/Portainer secrets when GRPC_TLS_ENABLED=true (default).
+# Create these secrets from rotated files outside Git before starting backend:
+#   spooled_grpc_cert -> rotated public certificate
+#   spooled_grpc_key  -> rotated private key
+# Optional: override secret names with GRPC_TLS_CERT_SECRET / GRPC_TLS_KEY_SECRET.
 EOF
 
 # Without Cloudflare Tunnel, start only the application services and expose

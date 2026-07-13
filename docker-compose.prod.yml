@@ -45,6 +45,8 @@
 #
 # Optional Environment Variables:
 #   BACKEND_IMAGE        - Docker image (default: ghcr.io/spooled-cloud/spooled-backend:latest)
+#   GRPC_TLS_CERT_SECRET - Docker/Portainer secret name for the rotated gRPC certificate (default: spooled_grpc_cert)
+#   GRPC_TLS_KEY_SECRET  - Docker/Portainer secret name for the rotated gRPC private key (default: spooled_grpc_key)
 #   REDIS_PASSWORD       - Redis password (recommended for production)
 #   GRAFANA_USER         - Grafana admin username (default: admin)
 #   GRAFANA_PASSWORD     - Grafana admin password (default: admin) - CHANGE THIS!
@@ -415,13 +417,16 @@ volumes:
 # ===========================================
 # Secrets
 # ===========================================
-# For local Compose, set GRPC_TLS_CERT_FILE and GRPC_TLS_KEY_FILE to files outside Git.
-# In Portainer, create equivalent stack secrets and keep private keys out of repository history.
+# Create these secrets in Docker/Portainer from rotated files outside Git before
+# starting the backend. The defaults are names only, so compose pull/config can run
+# before the secret values exist, but the backend will not start until they do.
 secrets:
   grpc_cert:
-    file: ${GRPC_TLS_CERT_FILE:?set GRPC_TLS_CERT_FILE to the rotated public certificate path}
+    external: true
+    name: ${GRPC_TLS_CERT_SECRET:-spooled_grpc_cert}
   grpc_key:
-    file: ${GRPC_TLS_KEY_FILE:?set GRPC_TLS_KEY_FILE to the rotated private key path}
+    external: true
+    name: ${GRPC_TLS_KEY_SECRET:-spooled_grpc_key}
 
 # ===========================================
 # Networks
