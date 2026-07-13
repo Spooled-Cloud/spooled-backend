@@ -24,7 +24,8 @@
 # gRPC TLS:
 #   A private self-signed origin certificate is generated automatically and persisted
 #   in a Docker volume. No certificate files or environment variables are required.
-#   Cloudflare Tunnel public-hostname gRPC is currently blocked; prefer a supported HTTP/2 ingress.
+#   For Cloudflare Tunnel, use an HTTPS service to backend:50051 with HTTP/2 origin
+#   enabled and TLS verification disabled for the self-signed origin certificate.
 #
 # Registration Mode (for SaaS vs Self-hosted):
 #   REGISTRATION_MODE    - "open" (default, anyone can create orgs)
@@ -52,7 +53,7 @@
 #
 # Cloudflare Tunnel Routes (configure in Zero Trust dashboard):
 #   - api.spooled.cloud     -> http://backend:8080
-#   - grpc.spooled.cloud    -> use a supported end-to-end HTTP/2 ingress instead of Tunnel public hostname
+#   - grpc.spooled.cloud    -> https://backend:50051 (HTTP/2 origin ON, No TLS Verify ON)
 #   - grafana.spooled.cloud -> http://grafana:3000
 #
 # Note: the old image-baked self-signed gRPC key is compromised and must not be reused.

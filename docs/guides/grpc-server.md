@@ -53,7 +53,7 @@ cargo run --release --bin spooled-backend
 
 ### TLS Configuration
 
-gRPC TLS is required when an HTTPS ingress connects to the gRPC origin. Cloudflare Tunnel's public-hostname path is currently unsuitable for Spooled's production gRPC traffic because unary RPCs time out; use an ingress with working end-to-end HTTP/2 support.
+gRPC TLS is required when an HTTPS ingress connects to the gRPC origin. The production Cloudflare Tunnel route uses `https://backend:50051` with HTTP/2 origin enabled and TLS verification disabled for the private self-signed origin certificate. Direct and public Health, reflection, and an authenticated application unary RPC were verified after deployment on 2026-07-13.
 
 #### Automatic Self-Signed Certificate (Production Compose)
 
