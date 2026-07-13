@@ -7,6 +7,17 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.98] - 2026-07-13
+
+Security hardening for worker queue scope, lease fencing, and image secret handling.
+
+### Security
+
+- Require runtime-mounted gRPC TLS secrets instead of baking tracked certificate material into backend images.
+- Block queue-scoped API keys from administering API keys.
+- Enforce worker queue scope on REST and gRPC worker lifecycle operations.
+- Require the current lease token for worker complete, fail, and heartbeat operations.
+
 ## [0.1.97] - 2026-07-12
 
 Security authorization and realtime containment fixes.
