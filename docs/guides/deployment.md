@@ -245,9 +245,9 @@ volumes:
 
 ## Production host + Portainer
 
-Live Spooled backend on the shared production host uses a **durable** directory, not Portainer’s ephemeral Git clone paths under `/data/compose/71/<sha>/` (those disappear and break the UI).
+Preferred prod rollout: Portainer Git **Pull and redeploy** for stack `spooled-backend` (compose project name must match). `/opt/spooled/backend` is the disaster-recovery mirror + heal scripts if a Git checkout under `/data/compose/71/<sha>/` is left empty.
 
-Canonical operator guide (isolation rules, Portainer click-path, CLI rollout, name-conflict fix):
+Canonical operator guide (isolation rules, UI click-path, safe recreate, CLI fallback):
 
 → **[production-host-portainer.md](./production-host-portainer.md)**
 
@@ -255,12 +255,12 @@ Summary:
 
 | Item | Value |
 |------|--------|
-| Host path | `/opt/spooled/backend` |
-| Compose project | `spooled-backend` only |
-| Redeploy API | `sudo /opt/spooled/backend/bin/deploy-backend` |
-| Stable symlink | `/data/compose/71/spooled-backend` → durable dir |
+| Compose project / stack name | `spooled-backend` |
+| Preferred UI action | Portainer **Pull and redeploy** |
+| Disaster-recovery path | `/opt/spooled/backend` |
+| CLI fallback | `sudo /opt/spooled/backend/bin/deploy-backend` |
 
-**Isolation:** never run compose/`docker rm` against other host projects (`authentik`, `outlinewiki`, dashboard, SpriteForge, etc.). Prefer CLI pin+digest over Portainer Git “Pull and redeploy”.
+**Isolation:** never run compose/`docker rm` against other host projects (`authentik`, `outlinewiki`, dashboard, SpriteForge, etc.). Never remove volumes when deleting/recreating the Portainer stack.
 
 ---
 

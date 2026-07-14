@@ -2,12 +2,11 @@
 # SPOOLED BACKEND - PRODUCTION DEPLOYMENT
 # ===========================================
 #
-# Production host (shared machine): keep the live stack under the durable path
-#   /opt/spooled/backend
-# with compose project name exactly `spooled-backend`. Do not deploy this file
-# from ephemeral Portainer Git dirs under /data/compose/71/<sha>/ (they get
-# deleted and break the UI). Never run this compose project against other apps
-# on the same host (authentik, outline, dashboard, spriteforge, …).
+# Production host (shared machine): compose project name must be exactly
+#   `spooled-backend`. Preferred rollout is Portainer Git → Pull and redeploy
+#   (working dir under /data/compose/71/<sha>/). Disaster-recovery mirror:
+#   /opt/spooled/backend. Never run this compose project against other apps on
+#   the same host (authentik, outline, dashboard, spriteforge, …).
 #
 # Operator guide: docs/guides/production-host-portainer.md
 #
@@ -20,12 +19,10 @@
 #   1. Copy .env.example to .env and configure
 #   2. docker compose -f docker-compose.prod.yml up -d
 #
-# For Portainer:
-#   Prefer binding the stack to /opt/spooled/backend (or Web editor paste from
-#   that path). Avoid Git pull-and-redeploy into /data/compose/71/<sha>/.
-#   1. Create a new Stack
-#   2. Upload this file or paste contents
-#   3. Add environment variables in the Portainer UI
+# For Portainer (preferred on prod host):
+#   Git stack → repository Spooled-Cloud/spooled-backend → this file at repo root
+#   → set BACKEND_IMAGE digest in stack env → Pull and redeploy / repull images.
+#   Git stacks do not show the Web Editor tab (normal). See operator guide.
 #
 # Required Environment Variables:
 #   POSTGRES_PASSWORD       - Database password
