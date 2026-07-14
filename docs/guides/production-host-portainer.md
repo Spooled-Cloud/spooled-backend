@@ -8,6 +8,8 @@ Portainer **Git → Pull and redeploy** (repull images) must work for `spooled-b
 
 SSH helpers under `/opt/spooled/backend/bin/` remain for disaster recovery and host heals only.
 
+**Newcomers / other hosts:** `docker-compose.prod.yml` is self-contained. gRPC TLS, Prometheus scrape config, and Grafana datasource provisioning bootstrap automatically — no busybox Exited (0) init containers and no extra files beyond the compose + `.env`. See [deployment.md](./deployment.md#zero-touch-init-self-host--portainer--single-file).
+
 ## Why Editor is missing
 
 This stack is a **Git** stack. Portainer CE Git stacks show **Git configuration** + **Pull and redeploy**, not the Web **Editor** tab. That is normal. Other stacks that use Web editor / upload show Editor; Git stacks do not.

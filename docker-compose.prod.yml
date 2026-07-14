@@ -15,6 +15,12 @@
 #
 # Includes: Backend API, PostgreSQL, Redis, Prometheus, Grafana, Cloudflare Tunnel
 #
+# Zero-touch init (anybody can deploy):
+#   - gRPC TLS cert auto-generated into volume `grpc_tls` (helper stays Up/healthy)
+#   - Prometheus + Grafana self-bootstrap scrape/datasource config on start
+#   - No busybox one-shot Exited (0) containers; single-file curl of this compose works
+#   - Optional richer local assets: docker/prometheus, docker/grafana (dev compose)
+#
 # Quick start:
 #   1. Copy .env.example to .env and configure
 #   2. docker compose -f docker-compose.prod.yml up -d
@@ -109,14 +115,18 @@ services:
 
   # Generates a private origin certificate on first deploy and renews it when less
   # than 30 days remain. The key stays in the Docker volume and is never in Git or
-  # an image. This works with standalone Docker Compose and Portainer stacks.
-  # Keeps the gRPC TLS volume ready. Stays running after cert ensure so Portainer
-  # does not show a scary Exited (0) one-shot (busybox/alpine init pattern).
+  # an image. Works with full Git/Portainer clones and a single-file compose download
+  # — no host PEM upload and no Exited (0) busybox one-shot.
+  #
+  # After ensuring certs, stays healthy (`tail -f`) so Portainer looks clean.
+  # For one-shot CI checks set GRPC_TLS_INIT_ONCE=1 (exits 0 after write).
   grpc-tls-init:
     image: alpine/openssl:3.5.7
     container_name: spooled_grpc_tls_init
     user: root
     restart: unless-stopped
+    environment:
+      GRPC_TLS_INIT_ONCE: ${GRPC_TLS_INIT_ONCE:-0}
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - |
@@ -134,6 +144,9 @@ services:
         chown 1000:1000 /tls/grpc-cert.pem /tls/grpc-key.pem
         chmod 0444 /tls/grpc-cert.pem
         chmod 0400 /tls/grpc-key.pem
+        if [ "${GRPC_TLS_INIT_ONCE:-0}" = "1" ]; then
+          exit 0
+        fi
         exec tail -f /dev/null
     volumes:
       - grpc_tls:/tls
@@ -296,19 +309,40 @@ services:
   # ===========================================
   # Prometheus (Metrics Collection)
   # ===========================================
-  # Config is a static file in deploy/ (no busybox one-shot init container).
+  # Self-bootstraps scrape config on start (no extra busybox init container, no
+  # bind-mount from the repo). A single downloaded compose file still works.
+  # Richer local/dev rules live under docker/prometheus/ for `docker compose` (dev).
   prometheus:
     image: prom/prometheus:v2.48.0
     container_name: spooled_prometheus
     restart: unless-stopped
+    entrypoint: ["/bin/sh", "-ec"]
     command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--storage.tsdb.retention.time=15d'
-      - '--web.enable-lifecycle'
+      - |
+        cat > /tmp/prometheus.yml <<'EOF'
+        global:
+          scrape_interval: 15s
+          evaluation_interval: 15s
+          external_labels:
+            cluster: spooled
+            environment: production
+        scrape_configs:
+          - job_name: spooled-backend
+            static_configs:
+              - targets: ["backend:9090"]
+            metrics_path: /metrics
+            scrape_interval: 10s
+          - job_name: prometheus
+            static_configs:
+              - targets: ["localhost:9090"]
+        EOF
+        exec /bin/prometheus \
+          --config.file=/tmp/prometheus.yml \
+          --storage.tsdb.path=/prometheus \
+          --storage.tsdb.retention.time=15d \
+          --web.enable-lifecycle
     volumes:
       - prometheus_data:/prometheus
-      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     networks:
       - spooled-network
     depends_on:
@@ -322,7 +356,8 @@ services:
   # ===========================================
   # Grafana (Dashboards & Visualization)
   # ===========================================
-  # Provisioning is static under deploy/grafana (no busybox one-shot init).
+  # Self-bootstraps Prometheus datasource provisioning on start (no busybox init).
+  # Optional richer dashboards for local/dev: docker/grafana/ under repo root.
   grafana:
     image: grafana/grafana:10.2.2
     container_name: spooled_grafana
@@ -332,11 +367,39 @@ services:
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_SERVER_ROOT_URL: ${GRAFANA_URL:-http://localhost:3000}
-      # Auto-provision Prometheus datasource
+      GF_PATHS_PROVISIONING: /var/lib/grafana/provisioning
       GF_DATASOURCES_DEFAULT_NAME: Prometheus
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        mkdir -p /var/lib/grafana/provisioning/datasources \
+                 /var/lib/grafana/provisioning/dashboards \
+                 /var/lib/grafana/dashboards
+        cat > /var/lib/grafana/provisioning/datasources/prometheus.yml <<'EOF'
+        apiVersion: 1
+        datasources:
+          - name: Prometheus
+            type: prometheus
+            access: proxy
+            url: http://prometheus:9090
+            isDefault: true
+            editable: false
+        EOF
+        cat > /var/lib/grafana/provisioning/dashboards/default.yml <<'EOF'
+        apiVersion: 1
+        providers:
+          - name: Spooled
+            orgId: 1
+            folder: ""
+            type: file
+            disableDeletion: false
+            updateIntervalSeconds: 30
+            options:
+              path: /var/lib/grafana/dashboards
+        EOF
+        exec /run.sh
     volumes:
       - grafana_data:/var/lib/grafana
-      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
     networks:
       - spooled-network
     depends_on:

@@ -30,17 +30,20 @@ Spooled is a high-performance, multi-tenant job queue system designed for reliab
 
 ## 🐳 Quick Start with Docker
 
+Zero-touch init: production Compose generates gRPC TLS into a Docker volume, and
+Prometheus/Grafana write their own scrape/datasource config on start. No busybox
+one-shots, no host PEM files, no extra clone of `deploy/` paths.
+
 ### Pull and Run
 
-> **Production gRPC TLS:** images from `v0.1.99` onward do not bake the historical `certs/grpc-key.pem` into the image. The production Compose stack automatically generates a private self-signed origin certificate in a Docker volume and renews it before expiration. No certificate setup is required. See [SECURITY.md](SECURITY.md#unresolved-operator-actions).
+> **Production gRPC TLS:** images from `v0.1.99` onward do not bake a historical `certs/grpc-key.pem` into the image. The production Compose stack automatically generates a private self-signed origin certificate in a Docker volume and renews it before expiration. No certificate setup is required. See [SECURITY.md](SECURITY.md#unresolved-operator-actions).
 
 ```bash
 # Pull the multi-arch image (supports amd64 and arm64)
 docker pull ghcr.io/spooled-cloud/spooled-backend:latest
 
-# Run with Docker Compose
+# Minimal path: one compose file + .env (configs are embedded / self-bootstrapped)
 curl -O https://raw.githubusercontent.com/spooled-cloud/spooled-backend/main/docker-compose.prod.yml
-# Create the required environment file
 cat > .env << EOF
 POSTGRES_PASSWORD=$(openssl rand -base64 16)
 JWT_SECRET=$(openssl rand -base64 32)
@@ -62,11 +65,20 @@ docker compose -f docker-compose.prod.yml up -d db redis backend prometheus graf
 docker compose -f docker-compose.prod.yml exec backend curl -fsS http://localhost:8080/health
 ```
 
+Prefer a full Git clone (or Portainer Git stack) when you also want local/dev
+assets under `docker/prometheus` and `docker/grafana` (richer rules/dashboards).
+Those paths are optional for production — `docker-compose.prod.yml` is self-contained.
+
 ### Portainer
 
-Create a Git stack from this repository and set the required environment variables listed in `docker-compose.prod.yml`. The stack generates and stores its gRPC origin certificate automatically; no host shell access, PEM upload, Docker Swarm secret, or image-version variable is required. The backend follows `ghcr.io/spooled-cloud/spooled-backend:latest` and pulls it on each stack deployment by default.
+Create a **Git** stack from this repository (compose file `docker-compose.prod.yml` at repo root) and set the required environment variables listed in that file. Then use **Pull and redeploy** like any other stack.
 
-Set `BACKEND_IMAGE` only when you intentionally need an immutable release tag or digest for a controlled rollout or rollback.
+The stack:
+- generates and stores its gRPC origin certificate automatically (helper stays **Up / healthy**, not Exited 0)
+- self-bootstraps Prometheus scrape config + Grafana Prometheus datasource on start
+- needs no host shell access, PEM upload, Docker Swarm secret, or busybox init containers
+
+By default the backend follows `ghcr.io/spooled-cloud/spooled-backend:latest` and pulls on each deployment. Set `BACKEND_IMAGE` to an immutable tag/digest for controlled rollouts.
 
 ### Environment Variables
 

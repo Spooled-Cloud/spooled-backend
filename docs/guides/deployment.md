@@ -262,6 +262,18 @@ Summary:
 
 **Isolation:** never run compose/`docker rm` against other host projects (`authentik`, `outlinewiki`, dashboard, SpriteForge, etc.). Never remove volumes when deleting/recreating the Portainer stack.
 
+### Zero-touch init (self-host / Portainer / single-file)
+
+`docker-compose.prod.yml` is designed so newcomers do not run manual init containers:
+
+| Concern | What happens on `up` |
+|---------|----------------------|
+| gRPC origin TLS | `grpc-tls-init` writes/renews certs into volume `grpc_tls`, then stays **healthy** (not Exited 0). CI uses `GRPC_TLS_INIT_ONCE=1` for a one-shot exit. |
+| Prometheus | Service writes scrape config to `/tmp/prometheus.yml` then starts Prometheus. |
+| Grafana | Service writes Prometheus datasource provisioning under its data volume then starts Grafana. |
+
+No bind-mount of repo `deploy/` paths is required. A raw `curl` of the compose file + `.env` is enough. Full Git clones still get optional richer assets under `docker/prometheus` and `docker/grafana` for local/dev compose.
+
 ---
 
 ## Kubernetes Deployment
@@ -432,7 +444,7 @@ Cloudflare Tunnel requires HTTPS for HTTP/2 connections (which gRPC uses). You *
      - [x] HTTP2 Connection
      - [x] No TLS Verify (required for self-signed certs)
 
-3. **Certificates**: Self-signed certificates are included in `./certs/` directory (10-year validity)
+3. **Certificates**: Do **not** upload PEMs. Production Compose generates a private self-signed origin cert into the `grpc_tls` Docker volume on first start and renews it when fewer than 30 days remain. The helper container stays Up/healthy afterward (set `GRPC_TLS_INIT_ONCE=1` only for CI one-shot checks).
 
 #### Local Development (without Cloudflare)
 
@@ -503,14 +515,16 @@ spooled_api_request_duration  # Request latency histogram
 
 ### Grafana Dashboard
 
-Dashboards are auto-provisioned when using docker-compose:
+**Production Compose** (`docker-compose.prod.yml`) auto-provisions a Prometheus datasource on Grafana start (self-bootstrap; no init container).
+
+**Local/dev Compose** can mount richer dashboards from the repo:
 
 ```bash
-# Dashboard location:
+# Dashboard JSON (local/dev assets):
 docker/grafana/dashboards/spooled-overview.json
 ```
 
-Access Grafana at http://localhost:3000 (admin/admin)
+Access Grafana at http://localhost:3000 (admin/admin by default — change in production).
 
 ### Alerting Rules
 

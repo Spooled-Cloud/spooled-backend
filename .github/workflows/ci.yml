@@ -29,7 +29,9 @@ jobs:
         run: docker compose -f docker-compose.prod.yml config --quiet
       - name: Verify automatic gRPC TLS provisioning
         run: |
-          docker compose -p spooled-compose-test -f docker-compose.prod.yml run --rm grpc-tls-init
+          # ONCE=1 makes the helper exit after writing certs (stack keeps it
+          # running in normal deploys so Portainer does not show Exited (0)).
+          GRPC_TLS_INIT_ONCE=1 docker compose -p spooled-compose-test -f docker-compose.prod.yml run --rm -e GRPC_TLS_INIT_ONCE=1 grpc-tls-init
           docker run --rm --user 1000:1000 --entrypoint /bin/sh \
             -v spooled-compose-test_grpc_tls:/tls:ro alpine/openssl:3.5.7 \
             -ec 'test -s /tls/grpc-cert.pem && test -r /tls/grpc-key.pem && openssl x509 -checkend 2592000 -noout -in /tls/grpc-cert.pem'
