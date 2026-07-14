@@ -331,18 +331,17 @@ impl OutgoingWebhookService {
 fn sign_payload(secret: &str, timestamp: i64, payload_json: &str) -> Result<String> {
     type HmacSha256 = Hmac<Sha256>;
     let message = format!("{}.{}", timestamp, payload_json);
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .context("HMAC can take key of any size")?;
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).context("HMAC can take key of any size")?;
     mac.update(message.as_bytes());
-    Ok(format!("sha256={}", hex::encode(mac.finalize().into_bytes())))
+    Ok(format!(
+        "sha256={}",
+        hex::encode(mac.finalize().into_bytes())
+    ))
 }
 
 /// Deliver a per-job `completion_webhook` URL (best-effort, fire-and-forget).
-pub fn spawn_completion_webhook(
-    url: String,
-    event: String,
-    payload: serde_json::Value,
-) {
+pub fn spawn_completion_webhook(url: String, event: String, payload: serde_json::Value) {
     tokio::spawn(async move {
         if let Err(e) = deliver_completion_webhook(&url, &event, &payload).await {
             warn!(error = %e, url = %url, event = %event, "completion_webhook delivery failed");

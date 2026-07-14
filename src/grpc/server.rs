@@ -111,10 +111,18 @@ pub async fn start_grpc_server(
         .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?;
 
     // Create service implementations
-    let queue_service =
-        QueueServiceImpl::new(pool.clone(), metrics.clone(), cache.clone(), outgoing_webhooks.clone());
-    let worker_service =
-        WorkerServiceImpl::new(pool.clone(), metrics.clone(), cache.clone(), outgoing_webhooks);
+    let queue_service = QueueServiceImpl::new(
+        pool.clone(),
+        metrics.clone(),
+        cache.clone(),
+        outgoing_webhooks.clone(),
+    );
+    let worker_service = WorkerServiceImpl::new(
+        pool.clone(),
+        metrics.clone(),
+        cache.clone(),
+        outgoing_webhooks,
+    );
 
     // Setup health service
     let (health_reporter, health_service) = health_reporter();
