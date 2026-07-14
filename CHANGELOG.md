@@ -9,6 +9,12 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.101] - 2026-07-14
+
+### Fixed
+
+- Restore workflow unit-test fixtures after adding optional `expires_at` to job definitions.
+
 ## [0.1.100] - 2026-07-14
 
 ### Security

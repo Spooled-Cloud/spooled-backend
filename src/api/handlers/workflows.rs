@@ -1071,6 +1071,7 @@ mod tests {
                 priority: 0,
                 max_retries: None,
                 timeout_seconds: None,
+                expires_at: None,
             },
             WorkflowJobDefinition {
                 key: "job2".to_string(),
@@ -1081,6 +1082,7 @@ mod tests {
                 priority: 0,
                 max_retries: None,
                 timeout_seconds: None,
+                expires_at: None,
             },
         ];
 
@@ -1099,6 +1101,7 @@ mod tests {
                 priority: 0,
                 max_retries: None,
                 timeout_seconds: None,
+                expires_at: None,
             },
             WorkflowJobDefinition {
                 key: "job2".to_string(),
@@ -1109,6 +1112,7 @@ mod tests {
                 priority: 0,
                 max_retries: None,
                 timeout_seconds: None,
+                expires_at: None,
             },
         ];
 
@@ -1127,6 +1131,7 @@ mod tests {
                 priority: 0,
                 max_retries: None,
                 timeout_seconds: None,
+                expires_at: None,
             },
             WorkflowJobDefinition {
                 key: "job2".to_string(),
@@ -1137,6 +1142,7 @@ mod tests {
                 priority: 0,
                 max_retries: None,
                 timeout_seconds: None,
+                expires_at: None,
             },
             WorkflowJobDefinition {
                 key: "job3".to_string(),
@@ -1147,6 +1153,7 @@ mod tests {
                 priority: 0,
                 max_retries: None,
                 timeout_seconds: None,
+                expires_at: None,
             },
         ];
 
@@ -1171,6 +1178,7 @@ mod tests {
                 priority: 0,
                 max_retries: None,
                 timeout_seconds: None,
+                expires_at: None,
             },
             WorkflowJobDefinition {
                 key: "B".to_string(),
@@ -1181,6 +1189,7 @@ mod tests {
                 priority: 0,
                 max_retries: None,
                 timeout_seconds: None,
+                expires_at: None,
             },
             WorkflowJobDefinition {
                 key: "C".to_string(),
@@ -1191,6 +1200,7 @@ mod tests {
                 priority: 0,
                 max_retries: None,
                 timeout_seconds: None,
+                expires_at: None,
             },
             WorkflowJobDefinition {
                 key: "D".to_string(),
@@ -1201,6 +1211,7 @@ mod tests {
                 priority: 0,
                 max_retries: None,
                 timeout_seconds: None,
+                expires_at: None,
             },
         ];
 
