@@ -9,12 +9,13 @@ This guide covers deploying Spooled Cloud in various environments.
 3. [Prerequisites](#prerequisites)
 4. [Local Development](#local-development)
 5. [Docker Deployment](#docker-deployment)
-6. [Kubernetes Deployment](#kubernetes-deployment)
-7. [Release and Deployment Evidence Checklist](#release-and-deployment-evidence-checklist)
-8. [Production Checklist](#production-checklist)
-9. [Monitoring & Observability](#monitoring--observability)
-10. [Scaling Guidelines](#scaling-guidelines)
-11. [Troubleshooting](#troubleshooting)
+6. [Production host + Portainer](#production-host--portainer)
+7. [Kubernetes Deployment](#kubernetes-deployment)
+8. [Release and Deployment Evidence Checklist](#release-and-deployment-evidence-checklist)
+9. [Production Checklist](#production-checklist)
+10. [Monitoring & Observability](#monitoring--observability)
+11. [Scaling Guidelines](#scaling-guidelines)
+12. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -239,6 +240,27 @@ volumes:
   postgres_data:
   redis_data:
 ```
+
+---
+
+## Production host + Portainer
+
+Live Spooled backend on the shared production host uses a **durable** directory, not Portainer’s ephemeral Git clone paths under `/data/compose/71/<sha>/` (those disappear and break the UI).
+
+Canonical operator guide (isolation rules, Portainer click-path, CLI rollout, name-conflict fix):
+
+→ **[production-host-portainer.md](./production-host-portainer.md)**
+
+Summary:
+
+| Item | Value |
+|------|--------|
+| Host path | `/opt/spooled/backend` |
+| Compose project | `spooled-backend` only |
+| Redeploy API | `sudo /opt/spooled/backend/bin/deploy-backend` |
+| Stable symlink | `/data/compose/71/spooled-backend` → durable dir |
+
+**Isolation:** never run compose/`docker rm` against other host projects (`authentik`, `outlinewiki`, dashboard, SpriteForge, etc.). Prefer CLI pin+digest over Portainer Git “Pull and redeploy”.
 
 ---
 
