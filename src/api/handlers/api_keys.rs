@@ -29,13 +29,7 @@ fn can_update_with_queues(ctx: &ApiKeyContext, requested: Option<&[String]>) -> 
 }
 
 fn require_unrestricted_key(ctx: &ApiKeyContext) -> AppResult<()> {
-    if ctx.is_unrestricted() {
-        Ok(())
-    } else {
-        Err(AppError::Authorization(
-            "Queue-scoped API keys cannot administer API keys".to_string(),
-        ))
-    }
+    crate::api::handlers::require_unrestricted_key(ctx, "administer API keys")
 }
 
 /// List all API keys (without sensitive data)

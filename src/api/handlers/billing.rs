@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tracing::{error, info, warn};
 
+use crate::api::handlers::require_unrestricted_key;
 use crate::api::AppState;
 use crate::config::Environment;
 use crate::error::{AppError, AppResult};
@@ -123,6 +124,8 @@ pub async fn create_portal(
     Extension(context): Extension<ApiKeyContext>,
     Json(request): Json<CreatePortalRequest>,
 ) -> AppResult<Json<CreatePortalResponse>> {
+    require_unrestricted_key(&context, "open the billing portal")?;
+
     let stripe_secret = state
         .stripe
         .secret_key

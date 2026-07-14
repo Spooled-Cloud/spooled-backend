@@ -20,6 +20,7 @@ use serde::Serialize;
 use uuid::Uuid;
 use validator::Validate;
 
+use crate::api::handlers::require_unrestricted_key;
 use crate::api::middleware::limits::{check_resource_limit_conn, lock_resource};
 use crate::api::AppState;
 use crate::error::{AppError, AppResult};
@@ -50,6 +51,8 @@ pub async fn list(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
 ) -> AppResult<Json<Vec<OutgoingWebhookSummary>>> {
+    require_unrestricted_key(&ctx, "manage outgoing webhooks")?;
+
     let webhooks: Vec<OutgoingWebhook> = sqlx::query_as(
         r#"
         SELECT id, organization_id, name, url, secret, events, enabled,
@@ -81,6 +84,8 @@ pub async fn create(
     Extension(ctx): Extension<ApiKeyContext>,
     Json(request): Json<CreateOutgoingWebhookRequest>,
 ) -> AppResult<(StatusCode, Json<OutgoingWebhook>)> {
+    require_unrestricted_key(&ctx, "manage outgoing webhooks")?;
+
     // Validate request
     request
         .validate()
@@ -158,6 +163,8 @@ pub async fn get(
     Extension(ctx): Extension<ApiKeyContext>,
     Path(id): Path<String>,
 ) -> AppResult<Json<OutgoingWebhook>> {
+    require_unrestricted_key(&ctx, "manage outgoing webhooks")?;
+
     let webhook: Option<OutgoingWebhook> = sqlx::query_as(
         r#"
         SELECT id, organization_id, name, url, secret, events, enabled,
@@ -189,6 +196,8 @@ pub async fn update(
     Path(id): Path<String>,
     Json(request): Json<UpdateOutgoingWebhookRequest>,
 ) -> AppResult<Json<OutgoingWebhook>> {
+    require_unrestricted_key(&ctx, "manage outgoing webhooks")?;
+
     // Validate request
     request
         .validate()
@@ -274,6 +283,8 @@ pub async fn delete(
     Extension(ctx): Extension<ApiKeyContext>,
     Path(id): Path<String>,
 ) -> AppResult<StatusCode> {
+    require_unrestricted_key(&ctx, "manage outgoing webhooks")?;
+
     let result = sqlx::query(
         r#"
         DELETE FROM outgoing_webhooks
@@ -311,6 +322,8 @@ pub async fn test(
     Extension(ctx): Extension<ApiKeyContext>,
     Path(id): Path<String>,
 ) -> AppResult<Json<TestWebhookResponse>> {
+    require_unrestricted_key(&ctx, "manage outgoing webhooks")?;
+
     // Get the webhook
     let webhook: Option<OutgoingWebhook> = sqlx::query_as(
         r#"

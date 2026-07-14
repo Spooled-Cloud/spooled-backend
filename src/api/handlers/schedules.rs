@@ -429,8 +429,10 @@ pub async fn resume(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
     Path(id): Path<String>,
-) -> Result<Json<Schedule>, (StatusCode, String)> {
-    require_schedule_access(&state, &ctx, &id).await?;
+) -> Result<Json<Schedule>, Response> {
+    require_schedule_access(&state, &ctx, &id)
+        .await
+        .map_err(|(status, msg)| (status, msg).into_response())?;
     // Get current cron expression to calculate next run
     let current: Option<Schedule> =
         sqlx::query_as("SELECT * FROM schedules WHERE id = $1 AND organization_id = $2")
@@ -445,13 +447,39 @@ pub async fn resume(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Failed to get schedule".to_string(),
                 )
+                    .into_response()
             })?;
 
-    let current = current.ok_or((StatusCode::NOT_FOUND, "Schedule not found".to_string()))?;
+    let current = current
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Schedule not found".to_string()).into_response())?;
 
     let next_run = CronSchedule::parse(&current.cron_expression)
         .ok()
         .and_then(|c| c.next_run_after_in_timezone(Utc::now(), &current.timezone));
+
+    // Resuming a paused schedule re-consumes a schedules slot. Enforce the same
+    // advisory-locked cap as create so pause→create→resume cannot overshoot.
+    let mut tx = state.db.pool().begin().await.map_err(|e| {
+        error!(error = %e, "Failed to begin transaction for schedule resume");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to resume schedule".to_string(),
+        )
+            .into_response()
+    })?;
+    if !current.is_active {
+        lock_resource(&mut tx, &ctx.organization_id, "schedules")
+            .await
+            .map_err(|e| {
+                error!(error = %e, "Failed to acquire schedule limit lock on resume");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to resume schedule".to_string(),
+                )
+                    .into_response()
+            })?;
+        check_resource_limit_conn(&mut tx, &ctx.organization_id, "schedules", 1).await?;
+    }
 
     let schedule: Option<Schedule> = sqlx::query_as(
         r#"
@@ -464,7 +492,7 @@ pub async fn resume(
     .bind(&id)
     .bind(next_run)
     .bind(&ctx.organization_id)
-    .fetch_optional(state.db.pool())
+    .fetch_optional(&mut *tx)
     .await
     // Don't leak database error details
     .map_err(|e| {
@@ -473,11 +501,21 @@ pub async fn resume(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to resume schedule".to_string(),
         )
+            .into_response()
+    })?;
+
+    tx.commit().await.map_err(|e| {
+        error!(error = %e, "Failed to commit schedule resume");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to resume schedule".to_string(),
+        )
+            .into_response()
     })?;
 
     schedule
         .map(Json)
-        .ok_or((StatusCode::NOT_FOUND, "Schedule not found".to_string()))
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Schedule not found".to_string()).into_response())
 }
 
 /// Trigger a schedule immediately

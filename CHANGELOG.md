@@ -9,9 +9,21 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- Block queue-scoped API keys from org control-plane actions: organization update/delete, members/usage, inbound webhook token read/rotate, billing portal, and outgoing webhook CRUD/test.
+- Redact `settings.webhook_token` from `GET /organizations/{id}` for queue-scoped keys.
+- Scope `GET /jobs/stats` and `GET /dashboard` aggregates to the caller's queue allow-list.
+- Require exact `lease_id` on gRPC complete/fail/renew (and ProcessJobs stream) — empty lease no longer bypasses fencing.
+- Reject cross-queue `parent_job_id` dependencies (parent must be same queue).
+
 ### Fixed
 
 - Prevent transient REST and gRPC authentication failures while legacy API keys are being backfilled with indexed lookup hashes.
+- Schedule resume now enforces the same `max_schedules` quota as create (pause→create→resume can no longer overshoot).
+- Cancelled jobs (and workflow-cascade cancels) set `completed_at` so retention cleanup can age them out.
+- Cancelled workflows stay terminal: progress trigger no longer flips them back to completed/failed/running.
+- Workflow job definitions now persist optional `expires_at` / `expiresAt` onto created jobs.
 
 ## [0.1.99] - 2026-07-13
 

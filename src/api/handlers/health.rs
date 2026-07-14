@@ -139,6 +139,7 @@ pub async fn dashboard_data(
     Extension(ctx): Extension<ApiKeyContext>,
 ) -> Json<DashboardData> {
     let org_id = &ctx.organization_id;
+    let queue_scope = ctx.queue_scope_filter();
 
     // Get system info
     let db_healthy = state.db.health_check().await.unwrap_or(false);
@@ -162,7 +163,7 @@ pub async fn dashboard_data(
         environment: state.settings.server.environment.to_string(),
     };
 
-    // Get job stats filtered by organization
+    // Get job stats filtered by organization (+ queue scope for restricted keys)
     let job_stats: (i64, i64, i64, i64) = sqlx::query_as(
         r#"
         SELECT 
@@ -172,24 +173,29 @@ pub async fn dashboard_data(
             COUNT(*) FILTER (WHERE status IN ('failed', 'deadletter') AND updated_at > NOW() - INTERVAL '24 hours') as failed_24h
         FROM jobs
         WHERE organization_id = $1
+          AND ($2::TEXT[] IS NULL OR queue_name = ANY($2))
         "#
     )
     .bind(org_id)
+    .bind(queue_scope)
     .fetch_one(state.db.pool())
     .await
     .unwrap_or((0, 0, 0, 0));
 
-    let (total_jobs,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM jobs WHERE organization_id = $1")
-            .bind(org_id)
-            .fetch_one(state.db.pool())
-            .await
-            .unwrap_or((0,));
-
-    let (deadletter_count,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM jobs WHERE status = 'deadletter' AND organization_id = $1",
+    let (total_jobs,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM jobs WHERE organization_id = $1 AND ($2::TEXT[] IS NULL OR queue_name = ANY($2))",
     )
     .bind(org_id)
+    .bind(queue_scope)
+    .fetch_one(state.db.pool())
+    .await
+    .unwrap_or((0,));
+
+    let (deadletter_count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM jobs WHERE status = 'deadletter' AND organization_id = $1 AND ($2::TEXT[] IS NULL OR queue_name = ANY($2))",
+    )
+    .bind(org_id)
+    .bind(queue_scope)
     .fetch_one(state.db.pool())
     .await
     .unwrap_or((0,));
@@ -203,6 +209,7 @@ pub async fn dashboard_data(
             AVG(EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000)::FLOAT8 as avg_processing_ms
         FROM jobs
         WHERE organization_id = $1
+          AND ($2::TEXT[] IS NULL OR queue_name = ANY($2))
           AND status = 'completed'
           AND completed_at > NOW() - INTERVAL '24 hours'
           AND started_at IS NOT NULL
@@ -210,6 +217,7 @@ pub async fn dashboard_data(
         "#,
     )
     .bind(org_id)
+    .bind(queue_scope)
     .fetch_one(state.db.pool())
     .await
     .unwrap_or((None, None));
@@ -237,12 +245,14 @@ pub async fn dashboard_data(
         FROM jobs j
         LEFT JOIN queue_config qc ON qc.queue_name = j.queue_name AND qc.organization_id = j.organization_id
         WHERE j.organization_id = $1
+          AND ($2::TEXT[] IS NULL OR j.queue_name = ANY($2))
         GROUP BY j.queue_name, qc.enabled
         ORDER BY j.queue_name
         LIMIT 20
         "#
     )
     .bind(org_id)
+    .bind(queue_scope)
     .fetch_all(state.db.pool())
     .await
     .unwrap_or_default()
@@ -255,21 +265,41 @@ pub async fn dashboard_data(
     })
     .collect();
 
-    // Get worker summary filtered by organization
-    let worker_stats: (i64, i64) = sqlx::query_as(
-        r#"
-        SELECT 
-            COUNT(*) as total,
-            COUNT(*) FILTER (WHERE status = 'healthy') as healthy
-        FROM workers
-        WHERE last_heartbeat > NOW() - INTERVAL '1 minute'
-          AND organization_id = $1
-        "#,
-    )
-    .bind(org_id)
-    .fetch_one(state.db.pool())
-    .await
-    .unwrap_or((0, 0));
+    // Get worker summary filtered by organization (+ queue scope)
+    let worker_stats: (i64, i64) = if let Some(allowed) = queue_scope {
+        sqlx::query_as(
+            r#"
+            SELECT 
+                COUNT(*) as total,
+                COUNT(*) FILTER (WHERE status = 'healthy') as healthy
+            FROM workers
+            WHERE last_heartbeat > NOW() - INTERVAL '1 minute'
+              AND organization_id = $1
+              AND COALESCE(queue_names, ARRAY[]::TEXT[]) <@ $2::TEXT[]
+              AND (COALESCE(cardinality(queue_names), 0) > 0 OR queue_name = ANY($2::TEXT[]))
+            "#,
+        )
+        .bind(org_id)
+        .bind(allowed)
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap_or((0, 0))
+    } else {
+        sqlx::query_as(
+            r#"
+            SELECT 
+                COUNT(*) as total,
+                COUNT(*) FILTER (WHERE status = 'healthy') as healthy
+            FROM workers
+            WHERE last_heartbeat > NOW() - INTERVAL '1 minute'
+              AND organization_id = $1
+            "#,
+        )
+        .bind(org_id)
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap_or((0, 0))
+    };
 
     let workers = WorkerSummary {
         total: worker_stats.0,
@@ -286,9 +316,11 @@ pub async fn dashboard_data(
             COUNT(*) FILTER (WHERE updated_at > NOW() - INTERVAL '1 hour' AND status IN ('failed', 'deadletter')) as failed
         FROM jobs
         WHERE organization_id = $1
+          AND ($2::TEXT[] IS NULL OR queue_name = ANY($2))
         "#
     )
     .bind(org_id)
+    .bind(queue_scope)
     .fetch_one(state.db.pool())
     .await
     .unwrap_or((0, 0, 0));

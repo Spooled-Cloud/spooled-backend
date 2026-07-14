@@ -387,10 +387,10 @@ pub async fn create(
             r#"
             INSERT INTO jobs (
                 id, organization_id, queue_name, status, payload, priority,
-                max_retries, timeout_seconds, workflow_id, workflow_step,
+                max_retries, timeout_seconds, expires_at, workflow_id, workflow_step,
                 dependency_mode, dependencies_met, created_at, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $14)
             "#,
         )
         .bind(&job_id)
@@ -401,6 +401,7 @@ pub async fn create(
         .bind(job_def.priority)
         .bind(job_def.max_retries.unwrap_or(3))
         .bind(job_def.timeout_seconds.unwrap_or(300))
+        .bind(job_def.expires_at)
         .bind(&workflow_id)
         .bind(step as i32)
         .bind(job_def.dependency_mode.to_string())
@@ -689,7 +690,7 @@ pub async fn cancel(
     sqlx::query(
         r#"
         UPDATE jobs
-        SET status = 'cancelled', updated_at = NOW()
+        SET status = 'cancelled', completed_at = NOW(), updated_at = NOW()
         WHERE workflow_id = $1 AND organization_id = $2 AND status IN ('pending', 'scheduled')
         "#,
     )

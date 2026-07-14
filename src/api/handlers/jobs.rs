@@ -209,14 +209,22 @@ pub async fn create(
     // trigger releases the child (and the scheduler cancel-sweep terminates it if the
     // parent fails). Previously parent_job_id was stored but the child ran immediately.
     let parent_already_completed = if let Some(ref parent_id) = request.parent_job_id {
-        let parent: Option<(String,)> =
-            sqlx::query_as("SELECT status FROM jobs WHERE id = $1 AND organization_id = $2")
-                .bind(parent_id)
-                .bind(&org_id)
-                .fetch_optional(state.db.pool())
-                .await?;
+        let parent: Option<(String, String)> = sqlx::query_as(
+            "SELECT status, queue_name FROM jobs WHERE id = $1 AND organization_id = $2",
+        )
+        .bind(parent_id)
+        .bind(&org_id)
+        .fetch_optional(state.db.pool())
+        .await?;
         match parent {
-            Some((status,)) => status == "completed",
+            Some((status, parent_queue)) => {
+                if parent_queue != request.queue_name {
+                    return Err(AppError::Validation(
+                        "parent_job_id must reference a job in the same queue".to_string(),
+                    ));
+                }
+                status == "completed"
+            }
             None => {
                 return Err(AppError::Validation(
                     "parent_job_id does not reference a job in this organization".to_string(),
@@ -703,7 +711,7 @@ pub async fn cancel(
     let result = sqlx::query(
         r#"
         UPDATE jobs
-        SET status = 'cancelled', updated_at = NOW()
+        SET status = 'cancelled', completed_at = NOW(), updated_at = NOW()
         WHERE id = $1 AND organization_id = $2 AND status IN ('pending', 'scheduled')
         "#,
     )
@@ -863,9 +871,11 @@ pub async fn stats(
             COUNT(*) FILTER (WHERE status = 'cancelled') as cancelled
         FROM jobs
         WHERE organization_id = $1
+          AND ($2::TEXT[] IS NULL OR queue_name = ANY($2))
         "#,
     )
     .bind(&ctx.organization_id)
+    .bind(ctx.queue_scope_filter())
     .fetch_one(state.db.pool())
     .await?;
 

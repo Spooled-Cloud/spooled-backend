@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::api::handlers::require_unrestricted_key;
 use crate::api::middleware::ValidatedJson;
 use crate::api::AppState;
 use crate::error::{AppError, AppResult};
@@ -552,11 +553,18 @@ pub async fn get(
         return Err(AppError::NotFound(format!("Organization {} not found", id)));
     }
 
-    let org = sqlx::query_as::<_, Organization>("SELECT * FROM organizations WHERE id = $1")
+    let mut org = sqlx::query_as::<_, Organization>("SELECT * FROM organizations WHERE id = $1")
         .bind(&id)
         .fetch_optional(state.db.pool())
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Organization {} not found", id)))?;
+
+    // Queue-scoped keys must not read the inbound webhook ingestion secret.
+    if !ctx.is_unrestricted() {
+        if let Some(obj) = org.settings.as_object_mut() {
+            obj.remove("webhook_token");
+        }
+    }
 
     Ok(Json(org))
 }
@@ -569,6 +577,8 @@ pub async fn members(
     Extension(ctx): Extension<ApiKeyContext>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Vec<OrganizationMember>>> {
+    require_unrestricted_key(&ctx, "list organization members")?;
+
     // Verify caller belongs to this organization
     if id != ctx.organization_id {
         return Err(AppError::NotFound(format!("Organization {} not found", id)));
@@ -635,6 +645,8 @@ pub async fn update(
     Path(id): Path<String>,
     ValidatedJson(request): ValidatedJson<UpdateOrganizationRequest>,
 ) -> AppResult<Json<Organization>> {
+    require_unrestricted_key(&ctx, "update organization settings")?;
+
     // Verify user belongs to this organization
     if id != ctx.organization_id {
         return Err(AppError::NotFound(format!("Organization {} not found", id)));
@@ -705,6 +717,8 @@ pub async fn delete(
     Extension(ctx): Extension<ApiKeyContext>,
     Path(id): Path<String>,
 ) -> AppResult<StatusCode> {
+    require_unrestricted_key(&ctx, "delete the organization")?;
+
     // Verify user belongs to this organization
     if id != ctx.organization_id {
         return Err(AppError::NotFound(format!("Organization {} not found", id)));
@@ -800,6 +814,8 @@ pub async fn usage(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
 ) -> AppResult<Json<crate::api::middleware::limits::UsageInfo>> {
+    require_unrestricted_key(&ctx, "view organization usage")?;
+
     let usage_info =
         crate::api::middleware::limits::get_usage_info(state.db.pool(), &ctx.organization_id)
             .await?;
@@ -821,6 +837,8 @@ pub async fn get_webhook_token(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
 ) -> AppResult<Json<WebhookTokenResponse>> {
+    require_unrestricted_key(&ctx, "read organization webhook tokens")?;
+
     let org: Organization = sqlx::query_as("SELECT * FROM organizations WHERE id = $1")
         .bind(&ctx.organization_id)
         .fetch_one(state.db.pool())
@@ -863,6 +881,8 @@ pub async fn regenerate_webhook_token(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
 ) -> AppResult<Json<RegenerateWebhookTokenResponse>> {
+    require_unrestricted_key(&ctx, "regenerate organization webhook tokens")?;
+
     // Generate new webhook token
     let new_token = generate_webhook_token();
 

@@ -271,6 +271,10 @@ pub struct WorkflowJobDefinition {
         message = "Timeout must be between 1 and 86400 seconds"
     ))]
     pub timeout_seconds: Option<i32>,
+
+    /// Optional absolute expiry time for the workflow job
+    #[serde(default, alias = "expiresAt")]
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 /// Response after creating a workflow

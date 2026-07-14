@@ -200,15 +200,21 @@ impl QueueServiceImpl {
         Ok(())
     }
 
-    /// Proto3 strings default to "" — treat an empty `lease_id` as "not
-    /// provided" so legacy clients keep the worker+expiry fence while
-    /// clients that echo the token get strict lease fencing.
+    /// Proto3 strings default to "" — empty means missing. Settlement SQL
+    /// requires an exact `lease_id` match (same as REST); omitting the token
+    /// must not bypass fencing via `IS NULL OR`.
     fn opt_lease_id(lease_id: &str) -> Option<&str> {
         if lease_id.is_empty() {
             None
         } else {
             Some(lease_id)
         }
+    }
+
+    fn require_lease_id(lease_id: &str) -> Result<&str, Status> {
+        Self::opt_lease_id(lease_id).ok_or_else(|| {
+            Status::invalid_argument("lease_id is required for job settlement")
+        })
     }
 
     /// Validate and clamp lease duration
@@ -534,6 +540,7 @@ impl QueueService for QueueServiceImpl {
             return Err(Status::invalid_argument("Worker ID is required"));
         }
 
+        let lease_id = Self::require_lease_id(&req.lease_id)?;
         let allowed_queues = queue_scope_filter(&auth);
 
         // Validate result size
@@ -567,7 +574,7 @@ impl QueueService for QueueServiceImpl {
               AND status = 'processing'
               AND lease_expires_at IS NOT NULL
               AND lease_expires_at > NOW()
-              AND ($5::TEXT IS NULL OR lease_id = $5)
+              AND lease_id = $5
               AND ($6::TEXT[] IS NULL OR queue_name = ANY($6))
             "#,
         )
@@ -575,7 +582,7 @@ impl QueueService for QueueServiceImpl {
         .bind(&req.job_id)
         .bind(&req.worker_id)
         .bind(&auth.organization_id)
-        .bind(Self::opt_lease_id(&req.lease_id))
+        .bind(lease_id)
         .bind(allowed_queues)
         .execute(self.pool.as_ref())
         .await
@@ -590,7 +597,7 @@ impl QueueService for QueueServiceImpl {
                 &req.job_id,
                 &req.worker_id,
                 &auth.organization_id,
-                Self::opt_lease_id(&req.lease_id),
+                Some(lease_id),
                 allowed_queues,
             )
             .await);
@@ -618,6 +625,7 @@ impl QueueService for QueueServiceImpl {
             return Err(Status::invalid_argument("Worker ID is required"));
         }
 
+        let lease_id = Self::require_lease_id(&req.lease_id)?;
         let allowed_queues = queue_scope_filter(&auth);
         let error_message = truncate_error_message(&req.error);
 
@@ -653,7 +661,7 @@ impl QueueService for QueueServiceImpl {
               AND status = 'processing'
               AND lease_expires_at IS NOT NULL
               AND lease_expires_at > NOW()
-              AND ($6::TEXT IS NULL OR lease_id = $6)
+              AND lease_id = $6
               AND ($7::TEXT[] IS NULL OR queue_name = ANY($7))
             RETURNING
                 status as new_status,
@@ -670,7 +678,7 @@ impl QueueService for QueueServiceImpl {
         .bind(&req.job_id)
         .bind(&req.worker_id)
         .bind(&auth.organization_id)
-        .bind(Self::opt_lease_id(&req.lease_id))
+        .bind(lease_id)
         .bind(allowed_queues)
         .fetch_optional(self.pool.as_ref())
         .await
@@ -687,7 +695,7 @@ impl QueueService for QueueServiceImpl {
                     &req.job_id,
                     &req.worker_id,
                     &auth.organization_id,
-                    Self::opt_lease_id(&req.lease_id),
+                    Some(lease_id),
                     allowed_queues,
                 )
                 .await);
@@ -765,6 +773,7 @@ impl QueueService for QueueServiceImpl {
             return Err(Status::invalid_argument("Worker ID is required"));
         }
 
+        let lease_id = Self::require_lease_id(&req.lease_id)?;
         let allowed_queues = queue_scope_filter(&auth);
         let extension_secs = Self::safe_lease_duration(req.extension_secs);
         let new_expires_at = Utc::now() + chrono::Duration::seconds(extension_secs as i64);
@@ -779,7 +788,7 @@ impl QueueService for QueueServiceImpl {
               AND status = 'processing'
               AND lease_expires_at IS NOT NULL
               AND lease_expires_at > NOW()
-              AND ($5::TEXT IS NULL OR lease_id = $5)
+              AND lease_id = $5
               AND ($6::TEXT[] IS NULL OR queue_name = ANY($6))
             "#,
         )
@@ -787,7 +796,7 @@ impl QueueService for QueueServiceImpl {
         .bind(&req.job_id)
         .bind(&req.worker_id)
         .bind(&auth.organization_id)
-        .bind(Self::opt_lease_id(&req.lease_id))
+        .bind(lease_id)
         .bind(allowed_queues)
         .execute(self.pool.as_ref())
         .await
@@ -802,7 +811,7 @@ impl QueueService for QueueServiceImpl {
                 &req.job_id,
                 &req.worker_id,
                 &auth.organization_id,
-                Self::opt_lease_id(&req.lease_id),
+                Some(lease_id),
                 allowed_queues,
             )
             .await);
@@ -1543,6 +1552,16 @@ async fn handle_process_complete(
     // Bind the result as a TEXT JSON string (matching the REST/unary paths)
     // so an identical SQL string can never be prepared with conflicting
     // parameter types on a shared pool connection (see unary `complete`).
+    if req.lease_id.is_empty() {
+        return ProcessResponse {
+            response: Some(crate::grpc::proto::process_response::Response::Error(
+                crate::grpc::proto::ErrorResponse {
+                    code: "INVALID_ARGUMENT".to_string(),
+                    message: "lease_id is required for job settlement".to_string(),
+                },
+            )),
+        };
+    }
     let result_json = struct_to_json_opt(req.result.as_ref());
     let result_str = serde_json::to_string(&result_json).unwrap_or_default();
     if result_str.len() > MAX_RESULT_SIZE {
@@ -1579,7 +1598,7 @@ async fn handle_process_complete(
           AND status = 'processing'
           AND lease_expires_at IS NOT NULL
           AND lease_expires_at > NOW()
-          AND ($5::TEXT IS NULL OR lease_id = $5)
+          AND lease_id = $5
           AND EXISTS (
               SELECT 1 FROM api_keys k
               WHERE k.id = $6
@@ -1653,6 +1672,16 @@ async fn handle_process_fail(
     api_key_id: &str,
     req: FailRequest,
 ) -> ProcessResponse {
+    if req.lease_id.is_empty() {
+        return ProcessResponse {
+            response: Some(crate::grpc::proto::process_response::Response::Error(
+                crate::grpc::proto::ErrorResponse {
+                    code: "INVALID_ARGUMENT".to_string(),
+                    message: "lease_id is required for job settlement".to_string(),
+                },
+            )),
+        };
+    }
     let error_message = truncate_error_message(&req.error);
     let mut tx = match begin_stream_operation(pool, api_key_id, org_id, None).await {
         Ok(tx) => tx,
@@ -1691,7 +1720,7 @@ async fn handle_process_fail(
           AND status = 'processing'
           AND lease_expires_at IS NOT NULL
           AND lease_expires_at > NOW()
-          AND ($6::TEXT IS NULL OR lease_id = $6)
+          AND lease_id = $6
           AND EXISTS (
               SELECT 1 FROM api_keys k
               WHERE k.id = $7
@@ -1811,6 +1840,16 @@ async fn handle_process_renew(
     api_key_id: &str,
     req: RenewLeaseRequest,
 ) -> ProcessResponse {
+    if req.lease_id.is_empty() {
+        return ProcessResponse {
+            response: Some(crate::grpc::proto::process_response::Response::Error(
+                crate::grpc::proto::ErrorResponse {
+                    code: "INVALID_ARGUMENT".to_string(),
+                    message: "lease_id is required for job settlement".to_string(),
+                },
+            )),
+        };
+    }
     let extension_secs = QueueServiceImpl::safe_lease_duration(req.extension_secs);
     let new_expires_at = Utc::now() + chrono::Duration::seconds(extension_secs as i64);
     let mut tx = match begin_stream_operation(pool, api_key_id, org_id, None).await {
@@ -1828,7 +1867,7 @@ async fn handle_process_renew(
           AND status = 'processing'
           AND lease_expires_at IS NOT NULL
           AND lease_expires_at > NOW()
-          AND ($5::TEXT IS NULL OR lease_id = $5)
+          AND lease_id = $5
           AND EXISTS (
               SELECT 1 FROM api_keys k
               WHERE k.id = $6

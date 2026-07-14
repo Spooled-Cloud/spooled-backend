@@ -22,6 +22,23 @@ pub fn require_queue_access(
     }
 }
 
+/// Enforce that an API key is unrestricted (empty queues or `*`).
+///
+/// Queue-scoped keys are for job/worker traffic only. Org settings, billing
+/// portal, outgoing webhooks, and API-key administration stay on unrestricted keys.
+pub fn require_unrestricted_key(
+    ctx: &crate::models::ApiKeyContext,
+    capability: &str,
+) -> crate::error::AppResult<()> {
+    if ctx.is_unrestricted() {
+        Ok(())
+    } else {
+        Err(crate::error::AppError::Authorization(format!(
+            "Queue-scoped API keys cannot {capability}"
+        )))
+    }
+}
+
 pub mod admin;
 pub mod api_keys;
 pub mod auth;
