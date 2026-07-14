@@ -23,6 +23,7 @@ mod error;
 mod grpc;
 mod models;
 mod observability;
+mod outgoing_webhooks;
 mod queue;
 mod scheduler;
 mod security;
@@ -121,6 +122,7 @@ async fn main() -> Result<()> {
     let grpc_db = Arc::new(db.clone());
     let grpc_metrics = state.metrics.clone();
     let grpc_cache = cache.clone();
+    let grpc_webhooks = state.outgoing_webhooks.clone();
     let grpc_shutdown_rx = shutdown_rx.clone();
     let grpc_handle = tokio::spawn(async move {
         // Wait a bit to not block startup
@@ -129,7 +131,7 @@ async fn main() -> Result<()> {
         // Run until shutdown
         let mut rx = grpc_shutdown_rx;
         tokio::select! {
-            result = grpc::start_grpc_server(grpc_addr, grpc_db, grpc_metrics, grpc_cache) => {
+            result = grpc::start_grpc_server(grpc_addr, grpc_db, grpc_metrics, grpc_cache, grpc_webhooks) => {
                 match result {
                     Ok(_) => info!("gRPC server stopped"),
                     Err(e) => error!(error = %e, "gRPC server failed to start"),

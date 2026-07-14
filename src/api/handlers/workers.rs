@@ -179,6 +179,17 @@ pub async fn register(
     state.metrics.workers_active.inc();
     state.metrics.workers_healthy.inc();
 
+    state.outgoing_webhooks.spawn_dispatch(
+        ctx.organization_id.clone(),
+        "worker.registered".to_string(),
+        worker_id.clone(),
+        serde_json::json!({
+            "worker_id": worker_id,
+            "queue_name": request.queue_name,
+            "hostname": request.hostname,
+        }),
+    );
+
     Ok((
         StatusCode::CREATED,
         Json(RegisterWorkerResponse {
@@ -328,6 +339,16 @@ pub async fn deregister(
             )
             .await;
     }
+
+    state.outgoing_webhooks.spawn_dispatch(
+        ctx.organization_id.clone(),
+        "worker.deregistered".to_string(),
+        id.clone(),
+        serde_json::json!({
+            "worker_id": id,
+            "queue_name": worker.queue_name,
+        }),
+    );
 
     Ok(StatusCode::NO_CONTENT)
 }

@@ -2298,7 +2298,13 @@ async fn test_grpc_unary_transport_rejects_out_of_scope_settlement() {
     .await
     .unwrap();
 
-    let service = QueueServiceImpl::new(db.pool.clone(), Arc::new(Metrics::new()), None);
+    let outgoing = Arc::new(
+        spooled_backend::outgoing_webhooks::service::OutgoingWebhookService::new(
+            db.pool().clone(),
+            3,
+        ),
+    );
+    let service = QueueServiceImpl::new(db.pool().clone(), Arc::new(Metrics::new()), None, outgoing);
 
     let complete = service
         .complete(authenticated_request(

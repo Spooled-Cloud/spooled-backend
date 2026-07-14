@@ -39,6 +39,7 @@ use crate::grpc::proto::{
 };
 use crate::models::Job as DbJob;
 use crate::observability::Metrics;
+use crate::outgoing_webhooks::service::OutgoingWebhookService;
 
 /// Maximum payload size in bytes (1MB)
 const MAX_PAYLOAD_SIZE: usize = 1024 * 1024;
@@ -71,14 +72,21 @@ pub struct QueueServiceImpl {
     pool: Arc<PgPool>,
     metrics: Arc<Metrics>,
     cache: Option<RedisCache>,
+    outgoing_webhooks: Arc<OutgoingWebhookService>,
 }
 
 impl QueueServiceImpl {
-    pub fn new(pool: Arc<PgPool>, metrics: Arc<Metrics>, cache: Option<RedisCache>) -> Self {
+    pub fn new(
+        pool: Arc<PgPool>,
+        metrics: Arc<Metrics>,
+        cache: Option<RedisCache>,
+        outgoing_webhooks: Arc<OutgoingWebhookService>,
+    ) -> Self {
         Self {
             pool,
             metrics,
             cache,
+            outgoing_webhooks,
         }
     }
 
@@ -456,6 +464,19 @@ impl QueueService for QueueServiceImpl {
             "Job enqueued via gRPC"
         );
 
+        if created {
+            self.outgoing_webhooks.spawn_dispatch(
+                auth.organization_id.clone(),
+                "job.created".to_string(),
+                returned_id.clone(),
+                serde_json::json!({
+                    "job_id": returned_id,
+                    "queue_name": req.queue_name,
+                    "status": "pending",
+                }),
+            );
+        }
+
         Ok(Response::new(EnqueueResponse {
             job_id: returned_id,
             created,
@@ -516,6 +537,19 @@ impl QueueService for QueueServiceImpl {
             worker = %req.worker_id,
             "Dequeued jobs via gRPC"
         );
+
+        for job in &jobs {
+            self.outgoing_webhooks.spawn_dispatch(
+                auth.organization_id.clone(),
+                "job.started".to_string(),
+                job.id.clone(),
+                serde_json::json!({
+                    "job_id": job.id,
+                    "queue_name": job.queue_name,
+                    "worker_id": req.worker_id,
+                }),
+            );
+        }
 
         Ok(Response::new(DequeueResponse {
             jobs: jobs_to_proto(&jobs),
@@ -606,6 +640,42 @@ impl QueueService for QueueServiceImpl {
         self.metrics.jobs_processing.dec();
 
         info!(job_id = %req.job_id, "Job completed via gRPC");
+
+        let job_data: Option<(String, Option<serde_json::Value>, Option<String>)> =
+            sqlx::query_as(
+                "SELECT queue_name, result, completion_webhook FROM jobs WHERE id = $1 AND organization_id = $2",
+            )
+            .bind(&req.job_id)
+            .bind(&auth.organization_id)
+            .fetch_optional(self.pool.as_ref())
+            .await
+            .unwrap_or(None);
+        let (queue_name, result, completion_webhook) =
+            job_data.unwrap_or_else(|| ("unknown".to_string(), None, None));
+
+        self.outgoing_webhooks.spawn_dispatch(
+            auth.organization_id.clone(),
+            "job.completed".to_string(),
+            req.job_id.clone(),
+            serde_json::json!({
+                "job_id": req.job_id,
+                "queue_name": queue_name,
+                "status": "completed",
+                "result": result,
+            }),
+        );
+        if let Some(url) = completion_webhook.filter(|u| !u.is_empty()) {
+            crate::outgoing_webhooks::service::spawn_completion_webhook(
+                url,
+                "job.completed".to_string(),
+                serde_json::json!({
+                    "job_id": req.job_id,
+                    "queue_name": queue_name,
+                    "status": "completed",
+                    "result": result,
+                }),
+            );
+        }
 
         Ok(Response::new(CompleteResponse { success: true }))
     }
@@ -747,6 +817,31 @@ impl QueueService for QueueServiceImpl {
             new_status = %result.new_status,
             "Job failed via gRPC"
         );
+
+        if result.new_status == "deadletter" || result.new_status == "failed" {
+            let queue_name: String = sqlx::query_scalar(
+                "SELECT queue_name FROM jobs WHERE id = $1 AND organization_id = $2",
+            )
+            .bind(&req.job_id)
+            .bind(&auth.organization_id)
+            .fetch_optional(self.pool.as_ref())
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "unknown".to_string());
+
+            self.outgoing_webhooks.spawn_dispatch(
+                auth.organization_id.clone(),
+                "job.failed".to_string(),
+                req.job_id.clone(),
+                serde_json::json!({
+                    "job_id": req.job_id,
+                    "queue_name": queue_name,
+                    "status": result.new_status,
+                    "error": error_message,
+                }),
+            );
+        }
 
         Ok(Response::new(FailResponse {
             success: true,

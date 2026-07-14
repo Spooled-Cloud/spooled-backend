@@ -637,6 +637,17 @@ pub async fn trigger(
             .await;
     }
 
+    state.outgoing_webhooks.spawn_dispatch(
+        ctx.organization_id.clone(),
+        "schedule.triggered".to_string(),
+        id.clone(),
+        serde_json::json!({
+            "schedule_id": id,
+            "job_id": job_id,
+            "queue_name": schedule.queue_name,
+        }),
+    );
+
     Ok(Json(TriggerResponse {
         job_id,
         triggered_at: now,

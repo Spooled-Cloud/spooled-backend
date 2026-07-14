@@ -45,14 +45,21 @@ pub struct WorkerServiceImpl {
     pool: Arc<PgPool>,
     metrics: Arc<Metrics>,
     cache: Option<RedisCache>,
+    outgoing_webhooks: Arc<crate::outgoing_webhooks::service::OutgoingWebhookService>,
 }
 
 impl WorkerServiceImpl {
-    pub fn new(pool: Arc<PgPool>, metrics: Arc<Metrics>, cache: Option<RedisCache>) -> Self {
+    pub fn new(
+        pool: Arc<PgPool>,
+        metrics: Arc<Metrics>,
+        cache: Option<RedisCache>,
+        outgoing_webhooks: Arc<crate::outgoing_webhooks::service::OutgoingWebhookService>,
+    ) -> Self {
         Self {
             pool,
             metrics,
             cache,
+            outgoing_webhooks,
         }
     }
 
@@ -371,6 +378,17 @@ impl WorkerService for WorkerServiceImpl {
             "Worker registered via gRPC"
         );
 
+        self.outgoing_webhooks.spawn_dispatch(
+            auth.organization_id.clone(),
+            "worker.registered".to_string(),
+            worker_id.clone(),
+            serde_json::json!({
+                "worker_id": worker_id,
+                "queue_name": req.queue_name,
+                "hostname": req.hostname,
+            }),
+        );
+
         Ok(Response::new(RegisterWorkerResponse {
             worker_id,
             lease_duration_secs: DEFAULT_LEASE_DURATION_SECS,
@@ -584,6 +602,14 @@ impl WorkerService for WorkerServiceImpl {
                 worker_id = %req.worker_id,
                 org_id = %auth.organization_id,
                 "Worker deregistered via gRPC"
+            );
+            self.outgoing_webhooks.spawn_dispatch(
+                auth.organization_id.clone(),
+                "worker.deregistered".to_string(),
+                req.worker_id.clone(),
+                serde_json::json!({
+                    "worker_id": req.worker_id,
+                }),
             );
         }
 

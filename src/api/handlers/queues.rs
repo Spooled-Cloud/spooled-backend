@@ -344,6 +344,16 @@ pub async fn pause(
             .await;
     }
 
+    state.outgoing_webhooks.spawn_dispatch(
+        ctx.organization_id.clone(),
+        "queue.paused".to_string(),
+        name.clone(),
+        serde_json::json!({
+            "queue_name": name,
+            "reason": reason,
+        }),
+    );
+
     Ok(Json(PauseQueueResponse {
         queue_name: name,
         paused: true,
@@ -410,6 +420,16 @@ pub async fn resume(
             )
             .await;
     }
+
+    state.outgoing_webhooks.spawn_dispatch(
+        ctx.organization_id.clone(),
+        "queue.resumed".to_string(),
+        name.clone(),
+        serde_json::json!({
+            "queue_name": name,
+            "paused_duration_secs": paused_duration_secs,
+        }),
+    );
 
     Ok(Json(ResumeQueueResponse {
         queue_name: name,

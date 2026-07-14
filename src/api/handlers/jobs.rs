@@ -397,6 +397,20 @@ pub async fn create(
         }
     }
 
+    if created {
+        state.outgoing_webhooks.spawn_dispatch(
+            org_id.clone(),
+            "job.created".to_string(),
+            returned_id.clone(),
+            serde_json::json!({
+                "job_id": returned_id,
+                "queue_name": request.queue_name,
+                "priority": priority,
+                "status": initial_status,
+            }),
+        );
+    }
+
     Ok((
         if created {
             StatusCode::CREATED
@@ -459,6 +473,19 @@ pub async fn claim(
         state.metrics.jobs_pending.sub(claimed_count);
     }
 
+    for job in &claimed_jobs {
+        state.outgoing_webhooks.spawn_dispatch(
+            ctx.organization_id.clone(),
+            "job.started".to_string(),
+            job.id.clone(),
+            serde_json::json!({
+                "job_id": job.id,
+                "queue_name": job.queue_name,
+                "worker_id": request.worker_id,
+            }),
+        );
+    }
+
     let jobs: Vec<ClaimedJob> = claimed_jobs.into_iter().map(Into::into).collect();
 
     Ok(Json(ClaimJobsResponse { jobs }))
@@ -508,21 +535,21 @@ pub async fn complete(
     state.metrics.jobs_processing.dec();
     state.metrics.jobs_completed.inc();
 
-    // Best-effort realtime publish (queue_name + result fetched after completion)
+    // Fetch job fields once for realtime + org webhooks + per-job completion_webhook.
+    let job_data: Option<(String, Option<serde_json::Value>, Option<String>)> = sqlx::query_as(
+        "SELECT queue_name, result, completion_webhook FROM jobs WHERE id = $1 AND organization_id = $2",
+    )
+    .bind(&id)
+    .bind(&ctx.organization_id)
+    .fetch_optional(state.db.pool())
+    .await
+    .unwrap_or(None);
+
+    let (queue_name, result, completion_webhook) =
+        job_data.unwrap_or_else(|| ("unknown".to_string(), None, None));
+
+    // Best-effort realtime publish
     if let Some(ref cache) = state.cache {
-        let job_data: Option<(String, Option<serde_json::Value>)> = sqlx::query_as(
-            "SELECT queue_name, result FROM jobs WHERE id = $1 AND organization_id = $2",
-        )
-        .bind(&id)
-        .bind(&ctx.organization_id)
-        .fetch_optional(state.db.pool())
-        .await
-        .unwrap_or(None);
-
-        let (queue_name, result) = job_data.unwrap_or_else(|| ("unknown".to_string(), None));
-
-        // Publish JobCompleted event with result for realtime consumers (e.g. SpriteForge demo)
-        // Use PascalCase type and snake_case fields to match RealtimeEvent enum
         publish_realtime_event(
             cache,
             &ctx.organization_id,
@@ -538,6 +565,31 @@ pub async fn complete(
             }),
         )
         .await;
+    }
+
+    state.outgoing_webhooks.spawn_dispatch(
+        ctx.organization_id.clone(),
+        "job.completed".to_string(),
+        id.clone(),
+        serde_json::json!({
+            "job_id": id,
+            "queue_name": queue_name,
+            "status": "completed",
+            "result": result,
+        }),
+    );
+
+    if let Some(url) = completion_webhook.filter(|u| !u.is_empty()) {
+        crate::outgoing_webhooks::service::spawn_completion_webhook(
+            url,
+            "job.completed".to_string(),
+            serde_json::json!({
+                "job_id": id,
+                "queue_name": queue_name,
+                "status": "completed",
+                "result": result,
+            }),
+        );
     }
 
     Ok((StatusCode::OK, Json(serde_json::json!({ "success": true }))))
@@ -590,17 +642,17 @@ pub async fn fail(
     state.metrics.jobs_processing.dec();
 
     // Best-effort realtime publish (status after fail may be pending (retry), failed, or deadletter)
-    if let Some(ref cache) = state.cache {
-        let updated: Option<(String, String)> = sqlx::query_as(
-            "SELECT status, queue_name FROM jobs WHERE id = $1 AND organization_id = $2",
-        )
-        .bind(&id)
-        .bind(&ctx.organization_id)
-        .fetch_optional(state.db.pool())
-        .await
-        .unwrap_or(None);
+    let updated: Option<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT status, queue_name, completion_webhook FROM jobs WHERE id = $1 AND organization_id = $2",
+    )
+    .bind(&id)
+    .bind(&ctx.organization_id)
+    .fetch_optional(state.db.pool())
+    .await
+    .unwrap_or(None);
 
-        if let Some((new_status, queue_name)) = updated {
+    if let Some((new_status, queue_name, completion_webhook)) = updated {
+        if let Some(ref cache) = state.cache {
             publish_realtime_event(
                 cache,
                 &ctx.organization_id,
@@ -616,6 +668,34 @@ pub async fn fail(
                 }),
             )
             .await;
+        }
+
+        // Fire job.failed for terminal failure / DLQ; retries stay pending.
+        if new_status == "failed" || new_status == "deadletter" {
+            state.outgoing_webhooks.spawn_dispatch(
+                ctx.organization_id.clone(),
+                "job.failed".to_string(),
+                id.clone(),
+                serde_json::json!({
+                    "job_id": id,
+                    "queue_name": queue_name,
+                    "status": new_status,
+                    "error": request.error,
+                }),
+            );
+
+            if let Some(url) = completion_webhook.filter(|u| !u.is_empty()) {
+                crate::outgoing_webhooks::service::spawn_completion_webhook(
+                    url,
+                    "job.failed".to_string(),
+                    serde_json::json!({
+                        "job_id": id,
+                        "queue_name": queue_name,
+                        "status": new_status,
+                        "error": request.error,
+                    }),
+                );
+            }
         }
     }
 
@@ -770,6 +850,31 @@ pub async fn cancel(
             }),
         )
         .await;
+
+        state.outgoing_webhooks.spawn_dispatch(
+            ctx.organization_id.clone(),
+            "job.cancelled".to_string(),
+            id.clone(),
+            serde_json::json!({
+                "job_id": id,
+                "queue_name": queue_name,
+                "status": "cancelled",
+                "old_status": old_status,
+            }),
+        );
+    } else {
+        let (_, queue_name) =
+            before.unwrap_or_else(|| ("pending".to_string(), "unknown".to_string()));
+        state.outgoing_webhooks.spawn_dispatch(
+            ctx.organization_id.clone(),
+            "job.cancelled".to_string(),
+            id.clone(),
+            serde_json::json!({
+                "job_id": id,
+                "queue_name": queue_name,
+                "status": "cancelled",
+            }),
+        );
     }
 
     Ok(StatusCode::NO_CONTENT)

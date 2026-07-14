@@ -30,6 +30,7 @@ use crate::cache::RedisCache;
 use crate::config::Settings;
 use crate::db::Database;
 use crate::observability::Metrics;
+use crate::outgoing_webhooks::service::OutgoingWebhookService;
 
 use self::middleware::api_versioning_middleware;
 
@@ -44,6 +45,8 @@ pub struct AppState {
     pub stripe: crate::config::StripeSettings,
     /// Process start time, for reporting server uptime (e.g. /admin/stats).
     pub start_time: std::time::Instant,
+    /// Org-level outgoing webhook dispatcher (job/queue/worker/schedule events).
+    pub outgoing_webhooks: Arc<OutgoingWebhookService>,
 }
 
 impl AppState {
@@ -54,6 +57,7 @@ impl AppState {
         settings: Settings,
     ) -> Self {
         let stripe = settings.stripe.clone();
+        let outgoing_webhooks = Arc::new(OutgoingWebhookService::new(db.pool().clone(), 5));
         Self {
             db,
             cache,
@@ -61,6 +65,7 @@ impl AppState {
             settings,
             stripe,
             start_time: std::time::Instant::now(),
+            outgoing_webhooks,
         }
     }
 }

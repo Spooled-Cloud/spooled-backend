@@ -9,6 +9,14 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.104] - 2026-07-14
+
+### Fixed
+
+- **Outgoing org webhooks now dispatch on real events.** `OutgoingWebhookService::dispatch_event` was never called from REST or gRPC handlers, so CRUD + `/test` worked while `job.created` / `job.started` / `job.completed` / `job.failed` / `job.cancelled` / `queue.paused` / `queue.resumed` / `worker.registered` / `worker.deregistered` / `schedule.triggered` produced zero deliveries.
+- **Per-job `completion_webhook` now fires** on complete and terminal fail (REST + gRPC). Previously the URL was stored but never delivered.
+- Outgoing delivery signing aligned with `/outgoing-webhooks/{id}/test` (per-webhook secret + `timestamp.payload` HMAC). Delivery attempts now update `last_triggered_at` / `last_status` / `failure_count`.
+
 ## [0.1.103] - 2026-07-14
 
 ### Fixed

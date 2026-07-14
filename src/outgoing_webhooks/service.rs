@@ -4,6 +4,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use reqwest::Client;
 use sha2::Sha256;
 use sqlx::{Pool, Postgres};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
@@ -16,12 +17,11 @@ use crate::security::{
 pub struct OutgoingWebhookService {
     pool: Pool<Postgres>,
     client: Client,
-    signing_secret: String,
     max_attempts: i32,
 }
 
 impl OutgoingWebhookService {
-    pub fn new(pool: Pool<Postgres>, signing_secret: String, max_attempts: i32) -> Self {
+    pub fn new(pool: Pool<Postgres>, max_attempts: i32) -> Self {
         Self {
             pool,
             // SECURITY: Never fall back to a default client. A default client may have no timeouts
@@ -31,9 +31,27 @@ impl OutgoingWebhookService {
                 Duration::from_secs(5),
                 "Spooled-OutgoingWebhook/1.0",
             ),
-            signing_secret,
             max_attempts,
         }
+    }
+
+    /// Best-effort fire-and-forget dispatch used by REST/gRPC handlers.
+    pub fn spawn_dispatch(
+        self: &Arc<Self>,
+        organization_id: String,
+        event: String,
+        resource_id: String,
+        payload: serde_json::Value,
+    ) {
+        let service = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(e) = service
+                .dispatch_event(event, &resource_id, payload, &organization_id)
+                .await
+            {
+                warn!(error = %e, org_id = %organization_id, "Outgoing webhook dispatch failed");
+            }
+        });
     }
 
     pub async fn dispatch_event(
@@ -97,8 +115,6 @@ impl OutgoingWebhookService {
         payload: serde_json::Value,
         delivery_id: uuid::Uuid,
     ) -> Result<()> {
-        let signature = self.generate_signature(&payload)?;
-
         let body = serde_json::json!({
             "id": delivery_id,
             "event": event,
@@ -106,7 +122,7 @@ impl OutgoingWebhookService {
             "data": payload,
         });
 
-        self.try_deliver(&webhook, &body, &signature, 1).await
+        self.try_deliver(&webhook, &body, 1).await
     }
 
     pub async fn retry_delivery(&self, delivery_id: uuid::Uuid) -> Result<()> {
@@ -146,9 +162,7 @@ impl OutgoingWebhookService {
             name: String::new(),
         };
 
-        // Reconstruct signature (or use stored one if we had it, but we generate fresh)
         let payload: serde_json::Value = row.get("payload");
-        let signature = self.generate_signature(&payload)?;
         let event: String = row.get("event");
         let created_at: chrono::DateTime<Utc> = row.get("created_at");
         let attempts: i32 = row.get("attempts");
@@ -161,15 +175,13 @@ impl OutgoingWebhookService {
             "data": payload,
         });
 
-        self.try_deliver(&webhook, &body, &signature, attempts + 1)
-            .await
+        self.try_deliver(&webhook, &body, attempts + 1).await
     }
 
     async fn try_deliver(
         &self,
         webhook: &OutgoingWebhook,
         body: &serde_json::Value,
-        signature: &str,
         attempt: i32,
     ) -> Result<()> {
         let start = Utc::now();
@@ -181,17 +193,27 @@ impl OutgoingWebhookService {
             return Err(e);
         }
 
-        let response = self
+        let payload_json = serde_json::to_string(body).unwrap_or_default();
+        let timestamp = Utc::now().timestamp();
+        let event = body["event"].as_str().unwrap_or_default();
+
+        let mut request_builder = self
             .client
             .post(&webhook.url)
-            .header("X-Spooled-Signature", signature)
-            .header(
-                "X-Spooled-Event",
-                body["event"].as_str().unwrap_or_default(),
-            )
-            .json(body)
-            .send()
-            .await;
+            .header("Content-Type", "application/json")
+            .header("X-Spooled-Event", event)
+            .header("X-Spooled-Timestamp", timestamp.to_string())
+            .header("X-Spooled-Delivery-Attempt", attempt.to_string());
+
+        // Prefer the per-webhook secret (matches /outgoing-webhooks/{id}/test).
+        if let Some(ref secret) = webhook.secret {
+            if !secret.is_empty() {
+                let signature = sign_payload(secret, timestamp, &payload_json)?;
+                request_builder = request_builder.header("X-Spooled-Signature", signature);
+            }
+        }
+
+        let response = request_builder.body(payload_json).send().await;
 
         match response {
             Ok(res) => {
@@ -214,8 +236,6 @@ impl OutgoingWebhookService {
                 .await?;
 
                 if !success && attempt < self.max_attempts {
-                    // Schedule retry (in a real system, this would be a delayed job)
-                    // For now, we just log it
                     warn!(
                         "Webhook delivery failed (attempt {}/{}), should retry",
                         attempt, self.max_attempts
@@ -274,16 +294,26 @@ impl OutgoingWebhookService {
         .execute(&self.pool)
         .await?;
 
-        Ok(())
-    }
+        // Keep webhook summary fields current for dashboard / list views.
+        sqlx::query(
+            r#"
+            UPDATE outgoing_webhooks
+            SET last_triggered_at = NOW(),
+                last_status = $2,
+                failure_count = CASE
+                    WHEN $2 = 'success' THEN 0
+                    ELSE failure_count + 1
+                END,
+                updated_at = NOW()
+            WHERE id = $1
+            "#,
+        )
+        .bind(webhook_id)
+        .bind(status)
+        .execute(&self.pool)
+        .await?;
 
-    fn generate_signature(&self, payload: &serde_json::Value) -> Result<String> {
-        type HmacSha256 = Hmac<Sha256>;
-        let mut mac = HmacSha256::new_from_slice(self.signing_secret.as_bytes())
-            .context("HMAC can take key of any size")?;
-        mac.update(payload.to_string().as_bytes());
-        let result = mac.finalize();
-        Ok(hex::encode(result.into_bytes()))
+        Ok(())
     }
 
     /// Validate webhook URL to prevent SSRF attacks
@@ -296,4 +326,57 @@ impl OutgoingWebhookService {
             anyhow::anyhow!("Invalid webhook URL: {}", e)
         })
     }
+}
+
+fn sign_payload(secret: &str, timestamp: i64, payload_json: &str) -> Result<String> {
+    type HmacSha256 = Hmac<Sha256>;
+    let message = format!("{}.{}", timestamp, payload_json);
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .context("HMAC can take key of any size")?;
+    mac.update(message.as_bytes());
+    Ok(format!("sha256={}", hex::encode(mac.finalize().into_bytes())))
+}
+
+/// Deliver a per-job `completion_webhook` URL (best-effort, fire-and-forget).
+pub fn spawn_completion_webhook(
+    url: String,
+    event: String,
+    payload: serde_json::Value,
+) {
+    tokio::spawn(async move {
+        if let Err(e) = deliver_completion_webhook(&url, &event, &payload).await {
+            warn!(error = %e, url = %url, event = %event, "completion_webhook delivery failed");
+        }
+    });
+}
+
+async fn deliver_completion_webhook(
+    url: &str,
+    event: &str,
+    payload: &serde_json::Value,
+) -> Result<()> {
+    let options = UrlValidationOptions::default();
+    validate_url_ssrf(url, &options).map_err(|e| anyhow::anyhow!("Invalid webhook URL: {}", e))?;
+
+    let client = build_outbound_http_client(
+        Duration::from_secs(10),
+        Duration::from_secs(5),
+        "Spooled-CompletionWebhook/1.0",
+    );
+    let body = serde_json::json!({
+        "event": event,
+        "created_at": Utc::now(),
+        "data": payload,
+    });
+    let resp = client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header("X-Spooled-Event", event)
+        .json(&body)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("HTTP {}", resp.status());
+    }
+    Ok(())
 }
