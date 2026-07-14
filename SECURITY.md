@@ -54,7 +54,7 @@ When deploying Spooled Backend, please follow these security guidelines:
 
 The following credential-remediation work remains open. Do not place current or replacement secret values in this repository, documentation, tickets, logs, or chat transcripts.
 
-- **Rotate `ADMIN_API_KEY`.** Treat any credential that appeared in a chat transcript or shared log as exposed. Generate a new high-entropy value in the deployment secret manager, update the production service, restart or roll the backend, verify old-key rejection and new-key access, then revoke the old value.
+- **`ADMIN_API_KEY` rotated 2026-07-14.** Prior value appeared in a chat transcript and is revoked (prod rejects it with 401). New value lives only in the production host backend `.env` and the local workspace `.env` (mode 600). Do not paste it into chats, commits, or public repos. If another copy exists in Portainer stack env UI, sync or clear it so the next Pull does not revive the old key.
 - **Replace the tracked gRPC origin private key.** Treat the historical `certs/grpc-key.pem` and its certificate as compromised because the private key was tracked and copied into old container images. Production Compose now generates a replacement keypair in a private Docker volume and mounts it read-only into the backend. Other platforms must generate a replacement outside Git and provide it through their secret manager. Removing the file from the latest tree does not erase Git or image history.
 
 These are current actions, not instructions to expose either credential. Coordinate rotation to avoid locking out the admin portal or interrupting hosted gRPC.
