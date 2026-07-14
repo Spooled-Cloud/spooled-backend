@@ -122,7 +122,8 @@ services:
   # For one-shot CI checks set GRPC_TLS_INIT_ONCE=1 (exits 0 after write).
   grpc-tls-init:
     image: alpine/openssl:3.5.7
-    container_name: spooled_grpc_tls_init
+    # No fixed container_name: allows `compose run --rm` in CI alongside any
+    # already-running stack. Portainer still shows the compose service name.
     user: root
     restart: unless-stopped
     environment:
