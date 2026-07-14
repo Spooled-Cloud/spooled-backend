@@ -110,11 +110,13 @@ services:
   # Generates a private origin certificate on first deploy and renews it when less
   # than 30 days remain. The key stays in the Docker volume and is never in Git or
   # an image. This works with standalone Docker Compose and Portainer stacks.
+  # Keeps the gRPC TLS volume ready. Stays running after cert ensure so Portainer
+  # does not show a scary Exited (0) one-shot (busybox/alpine init pattern).
   grpc-tls-init:
     image: alpine/openssl:3.5.7
     container_name: spooled_grpc_tls_init
     user: root
-    restart: "no"
+    restart: unless-stopped
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - |
@@ -132,8 +134,15 @@ services:
         chown 1000:1000 /tls/grpc-cert.pem /tls/grpc-key.pem
         chmod 0444 /tls/grpc-cert.pem
         chmod 0400 /tls/grpc-key.pem
+        exec tail -f /dev/null
     volumes:
       - grpc_tls:/tls
+    healthcheck:
+      test: ["CMD", "test", "-s", "/tls/grpc-cert.pem"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
   # ===========================================
   # Spooled Backend API
@@ -150,7 +159,7 @@ services:
       redis:
         condition: service_healthy
       grpc-tls-init:
-        condition: service_completed_successfully
+        condition: service_healthy
     environment:
       # =====================
       # Database
@@ -287,6 +296,7 @@ services:
   # ===========================================
   # Prometheus (Metrics Collection)
   # ===========================================
+  # Config is a static file in deploy/ (no busybox one-shot init container).
   prometheus:
     image: prom/prometheus:v2.48.0
     container_name: spooled_prometheus
@@ -298,7 +308,7 @@ services:
       - '--web.enable-lifecycle'
     volumes:
       - prometheus_data:/prometheus
-      - prometheus_config:/etc/prometheus
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     networks:
       - spooled-network
     depends_on:
@@ -309,39 +319,10 @@ services:
       timeout: 10s
       retries: 3
 
-  # Prometheus config init - creates config file
-  prometheus-init:
-    image: busybox:latest
-    container_name: spooled_prometheus_init
-    command: |
-      sh -c 'cat > /etc/prometheus/prometheus.yml << EOF
-      global:
-        scrape_interval: 15s
-        evaluation_interval: 15s
-        external_labels:
-          cluster: spooled
-          environment: production
-
-      scrape_configs:
-        - job_name: spooled-backend
-          static_configs:
-            - targets: ["backend:9090"]
-          metrics_path: /metrics
-          scrape_interval: 10s
-
-        - job_name: prometheus
-          static_configs:
-            - targets: ["localhost:9090"]
-      EOF
-      echo "Prometheus config created"'
-    volumes:
-      - prometheus_config:/etc/prometheus
-    networks:
-      - spooled-network
-
   # ===========================================
   # Grafana (Dashboards & Visualization)
   # ===========================================
+  # Provisioning is static under deploy/grafana (no busybox one-shot init).
   grafana:
     image: grafana/grafana:10.2.2
     container_name: spooled_grafana
@@ -355,61 +336,16 @@ services:
       GF_DATASOURCES_DEFAULT_NAME: Prometheus
     volumes:
       - grafana_data:/var/lib/grafana
-      - grafana_provisioning:/etc/grafana/provisioning
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
     networks:
       - spooled-network
     depends_on:
       - prometheus
-      - grafana-init
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/api/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-
-  # Grafana provisioning init - configures datasource and dashboards
-  grafana-init:
-    image: busybox:latest
-    container_name: spooled_grafana_init
-    command: |
-      sh -c '
-      mkdir -p /etc/grafana/provisioning/datasources
-      mkdir -p /etc/grafana/provisioning/dashboards
-      mkdir -p /var/lib/grafana/dashboards
-
-      # Datasource config
-      cat > /etc/grafana/provisioning/datasources/prometheus.yml << EOF
-      apiVersion: 1
-      datasources:
-        - name: Prometheus
-          type: prometheus
-          access: proxy
-          url: http://prometheus:9090
-          isDefault: true
-          editable: false
-      EOF
-
-      # Dashboard provider config
-      cat > /etc/grafana/provisioning/dashboards/default.yml << EOF
-      apiVersion: 1
-      providers:
-        - name: Spooled
-          orgId: 1
-          folder: ""
-          type: file
-          disableDeletion: false
-          updateIntervalSeconds: 30
-          options:
-            path: /var/lib/grafana/dashboards
-      EOF
-
-      echo "Grafana provisioning complete"
-      '
-    volumes:
-      - grafana_provisioning:/etc/grafana/provisioning
-      - grafana_data:/var/lib/grafana
-    networks:
-      - spooled-network
 
   # ===========================================
   # pgAdmin (Optional - Database Admin)
@@ -444,11 +380,7 @@ volumes:
     driver: local
   prometheus_data:
     driver: local
-  prometheus_config:
-    driver: local
   grafana_data:
-    driver: local
-  grafana_provisioning:
     driver: local
   pgadmin_data:
     driver: local
