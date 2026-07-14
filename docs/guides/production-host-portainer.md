@@ -21,9 +21,9 @@ If you need an Editor tab, you must retire the Git stack and recreate it as **We
 | Item | Value |
 |------|--------|
 | Portainer stack name / Compose project | **`spooled-backend`** |
-| Portainer stack id (this host) | `71` → working dirs under `/data/compose/71/<git-sha>/` |
+| Live WD (preferred) | `/opt/spooled/backend` (durable) — Portainer Git sha dirs often get wiped after deploy |
+| Portainer stack id (this host) | `71` → `/data/compose/71/<git-sha>/` (may be symlink → durable) |
 | Compose file in repo | `docker-compose.prod.yml` (repo root) |
-| Live WD after a good redeploy | `/data/compose/71/<current-sha>/` (full checkout with compose + `.env`) |
 | Disaster-recovery mirror | `/opt/spooled/backend` (compose, `.env` mode `600`, `.env.image`, `bin/*`) |
 | Image pin | Stack env / `.env`: `BACKEND_IMAGE=ghcr.io/spooled-cloud/spooled-backend:vX.Y.Z@sha256:…` |
 
@@ -58,18 +58,27 @@ The production host runs **other** Compose projects (`authentik`, `outlinewiki`,
    - Public `GET https://api.spooled.cloud/health` → 200
    - Authenticated `GET /api/v1/dashboard` → `system.version` + fresh `uptime_seconds` (not `/health` alone for version proof)
 
-After a successful pull, Portainer’s working directory should be a **full** checkout under `/data/compose/71/<new-sha>/` (compose file present, not `certs/` only).
+After a successful pull, containers should be healthy. Portainer may still leave the Git checkout under `/data/compose/71/<sha>/` **empty or deleted** (labels point at a missing path; UI cannot open the compose file). That does **not** mean the stack is down — heal immediately:
+
+```bash
+ssh opc@<prod-host>
+sudo /opt/spooled/backend/bin/heal-portainer-stack-files
+# If containers still label a missing WD, re-adopt from durable:
+cd /opt/spooled/backend && sudo ./bin/compose up -d
+```
+
+Also pin `BACKEND_IMAGE` in the Portainer stack env (digest). Without it, Pull and redeploy often floats to `:latest`.
 
 ### If UI says it cannot retrieve `docker-compose.prod.yml`
 
-Old Git sha dirs were left empty (`certs/` only). Heal **only** stack `71`:
+Same heal as above (stack id `71` only):
 
 ```bash
 ssh opc@<prod-host>
 sudo /opt/spooled/backend/bin/heal-portainer-stack-files
 ```
 
-Then refresh Portainer and retry **Pull and redeploy**. Do not run heals against other stack IDs.
+Then refresh Portainer. Do not run heals against other stack IDs.
 
 ## Safe recreate (only if Pull and redeploy stays broken)
 
