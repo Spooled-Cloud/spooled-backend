@@ -9,6 +9,12 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.102] - 2026-07-14
+
+### Fixed
+
+- rustfmt `require_lease_id` so CI format gate passes.
+
 ## [0.1.101] - 2026-07-14
 
 ### Fixed

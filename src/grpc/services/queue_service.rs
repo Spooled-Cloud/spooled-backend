@@ -212,9 +212,8 @@ impl QueueServiceImpl {
     }
 
     fn require_lease_id(lease_id: &str) -> Result<&str, Status> {
-        Self::opt_lease_id(lease_id).ok_or_else(|| {
-            Status::invalid_argument("lease_id is required for job settlement")
-        })
+        Self::opt_lease_id(lease_id)
+            .ok_or_else(|| Status::invalid_argument("lease_id is required for job settlement"))
     }
 
     /// Validate and clamp lease duration
