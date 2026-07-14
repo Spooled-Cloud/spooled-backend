@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 # Heal Portainer Git leftovers for Spooled backend on the shared prod host.
-# Safe scope: stack id 71 paths + /opt/spooled/backend only.
+#
+# WHY: Portainer Git "Pull and redeploy" clones into /data/compose/71/<sha>/ then
+# often deletes that directory after compose up. Containers keep running, but
+# labels still point at the missing path → UI "Unable to retrieve stack file".
+# This script only repairs stack id 71 / durable /opt/spooled/backend. It never
+# touches other Compose projects and never removes volumes.
+#
+# WHEN: After Pull and redeploy, if Portainer cannot open docker-compose.prod.yml
+# or `docker inspect spooled_backend` shows a working_dir that does not exist.
+#
+# Image policy: production follows ghcr.io/spooled-cloud/spooled-backend:latest
+# (see docs/guides/production-host-portainer.md).
 set -euo pipefail
 
 DURABLE="${SPOOL_BACKEND_DURABLE:-/opt/spooled/backend}"

@@ -28,7 +28,8 @@
 #
 # For Portainer (preferred on prod host):
 #   Git stack → repository Spooled-Cloud/spooled-backend → this file at repo root
-#   → set BACKEND_IMAGE digest in stack env → Pull and redeploy / repull images.
+#   → BACKEND_IMAGE defaults to :latest (intentional for Pull and redeploy).
+#   → set BACKEND_IMAGE only for temporary rollback to a tag/digest.
 #   Git stacks do not show the Web Editor tab (normal). See operator guide.
 #
 # Required Environment Variables:
@@ -61,6 +62,7 @@
 #
 # Optional Environment Variables:
 #   BACKEND_IMAGE        - Docker image (default: ghcr.io/spooled-cloud/spooled-backend:latest)
+#                          Production Portainer workflow follows :latest on purpose.
 #   REDIS_PASSWORD       - Redis password (recommended for production)
 #   GRAFANA_USER         - Grafana admin username (default: admin)
 #   GRAFANA_PASSWORD     - Grafana admin password (default: admin) - CHANGE THIS!

@@ -63,7 +63,7 @@ The production Compose stack generates a private self-signed origin certificate 
 - TLS is enabled by default
 - Certificate generation and renewal are automatic (`grpc-tls-init` stays Up/healthy after ensure; CI uses `GRPC_TLS_INIT_ONCE=1`)
 - The private key is stored outside Git and container images (volume `grpc_tls`)
-- Pin `BACKEND_IMAGE` to an immutable tag/digest on production hosts; default `latest` is only for casual/dev deploys
+- Follow `BACKEND_IMAGE=ghcr.io/spooled-cloud/spooled-backend:latest` on production Portainer hosts (intentional; Pull and redeploy re-pulls). Override with a tag/digest only for temporary rollback.
 
 #### Supplying Your Own Certificate
 

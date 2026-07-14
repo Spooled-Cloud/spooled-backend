@@ -245,9 +245,9 @@ volumes:
 
 ## Production host + Portainer
 
-Preferred prod rollout: Portainer Git **Pull and redeploy** for stack `spooled-backend` (compose project name must match). Keep live WD on durable `/opt/spooled/backend`. Portainer often deletes `/data/compose/71/<sha>/` after Pull — that is expected; heal with `bin/heal-portainer-stack-files` (repo: `scripts/heal-portainer-stack-files.sh`) and re-adopt from durable if labels point at a missing path. Pin `BACKEND_IMAGE` to a digest in stack env.
+Preferred prod rollout: Portainer Git **Pull and redeploy** for stack `spooled-backend` (compose project name must match). Keep live WD on durable `/opt/spooled/backend`. Image policy is **`:latest`** (compose default + host `.env`). Portainer often deletes `/data/compose/71/<sha>/` after Pull — heal with `bin/heal-portainer-stack-files` (repo: `scripts/heal-portainer-stack-files.sh`) and re-adopt from durable if labels point at a missing path.
 
-Canonical operator guide (isolation rules, UI click-path, safe recreate, CLI fallback, heal):
+Canonical operator guide (isolation, Pull path, heal explanation, recreate, CLI):
 
 → **[production-host-portainer.md](./production-host-portainer.md)**
 
@@ -257,6 +257,7 @@ Summary:
 |------|--------|
 | Compose project / stack name | `spooled-backend` |
 | Preferred UI action | Portainer **Pull and redeploy** |
+| Image | `ghcr.io/spooled-cloud/spooled-backend:latest` |
 | Live / durable path | `/opt/spooled/backend` |
 | Post-Pull heal | `sudo /opt/spooled/backend/bin/heal-portainer-stack-files` |
 | CLI fallback | `sudo /opt/spooled/backend/bin/deploy-backend` |
