@@ -23,7 +23,7 @@ labels:
       app.kubernetes.io/managed-by: kustomize
     includeSelectors: true
   - pairs:
-      app.kubernetes.io/version: "0.1.102"
+      app.kubernetes.io/version: "0.1.103"
     includeSelectors: false
 
 images:

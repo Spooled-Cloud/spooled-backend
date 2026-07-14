@@ -9,6 +9,18 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.103] - 2026-07-14
+
+### Fixed
+
+- Compose zero-touch metrics/Grafana bootstrap (no busybox Exited init helpers).
+- gRPC TLS helper stays Up/healthy; `GRPC_TLS_INIT_ONCE` escaped for Compose interpolation.
+- Drop fixed container name on TLS helper so `compose run --rm` does not clash with the live stack.
+
+### Changed
+
+- Prefer `BACKEND_IMAGE=:latest` for Portainer Pull and redeploy; public Portainer guide scrubbed of private host paths.
+
 ## [0.1.102] - 2026-07-14
 
 ### Fixed
