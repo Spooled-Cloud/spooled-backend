@@ -23,18 +23,30 @@ use crate::api::middleware::limits::{
 use crate::cache::RedisCache;
 use crate::models::CronSchedule;
 use crate::observability::Metrics;
+use crate::outgoing_webhooks::service::OutgoingWebhookService;
 
 /// Background scheduler that runs periodic maintenance tasks
 pub struct Scheduler {
     db: Arc<PgPool>,
     cache: Option<Arc<RedisCache>>,
     metrics: Arc<Metrics>,
+    outgoing_webhooks: Arc<OutgoingWebhookService>,
 }
 
 impl Scheduler {
     /// Create a new scheduler
-    pub fn new(db: Arc<PgPool>, cache: Option<Arc<RedisCache>>, metrics: Arc<Metrics>) -> Self {
-        Self { db, cache, metrics }
+    pub fn new(
+        db: Arc<PgPool>,
+        cache: Option<Arc<RedisCache>>,
+        metrics: Arc<Metrics>,
+        outgoing_webhooks: Arc<OutgoingWebhookService>,
+    ) -> Self {
+        Self {
+            db,
+            cache,
+            metrics,
+            outgoing_webhooks,
+        }
     }
 
     /// Run all background tasks
@@ -568,6 +580,31 @@ impl Scheduler {
                             )
                             .await;
                     }
+
+                    self.outgoing_webhooks.spawn_dispatch(
+                        schedule.organization_id.clone(),
+                        "schedule.triggered".to_string(),
+                        schedule.id.clone(),
+                        serde_json::json!({
+                            "schedule_id": schedule.id,
+                            "job_id": job_id,
+                            "queue_name": schedule.queue_name,
+                            "source": "cron",
+                        }),
+                    );
+                    self.outgoing_webhooks.spawn_dispatch(
+                        schedule.organization_id.clone(),
+                        "job.created".to_string(),
+                        job_id.clone(),
+                        serde_json::json!({
+                            "job_id": job_id,
+                            "queue_name": schedule.queue_name,
+                            "priority": schedule.priority,
+                            "status": "pending",
+                            "source": "cron",
+                            "schedule_id": schedule.id,
+                        }),
+                    );
                 }
                 Err(e) => {
                     // Rollback transaction
@@ -647,14 +684,14 @@ impl Scheduler {
         // Also handle jobs where parent failed/deadlettered - these should be cancelled
         // or marked as blocked (policy decision - here we cancel them)
         // SECURITY: Include organization_id filter to ensure cross-tenant isolation
-        let failed_parent_result = sqlx::query(
+        let cancelled_children: Vec<(String, String, String)> = sqlx::query_as(
             r#"
             UPDATE jobs child
-            SET 
+            SET
                 status = 'cancelled',
                 last_error = 'Parent job failed or was deadlettered',
                 updated_at = NOW()
-            WHERE 
+            WHERE
                 child.parent_job_id IS NOT NULL
                 AND child.status IN ('pending', 'scheduled')
                 AND (child.dependencies_met = FALSE OR child.dependencies_met IS NULL)
@@ -664,17 +701,30 @@ impl Scheduler {
                       AND parent.organization_id = child.organization_id
                       AND parent.status IN ('failed', 'deadletter', 'cancelled')
                 )
+            RETURNING child.id, child.organization_id, child.queue_name
             "#,
         )
-        .execute(&*self.db)
+        .fetch_all(&*self.db)
         .await?;
 
-        let cancelled = failed_parent_result.rows_affected();
-        if cancelled > 0 {
+        if !cancelled_children.is_empty() {
             warn!(
-                count = cancelled,
+                count = cancelled_children.len(),
                 "Cancelled child jobs due to failed parent dependencies"
             );
+            for (job_id, org_id, queue_name) in &cancelled_children {
+                self.outgoing_webhooks.spawn_dispatch(
+                    org_id.clone(),
+                    "job.cancelled".to_string(),
+                    job_id.clone(),
+                    serde_json::json!({
+                        "job_id": job_id,
+                        "queue_name": queue_name,
+                        "status": "cancelled",
+                        "reason": "parent_failed",
+                    }),
+                );
+            }
         }
 
         // Workflow jobs express dependencies via job_dependencies (not
@@ -687,7 +737,7 @@ impl Scheduler {
         // Looped so multi-level chains cascade within one sweep.
         let mut workflow_cancelled = 0u64;
         for _ in 0..10 {
-            let result = sqlx::query(
+            let cancelled_batch: Vec<(String, String, String)> = sqlx::query_as(
                 r#"
                 UPDATE jobs child
                 SET
@@ -725,12 +775,26 @@ impl Scheduler {
                             )
                         )
                     )
+                RETURNING child.id, child.organization_id, child.queue_name
                 "#,
             )
-            .execute(&*self.db)
+            .fetch_all(&*self.db)
             .await?;
 
-            let batch = result.rows_affected();
+            let batch = cancelled_batch.len() as u64;
+            for (job_id, org_id, queue_name) in &cancelled_batch {
+                self.outgoing_webhooks.spawn_dispatch(
+                    org_id.clone(),
+                    "job.cancelled".to_string(),
+                    job_id.clone(),
+                    serde_json::json!({
+                        "job_id": job_id,
+                        "queue_name": queue_name,
+                        "status": "cancelled",
+                        "reason": "dependency_failed",
+                    }),
+                );
+            }
             workflow_cancelled += batch;
             if batch == 0 {
                 break;

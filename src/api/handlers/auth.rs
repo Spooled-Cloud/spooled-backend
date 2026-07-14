@@ -7,6 +7,7 @@
 //! - Current user info
 
 use axum::{
+    body::Bytes,
     extract::{Extension, State},
     http::StatusCode,
     Json,
@@ -515,11 +516,14 @@ pub struct LogoutRequest {
 /// Logout handler - invalidate tokens
 ///
 /// POST /api/v1/auth/logout
+///
+/// Body is optional. Clients often send `Content-Type: application/json` with an
+/// empty body; soft-parse so that does not become 422.
 pub async fn logout(
     State(state): State<AppState>,
     Extension(context): Extension<ApiKeyContext>,
     headers: axum::http::HeaderMap,
-    body: Option<Json<LogoutRequest>>,
+    body: Bytes,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     // Extract token from Authorization header
     let auth_header = headers
@@ -569,11 +573,17 @@ pub async fn logout(
         )
     })?;
 
+    // Soft-parse optional body so empty JSON + Content-Type still logs out.
     // Blacklist the refresh token as well when the client supplies it —
     // otherwise the session survives logout via /auth/refresh.
-    if let Some(Json(LogoutRequest {
+    let logout_body: Option<LogoutRequest> = if body.is_empty() {
+        None
+    } else {
+        serde_json::from_slice(&body).ok()
+    };
+    if let Some(LogoutRequest {
         refresh_token: Some(refresh_token),
-    })) = body
+    }) = logout_body
     {
         match decode::<Claims>(
             &refresh_token,

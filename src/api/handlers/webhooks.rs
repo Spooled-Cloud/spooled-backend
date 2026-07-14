@@ -182,6 +182,19 @@ pub async fn custom(
         if let Err(e) = increment_daily_jobs(state.db.pool(), &org_id, 1).await {
             tracing::warn!(error = %e, org_id = %org_id, "Failed to increment daily job counter");
         }
+
+        state.outgoing_webhooks.spawn_dispatch(
+            org_id.clone(),
+            "job.created".to_string(),
+            returned_id.clone(),
+            serde_json::json!({
+                "job_id": returned_id,
+                "queue_name": request.queue_name,
+                "priority": priority,
+                "status": "pending",
+                "source": "incoming_webhook",
+            }),
+        );
     }
 
     // Publish to Redis with org context to prevent cross-tenant leakage

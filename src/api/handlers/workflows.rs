@@ -489,6 +489,23 @@ pub async fn create(
         }
     }
 
+    for job_def in &request.jobs {
+        if let Some(job_id) = job_mappings.get(&job_def.key) {
+            state.outgoing_webhooks.spawn_dispatch(
+                ctx.organization_id.clone(),
+                "job.created".to_string(),
+                job_id.clone(),
+                serde_json::json!({
+                    "job_id": job_id,
+                    "queue_name": job_def.queue_name,
+                    "priority": job_def.priority,
+                    "status": "pending",
+                    "workflow_id": workflow_id,
+                }),
+            );
+        }
+    }
+
     Ok(Json(CreateWorkflowResponse {
         workflow_id,
         job_ids: response_mappings,

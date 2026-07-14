@@ -151,6 +151,7 @@ async fn main() -> Result<()> {
         state.db.pool_arc(),
         state.cache.as_ref().map(|c| Arc::new(c.clone())),
         state.metrics.clone(),
+        state.outgoing_webhooks.clone(),
     );
     let scheduler_shutdown_rx = shutdown_rx.clone();
     let scheduler_handle = tokio::spawn(async move {

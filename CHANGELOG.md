@@ -9,6 +9,20 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.105] - 2026-07-14
+
+### Fixed
+
+- Cron schedule fires now emit `schedule.triggered` + `job.created` outgoing webhooks (scheduler previously only published Redis).
+- Bulk enqueue, workflow create, incoming custom webhook ingest, and manual schedule trigger now emit `job.created`.
+- gRPC `StreamJobs` / `ProcessJobs` now emit `job.started` / `job.completed` / `job.failed` and per-job `completion_webhook` (parity with unary + REST).
+- gRPC unary Fail now fires per-job `completion_webhook` on terminal failure.
+- Scheduler cascade cancels (parent/dependency failure) emit `job.cancelled`.
+- Outgoing delivery rows persist the signed envelope `id` (retry no longer re-wraps stored envelopes).
+- gRPC `GetJob` miss returns `NotFound` instead of empty `{}`.
+- `POST /auth/logout` soft-parses empty JSON bodies (no more 422 with `Content-Type: application/json`).
+- Job retry returns `404` when missing vs `409` when wrong status.
+
 ## [0.1.104] - 2026-07-14
 
 ### Fixed

@@ -841,6 +841,29 @@ impl QueueService for QueueServiceImpl {
                     "error": error_message,
                 }),
             );
+
+            let completion_webhook: Option<String> = sqlx::query_scalar(
+                "SELECT completion_webhook FROM jobs WHERE id = $1 AND organization_id = $2",
+            )
+            .bind(&req.job_id)
+            .bind(&auth.organization_id)
+            .fetch_optional(self.pool.as_ref())
+            .await
+            .ok()
+            .flatten()
+            .flatten();
+            if let Some(url) = completion_webhook.filter(|u| !u.is_empty()) {
+                crate::outgoing_webhooks::service::spawn_completion_webhook(
+                    url,
+                    "job.failed".to_string(),
+                    serde_json::json!({
+                        "job_id": req.job_id,
+                        "queue_name": queue_name,
+                        "status": result.new_status,
+                        "error": error_message,
+                    }),
+                );
+            }
         }
 
         Ok(Response::new(FailResponse {
@@ -950,8 +973,12 @@ impl QueueService for QueueServiceImpl {
                     Status::internal("Failed to get job")
                 })?;
 
+        let Some(job) = job else {
+            return Err(Status::not_found("Job not found"));
+        };
+
         Ok(Response::new(GetJobResponse {
-            job: job.as_ref().map(job_to_proto),
+            job: Some(job_to_proto(&job)),
         }))
     }
 
@@ -1173,6 +1200,17 @@ impl QueueService for QueueServiceImpl {
                         metrics.jobs_processing.inc();
                         debug!(job_id = %job.id, queue = %queue_name, "Streaming job to worker");
 
+                        this.outgoing_webhooks.spawn_dispatch(
+                            org_id.clone(),
+                            "job.started".to_string(),
+                            job.id.clone(),
+                            serde_json::json!({
+                                "job_id": job.id,
+                                "queue_name": job.queue_name,
+                                "worker_id": worker_id,
+                            }),
+                        );
+
                         if tx.send(Ok(job_to_proto(&job))).await.is_err() {
                             break;
                         }
@@ -1265,15 +1303,37 @@ impl QueueService for QueueServiceImpl {
 
                 let response = match req.request {
                     Some(crate::grpc::proto::process_request::Request::Dequeue(dequeue_req)) => {
-                        handle_process_dequeue(&pool, &metrics, &org_id, &api_key_id, dequeue_req)
-                            .await
+                        handle_process_dequeue(
+                            &pool,
+                            &metrics,
+                            &this.outgoing_webhooks,
+                            &org_id,
+                            &api_key_id,
+                            dequeue_req,
+                        )
+                        .await
                     }
                     Some(crate::grpc::proto::process_request::Request::Complete(complete_req)) => {
-                        handle_process_complete(&pool, &metrics, &org_id, &api_key_id, complete_req)
-                            .await
+                        handle_process_complete(
+                            &pool,
+                            &metrics,
+                            &this.outgoing_webhooks,
+                            &org_id,
+                            &api_key_id,
+                            complete_req,
+                        )
+                        .await
                     }
                     Some(crate::grpc::proto::process_request::Request::Fail(fail_req)) => {
-                        handle_process_fail(&pool, &metrics, &org_id, &api_key_id, fail_req).await
+                        handle_process_fail(
+                            &pool,
+                            &metrics,
+                            &this.outgoing_webhooks,
+                            &org_id,
+                            &api_key_id,
+                            fail_req,
+                        )
+                        .await
                     }
                     Some(crate::grpc::proto::process_request::Request::RenewLease(renew_req)) => {
                         handle_process_renew(&pool, &org_id, &api_key_id, renew_req).await
@@ -1401,6 +1461,7 @@ fn truncate_error_message(message: &str) -> String {
 async fn handle_process_dequeue(
     pool: &PgPool,
     metrics: &Metrics,
+    outgoing_webhooks: &Arc<OutgoingWebhookService>,
     org_id: &str,
     api_key_id: &str,
     req: DequeueRequest,
@@ -1471,6 +1532,16 @@ async fn handle_process_dequeue(
                 return process_error("INTERNAL", "Failed to dequeue job");
             }
             metrics.jobs_processing.inc();
+            outgoing_webhooks.spawn_dispatch(
+                org_id.to_string(),
+                "job.started".to_string(),
+                job.id.clone(),
+                serde_json::json!({
+                    "job_id": job.id,
+                    "queue_name": job.queue_name,
+                    "worker_id": req.worker_id,
+                }),
+            );
             ProcessResponse {
                 response: Some(crate::grpc::proto::process_response::Response::Job(
                     job_to_proto(&job),
@@ -1639,6 +1710,7 @@ async fn classify_worker_miss_process_response(
 async fn handle_process_complete(
     pool: &PgPool,
     metrics: &Metrics,
+    outgoing_webhooks: &Arc<OutgoingWebhookService>,
     org_id: &str,
     api_key_id: &str,
     req: CompleteRequest,
@@ -1722,6 +1794,43 @@ async fn handle_process_complete(
             }
             metrics.jobs_completed.inc();
             metrics.jobs_processing.dec();
+
+            let job_data: Option<(String, Option<serde_json::Value>, Option<String>)> =
+                sqlx::query_as(
+                    "SELECT queue_name, result, completion_webhook FROM jobs WHERE id = $1 AND organization_id = $2",
+                )
+                .bind(&req.job_id)
+                .bind(org_id)
+                .fetch_optional(pool)
+                .await
+                .unwrap_or(None);
+            let (queue_name, result_payload, completion_webhook) =
+                job_data.unwrap_or_else(|| ("unknown".to_string(), None, None));
+
+            outgoing_webhooks.spawn_dispatch(
+                org_id.to_string(),
+                "job.completed".to_string(),
+                req.job_id.clone(),
+                serde_json::json!({
+                    "job_id": req.job_id,
+                    "queue_name": queue_name,
+                    "status": "completed",
+                    "result": result_payload,
+                }),
+            );
+            if let Some(url) = completion_webhook.filter(|u| !u.is_empty()) {
+                crate::outgoing_webhooks::service::spawn_completion_webhook(
+                    url,
+                    "job.completed".to_string(),
+                    serde_json::json!({
+                        "job_id": req.job_id,
+                        "queue_name": queue_name,
+                        "status": "completed",
+                        "result": result_payload,
+                    }),
+                );
+            }
+
             ProcessResponse {
                 response: Some(crate::grpc::proto::process_response::Response::Complete(
                     CompleteResponse { success: true },
@@ -1762,6 +1871,7 @@ async fn handle_process_complete(
 async fn handle_process_fail(
     pool: &PgPool,
     metrics: &Metrics,
+    outgoing_webhooks: &Arc<OutgoingWebhookService>,
     org_id: &str,
     api_key_id: &str,
     req: FailRequest,
@@ -1887,6 +1997,44 @@ async fn handle_process_fail(
             if update_result.new_status == "deadletter" {
                 metrics.jobs_deadlettered.inc();
             }
+
+            if update_result.new_status == "deadletter" || update_result.new_status == "failed" {
+                let job_data: Option<(String, Option<String>)> = sqlx::query_as(
+                    "SELECT queue_name, completion_webhook FROM jobs WHERE id = $1 AND organization_id = $2",
+                )
+                .bind(&req.job_id)
+                .bind(org_id)
+                .fetch_optional(pool)
+                .await
+                .unwrap_or(None);
+                let (queue_name, completion_webhook) =
+                    job_data.unwrap_or_else(|| ("unknown".to_string(), None));
+
+                outgoing_webhooks.spawn_dispatch(
+                    org_id.to_string(),
+                    "job.failed".to_string(),
+                    req.job_id.clone(),
+                    serde_json::json!({
+                        "job_id": req.job_id,
+                        "queue_name": queue_name,
+                        "status": update_result.new_status,
+                        "error": error_message,
+                    }),
+                );
+                if let Some(url) = completion_webhook.filter(|u| !u.is_empty()) {
+                    crate::outgoing_webhooks::service::spawn_completion_webhook(
+                        url,
+                        "job.failed".to_string(),
+                        serde_json::json!({
+                            "job_id": req.job_id,
+                            "queue_name": queue_name,
+                            "status": update_result.new_status,
+                            "error": error_message,
+                        }),
+                    );
+                }
+            }
+
             ProcessResponse {
                 response: Some(crate::grpc::proto::process_response::Response::Fail(
                     FailResponse {

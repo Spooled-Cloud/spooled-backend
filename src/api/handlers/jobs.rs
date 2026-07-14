@@ -920,9 +920,11 @@ pub async fn retry(
     .fetch_optional(state.db.pool())
     .await?
     .ok_or_else(|| {
-        AppError::Conflict(
-            "Job cannot be retried (not found or not in failed/deadletter state)".to_string(),
-        )
+        if before.is_none() {
+            AppError::NotFound("Job not found".to_string())
+        } else {
+            AppError::Conflict("Job cannot be retried (not in failed/deadletter state)".to_string())
+        }
     })?;
 
     state.metrics.jobs_retried.inc();
@@ -1294,6 +1296,26 @@ pub async fn bulk_enqueue(
                     )
                     .await;
                 }
+            }
+        }
+
+        for item in &succeeded {
+            if item.created {
+                let priority = priorities
+                    .get(item.index)
+                    .copied()
+                    .unwrap_or(default_priority);
+                state.outgoing_webhooks.spawn_dispatch(
+                    org_id.clone(),
+                    "job.created".to_string(),
+                    item.job_id.clone(),
+                    serde_json::json!({
+                        "job_id": item.job_id,
+                        "queue_name": request.queue_name,
+                        "priority": priority,
+                        "status": "pending",
+                    }),
+                );
             }
         }
     }

@@ -167,13 +167,20 @@ impl OutgoingWebhookService {
         let created_at: chrono::DateTime<Utc> = row.get("created_at");
         let attempts: i32 = row.get("attempts");
 
-        // Construct body (same as original)
-        let body = serde_json::json!({
-            "id": delivery_id,
-            "event": event,
-            "created_at": created_at,
-            "data": payload,
-        });
+        // Deliveries store the full signed envelope (`id`/`event`/`data`). Older
+        // rows may only have the inner `data` object — wrap those for retry.
+        let body = if payload.get("event").is_some() && payload.get("data").is_some() {
+            let mut envelope = payload;
+            envelope["id"] = serde_json::json!(delivery_id);
+            envelope
+        } else {
+            serde_json::json!({
+                "id": delivery_id,
+                "event": event,
+                "created_at": created_at,
+                "data": payload,
+            })
+        };
 
         self.try_deliver(&webhook, &body, attempts + 1).await
     }
@@ -272,16 +279,29 @@ impl OutgoingWebhookService {
             "failed"
         };
 
+        let delivery_id = request_payload
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
         sqlx::query(
             r#"
             INSERT INTO outgoing_webhook_deliveries (
-                webhook_id, event, status, payload, 
-                status_code, response_body, attempts, 
+                id, webhook_id, event, status, payload,
+                status_code, response_body, attempts,
                 created_at, delivered_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            ON CONFLICT (id) DO UPDATE SET
+                status = EXCLUDED.status,
+                status_code = EXCLUDED.status_code,
+                response_body = EXCLUDED.response_body,
+                attempts = EXCLUDED.attempts,
+                delivered_at = EXCLUDED.delivered_at
             "#,
         )
+        .bind(&delivery_id)
         .bind(webhook_id)
         .bind(request_payload["event"].as_str().unwrap_or("unknown"))
         .bind(status)

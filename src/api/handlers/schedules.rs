@@ -647,6 +647,19 @@ pub async fn trigger(
             "queue_name": schedule.queue_name,
         }),
     );
+    state.outgoing_webhooks.spawn_dispatch(
+        ctx.organization_id.clone(),
+        "job.created".to_string(),
+        job_id.clone(),
+        serde_json::json!({
+            "job_id": job_id,
+            "queue_name": schedule.queue_name,
+            "priority": schedule.priority,
+            "status": "pending",
+            "source": "schedule_trigger",
+            "schedule_id": id,
+        }),
+    );
 
     Ok(Json(TriggerResponse {
         job_id,
