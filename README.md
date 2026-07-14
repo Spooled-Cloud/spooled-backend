@@ -78,7 +78,9 @@ The stack:
 - self-bootstraps Prometheus scrape config + Grafana Prometheus datasource on start
 - needs no host shell access, PEM upload, Docker Swarm secret, or busybox init containers
 
-By default the backend follows `ghcr.io/spooled-cloud/spooled-backend:latest` and pulls on each deployment. Set `BACKEND_IMAGE` to an immutable tag/digest for controlled rollouts.
+By default the backend follows `ghcr.io/spooled-cloud/spooled-backend:latest` and pulls on each deployment. **Set `BACKEND_IMAGE` to an immutable tag/digest** for controlled rollouts (required on shared production hosts).
+
+On the Spooled production host, prefer durable WD `/opt/spooled/backend`. After Pull and redeploy, Portainer may delete `/data/compose/71/<sha>/` — run `scripts/heal-portainer-stack-files.sh` (installed as `/opt/spooled/backend/bin/heal-portainer-stack-files`). Full operator guide: [docs/guides/production-host-portainer.md](docs/guides/production-host-portainer.md).
 
 ### Environment Variables
 
@@ -93,8 +95,8 @@ By default the backend follows `ghcr.io/spooled-cloud/spooled-backend:latest` an
 | `PORT` | ❌ | `8080` | REST API server port |
 | `GRPC_PORT` | ❌ | `50051` | gRPC API server port |
 | `GRPC_TLS_ENABLED` | ❌ | `true` (prod) | Enable TLS for gRPC (required for Cloudflare Tunnel) |
-| `GRPC_TLS_CERT_PATH` | ❌ | `/certs/grpc-cert.pem` | Path to TLS certificate (PEM); production Compose configures its generated volume automatically |
-| `GRPC_TLS_KEY_PATH` | ❌ | `/certs/grpc-key.pem` | Path to TLS private key (PEM); production Compose configures its generated read-only volume automatically |
+| `GRPC_TLS_CERT_PATH` | ❌ | (Compose sets `/run/secrets/grpc-cert.pem`) | Path to TLS certificate (PEM); production Compose mounts the generated volume automatically |
+| `GRPC_TLS_KEY_PATH` | ❌ | (Compose sets `/run/secrets/grpc-key.pem`) | Path to TLS private key (PEM); production Compose mounts the generated volume read-only |
 | `METRICS_PORT` | ❌ | `9090` | Prometheus metrics port |
 | `METRICS_TOKEN` | ❌ | - | If set, requires `Authorization: Bearer <token>` for `/metrics` |
 
@@ -367,7 +369,7 @@ When using Cloudflare Tunnel with HTTPS origin, gRPC TLS is **required** because
 
 The production docker-compose includes:
 - **TLS enabled by default** (`GRPC_TLS_ENABLED=true`)
-- **Self-signed certificates** in `./certs/` (10-year validity)
+- **Automatic private self-signed origin cert** in Docker volume `grpc_tls` (generated/renewed by `grpc-tls-init`; not `./certs/` in Git or the image)
 - **Performance Optimized**: HTTP/2 keepalives, TCP_NODELAY, and tuned connection windows
 
 **Cloudflare Tunnel Configuration:**

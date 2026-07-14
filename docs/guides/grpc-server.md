@@ -61,9 +61,9 @@ The production Compose stack generates a private self-signed origin certificate 
 
 **Default setup (docker-compose.prod.yml):**
 - TLS is enabled by default
-- Certificate generation and renewal are automatic
-- The private key is stored outside Git and container images
-- `BACKEND_IMAGE` is optional; the stack follows `latest` by default
+- Certificate generation and renewal are automatic (`grpc-tls-init` stays Up/healthy after ensure; CI uses `GRPC_TLS_INIT_ONCE=1`)
+- The private key is stored outside Git and container images (volume `grpc_tls`)
+- Pin `BACKEND_IMAGE` to an immutable tag/digest on production hosts; default `latest` is only for casual/dev deploys
 
 #### Supplying Your Own Certificate
 

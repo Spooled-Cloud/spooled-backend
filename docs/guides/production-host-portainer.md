@@ -6,7 +6,7 @@ Operator guide for the live Spooled **backend** stack on the shared production h
 
 Portainer **Git → Pull and redeploy** (repull images) must work for `spooled-backend` the same way it does for other stacks. Day-to-day rollouts are UI clicks, not SSH.
 
-SSH helpers under `/opt/spooled/backend/bin/` remain for disaster recovery and host heals only.
+SSH helpers under `/opt/spooled/backend/bin/` remain for disaster recovery and host heals only. The heal script is also checked in as [`scripts/heal-portainer-stack-files.sh`](../../scripts/heal-portainer-stack-files.sh).
 
 **Newcomers / other hosts:** `docker-compose.prod.yml` is self-contained. gRPC TLS, Prometheus scrape config, and Grafana datasource provisioning bootstrap automatically — no busybox Exited (0) init containers and no extra files beyond the compose + `.env`. See [deployment.md](./deployment.md#zero-touch-init-self-host--portainer--single-file).
 
