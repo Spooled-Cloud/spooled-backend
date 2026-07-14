@@ -9,6 +9,8 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.100] - 2026-07-14
+
 ### Security
 
 - Block queue-scoped API keys from org control-plane actions: organization update/delete, members/usage, inbound webhook token read/rotate, billing portal, and outgoing webhook CRUD/test.

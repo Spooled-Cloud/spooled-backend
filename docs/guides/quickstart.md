@@ -124,7 +124,7 @@ cargo run
 
 You should see:
 ```
-INFO spooled_backend: Starting Spooled Backend v0.1.99
+INFO spooled_backend: Starting Spooled Backend v0.1.100
 INFO spooled_backend: Database connection pool established
 INFO spooled_backend: Database migrations completed
 INFO spooled_backend: Redis cache connected
