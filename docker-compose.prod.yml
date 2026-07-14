@@ -145,7 +145,7 @@ services:
         chown 1000:1000 /tls/grpc-cert.pem /tls/grpc-key.pem
         chmod 0444 /tls/grpc-cert.pem
         chmod 0400 /tls/grpc-key.pem
-        if [ "${GRPC_TLS_INIT_ONCE:-0}" = "1" ]; then
+        if [ "$${GRPC_TLS_INIT_ONCE:-0}" = "1" ]; then
           exit 0
         fi
         exec tail -f /dev/null
