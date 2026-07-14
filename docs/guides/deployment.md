@@ -245,9 +245,11 @@ volumes:
 
 ## Production host + Portainer
 
-Preferred prod rollout: Portainer Git **Pull and redeploy** for stack `spooled-backend` (compose project name must match). Keep live WD on durable `/opt/spooled/backend`. Image policy is **`:latest`** (compose default + host `.env`). Portainer often deletes `/data/compose/71/<sha>/` after Pull — heal with `bin/heal-portainer-stack-files` (repo: `scripts/heal-portainer-stack-files.sh`) and re-adopt from durable if labels point at a missing path.
+## Production host + Portainer
 
-Canonical operator guide (isolation, Pull path, heal explanation, recreate, CLI):
+Preferred rollout for many operators: Portainer Git **Pull and redeploy** with compose project / stack name `spooled-backend` and image **`:latest`** (compose default).
+
+Canonical public guide:
 
 → **[production-host-portainer.md](./production-host-portainer.md)**
 
@@ -258,11 +260,8 @@ Summary:
 | Compose project / stack name | `spooled-backend` |
 | Preferred UI action | Portainer **Pull and redeploy** |
 | Image | `ghcr.io/spooled-cloud/spooled-backend:latest` |
-| Live / durable path | `/opt/spooled/backend` |
-| Post-Pull heal | `sudo /opt/spooled/backend/bin/heal-portainer-stack-files` |
-| CLI fallback | `sudo /opt/spooled/backend/bin/deploy-backend` |
 
-**Isolation:** never run compose/`docker rm` against other host projects (`authentik`, `outlinewiki`, dashboard, SpriteForge, etc.). Never remove volumes when deleting/recreating the Portainer stack.
+**Isolation:** use a dedicated Compose project; never `down -v` unless you intend to wipe volumes; do not stop unrelated stacks on a shared Docker host.
 
 ### Zero-touch init (self-host / Portainer / single-file)
 

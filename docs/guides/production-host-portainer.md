@@ -1,155 +1,66 @@
-# Production host + Portainer (Spooled backend)
+# Deploying Spooled backend with Portainer
 
-Operator guide for the live Spooled **backend** stack on the shared production host.
+Public operator guide for self-hosters using [Portainer](https://www.portainer.io/) with the production Compose file.
 
-## Goal
+## Recommended setup
 
-Day-to-day rollouts are Portainer UI clicks: **Pull and redeploy** (repull images), same as other stacks. SSH is only for disaster recovery and heals.
+1. Create a **Git** stack (not Web editor) from this repository.
+2. Compose path: `docker-compose.prod.yml` (repo root).
+3. Branch: `main` (or the release branch you track).
+4. Set required secrets in the **stack environment** (see compose file header / `.env.example`). Do not commit real secrets.
+5. Image: leave unset or set  
+   `BACKEND_IMAGE=ghcr.io/spooled-cloud/spooled-backend:latest`  
+   The compose default is `:latest` with `pull_policy: always` so **Pull and redeploy** picks up new CI builds. Use a version tag or digest only for temporary rollback.
+6. Deploy, then use **Pull and redeploy** for updates (same as other Git stacks).
 
-**Newcomers / any host:** `docker-compose.prod.yml` is self-contained. One compose file + `.env` is enough. gRPC TLS and Prometheus/Grafana bootstrap automatically. See [deployment.md](./deployment.md#zero-touch-init-self-host--portainer--single-file).
+Git stacks in Portainer CE show **Git configuration** + **Pull and redeploy**, not the Web **Editor** tab. That is normal.
 
-## Image policy: `:latest` (intentional)
+## Zero-touch init
 
-This product’s Portainer workflow is **follow `latest`**.
-
-| Setting | Value |
-|---------|--------|
-| Default in compose | `BACKEND_IMAGE=ghcr.io/spooled-cloud/spooled-backend:latest` |
-| Host `/opt/spooled/backend/.env` + `.env.image` | `BACKEND_IMAGE=ghcr.io/spooled-cloud/spooled-backend:latest` |
-| Portainer stack env | Use the same, or omit `BACKEND_IMAGE` (compose default is `:latest`) |
-| `pull_policy` | `always` on the backend service — every Pull and redeploy re-pulls |
-
-CI on `main` publishes multi-arch `latest`. Clicking **Pull and redeploy** is how you pick up new builds.
-
-Optional: set `BACKEND_IMAGE` to a version tag or `@sha256:…` only for a temporary rollback. That is not the normal path.
-
-## Why there is no Editor tab
-
-This stack is a **Git** stack. Portainer CE Git stacks show **Git configuration** + **Pull and redeploy**, not Web **Editor**. Normal. Keep Git + Pull and redeploy.
-
-## Layout
-
-| Item | Value |
-|------|--------|
-| Portainer stack / Compose project | **`spooled-backend`** |
-| Preferred live WD | `/opt/spooled/backend` (durable) |
-| Portainer stack id (this host) | `71` → `/data/compose/71/<git-sha>/` (often wiped or symlinked → durable) |
-| Compose file | `docker-compose.prod.yml` (repo root) |
-| Secrets | `/opt/spooled/backend/.env` (mode `600`) |
-| Image | `BACKEND_IMAGE=…:latest` (see above) |
-| Heal script | `/opt/spooled/backend/bin/heal-portainer-stack-files` (repo: [`scripts/heal-portainer-stack-files.sh`](../../scripts/heal-portainer-stack-files.sh)) |
-
-Dashboard: `/opt/spooled/dashboard`, project `spooled-dashboard`. SpriteForge separate. Do not mix.
-
-## What “heal” means (and when you need it)
-
-### The problem
-
-Portainer Git stacks clone the repo into something like:
-
-`/data/compose/71/<git-commit-sha>/`
-
-On **Pull and redeploy**, Portainer:
-
-1. Pulls a new commit into a **new** sha directory
-2. Runs `docker compose up`
-3. Often **deletes or empties** the old (and sometimes the new) checkout afterward
-
-Containers keep running (env came from Portainer stack env / last compose). But Docker labels may still say:
-
-`com.docker.compose.project.working_dir=/data/compose/71/<old-or-new-sha>`
-
-If that path is **gone**, Portainer UI shows errors like **Unable to retrieve stack file: docker-compose.prod.yml**. Looks scary; API may still be healthy.
-
-### What the heal script does
-
-`heal-portainer-stack-files` (stack **71** / Spooled backend **only**):
-
-1. If the running `spooled_backend` container labels a WD that **does not exist**, symlink that path → `/opt/spooled/backend`
-2. For empty leftover sha dirs under `/data/compose/71/`, link `docker-compose.prod.yml` and `.env` to the durable copies
-3. Ensure `/data/compose/71/spooled-backend` → durable
-
-It does **not** touch other stacks (`authentik`, `outlinewiki`, dashboard, …). It does **not** delete volumes.
-
-### When to run it
-
-```bash
-ssh opc@<prod-host>
-sudo /opt/spooled/backend/bin/heal-portainer-stack-files
-```
-
-Run after Pull and redeploy if:
-
-- Portainer cannot open/retrieve `docker-compose.prod.yml`
-- `docker inspect spooled_backend` shows a `working_dir` that `ls` says is missing
-
-If containers are unhealthy or WD is still wrong after heal:
-
-```bash
-cd /opt/spooled/backend
-sudo ./bin/compose up -d
-```
-
-That re-adopts the project onto the durable directory (labels → `/opt/spooled/backend`).
-
-## Host isolation (mandatory)
-
-**Allowed:** project `spooled-backend` only; paths `/data/compose/71/**` and `/opt/spooled/backend/**`.
-
-**Forbidden:** compose without `-p spooled-backend`; `down -v` / Remove volumes; host-wide stop/rm; other stack trees; changing dashboard/SpriteForge while doing backend work.
-
-## Normal rollout: Pull and redeploy
-
-1. Portainer → this host’s agent env → **Stacks** → **`spooled-backend`**
-2. Git: `https://github.com/Spooled-Cloud/spooled-backend.git`, compose `docker-compose.prod.yml`, branch `main`
-3. Stack env: secrets from durable `.env`; **`BACKEND_IMAGE=ghcr.io/spooled-cloud/spooled-backend:latest`** (or omit)
-4. **Pull and redeploy**
-5. Wait healthy
-6. Verify:
-   - `GET https://api.spooled.cloud/health` → 200
-   - Authenticated `GET /api/v1/dashboard` → `system.version` + fresh `uptime_seconds`
-7. If UI cannot retrieve compose → run heal (above)
-
-## Zero-touch init (no scary Exited 0)
+`docker-compose.prod.yml` is self-contained (single-file download works):
 
 | Concern | Behavior |
 |---------|----------|
-| gRPC TLS | `grpc-tls-init` writes/renews certs into volume `grpc_tls`, stays **Up/healthy** (`tail -f`). CI uses `GRPC_TLS_INIT_ONCE=1` for one-shot exit. |
-| Prometheus | Writes scrape config on start, then runs Prometheus. |
-| Grafana | Writes datasource provisioning on start, then runs Grafana. |
+| gRPC origin TLS | Helper writes/renews certs into volume `grpc_tls`, then stays **Up/healthy**. For CI one-shot checks set `GRPC_TLS_INIT_ONCE=1`. |
+| Prometheus | Writes scrape config on start, then runs. |
+| Grafana | Writes datasource provisioning on start, then runs. |
 
-No busybox one-shot containers. Single-file `curl` of compose still works.
+No busybox one-shot “Exited (0)” init containers are required.
 
-## Safe recreate (only if Pull stays broken)
+## Portainer Git working directories
 
-**Warning:** Delete stack with **Remove volumes = OFF**. Volumes on = wipe DB/Redis.
+Portainer clones Git stacks under its data directory (path varies by install), often including a commit SHA segment. After **Pull and redeploy**, some installs empty or remove that checkout while containers keep running. If the UI then says it cannot retrieve `docker-compose.prod.yml`:
 
-1. Confirm `docker volume ls | grep '^spooled-backend_'`
-2. Delete stack `spooled-backend`, volumes off
-3. Recreate Git stack, name exactly `spooled-backend`, compose `docker-compose.prod.yml`
-4. Env from `/opt/spooled/backend/.env`; image `:latest`
-5. Deploy; verify health + authenticated dashboard
+- Confirm containers are still healthy (`docker ps`, public `/health`, authenticated dashboard if you use one).
+- Point the stack at a **stable host directory** you control (bind/relative path or Web editor paste), **or** recreate the Git stack carefully (see below).
+- Prefer keeping secrets only in Portainer stack env (or a host `.env` outside Git), never in the public repo.
 
-## Disaster-recovery CLI
+Do not publish host-specific SSH targets, private IPs, or internal stack IDs in shared docs.
 
-```bash
-ssh opc@<prod-host>
-# Image follows latest by default in .env / .env.image
-sudo /opt/spooled/backend/bin/deploy-backend
-```
+## Safe recreate
 
-Wrappers hard-code `-p spooled-backend` and refuse `down -v`.
+If the Git stack metadata is corrupt:
 
-## Name-conflict error
+1. Confirm named volumes for your project still exist.
+2. Delete the stack with **Remove volumes = OFF** (volumes on destroys Postgres/Redis data).
+3. Recreate with the **same stack/project name** so volume names reuse.
+4. Restore env vars; image `:latest` unless rolling back.
+5. Verify health and your application endpoints.
+
+## Isolation on shared Docker hosts
+
+Always pass an explicit Compose project name (this file expects operators to use a dedicated project such as `spooled-backend`). Never run `docker compose down -v` against a production data project unless you intend to wipe volumes. Do not stop or remove containers belonging to unrelated stacks on a shared machine.
+
+## Name conflict
 
 ```
 Conflict. The container name "/spooled_backend" is already in use
 ```
 
-Adopt back with durable compose (`./bin/compose up -d`). Never remove unrelated containers.
+Something owns that name outside the Compose project (often a one-off `docker run`). Adopt or remove **only** that container, then redeploy the stack. Never mass-delete unrelated containers.
 
-## Related docs
+## Related
 
-- [deployment.md](./deployment.md) — deploy options + zero-touch
+- [deployment.md](./deployment.md) — broader deploy options
 - [operations.md](./operations.md) — day-2 ops
-- Dashboard: `spooled-dashboard/docs/DEPLOYMENT.md` (`/opt/spooled/dashboard`)
+- Backend README — quick start + Portainer summary

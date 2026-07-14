@@ -454,7 +454,7 @@ Schedule with cron:
 
 ```bash
 # Daily at 2 AM
-0 2 * * * /opt/spooled/scripts/backup_database.sh >> /var/log/spooled/backup.log 2>&1
+0 2 * * * /usr/local/bin/spooled-backup-database.sh >> /var/log/spooled/backup.log 2>&1
 ```
 
 #### Point-in-Time Recovery (PITR)

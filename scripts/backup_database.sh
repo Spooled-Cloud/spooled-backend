@@ -12,7 +12,7 @@
 #   BACKUP_RETENTION   - Days to keep backups (default: 30)
 #
 # Schedule with cron:
-#   0 2 * * * /opt/spooled/scripts/backup_database.sh >> /var/log/spooled/backup.log 2>&1
+#   0 2 * * * /usr/local/bin/spooled-backup-database.sh >> /var/log/spooled/backup.log 2>&1
 
 set -euo pipefail
 

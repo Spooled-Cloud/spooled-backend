@@ -3,11 +3,9 @@
 # ===========================================
 #
 # Production host (shared machine): compose project name must be exactly
-#   `spooled-backend`. Preferred rollout is Portainer Git → Pull and redeploy.
-#   Live WD should be durable `/opt/spooled/backend` (Portainer often deletes
-#   `/data/compose/71/<sha>/` after deploy — heal with bin/heal-portainer-stack-files).
-#   Never run this compose project against other apps on the same host
-#   (authentik, outline, dashboard, spriteforge, …).
+#   `spooled-backend`. Preferred rollout is Portainer Git → Pull and redeploy
+#   with BACKEND_IMAGE defaulting to :latest. Never run this compose project
+#   against unrelated apps on a shared Docker host.
 #
 # Operator guide: docs/guides/production-host-portainer.md
 #

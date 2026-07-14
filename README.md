@@ -78,9 +78,9 @@ The stack:
 - self-bootstraps Prometheus scrape config + Grafana Prometheus datasource on start
 - needs no host shell access, PEM upload, Docker Swarm secret, or busybox init containers
 
-By default the backend follows `ghcr.io/spooled-cloud/spooled-backend:latest` and pulls on each deployment (`pull_policy: always`). **That is the intentional production path** for Portainer **Pull and redeploy**. Set `BACKEND_IMAGE` to a version tag or digest only for a temporary rollback.
+By default the backend follows `ghcr.io/spooled-cloud/spooled-backend:latest` and pulls on each deployment (`pull_policy: always`). **That is the intentional path** for Portainer **Pull and redeploy**. Set `BACKEND_IMAGE` to a version tag or digest only for a temporary rollback.
 
-On the Spooled production host, prefer durable WD `/opt/spooled/backend`. After Pull and redeploy, Portainer may delete `/data/compose/71/<sha>/` — run `scripts/heal-portainer-stack-files.sh` (installed as `/opt/spooled/backend/bin/heal-portainer-stack-files`). Full operator guide: [docs/guides/production-host-portainer.md](docs/guides/production-host-portainer.md).
+Portainer details (Git stacks, ephemeral checkouts, recreate): [docs/guides/production-host-portainer.md](docs/guides/production-host-portainer.md).
 
 ### Environment Variables
 
