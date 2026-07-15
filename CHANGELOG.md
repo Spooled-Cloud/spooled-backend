@@ -9,6 +9,12 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.106] - 2026-07-15
+
+### Fixed
+
+- **gRPC Enqueue `max_retries` default.** Omitted proto3 `max_retries` was stored as `0`, so the first failure deadlettered immediately. REST omit uses `QUEUE_DEFAULT_MAX_RETRIES` (3). gRPC now treats `max_retries <= 0` as default `3`, matching the existing `timeout_seconds <= 0 → 300` pattern.
+
 ## [0.1.105] - 2026-07-14
 
 ### Fixed

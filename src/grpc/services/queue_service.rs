@@ -395,7 +395,14 @@ impl QueueService for QueueServiceImpl {
         .bind(status)
         .bind(&payload)
         .bind(req.priority)
-        .bind(req.max_retries.max(0))
+        // proto3 int32 is 0 when the field is omitted; treat 0 as "use the REST
+        // default" (3) instead of "no retries", which deadletters on first fail.
+        // Same tradeoff as timeout_seconds below — explicit zero is not expressible.
+        .bind(if req.max_retries <= 0 {
+            3
+        } else {
+            req.max_retries.clamp(1, 100)
+        })
         // proto3 int32 is 0 when the field is omitted; treat 0 as "use the
         // default" (300s, matching the REST handler) instead of clamping to a
         // 1-second budget that deadletters any job taking longer than a second.
