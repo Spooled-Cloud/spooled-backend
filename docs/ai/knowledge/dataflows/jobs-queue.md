@@ -6,7 +6,7 @@
 2. Job row `pending` with priority, payload, `max_retries`, `timeout_seconds`, optional `idempotency_key`.
 3. **Claim / Dequeue** — worker claims via REST claim or gRPC `Dequeue` → `running` + lease.
 4. **Complete** or **Fail** — fail increments `retry_count`; if `retry_count >= max_retries` → `deadletter` (+ DLQ audit insert on relevant paths).
-5. **Lease recovery** — Scheduler `recover_expired_leases` (~10s) requeues or deadletters exhausted leases.
+5. **Lease recovery** — Scheduler `recover_expired_leases` (~10s) requeues (`retry_count < max_retries`) or deadletters exhausted leases. Both sweeps use `lease_expires_at <= NOW()` so the expiry instant is owned by recovery (worker ops require `>`).
 
 ## Defaults (verified)
 

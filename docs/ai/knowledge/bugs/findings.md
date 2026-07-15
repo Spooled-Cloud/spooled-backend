@@ -25,6 +25,7 @@ Cartography + fix pass: 2026-07-15. Only code-verified items. No amount/formula 
 | BE-17 | P3 | ~~`GET /jobs?queue=` silently ignored~~ **FIXED + live** (Portainer tip Pull 2026-07-15 ~02:39Z) — `serde(alias = "queue")` | `src/models/job.rs` `ListJobsQuery` | Clients using short `queue` param | Unfiltered list (looks like filter broken) | Alias + keep OpenAPI `queue_name` |
 | BE-18 | P2 | ~~`GET /jobs/stats` ignored `queue_name`~~ **FIXED + live** (Portainer tip Pull 2026-07-15 ~02:59Z) | `handlers/jobs.rs` `stats` | Client passes queue filter | Always org totals | Bind `JobStatsQuery` + SQL filter |
 | BE-19 | P2 | Stripe signed replay/ordering coverage was unit-only — **mitigated** with docker fixture tests | `tests/stripe_webhook_tests.rs`; `billing.rs` verify/claim/order | Valid-sig replay / out-of-order | Stale plan restore risk | Keep docker-tests green; residual same-second `<=` + no live resend |
+| BE-20 | P2 | ~~Deadletter sweep used `< NOW()` while reclaim used `<=`~~ **FIXED 0.1.108** | `scheduler/mod.rs` deadletter CTE; `queue/mod.rs` `recover_expired_leases` | Lease at exact expiry + `retry_count >= max_retries` | One-tick stuck in `processing` (neither complete nor DLQ) | Use `<=` on both paths |
 
 ## Live gap re-verify (2026-07-15 on `0.1.107`)
 

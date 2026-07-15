@@ -9,7 +9,13 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.108] - 2026-07-15
+
 ### Fixed
+
+- **Expired-lease deadletter boundary.** Scheduler deadletter sweep and `QueueManager::recover_expired_leases` now use `lease_expires_at <= NOW()`, matching the reclaim path. With `<`, a lease at the exact expiry tick was neither worker-usable nor deadletterable until the next tick.
+
+### Fixed (already on tip / prior)
 
 - `GET /api/v1/jobs` accepts `queue` as a serde alias for `queue_name` (canonical OpenAPI name unchanged).
 - `GET /api/v1/jobs/stats` honors optional `queue_name` / `queue` filter (previously org-wide only; query param was ignored).

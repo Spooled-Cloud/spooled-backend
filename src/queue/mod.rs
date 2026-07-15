@@ -1191,7 +1191,9 @@ impl QueueManager {
                 updated_at = NOW()
             WHERE
                 status = 'processing'
-                AND lease_expires_at < NOW()
+                -- `<=` matches scheduler reclaim/deadletter: expiry instant is
+                -- owned by recovery, not left in a neither-usable-nor-reclaimable gap.
+                AND lease_expires_at <= NOW()
             "#,
         )
         .execute(&*self.db)

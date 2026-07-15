@@ -224,7 +224,11 @@ impl Scheduler {
                     updated_at = NOW()
                 WHERE
                     status = 'processing'
-                    AND lease_expires_at < NOW()
+                    -- Match reclaim path: `<=` so the expiry boundary is owned by
+                    -- recovery. Worker ops require `lease_expires_at > NOW()`, so at
+                    -- exactly NOW() an exhausted lease is neither usable nor (with
+                    -- `<`) deadletterable — a one-tick stuck window.
+                    AND lease_expires_at <= NOW()
                     AND retry_count >= max_retries
                 RETURNING id, organization_id, queue_name, payload, retry_count
             )

@@ -1060,11 +1060,12 @@ async fn test_lease_recovery_respects_max_retries() {
     .expect("Failed to create job that can retry");
 
     // Simulate lease recovery: jobs below max_retries go back to pending
+    // (`<=` matches production scheduler — expiry instant owned by reclaim)
     sqlx::query(
         r#"
         UPDATE jobs
         SET status = 'pending', retry_count = retry_count + 1
-        WHERE status = 'processing' AND lease_expires_at < NOW() AND retry_count < max_retries
+        WHERE status = 'processing' AND lease_expires_at <= NOW() AND retry_count < max_retries
         "#,
     )
     .execute(db.pool())
@@ -1076,7 +1077,7 @@ async fn test_lease_recovery_respects_max_retries() {
         r#"
         UPDATE jobs
         SET status = 'deadletter'
-        WHERE status = 'processing' AND lease_expires_at < NOW() AND retry_count >= max_retries
+        WHERE status = 'processing' AND lease_expires_at <= NOW() AND retry_count >= max_retries
         "#,
     )
     .execute(db.pool())
