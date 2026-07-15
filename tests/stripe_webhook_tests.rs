@@ -104,9 +104,13 @@ async fn test_stripe_signed_replay_same_event_id_is_noop() {
     let body = subscription_event("evt_replay_1", 1_700_000_200, customer_id, "active");
     let headers = signed_headers(&body);
 
-    let first = webhook(State(state.clone()), headers.clone(), Bytes::from(body.clone()))
-        .await
-        .expect("first delivery");
+    let first = webhook(
+        State(state.clone()),
+        headers.clone(),
+        Bytes::from(body.clone()),
+    )
+    .await
+    .expect("first delivery");
     assert_eq!(first, StatusCode::OK);
 
     let claimed: (i64,) =
@@ -194,7 +198,10 @@ async fn test_stripe_older_event_rejected_by_ordering_guard() {
         Some("active"),
         "stale canceled must not overwrite newer active"
     );
-    assert_eq!(after.1, "starter", "plan_tier must not drop to free from stale cancel");
+    assert_eq!(
+        after.1, "starter",
+        "plan_tier must not drop to free from stale cancel"
+    );
 
     // Older event was still claimed (handled + success no-op) so Stripe won't retry forever.
     let claimed: (i64,) =
@@ -219,9 +226,13 @@ async fn test_stripe_handler_error_releases_event_claim() {
         "active",
     );
     let headers = signed_headers(&body);
-    let err = webhook(State(state.clone()), headers.clone(), Bytes::from(body.clone()))
-        .await
-        .expect_err("unlinked recent subscription should 5xx");
+    let err = webhook(
+        State(state.clone()),
+        headers.clone(),
+        Bytes::from(body.clone()),
+    )
+    .await
+    .expect_err("unlinked recent subscription should 5xx");
     let _ = err;
 
     let claimed: (i64,) =

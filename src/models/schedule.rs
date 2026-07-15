@@ -848,7 +848,10 @@ mod tests {
             .next_run_after_in_timezone(first, "Europe/Kyiv")
             .unwrap();
         // Skip repeated 01:30 UTC; next is Oct 26 03:30 EET = 01:30 UTC
-        assert_eq!(second, Utc.with_ymd_and_hms(2026, 10, 26, 1, 30, 0).unwrap());
+        assert_eq!(
+            second,
+            Utc.with_ymd_and_hms(2026, 10, 26, 1, 30, 0).unwrap()
+        );
     }
 
     #[test]

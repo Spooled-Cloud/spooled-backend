@@ -24,8 +24,7 @@ use crate::models::ApiKeyContext;
 use crate::models::{
     ClaimJobsRequest, ClaimJobsResponse, ClaimedJob, CompleteJobRequest, CreateJobRequest,
     CreateJobResponse, FailJobRequest, HeartbeatJobRequest, Job, JobStats, JobStatsQuery,
-    JobSummary,
-    ListJobsQuery,
+    JobSummary, ListJobsQuery,
 };
 use crate::queue::{QueueManager, WorkerOpOutcome};
 use axum::extract::Extension;
