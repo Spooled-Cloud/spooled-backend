@@ -672,12 +672,13 @@ impl QueueService for QueueServiceImpl {
 
         info!(job_id = %req.job_id, "Job completed via gRPC");
 
-        let job_data: Option<(
+        type CompletionJobRow = (
             String,
             Option<serde_json::Value>,
             Option<String>,
             Option<String>,
-        )> = sqlx::query_as(
+        );
+        let job_data: Option<CompletionJobRow> = sqlx::query_as(
             "SELECT queue_name, result, completion_webhook, completion_webhook_secret FROM jobs WHERE id = $1 AND organization_id = $2",
         )
         .bind(&req.job_id)
@@ -1833,12 +1834,13 @@ async fn handle_process_complete(
             metrics.jobs_completed.inc();
             metrics.jobs_processing.dec();
 
-            let job_data: Option<(
+            type CompletionJobRow = (
                 String,
                 Option<serde_json::Value>,
                 Option<String>,
                 Option<String>,
-            )> = sqlx::query_as(
+            );
+            let job_data: Option<CompletionJobRow> = sqlx::query_as(
                 "SELECT queue_name, result, completion_webhook, completion_webhook_secret FROM jobs WHERE id = $1 AND organization_id = $2",
             )
             .bind(&req.job_id)

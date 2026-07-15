@@ -537,12 +537,13 @@ pub async fn complete(
     state.metrics.jobs_completed.inc();
 
     // Fetch job fields once for realtime + org webhooks + per-job completion_webhook.
-    let job_data: Option<(
+    type CompletionJobRow = (
         String,
         Option<serde_json::Value>,
         Option<String>,
         Option<String>,
-    )> = sqlx::query_as(
+    );
+    let job_data: Option<CompletionJobRow> = sqlx::query_as(
         "SELECT queue_name, result, completion_webhook, completion_webhook_secret FROM jobs WHERE id = $1 AND organization_id = $2",
     )
     .bind(&id)
@@ -649,7 +650,8 @@ pub async fn fail(
     state.metrics.jobs_processing.dec();
 
     // Best-effort realtime publish (status after fail may be pending (retry), failed, or deadletter)
-    let updated: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+    type FailJobRow = (String, String, Option<String>, Option<String>);
+    let updated: Option<FailJobRow> = sqlx::query_as(
         "SELECT status, queue_name, completion_webhook, completion_webhook_secret FROM jobs WHERE id = $1 AND organization_id = $2",
     )
     .bind(&id)
