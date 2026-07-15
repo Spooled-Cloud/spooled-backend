@@ -25,7 +25,7 @@ Cartography + fix pass: 2026-07-15. Only code-verified items. No amount/formula 
 
 ## P0
 
-None proven this cartography pass against current `0.1.106`.
+None proven this cartography pass against current `0.1.107` (open items remain below).
 
 ## Machine-readable
 
