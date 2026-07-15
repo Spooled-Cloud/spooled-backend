@@ -9,6 +9,14 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- `GET /api/v1/jobs` accepts `queue` as a serde alias for `queue_name` (canonical OpenAPI name unchanged).
+
+### Tests
+
+- DST spring-forward gap skip; Europe/Kyiv EET/EEST + fall-back no double-fire (`models/schedule.rs`).
+
 ## [0.1.107] - 2026-07-15
 
 ### Fixed

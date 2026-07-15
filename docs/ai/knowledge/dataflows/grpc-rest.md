@@ -18,7 +18,7 @@ REST and gRPC both read `QUEUE_DEFAULT_*` from settings when the client omits va
 
 ## Streaming
 
-`StreamJobs` / `ProcessJobs` exist on QueueService. Long-lived streaming under load remains residual operational risk (workspace boundary notes). Prefer bounded streams in tests.
+`StreamJobs` / `ProcessJobs` exist on QueueService. Live consume re-verified 2026-07-15 on `0.1.107` (bounded): ProcessJobs dequeue→complete ×5 + stale double-complete rejected; StreamJobs drained ×2. Long-lived streaming under load remains residual operational risk. Prefer bounded streams in tests.
 
 ## Proto JSON
 

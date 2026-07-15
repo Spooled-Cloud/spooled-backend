@@ -794,6 +794,64 @@ mod tests {
     }
 
     #[test]
+    fn test_next_run_skips_dst_spring_forward_gap() {
+        // US DST starts 2026-03-08 02:00 local: clocks jump 02:00 -> 03:00, so
+        // 02:30 never exists that day. After the Mar 7 02:30 fire, next must be
+        // Mar 9 02:30 EDT (06:30 UTC), not a phantom Mar 8 instant.
+        let schedule = CronSchedule::parse("0 30 2 * * *").unwrap();
+        let start = Utc.with_ymd_and_hms(2026, 3, 7, 0, 0, 0).unwrap();
+        let first = schedule
+            .next_run_after_in_timezone(start, "America/New_York")
+            .unwrap();
+        assert_eq!(first, Utc.with_ymd_and_hms(2026, 3, 7, 7, 30, 0).unwrap());
+        let second = schedule
+            .next_run_after_in_timezone(first, "America/New_York")
+            .unwrap();
+        assert_eq!(second, Utc.with_ymd_and_hms(2026, 3, 9, 6, 30, 0).unwrap());
+    }
+
+    #[test]
+    fn test_next_run_europe_kyiv_eet_eest() {
+        // IANA Europe/Kyiv still observes DST in 2026 (EET UTC+2 winter /
+        // EEST UTC+3 summer). Parliament voted to abolish DST but the law was
+        // not signed — tzdb keeps the transitions. 12:00 local → 10:00Z Jan,
+        // 09:00Z Jul.
+        let schedule = CronSchedule::parse("0 0 12 * * *").unwrap();
+        let winter = Utc.with_ymd_and_hms(2026, 1, 15, 0, 0, 0).unwrap();
+        let summer = Utc.with_ymd_and_hms(2026, 7, 15, 0, 0, 0).unwrap();
+        assert_eq!(
+            schedule
+                .next_run_after_in_timezone(winter, "Europe/Kyiv")
+                .unwrap(),
+            Utc.with_ymd_and_hms(2026, 1, 15, 10, 0, 0).unwrap()
+        );
+        assert_eq!(
+            schedule
+                .next_run_after_in_timezone(summer, "Europe/Kyiv")
+                .unwrap(),
+            Utc.with_ymd_and_hms(2026, 7, 15, 9, 0, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_next_run_europe_kyiv_no_double_fire_on_dst_fall_back() {
+        // Kyiv DST ends 2026-10-25 04:00 EEST -> 03:00 EET. 03:30 local occurs
+        // twice; daily 03:30 must fire once.
+        let schedule = CronSchedule::parse("0 30 3 * * *").unwrap();
+        let start = Utc.with_ymd_and_hms(2026, 10, 24, 12, 0, 0).unwrap();
+        let first = schedule
+            .next_run_after_in_timezone(start, "Europe/Kyiv")
+            .unwrap();
+        // 03:30 EEST on Oct 25 = 00:30 UTC
+        assert_eq!(first, Utc.with_ymd_and_hms(2026, 10, 25, 0, 30, 0).unwrap());
+        let second = schedule
+            .next_run_after_in_timezone(first, "Europe/Kyiv")
+            .unwrap();
+        // Skip repeated 01:30 UTC; next is Oct 26 03:30 EET = 01:30 UTC
+        assert_eq!(second, Utc.with_ymd_and_hms(2026, 10, 26, 1, 30, 0).unwrap());
+    }
+
+    #[test]
     fn test_next_run_sparse_yearly_schedule_resolves() {
         // Once-a-year schedule must resolve without exhausting the iteration cap.
         let schedule = CronSchedule::parse("0 0 0 1 1 *").unwrap(); // Jan 1 00:00

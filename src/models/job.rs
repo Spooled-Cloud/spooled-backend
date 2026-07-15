@@ -422,7 +422,8 @@ pub const ALLOWED_ORDER_BY_FIELDS: &[&str] = &[
 ///
 #[derive(Debug, Deserialize, Default)]
 pub struct ListJobsQuery {
-    /// Filter by queue name
+    /// Filter by queue name (`queue_name` canonical; `queue` accepted as alias).
+    #[serde(alias = "queue")]
     pub queue_name: Option<String>,
     /// Filter by status
     pub status: Option<String>,
@@ -935,5 +936,16 @@ mod tests {
             + stats.deadletter
             + stats.cancelled;
         assert_eq!(calculated_total, stats.total);
+    }
+
+    #[test]
+    fn test_list_jobs_query_accepts_queue_alias() {
+        // Canonical OpenAPI name is queue_name; short `queue` is a common client footgun.
+        let via_alias: ListJobsQuery =
+            serde_json::from_value(serde_json::json!({ "queue": "emails" })).unwrap();
+        assert_eq!(via_alias.queue_name.as_deref(), Some("emails"));
+        let via_canonical: ListJobsQuery =
+            serde_json::from_value(serde_json::json!({ "queue_name": "billing" })).unwrap();
+        assert_eq!(via_canonical.queue_name.as_deref(), Some("billing"));
     }
 }

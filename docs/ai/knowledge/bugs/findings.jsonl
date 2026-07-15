@@ -14,3 +14,4 @@
 {"id": "BE-14", "sev": "P3", "summary": "retention SQL ignores some plan env windows", "path": "src/scheduler/mod.rs", "lines": "1010-1017", "status": "open"}
 {"id": "BE-15", "sev": "P3", "summary": "outgoing webhook retry uuid/text bind", "path": "src/api/handlers/outgoing_webhooks.rs", "lines": "504-513", "status": "open"}
 {"id": "BE-16", "sev": "P3", "summary": "hand OpenAPI drift risk", "path": "docs/openapi.yaml", "lines": "1", "status": "open"}
+{"id":"BE-17","sev":"P3","summary":"GET /jobs?queue= silently ignored; alias queue accepted","path":"src/models/job.rs","status":"fixed","note":"serde alias queue on ListJobsQuery; live footgun 2026-07-15"}
