@@ -500,16 +500,16 @@ pub async fn retry_delivery(
     Extension(ctx): Extension<ApiKeyContext>,
     Path((webhook_id, delivery_id)): Path<(String, String)>,
 ) -> AppResult<Json<RetryDeliveryResponse>> {
-    // Parse UUIDs
-    let webhook_uuid = Uuid::parse_str(&webhook_id)
+    // Validate UUID shape, but bind as TEXT — columns are TEXT PKs (BE-15).
+    Uuid::parse_str(&webhook_id)
         .map_err(|_| AppError::Validation("Invalid webhook ID format".to_string()))?;
-    let delivery_uuid = Uuid::parse_str(&delivery_id)
+    Uuid::parse_str(&delivery_id)
         .map_err(|_| AppError::Validation("Invalid delivery ID format".to_string()))?;
 
     // Verify webhook belongs to organization
     let webhook: Option<OutgoingWebhook> =
         sqlx::query_as("SELECT * FROM outgoing_webhooks WHERE id = $1 AND organization_id = $2")
-            .bind(webhook_uuid)
+            .bind(&webhook_id)
             .bind(&ctx.organization_id)
             .fetch_optional(state.db.pool())
             .await?;
@@ -522,8 +522,8 @@ pub async fn retry_delivery(
     let delivery: Option<OutgoingWebhookDelivery> = sqlx::query_as(
         "SELECT * FROM outgoing_webhook_deliveries WHERE id = $1 AND webhook_id = $2",
     )
-    .bind(delivery_uuid)
-    .bind(webhook_uuid)
+    .bind(&delivery_id)
+    .bind(&webhook_id)
     .fetch_optional(state.db.pool())
     .await?;
 
@@ -560,8 +560,8 @@ pub async fn retry_delivery(
         WHERE id = $1 AND webhook_id = $2
         "#,
     )
-    .bind(delivery_uuid)
-    .bind(webhook_uuid)
+    .bind(&delivery_id)
+    .bind(&webhook_id)
     .execute(state.db.pool())
     .await?;
 

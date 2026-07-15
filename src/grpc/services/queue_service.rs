@@ -75,6 +75,8 @@ pub struct QueueServiceImpl {
     outgoing_webhooks: Arc<OutgoingWebhookService>,
     /// Shared with REST (`QUEUE_DEFAULT_*`) so omit/`<=0` proto3 zeros match.
     queue_defaults: QueueSettings,
+    /// Mirror REST `RATE_LIMIT_FAIL_CLOSED`.
+    rate_limit_fail_closed: bool,
 }
 
 impl QueueServiceImpl {
@@ -84,6 +86,7 @@ impl QueueServiceImpl {
         cache: Option<RedisCache>,
         outgoing_webhooks: Arc<OutgoingWebhookService>,
         queue_defaults: QueueSettings,
+        rate_limit_fail_closed: bool,
     ) -> Self {
         Self {
             pool,
@@ -91,6 +94,7 @@ impl QueueServiceImpl {
             cache,
             outgoing_webhooks,
             queue_defaults,
+            rate_limit_fail_closed,
         }
     }
 
@@ -118,7 +122,12 @@ impl QueueServiceImpl {
         api_key_per_minute: Option<i32>,
     ) -> Result<(), Status> {
         let Some(ref cache) = self.cache else {
-            // Redis is optional; if absent we can't reliably enforce distributed rate limits.
+            if self.rate_limit_fail_closed {
+                return Err(Status::resource_exhausted(
+                    "Rate limit unavailable (Redis not configured)",
+                ));
+            }
+            // Redis optional for self-host; can't enforce distributed rate limits.
             return Ok(());
         };
 
@@ -159,9 +168,8 @@ impl QueueServiceImpl {
             }
         };
 
-        // Org token bucket (plan rps/burst). Fail OPEN on a transient Redis error:
-        // a rate-limit backend blip must not reject a legitimate worker op
-        // (rate limiting is best-effort, not a correctness gate).
+        // Org token bucket (plan rps/burst). Default fail-open on Redis errors
+        // (self-host); `RATE_LIMIT_FAIL_CLOSED` denies for hosted SaaS.
         let bucket_key = format!("rate_limit:grpc:org:{}", org_id);
         match cache
             .check_token_bucket(&bucket_key, org_limits.rps, org_limits.burst)
@@ -172,12 +180,14 @@ impl QueueServiceImpl {
             }
             Ok(_) => {}
             Err(e) => {
+                if self.rate_limit_fail_closed {
+                    warn!(error = %e, org_id = %org_id, "Redis error during gRPC org rate limit — denying (fail-closed)");
+                    return Err(Status::resource_exhausted("Rate limit unavailable"));
+                }
                 warn!(error = %e, org_id = %org_id, "Redis error during gRPC org rate limit — allowing (fail-open)");
             }
         }
 
-        // Optional per-key override (requests per minute). Also fail-open on a
-        // transient Redis error rather than rejecting a legitimate worker op.
         if let Some(per_min) = api_key_per_minute {
             let per_min = per_min.max(1) as u32;
             let key = format!("rate_limit:grpc:api_key:{}", api_key_id);
@@ -187,6 +197,10 @@ impl QueueServiceImpl {
                 }
                 Ok(_) => {}
                 Err(e) => {
+                    if self.rate_limit_fail_closed {
+                        warn!(error = %e, api_key_id = %api_key_id, "Redis error during gRPC api-key rate limit — denying (fail-closed)");
+                        return Err(Status::resource_exhausted("Rate limit unavailable"));
+                    }
                     warn!(error = %e, api_key_id = %api_key_id, "Redis error during gRPC api-key rate limit — allowing (fail-open)");
                 }
             }
@@ -658,17 +672,21 @@ impl QueueService for QueueServiceImpl {
 
         info!(job_id = %req.job_id, "Job completed via gRPC");
 
-        let job_data: Option<(String, Option<serde_json::Value>, Option<String>)> =
-            sqlx::query_as(
-                "SELECT queue_name, result, completion_webhook FROM jobs WHERE id = $1 AND organization_id = $2",
-            )
-            .bind(&req.job_id)
-            .bind(&auth.organization_id)
-            .fetch_optional(self.pool.as_ref())
-            .await
-            .unwrap_or(None);
-        let (queue_name, result, completion_webhook) =
-            job_data.unwrap_or_else(|| ("unknown".to_string(), None, None));
+        let job_data: Option<(
+            String,
+            Option<serde_json::Value>,
+            Option<String>,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT queue_name, result, completion_webhook, completion_webhook_secret FROM jobs WHERE id = $1 AND organization_id = $2",
+        )
+        .bind(&req.job_id)
+        .bind(&auth.organization_id)
+        .fetch_optional(self.pool.as_ref())
+        .await
+        .unwrap_or(None);
+        let (queue_name, result, completion_webhook, completion_webhook_secret) =
+            job_data.unwrap_or_else(|| ("unknown".to_string(), None, None, None));
 
         self.outgoing_webhooks.spawn_dispatch(
             auth.organization_id.clone(),
@@ -691,6 +709,7 @@ impl QueueService for QueueServiceImpl {
                     "status": "completed",
                     "result": result,
                 }),
+                completion_webhook_secret.filter(|s| !s.is_empty()),
             );
         }
 
@@ -859,27 +878,29 @@ impl QueueService for QueueServiceImpl {
                 }),
             );
 
-            let completion_webhook: Option<String> = sqlx::query_scalar(
-                "SELECT completion_webhook FROM jobs WHERE id = $1 AND organization_id = $2",
+            let completion_meta: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+                "SELECT completion_webhook, completion_webhook_secret FROM jobs WHERE id = $1 AND organization_id = $2",
             )
             .bind(&req.job_id)
             .bind(&auth.organization_id)
             .fetch_optional(self.pool.as_ref())
             .await
             .ok()
-            .flatten()
             .flatten();
-            if let Some(url) = completion_webhook.filter(|u| !u.is_empty()) {
-                crate::outgoing_webhooks::service::spawn_completion_webhook(
-                    url,
-                    "job.failed".to_string(),
-                    serde_json::json!({
-                        "job_id": req.job_id,
-                        "queue_name": queue_name,
-                        "status": result.new_status,
-                        "error": error_message,
-                    }),
-                );
+            if let Some((url, secret)) = completion_meta {
+                if let Some(url) = url.filter(|u| !u.is_empty()) {
+                    crate::outgoing_webhooks::service::spawn_completion_webhook(
+                        url,
+                        "job.failed".to_string(),
+                        serde_json::json!({
+                            "job_id": req.job_id,
+                            "queue_name": queue_name,
+                            "status": result.new_status,
+                            "error": error_message,
+                        }),
+                        secret.filter(|s| !s.is_empty()),
+                    );
+                }
             }
         }
 
@@ -1812,17 +1833,21 @@ async fn handle_process_complete(
             metrics.jobs_completed.inc();
             metrics.jobs_processing.dec();
 
-            let job_data: Option<(String, Option<serde_json::Value>, Option<String>)> =
-                sqlx::query_as(
-                    "SELECT queue_name, result, completion_webhook FROM jobs WHERE id = $1 AND organization_id = $2",
-                )
-                .bind(&req.job_id)
-                .bind(org_id)
-                .fetch_optional(pool)
-                .await
-                .unwrap_or(None);
-            let (queue_name, result_payload, completion_webhook) =
-                job_data.unwrap_or_else(|| ("unknown".to_string(), None, None));
+            let job_data: Option<(
+                String,
+                Option<serde_json::Value>,
+                Option<String>,
+                Option<String>,
+            )> = sqlx::query_as(
+                "SELECT queue_name, result, completion_webhook, completion_webhook_secret FROM jobs WHERE id = $1 AND organization_id = $2",
+            )
+            .bind(&req.job_id)
+            .bind(org_id)
+            .fetch_optional(pool)
+            .await
+            .unwrap_or(None);
+            let (queue_name, result_payload, completion_webhook, completion_webhook_secret) =
+                job_data.unwrap_or_else(|| ("unknown".to_string(), None, None, None));
 
             outgoing_webhooks.spawn_dispatch(
                 org_id.to_string(),
@@ -1845,6 +1870,7 @@ async fn handle_process_complete(
                         "status": "completed",
                         "result": result_payload,
                     }),
+                    completion_webhook_secret.filter(|s| !s.is_empty()),
                 );
             }
 
@@ -2016,16 +2042,16 @@ async fn handle_process_fail(
             }
 
             if update_result.new_status == "deadletter" || update_result.new_status == "failed" {
-                let job_data: Option<(String, Option<String>)> = sqlx::query_as(
-                    "SELECT queue_name, completion_webhook FROM jobs WHERE id = $1 AND organization_id = $2",
+                let job_data: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+                    "SELECT queue_name, completion_webhook, completion_webhook_secret FROM jobs WHERE id = $1 AND organization_id = $2",
                 )
                 .bind(&req.job_id)
                 .bind(org_id)
                 .fetch_optional(pool)
                 .await
                 .unwrap_or(None);
-                let (queue_name, completion_webhook) =
-                    job_data.unwrap_or_else(|| ("unknown".to_string(), None));
+                let (queue_name, completion_webhook, completion_webhook_secret) =
+                    job_data.unwrap_or_else(|| ("unknown".to_string(), None, None));
 
                 outgoing_webhooks.spawn_dispatch(
                     org_id.to_string(),
@@ -2048,6 +2074,7 @@ async fn handle_process_fail(
                             "status": update_result.new_status,
                             "error": error_message,
                         }),
+                        completion_webhook_secret.filter(|s| !s.is_empty()),
                     );
                 }
             }

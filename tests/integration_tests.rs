@@ -2315,6 +2315,7 @@ async fn test_grpc_unary_transport_rejects_out_of_scope_settlement() {
             default_timeout_secs: 300,
             max_payload_size_bytes: 1024 * 1024,
         },
+        false,
     );
 
     let complete = service

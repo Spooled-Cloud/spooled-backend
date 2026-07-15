@@ -9,6 +9,17 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.109] - 2026-07-15
+
+### Added
+
+- Optional per-job `completion_webhook_secret` (REST create). When set, completion delivery signs with the same `X-Spooled-Timestamp` / `X-Spooled-Signature` HMAC as org outgoing webhooks. Unset → unsigned (backward compatible).
+- `RATE_LIMIT_FAIL_CLOSED` (default `false`). When `true`, Redis missing/errors return HTTP 429 / gRPC `RESOURCE_EXHAUSTED` instead of fail-open. Set `true` on hosted SaaS.
+
+### Fixed
+
+- **BE-15:** `POST /outgoing-webhooks/{id}/retry/{delivery_id}` binds TEXT path ids (was Uuid → Postgres type mismatch / 500).
+
 ## [0.1.108] - 2026-07-15
 
 ### Fixed

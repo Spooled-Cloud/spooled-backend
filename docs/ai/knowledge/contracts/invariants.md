@@ -9,4 +9,4 @@
 7. **Plan limits** gate enqueue/resources; changing `config/plans.rs` or env plan overrides is a money-path change — owner sign-off.
 8. **OpenAPI** is hand-maintained — update `docs/openapi.yaml` when changing public REST shapes.
 9. **Admin key** never logged; compare constant-time.
-10. **Outgoing webhook secrets** optional; completion_webhook URLs are unsigned — callers must not assume HMAC.
+10. **Outgoing webhook secrets** optional; per-job `completion_webhook` is unsigned unless `completion_webhook_secret` is set (then same HMAC as org webhooks).

@@ -361,9 +361,19 @@ fn sign_payload(secret: &str, timestamp: i64, payload_json: &str) -> Result<Stri
 }
 
 /// Deliver a per-job `completion_webhook` URL (best-effort, fire-and-forget).
-pub fn spawn_completion_webhook(url: String, event: String, payload: serde_json::Value) {
+///
+/// When `secret` is `Some` and non-empty, signs with the same HMAC scheme as org
+/// outgoing webhooks (`X-Spooled-Timestamp` + `X-Spooled-Signature`). Unsigned
+/// when secret is absent — backward compatible with existing receivers.
+pub fn spawn_completion_webhook(
+    url: String,
+    event: String,
+    payload: serde_json::Value,
+    secret: Option<String>,
+) {
     tokio::spawn(async move {
-        if let Err(e) = deliver_completion_webhook(&url, &event, &payload).await {
+        if let Err(e) = deliver_completion_webhook(&url, &event, &payload, secret.as_deref()).await
+        {
             warn!(error = %e, url = %url, event = %event, "completion_webhook delivery failed");
         }
     });
@@ -373,6 +383,7 @@ async fn deliver_completion_webhook(
     url: &str,
     event: &str,
     payload: &serde_json::Value,
+    secret: Option<&str>,
 ) -> Result<()> {
     let options = UrlValidationOptions::default();
     validate_url_ssrf(url, &options).map_err(|e| anyhow::anyhow!("Invalid webhook URL: {}", e))?;
@@ -387,15 +398,49 @@ async fn deliver_completion_webhook(
         "created_at": Utc::now(),
         "data": payload,
     });
-    let resp = client
+    let payload_json = serde_json::to_string(&body).unwrap_or_default();
+
+    let mut request_builder = client
         .post(url)
         .header("Content-Type", "application/json")
-        .header("X-Spooled-Event", event)
-        .json(&body)
-        .send()
-        .await?;
+        .header("X-Spooled-Event", event);
+
+    if let Some(secret) = secret.filter(|s| !s.is_empty()) {
+        let timestamp = Utc::now().timestamp();
+        let signature = sign_payload(secret, timestamp, &payload_json)?;
+        request_builder = request_builder
+            .header("X-Spooled-Timestamp", timestamp.to_string())
+            .header("X-Spooled-Signature", signature);
+    }
+
+    let resp = request_builder.body(payload_json).send().await?;
     if !resp.status().is_success() {
         anyhow::bail!("HTTP {}", resp.status());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sign_payload_matches_org_webhook_format() {
+        let sig = sign_payload("whsec_test", 1_700_000_000, r#"{"event":"job.completed"}"#)
+            .expect("sign");
+        assert!(sig.starts_with("sha256="));
+        assert_eq!(sig.len(), "sha256=".len() + 64);
+        let again = sign_payload("whsec_test", 1_700_000_000, r#"{"event":"job.completed"}"#)
+            .expect("sign again");
+        assert_eq!(sig, again);
+    }
+
+    #[test]
+    fn sign_payload_changes_with_secret_or_body() {
+        let a = sign_payload("a", 1, "{}").unwrap();
+        let b = sign_payload("b", 1, "{}").unwrap();
+        let c = sign_payload("a", 1, "{\"x\":1}").unwrap();
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+    }
 }

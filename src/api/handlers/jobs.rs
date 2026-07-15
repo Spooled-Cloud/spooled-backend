@@ -252,9 +252,9 @@ pub async fn create(
             id, organization_id, queue_name, status, payload, priority,
             max_retries, timeout_seconds, created_at, scheduled_at,
             idempotency_key, updated_at, tags, parent_job_id,
-            completion_webhook, expires_at, dependencies_met
+            completion_webhook, completion_webhook_secret, expires_at, dependencies_met
         )
-        VALUES ($1, $2, $3, $4, $5::JSONB, $6, $7, $8, $9, $10, $11, $9, $12::JSONB, $13, $14, $15, $16)
+        VALUES ($1, $2, $3, $4, $5::JSONB, $6, $7, $8, $9, $10, $11, $9, $12::JSONB, $13, $14, $15, $16, $17)
         ON CONFLICT (organization_id, idempotency_key)
         WHERE idempotency_key IS NOT NULL
         DO UPDATE SET updated_at = NOW()
@@ -280,6 +280,7 @@ pub async fn create(
     )
     .bind(&request.parent_job_id)
     .bind(&request.completion_webhook)
+    .bind(&request.completion_webhook_secret)
     .bind(request.expires_at)
     .bind(dependencies_met)
     .fetch_one(state.db.pool())
@@ -536,8 +537,13 @@ pub async fn complete(
     state.metrics.jobs_completed.inc();
 
     // Fetch job fields once for realtime + org webhooks + per-job completion_webhook.
-    let job_data: Option<(String, Option<serde_json::Value>, Option<String>)> = sqlx::query_as(
-        "SELECT queue_name, result, completion_webhook FROM jobs WHERE id = $1 AND organization_id = $2",
+    let job_data: Option<(
+        String,
+        Option<serde_json::Value>,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT queue_name, result, completion_webhook, completion_webhook_secret FROM jobs WHERE id = $1 AND organization_id = $2",
     )
     .bind(&id)
     .bind(&ctx.organization_id)
@@ -545,8 +551,8 @@ pub async fn complete(
     .await
     .unwrap_or(None);
 
-    let (queue_name, result, completion_webhook) =
-        job_data.unwrap_or_else(|| ("unknown".to_string(), None, None));
+    let (queue_name, result, completion_webhook, completion_webhook_secret) =
+        job_data.unwrap_or_else(|| ("unknown".to_string(), None, None, None));
 
     // Best-effort realtime publish
     if let Some(ref cache) = state.cache {
@@ -589,6 +595,7 @@ pub async fn complete(
                 "status": "completed",
                 "result": result,
             }),
+            completion_webhook_secret.filter(|s| !s.is_empty()),
         );
     }
 
@@ -642,8 +649,8 @@ pub async fn fail(
     state.metrics.jobs_processing.dec();
 
     // Best-effort realtime publish (status after fail may be pending (retry), failed, or deadletter)
-    let updated: Option<(String, String, Option<String>)> = sqlx::query_as(
-        "SELECT status, queue_name, completion_webhook FROM jobs WHERE id = $1 AND organization_id = $2",
+    let updated: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT status, queue_name, completion_webhook, completion_webhook_secret FROM jobs WHERE id = $1 AND organization_id = $2",
     )
     .bind(&id)
     .bind(&ctx.organization_id)
@@ -651,7 +658,7 @@ pub async fn fail(
     .await
     .unwrap_or(None);
 
-    if let Some((new_status, queue_name, completion_webhook)) = updated {
+    if let Some((new_status, queue_name, completion_webhook, completion_webhook_secret)) = updated {
         if let Some(ref cache) = state.cache {
             publish_realtime_event(
                 cache,
@@ -694,6 +701,7 @@ pub async fn fail(
                         "status": new_status,
                         "error": request.error,
                     }),
+                    completion_webhook_secret.filter(|s| !s.is_empty()),
                 );
             }
         }

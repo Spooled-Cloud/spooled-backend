@@ -141,11 +141,13 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs \
   -d '{
     "queue_name": "exports",
     "payload": {"user_id": 123},
-    "completion_webhook": "https://api.example.com/webhooks/export-complete"
+    "completion_webhook": "https://api.example.com/webhooks/export-complete",
+    "completion_webhook_secret": "whsec_optional_shared_secret"
   }'
 ```
 
-When job completes, Spooled POSTs to your URL:
+When job completes, Spooled POSTs to your URL. With `completion_webhook_secret` set, also sends
+`X-Spooled-Timestamp` and `X-Spooled-Signature` (`sha256=` HMAC of `{timestamp}.{rawBody}`), same as org outgoing webhooks. Without a secret, the callback is unsigned.
 
 ```json
 {

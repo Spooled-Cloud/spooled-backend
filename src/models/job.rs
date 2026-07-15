@@ -104,6 +104,9 @@ pub struct Job {
     pub parent_job_id: Option<String>,
     /// Webhook URL for completion notification
     pub completion_webhook: Option<String>,
+    /// Optional HMAC secret for `completion_webhook` (never serialized in API responses)
+    #[serde(skip_serializing)]
+    pub completion_webhook_secret: Option<String>,
     /// Assigned worker ID
     pub assigned_worker_id: Option<String>,
     /// Current lease ID
@@ -239,6 +242,14 @@ pub struct CreateJobRequest {
     /// Webhook URL for completion notification (optional)
     #[validate(custom(function = "validate_webhook_url"))]
     pub completion_webhook: Option<String>,
+
+    /// Optional HMAC secret for the completion webhook (same scheme as org outgoing webhooks).
+    /// When set, delivery includes `X-Spooled-Timestamp` + `X-Spooled-Signature`.
+    #[validate(length(
+        max = 255,
+        message = "Completion webhook secret must be at most 255 characters"
+    ))]
+    pub completion_webhook_secret: Option<String>,
 
     /// Idempotency key for deduplication (optional)
     #[validate(length(max = 255, message = "Idempotency key must be at most 255 characters"))]
@@ -769,6 +780,7 @@ mod tests {
             timeout_seconds: 300,
             parent_job_id: None,
             completion_webhook: None,
+            completion_webhook_secret: None,
             assigned_worker_id: None,
             lease_id: None,
             lease_expires_at: None,

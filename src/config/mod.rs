@@ -146,6 +146,9 @@ pub struct RateLimitSettings {
     pub requests_per_second: u32,
     /// Burst size for rate limiting
     pub burst_size: u32,
+    /// When true, Redis missing/errors deny with 429 (hosted SaaS).
+    /// When false (default), fail-open so self-host without Redis keeps working.
+    pub fail_closed_on_redis_error: bool,
 }
 
 /// Worker configuration
@@ -347,6 +350,9 @@ impl Settings {
                     .unwrap_or_else(|_| "200".to_string())
                     .parse()
                     .context("Invalid RATE_LIMIT_BURST_SIZE")?,
+                fail_closed_on_redis_error: env::var("RATE_LIMIT_FAIL_CLOSED")
+                    .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+                    .unwrap_or(false),
             },
             worker: WorkerSettings {
                 heartbeat_interval_secs: env::var("WORKER_HEARTBEAT_INTERVAL_SECS")
@@ -596,6 +602,7 @@ impl Settings {
             rate_limit: RateLimitSettings {
                 requests_per_second: 100,
                 burst_size: 200,
+                fail_closed_on_redis_error: false,
             },
             worker: WorkerSettings {
                 heartbeat_interval_secs: 10,

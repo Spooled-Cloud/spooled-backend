@@ -15,4 +15,4 @@ Note: `job.deadlettered` appears in legacy `src/webhook/` but is **not** in `VAL
 
 ## Per-job `completion_webhook`
 
-`spawn_completion_webhook` / `deliver_completion_webhook` — SSRF check + POST JSON with `X-Spooled-Event` only; **no HMAC signature** (`service.rs` ~372–400).
+`spawn_completion_webhook` / `deliver_completion_webhook` — SSRF check + POST JSON with `X-Spooled-Event`. When `completion_webhook_secret` is set on the job (REST create), also sends `X-Spooled-Timestamp` + `X-Spooled-Signature` (`sha256=` HMAC of `{ts}.{body}`) — same scheme as org outgoing webhooks. Absent secret → unsigned (backward compatible).

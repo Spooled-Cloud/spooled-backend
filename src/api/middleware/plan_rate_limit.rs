@@ -44,6 +44,22 @@ fn current_timestamp() -> u64 {
         .as_secs()
 }
 
+fn rate_limit_unavailable_response(retry_after_secs: u64) -> Response {
+    let body = RateLimitExceededResponse {
+        error: "Rate limit unavailable".to_string(),
+        code: "RATE_LIMIT_EXCEEDED".to_string(),
+        retry_after_secs,
+        limit: 0,
+        remaining: 0,
+        reset_at: current_timestamp() + retry_after_secs,
+    };
+    let mut res = (StatusCode::TOO_MANY_REQUESTS, axum::Json(body)).into_response();
+    if let Ok(v) = retry_after_secs.to_string().parse() {
+        res.headers_mut().insert("Retry-After", v);
+    }
+    res
+}
+
 /// Extract a best-effort client id for unauthenticated routes (IP-based).
 fn extract_client_id(request: &Request<Body>) -> String {
     // X-Forwarded-For (first IP) if present
@@ -119,9 +135,14 @@ pub async fn plan_rate_limit_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    // If Redis isn't configured, don't break self-hosted setups.
-    // (We still have other safety limits like request body size, quotas, etc.)
+    let fail_closed = state.settings.rate_limit.fail_closed_on_redis_error;
+
+    // If Redis isn't configured: self-host default allows; SaaS fail-closed denies.
     let Some(ref cache) = state.cache else {
+        if fail_closed {
+            warn!("Redis not configured; denying request (RATE_LIMIT_FAIL_CLOSED)");
+            return rate_limit_unavailable_response(5);
+        }
         return next.run(request).await;
     };
 
@@ -161,7 +182,15 @@ pub async fn plan_rate_limit_middleware(
                 }
             }
             Err(e) => {
-                warn!(error = %e, org_id = %ctx.organization_id, "Redis error during org rate limit check");
+                if fail_closed {
+                    warn!(
+                        error = %e,
+                        org_id = %ctx.organization_id,
+                        "Redis error during org rate limit check; denying (fail-closed)"
+                    );
+                    return rate_limit_unavailable_response(5);
+                }
+                warn!(error = %e, org_id = %ctx.organization_id, "Redis error during org rate limit check; allowing");
             }
         }
 
@@ -192,10 +221,18 @@ pub async fn plan_rate_limit_middleware(
                     }
                 }
                 Err(e) => {
+                    if fail_closed {
+                        warn!(
+                            error = %e,
+                            api_key_id = %ctx.api_key_id,
+                            "Redis error during api-key rate limit check; denying (fail-closed)"
+                        );
+                        return rate_limit_unavailable_response(5);
+                    }
                     warn!(
                         error = %e,
                         api_key_id = %ctx.api_key_id,
-                        "Redis error during api-key rate limit check"
+                        "Redis error during api-key rate limit check; allowing"
                     );
                 }
             }
@@ -231,6 +268,10 @@ pub async fn plan_rate_limit_middleware(
             }
         }
         Err(e) => {
+            if fail_closed {
+                warn!(error = %e, "Redis error during public rate limit check; denying (fail-closed)");
+                return rate_limit_unavailable_response(5);
+            }
             debug!(error = %e, "Redis error during public rate limit check; allowing request");
         }
     }
@@ -239,14 +280,19 @@ pub async fn plan_rate_limit_middleware(
 }
 
 /// Rate-limit admin routes by client IP (brute-force cushion).
-/// Uses Redis fixed-window when available; fail-open if Redis is missing/errors
-/// so self-hosted setups without Redis keep working.
+/// Uses Redis fixed-window when available; fail-open by default if Redis is
+/// missing/errors (self-host). Set `RATE_LIMIT_FAIL_CLOSED=true` for SaaS.
 pub async fn admin_rate_limit_middleware(
     State(state): State<AppState>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    let fail_closed = state.settings.rate_limit.fail_closed_on_redis_error;
     let Some(ref cache) = state.cache else {
+        if fail_closed {
+            warn!("Redis not configured; denying admin request (RATE_LIMIT_FAIL_CLOSED)");
+            return rate_limit_unavailable_response(5);
+        }
         return next.run(request).await;
     };
 
@@ -279,6 +325,10 @@ pub async fn admin_rate_limit_middleware(
             }
         }
         Err(e) => {
+            if fail_closed {
+                warn!(error = %e, "Redis error during admin rate limit check; denying (fail-closed)");
+                return rate_limit_unavailable_response(5);
+            }
             debug!(error = %e, "Redis error during admin rate limit check; allowing request");
         }
     }
