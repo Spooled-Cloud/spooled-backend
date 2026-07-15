@@ -15,4 +15,4 @@
 {"id": "BE-15", "sev": "P3", "summary": "outgoing webhook retry uuid/text bind", "path": "src/api/handlers/outgoing_webhooks.rs", "lines": "504-513", "status": "open"}
 {"id": "BE-16", "sev": "P3", "summary": "hand OpenAPI drift risk", "path": "docs/openapi.yaml", "lines": "1", "status": "open"}
 {"id":"BE-17","sev":"P3","summary":"GET /jobs?queue= silently ignored; alias queue accepted","path":"src/models/job.rs","status":"fixed","note":"serde alias queue on ListJobsQuery; live footgun 2026-07-15"}
-{"id":"BE-18","sev":"P2","summary":"GET /jobs/stats ignored queue_name query filter","path":"src/api/handlers/jobs.rs","status":"fixed","note":"JobStatsQuery + SQL filter; live repro 2026-07-15; needs Portainer Pull"}
+{"id": "BE-18","sev": "P2","summary": "GET /jobs/stats ignored queue_name query filter","path": "src/api/handlers/jobs.rs","status": "fixed","note": "JobStatsQuery + SQL filter; live verified 2026-07-15 ~02:59Z after Portainer tip Pull"}
