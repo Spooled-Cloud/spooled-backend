@@ -23,7 +23,8 @@ Cartography + fix pass: 2026-07-15. Only code-verified items. No amount/formula 
 | BE-15 | P3 | Outgoing webhook retry UUID/TEXT bind risk | `outgoing_webhooks.rs` ~504–513 | Retry delivery | 500s | Cast/bind as text |
 | BE-16 | P3 | OpenAPI hand drift risk | `docs/openapi.yaml` | API change without yaml | Client codegen lies | CI drift check or codegen |
 | BE-17 | P3 | ~~`GET /jobs?queue=` silently ignored~~ **FIXED + live** (Portainer tip Pull 2026-07-15 ~02:39Z) — `serde(alias = "queue")` | `src/models/job.rs` `ListJobsQuery` | Clients using short `queue` param | Unfiltered list (looks like filter broken) | Alias + keep OpenAPI `queue_name` |
-| BE-18 | P2 | ~~`GET /jobs/stats` ignored `queue_name`~~ **FIXED + live** (Portainer tip Pull 2026-07-15 ~02:59Z) | `handlers/jobs.rs` `stats` | Client passes queue filter | Always org totals | Bind `JobStatsQuery` + SQL `queue_name = $3` |
+| BE-18 | P2 | ~~`GET /jobs/stats` ignored `queue_name`~~ **FIXED + live** (Portainer tip Pull 2026-07-15 ~02:59Z) | `handlers/jobs.rs` `stats` | Client passes queue filter | Always org totals | Bind `JobStatsQuery` + SQL filter |
+| BE-19 | P2 | Stripe signed replay/ordering coverage was unit-only — **mitigated** with docker fixture tests | `tests/stripe_webhook_tests.rs`; `billing.rs` verify/claim/order | Valid-sig replay / out-of-order | Stale plan restore risk | Keep docker-tests green; residual same-second `<=` + no live resend |
 
 ## Live gap re-verify (2026-07-15 on `0.1.107`)
 
@@ -32,6 +33,7 @@ Cartography + fix pass: 2026-07-15. Only code-verified items. No amount/formula 
 | DST fall-back / spring-forward | Unit: NY fall-back once; spring-forward skips 02:30 gap; Kyiv EET/EEST (IANA still has DST) + Kyiv fall-back once. Live: Kyiv noon → `09:00Z` (Jul). |
 | Cron auto-fire + catch-up | Live: `*/1` auto-fired once; deactivate→125s past due→reactivate → `run_count=1` (skip-missed, run once). |
 | ProcessJobs + StreamJobs consume | Live Node: ProcessJobs drained 5/5; double-complete → `NOT_FOUND`; StreamJobs 2/2 complete. |
+| Stripe signed replay / ordering | Unit: HMAC + multi-`v1` + ordering predicate. Docker (`stripe_webhook_tests`): same `event_id` replay no-op; older `created` after newer rejected; claim release on 5xx. Residual: same-second `<=`; no live Stripe resend. |
 
 ## P0
 

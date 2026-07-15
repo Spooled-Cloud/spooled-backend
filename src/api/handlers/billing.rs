@@ -335,6 +335,17 @@ fn event_created_at(event: &StripeEvent) -> DateTime<Utc> {
     }
 }
 
+/// Whether an event should mutate org billing state given the org's last applied
+/// Stripe event time. Mirrors the SQL guard
+/// `stripe_last_event_at IS NULL OR stripe_last_event_at <= $event_time`
+/// (second-granularity; equal timestamps both apply — known residual).
+fn stripe_event_applies(last_event_at: Option<DateTime<Utc>>, event_time: DateTime<Utc>) -> bool {
+    match last_event_at {
+        None => true,
+        Some(last) => last <= event_time,
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct StripeEventData {
     object: serde_json::Value,
@@ -1180,6 +1191,12 @@ mod tests {
         assert!(event_created_at(&event).timestamp() >= before);
     }
 
+    fn sign_stripe_body(secret: &str, body: &[u8], ts: i64) -> String {
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(format!("{}.{}", ts, String::from_utf8_lossy(body)).as_bytes());
+        hex::encode(mac.finalize().into_bytes())
+    }
+
     #[test]
     fn test_stripe_signature_format() {
         // Test signature format parsing (not actual verification)
@@ -1191,16 +1208,60 @@ mod tests {
     }
 
     #[test]
-    fn test_stripe_signature_accepts_any_v1_during_rotation() {
-        use hmac::{KeyInit, Mac};
+    fn test_stripe_signature_accepts_valid_hmac() {
+        let secret = "whsec_test_secret";
+        let body = br#"{"id":"evt_ok","type":"invoice.paid","data":{"object":{}}}"#;
+        let ts = Utc::now().timestamp();
+        let v1 = sign_stripe_body(secret, body, ts);
+        let header = format!("t={},v1={}", ts, v1);
+        assert!(verify_stripe_signature(secret, body, &header).is_ok());
+    }
 
+    #[test]
+    fn test_stripe_signature_rejects_tampered_body() {
+        let secret = "whsec_test_secret";
+        let body = br#"{"id":"evt_ok"}"#;
+        let ts = Utc::now().timestamp();
+        let v1 = sign_stripe_body(secret, body, ts);
+        let header = format!("t={},v1={}", ts, v1);
+        let tampered = br#"{"id":"evt_evil"}"#;
+        assert!(verify_stripe_signature(secret, tampered, &header).is_err());
+    }
+
+    #[test]
+    fn test_stripe_signature_rejects_stale_and_future_timestamp() {
+        let secret = "whsec_test_secret";
+        let body = b"{}";
+
+        let stale_ts = Utc::now().timestamp() - STRIPE_TIMESTAMP_TOLERANCE_SECS - 1;
+        let stale_v1 = sign_stripe_body(secret, body, stale_ts);
+        let stale_header = format!("t={},v1={}", stale_ts, stale_v1);
+        assert!(verify_stripe_signature(secret, body, &stale_header).is_err());
+
+        let future_ts = Utc::now().timestamp() + 120;
+        let future_v1 = sign_stripe_body(secret, body, future_ts);
+        let future_header = format!("t={},v1={}", future_ts, future_v1);
+        assert!(verify_stripe_signature(secret, body, &future_header).is_err());
+    }
+
+    #[test]
+    fn test_stripe_signature_rejects_missing_parts() {
+        let secret = "whsec_test_secret";
+        let body = b"{}";
+        let ts = Utc::now().timestamp();
+        let v1 = sign_stripe_body(secret, body, ts);
+
+        assert!(verify_stripe_signature(secret, body, &format!("v1={}", v1)).is_err());
+        assert!(verify_stripe_signature(secret, body, &format!("t={}", ts)).is_err());
+        assert!(verify_stripe_signature(secret, body, "").is_err());
+    }
+
+    #[test]
+    fn test_stripe_signature_accepts_any_v1_during_rotation() {
         let secret = "whsec_test_secret";
         let body = b"{\"id\":\"evt_1\"}";
-        let ts = Utc::now().timestamp().to_string();
-
-        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
-        mac.update(format!("{}.{}", ts, String::from_utf8_lossy(body)).as_bytes());
-        let valid = hex::encode(mac.finalize().into_bytes());
+        let ts = Utc::now().timestamp();
+        let valid = sign_stripe_body(secret, body, ts);
 
         // Valid signature first, stale one second (the rotation ordering that
         // used to fail because only the LAST v1 was kept).
@@ -1214,6 +1275,17 @@ mod tests {
         // No valid signature at all fails.
         let header = format!("t={},v1={}", ts, "0".repeat(64));
         assert!(verify_stripe_signature(secret, body, &header).is_err());
+    }
+
+    #[test]
+    fn test_stripe_event_applies_ordering_guard() {
+        let older = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let newer = DateTime::from_timestamp(1_700_000_100, 0).unwrap();
+
+        assert!(stripe_event_applies(None, older));
+        assert!(stripe_event_applies(Some(older), newer));
+        assert!(stripe_event_applies(Some(newer), newer)); // equal → apply (SQL `<=`)
+        assert!(!stripe_event_applies(Some(newer), older));
     }
 
     #[test]
