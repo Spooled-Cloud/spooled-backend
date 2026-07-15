@@ -347,10 +347,7 @@ async fn handle_checkout_completed(state: &AppState, event: &StripeEvent) -> App
     // Reject unpaid / incomplete checkouts before trusting client_reference_id linkage.
     // Empty payment_status kept for older fixtures / partial payloads (warn-free allow).
     let payment_status = session["payment_status"].as_str().unwrap_or("");
-    if !matches!(
-        payment_status,
-        "paid" | "no_payment_required" | ""
-    ) {
+    if !matches!(payment_status, "paid" | "no_payment_required" | "") {
         warn!(
             payment_status = %payment_status,
             event_id = %event.id,
