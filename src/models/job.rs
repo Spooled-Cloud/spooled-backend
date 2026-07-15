@@ -477,6 +477,14 @@ pub struct JobStats {
     pub total: i64,
 }
 
+/// Query parameters for job statistics
+#[derive(Debug, Deserialize, Default)]
+pub struct JobStatsQuery {
+    /// Optional queue filter (`queue_name` canonical; `queue` accepted as alias).
+    #[serde(alias = "queue")]
+    pub queue_name: Option<String>,
+}
+
 /// Maximum job history details size (64KB)
 const MAX_HISTORY_DETAILS_SIZE: usize = 64 * 1024;
 
@@ -945,6 +953,16 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "queue": "emails" })).unwrap();
         assert_eq!(via_alias.queue_name.as_deref(), Some("emails"));
         let via_canonical: ListJobsQuery =
+            serde_json::from_value(serde_json::json!({ "queue_name": "billing" })).unwrap();
+        assert_eq!(via_canonical.queue_name.as_deref(), Some("billing"));
+    }
+
+    #[test]
+    fn test_job_stats_query_accepts_queue_alias() {
+        let via_alias: JobStatsQuery =
+            serde_json::from_value(serde_json::json!({ "queue": "emails" })).unwrap();
+        assert_eq!(via_alias.queue_name.as_deref(), Some("emails"));
+        let via_canonical: JobStatsQuery =
             serde_json::from_value(serde_json::json!({ "queue_name": "billing" })).unwrap();
         assert_eq!(via_canonical.queue_name.as_deref(), Some("billing"));
     }

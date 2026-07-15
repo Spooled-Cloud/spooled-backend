@@ -23,6 +23,7 @@ Cartography + fix pass: 2026-07-15. Only code-verified items. No amount/formula 
 | BE-15 | P3 | Outgoing webhook retry UUID/TEXT bind risk | `outgoing_webhooks.rs` ~504–513 | Retry delivery | 500s | Cast/bind as text |
 | BE-16 | P3 | OpenAPI hand drift risk | `docs/openapi.yaml` | API change without yaml | Client codegen lies | CI drift check or codegen |
 | BE-17 | P3 | ~~`GET /jobs?queue=` silently ignored~~ **FIXED + live** (Portainer tip Pull 2026-07-15 ~02:39Z) — `serde(alias = "queue")` | `src/models/job.rs` `ListJobsQuery` | Clients using short `queue` param | Unfiltered list (looks like filter broken) | Alias + keep OpenAPI `queue_name` |
+| BE-18 | P2 | ~~`GET /jobs/stats` ignored `queue_name`~~ **FIXED** (source; needs Pull) — optional filter + OpenAPI param | `handlers/jobs.rs` `stats` | Client passes queue filter | Always org totals | Bind `JobStatsQuery` + SQL `queue_name = $3` |
 
 ## Live gap re-verify (2026-07-15 on `0.1.107`)
 

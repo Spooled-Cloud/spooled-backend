@@ -23,7 +23,8 @@ use crate::error::{AppError, AppResult};
 use crate::models::ApiKeyContext;
 use crate::models::{
     ClaimJobsRequest, ClaimJobsResponse, ClaimedJob, CompleteJobRequest, CreateJobRequest,
-    CreateJobResponse, FailJobRequest, HeartbeatJobRequest, Job, JobStats, JobSummary,
+    CreateJobResponse, FailJobRequest, HeartbeatJobRequest, Job, JobStats, JobStatsQuery,
+    JobSummary,
     ListJobsQuery,
 };
 use crate::queue::{QueueManager, WorkerOpOutcome};
@@ -962,10 +963,28 @@ pub async fn retry(
 
 /// Get job statistics
 ///
+/// Optional `queue_name` (alias `queue`) scopes counts to one queue. Without it,
+/// returns org-wide totals (still restricted by API-key queue scope).
 pub async fn stats(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
+    Query(query): Query<JobStatsQuery>,
 ) -> AppResult<Json<JobStats>> {
+    let validated_queue = query.queue_name.as_ref().and_then(|q| {
+        if validate_queue_name_filter(q) {
+            Some(q.as_str())
+        } else {
+            tracing::warn!(queue_name = %q, "Invalid queue_name stats filter ignored");
+            None
+        }
+    });
+
+    if let Some(queue) = validated_queue {
+        if !ctx.can_access_queue(queue) {
+            return Err(AppError::NotFound(format!("Queue '{}' not found", queue)));
+        }
+    }
+
     let stats = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64, i64)>(
         r#"
         SELECT
@@ -979,10 +998,12 @@ pub async fn stats(
         FROM jobs
         WHERE organization_id = $1
           AND ($2::TEXT[] IS NULL OR queue_name = ANY($2))
+          AND ($3::TEXT IS NULL OR queue_name = $3)
         "#,
     )
     .bind(&ctx.organization_id)
     .bind(ctx.queue_scope_filter())
+    .bind(validated_queue)
     .fetch_one(state.db.pool())
     .await?;
 

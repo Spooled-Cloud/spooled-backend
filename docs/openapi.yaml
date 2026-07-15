@@ -1141,6 +1141,14 @@ paths:
       tags: [Jobs]
       summary: Get job statistics
       operationId: getJobStats
+      parameters:
+        - name: queue_name
+          in: query
+          required: false
+          description: Optional queue filter (alias `queue` also accepted)
+          schema:
+            type: string
+          example: emails
       responses:
         '200':
           description: Job statistics

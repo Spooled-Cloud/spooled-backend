@@ -12,6 +12,7 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - `GET /api/v1/jobs` accepts `queue` as a serde alias for `queue_name` (canonical OpenAPI name unchanged).
+- `GET /api/v1/jobs/stats` honors optional `queue_name` / `queue` filter (previously org-wide only; query param was ignored).
 
 ### Tests
 
