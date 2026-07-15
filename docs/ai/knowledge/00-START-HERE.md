@@ -1,7 +1,7 @@
 # Spooled Backend — Agent Knowledge Base
 
 **Repo:** public OSS (`Spooled-Cloud/spooled-backend`)  
-**Version at cartography:** `0.1.109` (live verified 2026-07-15; tip `13dae60`)  
+**Version at cartography:** `0.1.109` (live re-verified 2026-07-15 ~05:56Z after Portainer `:latest` Pull; tip `f6541ef`)  
 **Load this folder before editing queue, auth, billing, gRPC, or webhooks.**
 
 ## Read order
