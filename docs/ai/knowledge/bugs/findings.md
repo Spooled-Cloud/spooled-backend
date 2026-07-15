@@ -22,7 +22,7 @@ Cartography + fix pass: 2026-07-15. Only code-verified items. No amount/formula 
 | BE-14 | P3 | Retention SQL ignores some `SPOOLED_PLAN_*` env windows | `scheduler/mod.rs` ~1010–1017 | Custom env retention | Unexpected purge window | Read settings |
 | BE-15 | P3 | Outgoing webhook retry UUID/TEXT bind risk | `outgoing_webhooks.rs` ~504–513 | Retry delivery | 500s | Cast/bind as text |
 | BE-16 | P3 | OpenAPI hand drift risk | `docs/openapi.yaml` | API change without yaml | Client codegen lies | CI drift check or codegen |
-| BE-17 | P3 | ~~`GET /jobs?queue=` silently ignored~~ **FIXED** — `serde(alias = "queue")` on `ListJobsQuery` | `src/models/job.rs` `ListJobsQuery` | Clients using short `queue` param | Unfiltered list (looks like filter broken) | Alias + keep OpenAPI `queue_name` |
+| BE-17 | P3 | ~~`GET /jobs?queue=` silently ignored~~ **FIXED + live** (Portainer tip Pull 2026-07-15 ~02:39Z) — `serde(alias = "queue")` | `src/models/job.rs` `ListJobsQuery` | Clients using short `queue` param | Unfiltered list (looks like filter broken) | Alias + keep OpenAPI `queue_name` |
 
 ## Live gap re-verify (2026-07-15 on `0.1.107`)
 
