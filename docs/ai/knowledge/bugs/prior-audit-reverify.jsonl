@@ -1,0 +1,28 @@
+{"claim": "Enterprise 5MB vs 1MiB cap", "memo": "01", "status": "FIXED", "evidence": "src/config/plans.rs:570-574"}
+{"claim": "k8s wrong STRIPE_WEBHOOK_SECRET name", "memo": "01", "status": "FIXED", "evidence": "k8s/base/deployment.yaml:165-183"}
+{"claim": "double subscribe via Payment Links", "memo": "02", "status": "FIXED", "evidence": "billing.rs cancel superseded + frontend gates"}
+{"claim": "Stripe event idempotency missing", "memo": "03", "status": "FIXED", "evidence": "billing.rs:259-266 + migration stripe_event_dedupe"}
+{"claim": "invoice.paid Basil subscription field", "memo": "03", "status": "FIXED", "evidence": "billing.rs:704-705"}
+{"claim": "subscription.updated before org link ACK 200", "memo": "03", "status": "FIXED", "evidence": "billing.rs:496-514"}
+{"claim": "past_due never downgrades entitlements", "memo": "02", "status": "SURVIVES", "evidence": "limits.rs plan_tier only", "sev": "P2"}
+{"claim": "Enterprise not grantable via Stripe", "memo": "01", "status": "SURVIVES", "evidence": "billing.rs determine_plan_tier", "sev": "P2"}
+{"claim": "checkout trusts client_reference_id", "memo": "02", "status": "SURVIVES", "evidence": "billing.rs:349-351", "sev": "P2"}
+{"claim": "signature parser last v1 only", "memo": "03", "status": "FIXED", "evidence": "billing.rs:968-1015"}
+{"claim": "cron TZ ignored", "memo": "05", "status": "FIXED", "evidence": "scheduler/mod.rs:366-393"}
+{"claim": "workflow deadletter strands dependents", "memo": "05", "status": "FIXED", "evidence": "scheduler/mod.rs:730-857"}
+{"claim": "lease expiry skips dead_letter_queue", "memo": "05", "status": "FIXED", "evidence": "scheduler/mod.rs:210-231"}
+{"claim": "RLS inert", "memo": "06", "status": "SURVIVES", "evidence": "db/mod.rs:92-122", "sev": "P2"}
+{"claim": "app-level org scoping OK", "memo": "06", "status": "FIXED", "evidence": "architecture guide + WHERE org_id pattern"}
+{"claim": "login rate limit shared sp_live_ prefix", "memo": "07", "status": "FIXED", "evidence": "auth.rs:156-166"}
+{"claim": "logout refresh survives / no-redis silent", "memo": "07", "status": "FIXED", "evidence": "auth.rs:555-597"}
+{"claim": "/auth/me accepts refresh", "memo": "07", "status": "FIXED", "evidence": "auth.rs:652-654"}
+{"claim": "query token on all protected routes", "memo": "07", "status": "SURVIVES", "evidence": "auth.rs:97-111", "sev": "P3"}
+{"claim": "admin unthrottled", "memo": "13", "status": "SURVIVES", "evidence": "api/mod.rs admin nest", "sev": "P3"}
+{"claim": "check-email enumeration", "memo": "13", "status": "SURVIVES", "evidence": "email_login.rs", "sev": "P3"}
+{"claim": "payload_too_large HTTP 200", "memo": "04", "status": "FIXED", "evidence": "limits.rs:407-413"}
+{"claim": "gRPC Register not worker-count gated", "memo": "04", "status": "FIXED", "evidence": "worker_service.rs:267-300"}
+{"claim": "retention ignores SPOOLED_PLAN_* env", "memo": "04", "status": "SURVIVES", "evidence": "scheduler/mod.rs:1010-1017", "sev": "P3"}
+{"claim": "bcrypt advisory 0.19.0", "memo": "11", "status": "FIXED", "evidence": "Cargo.lock bcrypt 0.19.2"}
+{"claim": "no committed production secrets", "memo": "11", "status": "PARTIAL", "evidence": "certs/grpc-key.pem tracked", "sev": "P2"}
+{"claim": "charge.dispute unhandled", "memo": "03", "status": "SURVIVES", "evidence": "billing.rs webhook match", "sev": "P2"}
+{"claim": "no Stripe-Version pin", "memo": "02", "status": "SURVIVES", "evidence": "billing.rs outbound HTTP", "sev": "P3"}
