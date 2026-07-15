@@ -23,7 +23,7 @@ use crate::api::middleware::limits::{
     try_increment_daily_jobs, LimitCheckError,
 };
 use crate::cache::RedisCache;
-use crate::config::PlanLimits;
+use crate::config::{PlanLimits, QueueSettings};
 use crate::grpc::auth::{
     authenticate_from_metadata, authenticate_request, reload_api_key_context, GrpcAuthContext,
 };
@@ -73,6 +73,8 @@ pub struct QueueServiceImpl {
     metrics: Arc<Metrics>,
     cache: Option<RedisCache>,
     outgoing_webhooks: Arc<OutgoingWebhookService>,
+    /// Shared with REST (`QUEUE_DEFAULT_*`) so omit/`<=0` proto3 zeros match.
+    queue_defaults: QueueSettings,
 }
 
 impl QueueServiceImpl {
@@ -81,12 +83,31 @@ impl QueueServiceImpl {
         metrics: Arc<Metrics>,
         cache: Option<RedisCache>,
         outgoing_webhooks: Arc<OutgoingWebhookService>,
+        queue_defaults: QueueSettings,
     ) -> Self {
         Self {
             pool,
             metrics,
             cache,
             outgoing_webhooks,
+            queue_defaults,
+        }
+    }
+
+    /// Proto3 omitted int32 is 0 — treat as "use configured default", not zero retries.
+    fn resolve_max_retries(&self, value: i32) -> i32 {
+        if value <= 0 {
+            self.queue_defaults.default_max_retries.clamp(0, 100)
+        } else {
+            value.clamp(1, 100)
+        }
+    }
+
+    fn resolve_timeout_seconds(&self, value: i32) -> i32 {
+        if value <= 0 {
+            self.queue_defaults.default_timeout_secs.clamp(1, 86400)
+        } else {
+            value.clamp(1, 86400)
         }
     }
 
@@ -395,22 +416,11 @@ impl QueueService for QueueServiceImpl {
         .bind(status)
         .bind(&payload)
         .bind(req.priority)
-        // proto3 int32 is 0 when the field is omitted; treat 0 as "use the REST
-        // default" (3) instead of "no retries", which deadletters on first fail.
-        // Same tradeoff as timeout_seconds below — explicit zero is not expressible.
-        .bind(if req.max_retries <= 0 {
-            3
-        } else {
-            req.max_retries.clamp(1, 100)
-        })
-        // proto3 int32 is 0 when the field is omitted; treat 0 as "use the
-        // default" (300s, matching the REST handler) instead of clamping to a
-        // 1-second budget that deadletters any job taking longer than a second.
-        .bind(if req.timeout_seconds <= 0 {
-            300
-        } else {
-            req.timeout_seconds.clamp(1, 86400)
-        })
+        // proto3 int32 is 0 when the field is omitted; treat 0 as "use
+        // QUEUE_DEFAULT_*" (same as REST omit) instead of "no retries".
+        // Explicit zero retries are not expressible on gRPC.
+        .bind(self.resolve_max_retries(req.max_retries))
+        .bind(self.resolve_timeout_seconds(req.timeout_seconds))
         .bind(scheduled_at)
         .bind(if req.idempotency_key.is_empty() {
             None

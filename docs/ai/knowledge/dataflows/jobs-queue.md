@@ -13,8 +13,9 @@
 | Source | max_retries | timeout_seconds |
 |--------|-------------|-----------------|
 | REST omit | `settings.queue.default_max_retries` ← env `QUEUE_DEFAULT_MAX_RETRIES` default `"3"` (`config/mod.rs`) | `QUEUE_DEFAULT_TIMEOUT_SECS` default `"300"` |
-| gRPC `<=0` / omit | hardcoded `3` (`queue_service.rs` ~401–404) | hardcoded `300` (~407–412) |
-| Custom webhook ingest | hardcoded `3`/`300` (`handlers/webhooks.rs`) | same |
+| gRPC `<=0` / omit | `settings.queue` ← `QUEUE_DEFAULT_*` | same |
+| Custom webhook ingest | settings defaults | settings defaults |
+| Schedules / workflows omit | settings defaults | settings defaults |
 | DB column default | `DEFAULT 3` (initial schema) | — |
 
 REST validation allows `max_retries` range `min = 0` (`models/job.rs` ~214).

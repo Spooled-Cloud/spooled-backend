@@ -4,3 +4,7 @@
 2. Follow `docs/ai/knowledge/MAINTENANCE.md` when those areas change.
 3. Workspace multi-repo rules (deploy, QA, secrets): `../AGENTS.md` when this repo sits in the `spooled-cloud` workspace.
 4. Public Portainer guide: `docs/guides/production-host-portainer.md`. Never copy private host SSH paths into this repo.
+
+## Knowledge base (required)
+
+When changing this repo's behavior or public contracts, update `docs/ai/knowledge/` in the **same commit** per `docs/ai/knowledge/MAINTENANCE.md`. Cursor rule: `.cursor/rules/kb-sync.mdc`.

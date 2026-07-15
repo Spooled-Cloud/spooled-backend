@@ -399,8 +399,18 @@ pub async fn create(
         .bind("pending") // All jobs start as pending, dependencies_met controls processing
         .bind(&job_def.payload)
         .bind(job_def.priority)
-        .bind(job_def.max_retries.unwrap_or(3))
-        .bind(job_def.timeout_seconds.unwrap_or(300))
+        .bind(
+            job_def
+                .max_retries
+                .unwrap_or(state.settings.queue.default_max_retries)
+                .clamp(0, 100),
+        )
+        .bind(
+            job_def
+                .timeout_seconds
+                .unwrap_or(state.settings.queue.default_timeout_secs)
+                .clamp(1, 86400),
+        )
         .bind(job_def.expires_at)
         .bind(&workflow_id)
         .bind(step as i32)

@@ -2309,6 +2309,11 @@ async fn test_grpc_unary_transport_rejects_out_of_scope_settlement() {
         Arc::new(Metrics::new()),
         None,
         outgoing,
+        spooled_backend::config::QueueSettings {
+            default_max_retries: 3,
+            default_timeout_secs: 300,
+            max_payload_size_bytes: 1024 * 1024,
+        },
     );
 
     let complete = service

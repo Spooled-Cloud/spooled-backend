@@ -123,6 +123,7 @@ async fn main() -> Result<()> {
     let grpc_metrics = state.metrics.clone();
     let grpc_cache = cache.clone();
     let grpc_webhooks = state.outgoing_webhooks.clone();
+    let grpc_queue_defaults = settings.queue.clone();
     let grpc_shutdown_rx = shutdown_rx.clone();
     let grpc_handle = tokio::spawn(async move {
         // Wait a bit to not block startup
@@ -131,7 +132,7 @@ async fn main() -> Result<()> {
         // Run until shutdown
         let mut rx = grpc_shutdown_rx;
         tokio::select! {
-            result = grpc::start_grpc_server(grpc_addr, grpc_db, grpc_metrics, grpc_cache, grpc_webhooks) => {
+            result = grpc::start_grpc_server(grpc_addr, grpc_db, grpc_metrics, grpc_cache, grpc_webhooks, grpc_queue_defaults) => {
                 match result {
                     Ok(_) => info!("gRPC server stopped"),
                     Err(e) => error!(error = %e, "gRPC server failed to start"),

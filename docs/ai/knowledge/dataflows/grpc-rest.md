@@ -12,9 +12,9 @@ Both paths mutate the same Postgres job/worker tables and honor org scoping from
 | JWT | yes | no |
 | Admin | `X-Admin-Key` on admin REST only | n/a |
 
-## Default difference (P1)
+## Default difference (resolved in 0.1.107)
 
-REST reads `QUEUE_DEFAULT_*` from settings. gRPC hardcodes 3/300 when field `<=0`. If an operator sets `QUEUE_DEFAULT_MAX_RETRIES=5`, REST omit gets 5; gRPC omit still gets 3.
+REST and gRPC both read `QUEUE_DEFAULT_*` from settings when the client omits values (gRPC via proto3 `<=0`). Explicit REST `max_retries: 0` remains allowed; gRPC still cannot express zero retries without a proto change.
 
 ## Streaming
 

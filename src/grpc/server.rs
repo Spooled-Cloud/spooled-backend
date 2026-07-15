@@ -101,6 +101,7 @@ pub async fn start_grpc_server(
     metrics: Arc<Metrics>,
     cache: Option<crate::cache::RedisCache>,
     outgoing_webhooks: Arc<crate::outgoing_webhooks::service::OutgoingWebhookService>,
+    queue_defaults: crate::config::QueueSettings,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let pool = db.pool_arc();
 
@@ -116,6 +117,7 @@ pub async fn start_grpc_server(
         metrics.clone(),
         cache.clone(),
         outgoing_webhooks.clone(),
+        queue_defaults,
     );
     let worker_service = WorkerServiceImpl::new(
         pool.clone(),

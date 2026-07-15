@@ -217,8 +217,16 @@ pub async fn create(
     .bind(&req.queue_name)
     .bind(&req.payload_template)
     .bind(req.priority.unwrap_or(0))
-    .bind(req.max_retries.unwrap_or(3))
-    .bind(req.timeout_seconds.unwrap_or(300))
+    .bind(
+        req.max_retries
+            .unwrap_or(state.settings.queue.default_max_retries)
+            .clamp(0, 100),
+    )
+    .bind(
+        req.timeout_seconds
+            .unwrap_or(state.settings.queue.default_timeout_secs)
+            .clamp(1, 86400),
+    )
     .bind(next_run)
     .bind(&req.tags)
     .bind(&req.metadata)

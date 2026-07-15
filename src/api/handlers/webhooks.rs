@@ -135,13 +135,15 @@ pub async fn custom(
     }
 
     // Insert job with idempotency support and return ID to detect new vs duplicate.
+    let max_retries = state.settings.queue.default_max_retries.clamp(0, 100);
+    let timeout_seconds = state.settings.queue.default_timeout_secs.clamp(1, 86400);
     let (returned_id,): (String,) = sqlx::query_as(
         r#"
         INSERT INTO jobs (
             id, organization_id, queue_name, status, payload, priority,
             max_retries, timeout_seconds, created_at, updated_at, idempotency_key
         )
-        VALUES ($1, $2, $3, 'pending', $4::JSONB, $5, 3, 300, $6, $6, $7)
+        VALUES ($1, $2, $3, 'pending', $4::JSONB, $5, $6, $7, $8, $8, $9)
         ON CONFLICT (organization_id, idempotency_key) WHERE idempotency_key IS NOT NULL
         DO UPDATE SET updated_at = NOW()
         RETURNING id
@@ -152,6 +154,8 @@ pub async fn custom(
     .bind(&request.queue_name)
     .bind(&payload_json)
     .bind(priority)
+    .bind(max_retries)
+    .bind(timeout_seconds)
     .bind(now)
     .bind(&request.idempotency_key)
     .fetch_one(state.db.pool())

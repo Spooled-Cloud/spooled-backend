@@ -1,15 +1,15 @@
-{"id": "BE-01", "sev": "P1", "summary": "gRPC enqueue hardcoded defaults ignore QUEUE_DEFAULT_*", "path": "src/grpc/services/queue_service.rs", "lines": "401-413", "status": "open"}
+{"id": "BE-01", "sev": "P1", "summary": "gRPC enqueue hardcoded defaults ignore QUEUE_DEFAULT_*", "path": "src/grpc/services/queue_service.rs", "lines": "401-413", "status": "fixed", "fixed_in": "0.1.107"}
 {"id": "BE-02", "sev": "P1", "summary": "REST max_retries=0 allowed; gRPC maps <=0 to 3", "path": "src/models/job.rs", "lines": "214", "status": "open"}
-{"id": "BE-03", "sev": "P2", "summary": "webhook/schedules/workflows hardcoded unwrap_or(3)", "path": "src/api/handlers/webhooks.rs", "lines": "144", "status": "open"}
+{"id": "BE-03", "sev": "P2", "summary": "webhook/schedules/workflows hardcoded unwrap_or(3)", "path": "src/api/handlers/webhooks.rs", "lines": "144", "status": "fixed", "fixed_in": "0.1.107"}
 {"id": "BE-04", "sev": "P2", "summary": "completion_webhook unsigned", "path": "src/outgoing_webhooks/service.rs", "lines": "372-400", "status": "open"}
 {"id": "BE-05", "sev": "P2", "summary": "rate limit fail-open on Redis errors", "path": "src/api/middleware/plan_rate_limit.rs", "lines": "234", "status": "open"}
 {"id": "BE-06", "sev": "P2", "summary": "past_due does not revoke plan quotas", "path": "src/api/middleware/limits.rs", "lines": "108-109", "status": "open"}
 {"id": "BE-07", "sev": "P2", "summary": "Enterprise price unmapped in Stripe tier map", "path": "src/api/handlers/billing.rs", "lines": "875-900", "status": "open"}
-{"id": "BE-08", "sev": "P2", "summary": "checkout trusts client_reference_id", "path": "src/api/handlers/billing.rs", "lines": "349-351", "status": "open"}
+{"id": "BE-08", "sev": "P2", "summary": "checkout trusts client_reference_id", "path": "src/api/handlers/billing.rs", "lines": "349-351", "status": "fixed", "fixed_in": "0.1.107"}
 {"id": "BE-09", "sev": "P2", "summary": "charge.dispute unhandled", "path": "src/api/handlers/billing.rs", "lines": "240", "status": "open"}
-{"id": "BE-10", "sev": "P2", "summary": "tracked grpc-key.pem private key", "path": "certs/grpc-key.pem", "lines": "1", "status": "open"}
+{"id": "BE-10", "sev": "P2", "summary": "tracked grpc-key.pem private key", "path": "certs/grpc-key.pem", "lines": "1", "status": "mitigated", "note": "certs/README.md documents disposable local-dev key; rotate if ever used in prod"}
 {"id": "BE-11", "sev": "P3", "summary": "query token on protected routes", "path": "src/api/middleware/auth.rs", "lines": "97-111", "status": "open"}
-{"id": "BE-12", "sev": "P3", "summary": "admin routes unthrottled", "path": "src/api/mod.rs", "lines": "375-406", "status": "open"}
+{"id": "BE-12", "sev": "P3", "summary": "admin routes unthrottled", "path": "src/api/mod.rs", "lines": "375-406", "status": "fixed", "fixed_in": "0.1.107"}
 {"id": "BE-13", "sev": "P3", "summary": "email check enumeration", "path": "src/api/handlers/email_login.rs", "lines": "130-139", "status": "open"}
 {"id": "BE-14", "sev": "P3", "summary": "retention SQL ignores some plan env windows", "path": "src/scheduler/mod.rs", "lines": "1010-1017", "status": "open"}
 {"id": "BE-15", "sev": "P3", "summary": "outgoing webhook retry uuid/text bind", "path": "src/api/handlers/outgoing_webhooks.rs", "lines": "504-513", "status": "open"}

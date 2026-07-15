@@ -372,6 +372,7 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
         ));
 
     // Admin routes (require X-Admin-Key authentication)
+    // Layer order: last added runs first → rate limit, then admin auth.
     let admin_routes = Router::new()
         .route(
             "/admin/organizations",
@@ -399,10 +400,13 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
         )
         .route("/admin/stats", get(handlers::admin::get_platform_stats))
         .route("/admin/plans", get(handlers::admin::list_plans))
-        // Apply admin authentication middleware
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::admin_auth::require_admin,
+        ))
         .route_layer(axum::middleware::from_fn_with_state(
             state,
-            middleware::admin_auth::require_admin,
+            middleware::plan_rate_limit::admin_rate_limit_middleware,
         ));
 
     // Merge public, protected, and admin routes

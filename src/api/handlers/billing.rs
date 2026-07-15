@@ -344,6 +344,21 @@ struct StripeEventData {
 async fn handle_checkout_completed(state: &AppState, event: &StripeEvent) -> AppResult<()> {
     let session = &event.data.object;
 
+    // Reject unpaid / incomplete checkouts before trusting client_reference_id linkage.
+    // Empty payment_status kept for older fixtures / partial payloads (warn-free allow).
+    let payment_status = session["payment_status"].as_str().unwrap_or("");
+    if !matches!(
+        payment_status,
+        "paid" | "no_payment_required" | ""
+    ) {
+        warn!(
+            payment_status = %payment_status,
+            event_id = %event.id,
+            "Ignoring checkout.session.completed with non-paid payment_status"
+        );
+        return Ok(());
+    }
+
     let customer_id = session["customer"].as_str();
     let subscription_id = session["subscription"].as_str();
     let client_reference_id = session["client_reference_id"].as_str(); // org_id

@@ -9,6 +9,18 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.107] - 2026-07-15
+
+### Fixed
+
+- **gRPC/REST/webhook/schedule/workflow default parity.** gRPC Enqueue omit/`<=0` now reads `QUEUE_DEFAULT_MAX_RETRIES` / `QUEUE_DEFAULT_TIMEOUT_SECS` (was hardcoded 3/300). Incoming custom webhooks, schedule create, and workflow job create use the same settings.
+- **Admin route rate limit.** Admin API is IP rate-limited via Redis fixed window (60/min) when Redis is configured.
+- **Checkout unpaid gate.** `checkout.session.completed` with explicit non-paid `payment_status` is ignored (empty status still allowed for older fixtures).
+
+### Docs
+
+- Agent knowledge base under `docs/ai/knowledge/`; `certs/README.md` clarifies local-dev key material.
+
 ## [0.1.106] - 2026-07-15
 
 ### Fixed

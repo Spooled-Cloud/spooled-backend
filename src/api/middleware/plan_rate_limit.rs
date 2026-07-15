@@ -237,3 +237,51 @@ pub async fn plan_rate_limit_middleware(
 
     next.run(request).await
 }
+
+/// Rate-limit admin routes by client IP (brute-force cushion).
+/// Uses Redis fixed-window when available; fail-open if Redis is missing/errors
+/// so self-hosted setups without Redis keep working.
+pub async fn admin_rate_limit_middleware(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let Some(ref cache) = state.cache else {
+        return next.run(request).await;
+    };
+
+    const WINDOW_SECS: u64 = 60;
+    const MAX_REQUESTS: u32 = 60;
+
+    let client_id = extract_client_id(&request);
+    let key = format!("rate_limit:admin:{}", client_id);
+    match cache
+        .check_rate_limit(&key, MAX_REQUESTS, WINDOW_SECS)
+        .await
+    {
+        Ok(result) => {
+            if !result.allowed {
+                let retry_after_secs =
+                    (result.reset_at - chrono::Utc::now()).num_seconds().max(1) as u64;
+                let body = RateLimitExceededResponse {
+                    error: "Rate limit exceeded".to_string(),
+                    code: "RATE_LIMIT_EXCEEDED".to_string(),
+                    retry_after_secs,
+                    limit: MAX_REQUESTS,
+                    remaining: 0,
+                    reset_at: current_timestamp() + retry_after_secs,
+                };
+                let mut res = (StatusCode::TOO_MANY_REQUESTS, axum::Json(body)).into_response();
+                if let Ok(v) = retry_after_secs.to_string().parse() {
+                    res.headers_mut().insert("Retry-After", v);
+                }
+                return res;
+            }
+        }
+        Err(e) => {
+            debug!(error = %e, "Redis error during admin rate limit check; allowing request");
+        }
+    }
+
+    next.run(request).await
+}
