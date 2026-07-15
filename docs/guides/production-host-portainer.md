@@ -10,7 +10,7 @@ Public operator guide for self-hosters using [Portainer](https://www.portainer.i
 4. Set required secrets in the **stack environment** (see compose file header / `.env.example`). Do not commit real secrets.
 5. Image: leave unset or set  
    `BACKEND_IMAGE=ghcr.io/spooled-cloud/spooled-backend:latest`  
-   The compose default is `:latest` with `pull_policy: always` so **Pull and redeploy** picks up new CI builds. Use a version tag or digest only for temporary rollback.
+   The compose default is `:latest` with `pull_policy: always` so **Pull and redeploy** picks up new CI builds. Prefer `:latest` day-to-day. Rolling back to an older version tag after a newer migration has already been applied will fail sqlx (`migration … previously applied but is missing`) — recover by deploying tip / `:latest` again, not by pinning forever.
 6. Deploy, then use **Pull and redeploy** for updates (same as other Git stacks).
 
 Git stacks in Portainer CE show **Git configuration** + **Pull and redeploy**, not the Web **Editor** tab. That is normal.

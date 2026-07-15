@@ -92,10 +92,9 @@ jobs:
           tags: |
             # On main push: create latest-amd64 / latest-arm64
             type=raw,value=latest-${{ matrix.suffix }},enable=${{ github.ref == 'refs/heads/main' }}
-            # On tag push v0.1.1: create 0.1.1-amd64 / 0.1.1-arm64
+            # On tag push v0.1.1: create 0.1.1-amd64 / 0.1.1-arm64 only
+            # (no floating major.minor — rebuilding an older tag must not clobber 0.1-*)
             type=semver,pattern={{version}}-${{ matrix.suffix }}
-            # On tag push v0.1.1: also create 0.1-amd64 / 0.1-arm64
-            type=semver,pattern={{major}}.{{minor}}-${{ matrix.suffix }}
 
       - name: Build and push
         uses: docker/build-push-action@v7

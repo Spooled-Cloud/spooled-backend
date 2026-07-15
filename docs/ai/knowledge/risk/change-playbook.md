@@ -9,3 +9,4 @@
 7. Validate: `cargo fmt`, `cargo test` / nextest, `cargo clippy` per CI.
 8. Release: sync `Cargo.toml` version + changelog + tag; deploy separately; verify with authenticated dashboard version — not `/health` alone.
 9. No Portainer Pull from agent sessions without operator OK.
+10. After a migration is applied in prod, never redeploy an older image/tag that lacks that migration file (sqlx hard-fails). Day-to-day image = `:latest` from `main`. Tag builds must not overwrite floating `major.minor` GHCR tags (exact version tags only).
