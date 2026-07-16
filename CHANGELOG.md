@@ -14,6 +14,7 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Outgoing webhook delivery now performs bounded in-process retries instead of only logging retry intent, and the manual retry endpoint now sends the retry immediately instead of only marking it pending.
 - OpenAPI and webhook/gRPC guides now match current request fields, completion webhook envelope shape, gRPC API-key auth, and outgoing webhook headers/events.
 - OpenAPI retry/worker schemas now match runtime response bodies and required lease fencing fields.
+- REST worker heartbeat and detail responses now use the current worker columns while keeping stable public JSON names (`current_jobs`, `max_concurrency`, `registered_at`).
 
 ## [0.1.109] - 2026-07-15
 

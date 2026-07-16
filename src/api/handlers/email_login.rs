@@ -1093,51 +1093,6 @@ async fn send_via_smtp(
     Ok(())
 }
 
-/// Create organization for email (legacy - used in self-hosted auto-create mode)
-#[allow(dead_code)]
-async fn create_organization_for_email(state: &AppState, email: &str) -> AppResult<String> {
-    let org_id = Uuid::new_v4().to_string();
-    let now = Utc::now();
-
-    // Generate slug from email
-    let slug = email
-        .split('@')
-        .next()
-        .unwrap_or("user")
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-        .take(20)
-        .collect::<String>()
-        .to_lowercase();
-
-    let slug = if slug.len() < 3 {
-        format!("{}-{}", slug, &org_id[..6])
-    } else {
-        // Add random suffix to ensure uniqueness
-        format!("{}-{}", slug, &org_id[..6])
-    };
-
-    let name = email.split('@').next().unwrap_or("User").to_string();
-
-    sqlx::query(
-        r#"
-        INSERT INTO organizations (id, name, slug, plan_tier, billing_email, settings, created_at, updated_at)
-        VALUES ($1, $2, $3, 'free', $4, '{}', $5, $5)
-        "#,
-    )
-    .bind(&org_id)
-    .bind(&name)
-    .bind(&slug)
-    .bind(email)
-    .bind(now)
-    .execute(state.db.pool())
-    .await?;
-
-    info!(org_id = %org_id, email = %mask_email(email), "Created organization for email login");
-
-    Ok(org_id)
-}
-
 /// Get or create API key for email login
 async fn get_or_create_email_api_key(
     state: &AppState,

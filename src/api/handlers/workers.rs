@@ -14,7 +14,7 @@ use crate::api::AppState;
 use crate::error::{AppError, AppResult};
 use crate::models::{
     ApiKeyContext, RegisterWorkerRequest, RegisterWorkerResponse, Worker, WorkerHeartbeatRequest,
-    WorkerSummary,
+    WorkerResponse, WorkerSummary,
 };
 
 /// Maximum workers per page
@@ -208,7 +208,7 @@ pub async fn get(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
     Path(id): Path<String>,
-) -> AppResult<Json<Worker>> {
+) -> AppResult<Json<WorkerResponse>> {
     let worker =
         sqlx::query_as::<_, Worker>("SELECT * FROM workers WHERE id = $1 AND organization_id = $2")
             .bind(&id)
@@ -220,7 +220,7 @@ pub async fn get(
 
     ensure_worker_in_scope(&ctx, &worker)?;
 
-    Ok(Json(worker))
+    Ok(Json(worker.into()))
 }
 
 /// Valid worker statuses
@@ -259,9 +259,10 @@ pub async fn heartbeat(
         UPDATE workers 
         SET 
             last_heartbeat = NOW(),
-            current_jobs = $1,
+            current_job_count = $1,
             status = $2,
-            metadata = COALESCE($3, metadata)
+            metadata = COALESCE($3, metadata),
+            updated_at = NOW()
         WHERE id = $4 AND organization_id = $5
         "#,
     )

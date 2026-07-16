@@ -259,12 +259,12 @@ impl OutgoingWebhookService {
                 )
                 .await?;
 
-                return Ok(success);
+                Ok(success)
             }
             Err(e) => {
                 self.record_attempt(&webhook.id, body, 0, Some(&e.to_string()), attempt, start)
                     .await?;
-                return Ok(false);
+                Ok(false)
             }
         }
     }

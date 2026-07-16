@@ -3139,6 +3139,7 @@ components:
           id,
           organization_id,
           queue_name,
+          queue_names,
           hostname,
           max_concurrency,
           current_jobs,
@@ -3146,6 +3147,7 @@ components:
           last_heartbeat,
           metadata,
           registered_at,
+          updated_at,
         ]
       properties:
         id:
@@ -3154,6 +3156,10 @@ components:
           type: string
         queue_name:
           type: string
+        queue_names:
+          type: array
+          items:
+            type: string
         hostname:
           type: string
         worker_type:
@@ -3173,6 +3179,9 @@ components:
         version:
           type: string
         registered_at:
+          type: string
+          format: date-time
+        updated_at:
           type: string
           format: date-time
 

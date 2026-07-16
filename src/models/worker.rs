@@ -230,6 +230,46 @@ impl From<Worker> for WorkerSummary {
     }
 }
 
+/// Worker detail response with stable public field names.
+#[derive(Debug, Serialize)]
+pub struct WorkerResponse {
+    pub id: String,
+    pub organization_id: String,
+    pub queue_name: String,
+    pub queue_names: Vec<String>,
+    pub hostname: String,
+    pub worker_type: Option<String>,
+    pub max_concurrency: i32,
+    pub current_jobs: i32,
+    pub status: String,
+    pub last_heartbeat: DateTime<Utc>,
+    pub metadata: serde_json::Value,
+    pub version: Option<String>,
+    pub registered_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl From<Worker> for WorkerResponse {
+    fn from(worker: Worker) -> Self {
+        Self {
+            id: worker.id,
+            organization_id: worker.organization_id,
+            queue_name: worker.queue_name,
+            queue_names: worker.queue_names,
+            hostname: worker.hostname,
+            worker_type: worker.worker_type,
+            max_concurrency: worker.max_concurrent_jobs,
+            current_jobs: worker.current_job_count,
+            status: worker.status,
+            last_heartbeat: worker.last_heartbeat,
+            metadata: worker.metadata,
+            version: worker.version,
+            registered_at: worker.created_at,
+            updated_at: worker.updated_at,
+        }
+    }
+}
+
 /// Worker statistics
 #[derive(Debug, Serialize)]
 pub struct WorkerStats {

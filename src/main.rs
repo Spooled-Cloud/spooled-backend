@@ -27,8 +27,6 @@ mod outgoing_webhooks;
 mod queue;
 mod scheduler;
 mod security;
-mod webhook;
-mod worker;
 
 use crate::config::Settings;
 use crate::db::Database;
