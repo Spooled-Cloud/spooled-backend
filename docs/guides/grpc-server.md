@@ -131,7 +131,7 @@ Standard gRPC health checking protocol.
 All `QueueService` and `WorkerService` methods require authentication via one of:
 
 - **API key credential**: send the API key value in the `x-api-key` gRPC metadata field, for example `x-api-key: sp_live_...`. The metadata field name is not the credential.
-- **JWT credential**: send the JWT in the `authorization` gRPC metadata field as `authorization: Bearer <jwt-token>`.
+- **Bearer API key credential**: send the API key value in the `authorization` gRPC metadata field as `authorization: Bearer <api-key>`.
 
 Although tools often call metadata entries “headers,” these names are HTTP/2/gRPC metadata. The health service does NOT require authentication.
 
@@ -303,11 +303,11 @@ If you see `launchd` using the port, use `GRPC_PORT=50052` instead.
 
 **Symptom**: `Unauthenticated: Missing x-api-key or authorization header`
 
-Here `x-api-key` and `authorization` are metadata field names. The credential is the API key value placed in `x-api-key`, or the JWT placed after `Bearer` in `authorization`.
+Here `x-api-key` and `authorization` are metadata field names. The credential is the API key value placed in `x-api-key`, or the API key placed after `Bearer` in `authorization`. REST dashboard JWTs are not accepted by the gRPC services.
 
 **Solutions**:
 1. Include the API key header: `-H "x-api-key: sp_live_..."` (or legacy `sk_live_...`)
-2. Or use JWT token: `-H "Authorization: Bearer <token>"`
+2. Or use bearer API key metadata: `-H "Authorization: Bearer sp_live_..."`
 3. Verify the API key is valid and not expired
 4. Check the organization has the correct permissions
 

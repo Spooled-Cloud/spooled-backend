@@ -503,7 +503,7 @@ pub async fn retry_delivery(
     // Validate UUID shape, but bind as TEXT — columns are TEXT PKs (BE-15).
     Uuid::parse_str(&webhook_id)
         .map_err(|_| AppError::Validation("Invalid webhook ID format".to_string()))?;
-    Uuid::parse_str(&delivery_id)
+    let parsed_delivery_id = Uuid::parse_str(&delivery_id)
         .map_err(|_| AppError::Validation("Invalid delivery ID format".to_string()))?;
 
     // Verify webhook belongs to organization
@@ -547,26 +547,18 @@ pub async fn retry_delivery(
         )));
     }
 
-    // Reset the delivery status to pending for retry
-    // SECURITY: Include webhook_id in WHERE clause as defense-in-depth
-    sqlx::query(
-        r#"
-        UPDATE outgoing_webhook_deliveries 
-        SET status = 'pending', 
-            attempts = attempts + 1,
-            error = NULL,
-            status_code = NULL,
-            response_body = NULL
-        WHERE id = $1 AND webhook_id = $2
-        "#,
-    )
-    .bind(&delivery_id)
-    .bind(&webhook_id)
-    .execute(state.db.pool())
-    .await?;
+    let retry_success = state
+        .outgoing_webhooks
+        .retry_delivery(parsed_delivery_id)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to retry delivery: {}", e)))?;
 
     Ok(Json(RetryDeliveryResponse {
-        success: true,
-        message: "Delivery queued for retry".to_string(),
+        success: retry_success,
+        message: if retry_success {
+            "Delivery retried successfully".to_string()
+        } else {
+            "Delivery retry attempted but target did not return success".to_string()
+        },
     }))
 }

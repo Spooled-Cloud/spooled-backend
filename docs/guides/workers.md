@@ -113,7 +113,7 @@ def process_job(job):
         requests.post(
             f"{BASE_URL}/api/v1/jobs/{job_id}/complete",
             headers=headers,
-            json={"result": result}
+            json={"worker_id": WORKER_ID, "lease_id": job.get("lease_id"), "result": result}
         )
         print(f"✓ Completed {job_id}")
         
@@ -122,7 +122,7 @@ def process_job(job):
         requests.post(
             f"{BASE_URL}/api/v1/jobs/{job_id}/fail",
             headers=headers,
-            json={"reason": str(e)}
+            json={"worker_id": WORKER_ID, "lease_id": job.get("lease_id"), "error": str(e)}
         )
         print(f"✗ Failed {job_id}: {e}")
 
@@ -325,7 +325,9 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs/job_xxx/fail \
   -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "reason": "SMTP server unavailable"
+    "worker_id": "worker-1",
+    "lease_id": "lease_from_claim",
+    "error": "SMTP server unavailable"
   }'
 ```
 

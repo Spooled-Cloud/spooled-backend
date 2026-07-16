@@ -199,7 +199,9 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs/job_xxx/fail \
   -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "reason": "SMTP server unavailable"
+    "worker_id": "worker-1",
+    "lease_id": "lease_from_claim",
+    "error": "SMTP server unavailable"
   }'
 ```
 
@@ -444,9 +446,9 @@ try:
     process_job(job)
     job.complete(result={"success": True})
 except TemporaryError as e:
-    job.fail(reason=str(e))  # Will retry
+    job.fail(error=str(e))  # Will retry
 except PermanentError as e:
-    job.fail(reason=str(e), no_retry=True)  # Go to DLQ
+    job.fail(error=str(e), retry=False)  # gRPC workers can skip retry; REST retries by policy
 ```
 
 ### 5. Monitor Queue Health

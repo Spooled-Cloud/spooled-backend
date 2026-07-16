@@ -33,6 +33,6 @@ Enqueue/resource gates use **plan_tier quotas** (`middleware/limits.rs` + `confi
 ## Known contract gaps (verified)
 
 - Enterprise price id not mapped in `determine_plan_tier` (starter/pro only).
-- `checkout.session.completed` trusts `client_reference_id` as org id; no `payment_status` check observed.
+- `checkout.session.completed` checks paid/no-payment status before linking. Residual risk: it still trusts `client_reference_id` as org id, so org linkage policy remains sensitive.
 - `charge.dispute.*` not handled.
 - Outbound Stripe HTTP calls: no pinned `Stripe-Version` header observed.

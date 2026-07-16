@@ -122,10 +122,27 @@ impl OutgoingWebhookService {
             "data": payload,
         });
 
-        self.try_deliver(&webhook, &body, 1).await
+        let max_attempts = self.max_attempts.max(1);
+        for attempt in 1..=max_attempts {
+            let success = self.try_deliver(&webhook, &body, attempt).await?;
+            if success || attempt >= max_attempts {
+                break;
+            }
+
+            let backoff = Duration::from_secs(2_u64.pow((attempt - 1).min(5) as u32));
+            warn!(
+                "Webhook delivery failed (attempt {}/{}), retrying in {}s",
+                attempt,
+                max_attempts,
+                backoff.as_secs()
+            );
+            tokio::time::sleep(backoff).await;
+        }
+
+        Ok(())
     }
 
-    pub async fn retry_delivery(&self, delivery_id: uuid::Uuid) -> Result<()> {
+    pub async fn retry_delivery(&self, delivery_id: uuid::Uuid) -> Result<bool> {
         // Fetch delivery details using runtime query (no compile-time check)
         let row = sqlx::query(
             r#"
@@ -144,7 +161,7 @@ impl OutgoingWebhookService {
         use sqlx::Row;
         let status: String = row.get("status");
         if status == "success" {
-            return Ok(());
+            return Ok(true);
         }
 
         let webhook = OutgoingWebhook {
@@ -190,7 +207,7 @@ impl OutgoingWebhookService {
         webhook: &OutgoingWebhook,
         body: &serde_json::Value,
         attempt: i32,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let start = Utc::now();
 
         // Validate URL prevents SSRF
@@ -242,26 +259,14 @@ impl OutgoingWebhookService {
                 )
                 .await?;
 
-                if !success && attempt < self.max_attempts {
-                    warn!(
-                        "Webhook delivery failed (attempt {}/{}), should retry",
-                        attempt, self.max_attempts
-                    );
-                }
+                return Ok(success);
             }
             Err(e) => {
                 self.record_attempt(&webhook.id, body, 0, Some(&e.to_string()), attempt, start)
                     .await?;
-                if attempt < self.max_attempts {
-                    warn!(
-                        "Webhook delivery error (attempt {}/{}), should retry: {}",
-                        attempt, self.max_attempts, e
-                    );
-                }
+                return Ok(false);
             }
         }
-
-        Ok(())
     }
 
     async fn record_attempt(

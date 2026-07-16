@@ -2,14 +2,14 @@
 
 ## Incoming (job ingest)
 
-`POST /api/v1/webhooks/{org_id}/custom` — requires `X-Webhook-Token`; production HTTPS via `X-Forwarded-Proto`. Inserts job with hardcoded retries/timeout `3`/`300`.
+`POST /api/v1/webhooks/{org_id}/custom` — requires `X-Webhook-Token`; production HTTPS via `X-Forwarded-Proto`. Inserts jobs using configured queue defaults (`QUEUE_DEFAULT_MAX_RETRIES` / `QUEUE_DEFAULT_TIMEOUT_SECS` via settings).
 
 ## Outgoing org webhooks (`outgoing_webhooks/service.rs`)
 
 Events in `VALID_WEBHOOK_EVENTS` (`models/webhook.rs`):  
 `job.created|started|completed|failed|cancelled`, `queue.paused|resumed`, `worker.registered|deregistered`, `schedule.triggered`.
 
-Delivery headers: `X-Spooled-Event`, `X-Spooled-Timestamp`, `X-Spooled-Delivery-Attempt`, optional `X-Spooled-Signature` (`sha256=` HMAC of `{ts}.{body}`) when secret set. URL SSRF-validated.
+Delivery body: `{ id, event, created_at, data }`. Headers: `X-Spooled-Event`, `X-Spooled-Timestamp`, `X-Spooled-Delivery-Attempt`, optional `X-Spooled-Signature` (`sha256=` HMAC of `{ts}.{body}`) when secret set. URL SSRF-validated. Delivery uses bounded in-process retries, plus a manual retry endpoint.
 
 Note: `job.deadlettered` appears in legacy `src/webhook/` but is **not** in `VALID_WEBHOOK_EVENTS` for the live outgoing service.
 

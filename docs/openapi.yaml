@@ -1065,6 +1065,7 @@ paths:
       description: Mark a claimed job as successfully completed
       operationId: completeJob
       requestBody:
+        required: true
         content:
           application/json:
             schema:
@@ -1075,7 +1076,11 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Job'
+                type: object
+                required: [success]
+                properties:
+                  success:
+                    type: boolean
         '404':
           description: Job not found
         '409':
@@ -1107,7 +1112,11 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Job'
+                type: object
+                required: [success]
+                properties:
+                  success:
+                    type: boolean
         '404':
           description: Job not found
 
@@ -1124,6 +1133,7 @@ paths:
       description: Extend the lease on a processing job to prevent it being reclaimed
       operationId: jobHeartbeat
       requestBody:
+        required: true
         content:
           application/json:
             schema:
@@ -1131,6 +1141,14 @@ paths:
       responses:
         '200':
           description: Lease renewed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success]
+                properties:
+                  success:
+                    type: boolean
         '404':
           description: Job not found
         '409':
@@ -2966,6 +2984,9 @@ components:
         completion_webhook:
           type: string
           format: uri
+        completion_webhook_secret:
+          type: string
+          description: Optional shared secret used to sign completion webhook callbacks.
         idempotency_key:
           type: string
           maxLength: 255
@@ -4238,7 +4259,7 @@ components:
     # Job Processing Schemas
     ClaimJobsRequest:
       type: object
-      required: [queue_name]
+      required: [queue_name, worker_id]
       properties:
         queue_name:
           type: string
@@ -4254,9 +4275,9 @@ components:
           description: Maximum number of jobs to claim
         lease_duration_secs:
           type: integer
-          minimum: 30
+          minimum: 5
           maximum: 3600
-          default: 300
+          default: 30
           description: Lease duration in seconds
 
     ClaimJobsResponse:
@@ -4302,6 +4323,7 @@ components:
 
     CompleteJobRequest:
       type: object
+      required: [worker_id]
       properties:
         result:
           type: object
@@ -4317,18 +4339,15 @@ components:
 
     FailJobRequest:
       type: object
-      required: [reason]
+      required: [worker_id, error]
       properties:
-        reason:
+        error:
           type: string
-          maxLength: 1000
-          description: Reason for failure
+          minLength: 1
+          maxLength: 2048
+          description: Error message for the failed attempt
         worker_id:
           type: string
-        no_retry:
-          type: boolean
-          default: false
-          description: Skip retries and go directly to DLQ
         lease_id:
           type: string
           description: >-
@@ -4338,13 +4357,13 @@ components:
 
     HeartbeatJobRequest:
       type: object
+      required: [worker_id, lease_duration_secs]
       properties:
-        extension_secs:
+        lease_duration_secs:
           type: integer
-          minimum: 30
+          minimum: 5
           maximum: 3600
-          default: 300
-          description: Extend lease by this many seconds
+          description: New lease duration from now, in seconds
         worker_id:
           type: string
         lease_id:

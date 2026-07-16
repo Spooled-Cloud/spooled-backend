@@ -58,16 +58,17 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs \
 # Claim up to 5 jobs
 curl -X POST https://api.spooled.cloud/api/v1/jobs/claim \
   -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
-  -d '{"queue_name": "my-queue", "limit": 5}'
+  -d '{"queue_name": "my-queue", "worker_id": "worker-1", "limit": 5}'
 
 # Complete a job
 curl -X POST https://api.spooled.cloud/api/v1/jobs/job_xyz123/complete \
-  -H "Authorization: Bearer sp_live_YOUR_API_KEY"
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
+  -d '{"worker_id": "worker-1", "lease_id": "lease_from_claim"}'
 
 # Or fail it (will retry)
 curl -X POST https://api.spooled.cloud/api/v1/jobs/job_xyz123/fail \
   -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
-  -d '{"reason": "Connection timeout"}'
+  -d '{"worker_id": "worker-1", "lease_id": "lease_from_claim", "error": "Connection timeout"}'
 ```
 
 ---
@@ -633,10 +634,9 @@ curl -N http://localhost:8080/api/v1/events/queues/emails \
 | Event | Description |
 |-------|-------------|
 | `job.created` | New job enqueued |
-| `job.processing` | Job claimed by worker |
+| `job.started` | Job claimed by worker |
 | `job.completed` | Job finished successfully |
-| `job.failed` | Job failed (will retry if retries remaining) |
-| `job.dead_letter` | Job moved to DLQ after exhausting retries |
+| `job.failed` | Job failed; `data.status` may be `failed` or `deadletter` |
 | `job.cancelled` | Job was cancelled |
 | `queue.paused` | Queue processing paused |
 | `queue.resumed` | Queue processing resumed |
@@ -841,7 +841,7 @@ curl "http://localhost:8080/api/v1/jobs?status=processing" \
 # Force-fail a stuck job
 curl -X POST http://localhost:8080/api/v1/jobs/job_xyz/fail \
   -H "Authorization: Bearer sp_live_..." \
-  -d '{"reason": "Manual intervention - stuck job"}'
+  -d '{"worker_id": "worker-1", "lease_id": "lease_from_claim", "error": "Manual intervention - stuck job"}'
 ```
 
 ---

@@ -152,11 +152,14 @@ When job completes, Spooled POSTs to your URL. With `completion_webhook_secret` 
 ```json
 {
   "event": "job.completed",
-  "job_id": "job_xxx",
-  "queue_name": "exports",
-  "status": "completed",
-  "result": { ... },
-  "completed_at": "2024-01-15T10:30:00Z"
+  "created_at": "2024-01-15T10:30:00Z",
+  "data": {
+    "job_id": "job_xxx",
+    "queue_name": "exports",
+    "status": "completed",
+    "result": { ... },
+    "completed_at": "2024-01-15T10:30:00Z"
+  }
 }
 ```
 
@@ -170,7 +173,7 @@ curl -X POST https://api.spooled.cloud/api/v1/outgoing-webhooks \
   -d '{
     "name": "Job Notifications",
     "url": "https://api.example.com/webhooks/spooled",
-    "events": ["job.completed", "job.failed", "job.dead_letter"],
+    "events": ["job.completed", "job.failed", "worker.registered"],
     "secret": "your_webhook_secret"
   }'
 ```
@@ -194,21 +197,22 @@ curl -X POST https://api.spooled.cloud/api/v1/outgoing-webhooks/{id}/retry/{deli
 | Event | Description |
 |-------|-------------|
 | `job.created` | New job enqueued |
-| `job.processing` | Job claimed by worker |
+| `job.started` | Job claimed by worker |
 | `job.completed` | Job completed successfully |
-| `job.failed` | Job failed (may retry) |
-| `job.dead_letter` | Job moved to DLQ |
+| `job.failed` | Job failed; `data.status` may be `failed` or `deadletter` |
+| `job.cancelled` | Job cancelled |
 | `queue.paused` | Queue paused |
 | `queue.resumed` | Queue resumed |
 | `worker.registered` | New worker connected |
-| `worker.offline` | Worker went offline |
+| `worker.deregistered` | Worker disconnected |
+| `schedule.triggered` | Schedule created jobs |
 
 ### Outgoing Webhook Format
 
 ```json
 {
   "id": "evt_xxx",
-  "type": "job.completed",
+  "event": "job.completed",
   "created_at": "2024-01-15T10:30:00Z",
   "data": {
     "job_id": "job_xxx",
@@ -228,8 +232,10 @@ Content-Type: application/json
 X-Spooled-Event: job.completed
 X-Spooled-Signature: sha256=xxxxx
 X-Spooled-Timestamp: 1705315800
-X-Spooled-Delivery-ID: del_xxx
+X-Spooled-Delivery-Attempt: 1
 ```
+
+The delivery ID is the top-level `id` field in the JSON body.
 
 ### Verify Outgoing Webhook Signature
 
@@ -250,17 +256,17 @@ def verify_spooled_signature(payload: bytes, signature: str, timestamp: str, sec
 
 ### Retry Behavior
 
-Outgoing webhooks retry with exponential backoff:
+Outgoing webhooks use best-effort in-process retry with short exponential backoff:
 
 | Attempt | Delay |
 |---------|-------|
 | 1 | Immediate |
-| 2 | 1 minute |
-| 3 | 5 minutes |
-| 4 | 30 minutes |
-| 5 | 2 hours |
+| 2 | 1 second |
+| 3 | 2 seconds |
+| 4 | 4 seconds |
+| 5 | 8 seconds |
 
-After 5 failed attempts, the webhook is marked as failed.
+After the configured attempt limit, the delivery remains failed. You can also use the manual retry endpoint above; manual retry sends immediately and records the new result.
 
 ---
 

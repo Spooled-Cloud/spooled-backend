@@ -78,21 +78,24 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs/job_xxx/fail \
   -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "reason": "Connection timeout to SMTP server"
+    "worker_id": "worker-1",
+    "lease_id": "lease_from_claim",
+    "error": "Connection timeout to SMTP server"
   }'
 ```
 
 ### Skip Retries
 
-For permanent failures, skip retries and send directly to DLQ:
+REST fail follows the job retry policy. For permanent failures, create the job with `max_retries: 0` or use gRPC `Fail` with `retry: false` from a worker that owns the lease.
 
 ```bash
-curl -X POST https://api.spooled.cloud/api/v1/jobs/job_xxx/fail \
+curl -X POST https://api.spooled.cloud/api/v1/jobs \
   -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "reason": "Invalid email address format",
-    "no_retry": true
+    "queue_name": "emails",
+    "payload": {"to": "user@example.com"},
+    "max_retries": 0
   }'
 ```
 
@@ -154,7 +157,7 @@ Jobs that fail after exhausting all retries are moved to the Dead Letter Queue (
 ### Why Jobs Go to DLQ
 
 1. **Max retries exceeded** - Failed `max_retries` times
-2. **Manual rejection** - Worker called fail with `no_retry: true`
+2. **Manual no-retry** - gRPC worker called `Fail` with `retry: false`, or the job was created with `max_retries: 0`
 3. **Timeout exceeded** - Job lease expired without completion
 4. **Poison pill** - Repeated crashes processing the job
 
@@ -281,10 +284,10 @@ try:
     job.complete(result)
 except ConnectionError as e:
     # Temporary - will retry
-    job.fail(reason=str(e))
+    job.fail(error=str(e))
 except ValidationError as e:
-    # Permanent - skip to DLQ
-    job.fail(reason=str(e), no_retry=True)
+    # Permanent - use gRPC retry=False or create this class of jobs with max_retries=0
+    job.fail(error=str(e), retry=False)
 ```
 
 ### 3. Monitor DLQ Growth
@@ -316,7 +319,7 @@ curl -X POST https://api.spooled.cloud/api/v1/outgoing-webhooks \
   -d '{
     "name": "DLQ Alerts",
     "url": "https://api.example.com/webhooks/job-failures",
-    "events": ["job.dead_letter"],
+    "events": ["job.failed"],
     "secret": "your_webhook_secret"
   }'
 ```
@@ -336,8 +339,8 @@ try:
     call_external_api(job.payload)
     job.complete()
 except CircuitBreakerError:
-    # Circuit open - fail without retry, try again later
-    job.fail(reason="Circuit breaker open", no_retry=True)
+    # Circuit open - fail according to queue policy, then try again later
+    job.fail(error="Circuit breaker open")
 ```
 
 ---
