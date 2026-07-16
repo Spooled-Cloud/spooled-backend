@@ -2455,13 +2455,11 @@ paths:
         
         **Limitations:**
         - Cannot retry successful deliveries (returns 400)
-        - Maximum 10 manual retry attempts per delivery (returns 400 when exceeded)
+        - Maximum 10 total attempts per delivery (returns 400 when exceeded)
       operationId: retryOutgoingWebhookDelivery
       responses:
         '200':
           description: Retry initiated
-        '400':
-          description: Bad request (delivery already successful or max retries exceeded)
           content:
             application/json:
               schema:
@@ -2472,6 +2470,12 @@ paths:
                     type: boolean
                   message:
                     type: string
+        '400':
+          description: Bad request (delivery already successful or max attempts exceeded)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '404':
           description: Webhook or delivery not found
 
@@ -2610,7 +2614,7 @@ components:
           type: string
         cron_expression:
           type: string
-          description: Cron expression: 5-field (minute hour day month weekday) or 6-field (leading seconds). 5-field defaults seconds to 0.
+          description: 'Cron expression: 5-field (minute hour day month weekday) or 6-field (leading seconds). 5-field defaults seconds to 0.'
           example: '0 */5 * * * *'
         timezone:
           type: string
@@ -4291,18 +4295,14 @@ components:
 
     ClaimedJob:
       type: object
-      required: [id, queue_name, status, payload, lease_expires_at]
+      required: [id, queue_name, payload, retry_count, max_retries, timeout_seconds, lease_expires_at, lease_id]
       properties:
         id:
           type: string
         queue_name:
           type: string
-        status:
-          type: string
         payload:
           type: object
-        priority:
-          type: integer
         retry_count:
           type: integer
         max_retries:
@@ -4317,13 +4317,10 @@ components:
           description: >-
             Fencing token for this lease. Echo it back in complete/fail/heartbeat
             so the operation applies only to the lease this worker actually holds.
-        created_at:
-          type: string
-          format: date-time
 
     CompleteJobRequest:
       type: object
-      required: [worker_id]
+      required: [worker_id, lease_id]
       properties:
         result:
           type: object
@@ -4333,13 +4330,13 @@ components:
         lease_id:
           type: string
           description: >-
-            Lease fencing token from the claim response. When provided, the
-            completion succeeds only if it matches the job's current lease
-            (409 LEASE_EXPIRED otherwise).
+            Required lease fencing token from the claim response. Completion
+            succeeds only if it matches the job's current lease (409
+            LEASE_EXPIRED otherwise).
 
     FailJobRequest:
       type: object
-      required: [worker_id, error]
+      required: [worker_id, lease_id, error]
       properties:
         error:
           type: string
@@ -4351,13 +4348,13 @@ components:
         lease_id:
           type: string
           description: >-
-            Lease fencing token from the claim response. When provided, the
-            failure succeeds only if it matches the job's current lease
-            (409 LEASE_EXPIRED otherwise).
+            Required lease fencing token from the claim response. Failure
+            succeeds only if it matches the job's current lease (409
+            LEASE_EXPIRED otherwise).
 
     HeartbeatJobRequest:
       type: object
-      required: [worker_id, lease_duration_secs]
+      required: [worker_id, lease_id, lease_duration_secs]
       properties:
         lease_duration_secs:
           type: integer
@@ -4369,9 +4366,9 @@ components:
         lease_id:
           type: string
           description: >-
-            Lease fencing token from the claim response. When provided, the
-            renewal succeeds only if it matches the job's current lease
-            (409 LEASE_EXPIRED otherwise).
+            Required lease fencing token from the claim response. Renewal
+            succeeds only if it matches the job's current lease (409
+            LEASE_EXPIRED otherwise).
 
     # Email Authentication Schemas
     CheckEmailRequest:

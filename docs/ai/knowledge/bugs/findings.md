@@ -27,6 +27,7 @@ Cartography + fix pass: 2026-07-15. Only code-verified items. No amount/formula 
 | BE-19 | P2 | Stripe signed replay/ordering coverage was unit-only — **mitigated** with docker fixture tests | `tests/stripe_webhook_tests.rs`; `billing.rs` verify/claim/order | Valid-sig replay / out-of-order | Stale plan restore risk | Keep docker-tests green; residual same-second `<=` + no live resend |
 | BE-20 | P2 | ~~Deadletter sweep used `< NOW()` while reclaim used `<=`~~ **FIXED 0.1.108** | `scheduler/mod.rs` deadletter CTE; `queue/mod.rs` `recover_expired_leases` | Lease at exact expiry + `retry_count >= max_retries` | One-tick stuck in `processing` (neither complete nor DLQ) | Use `<=` on both paths |
 | BE-21 | P2 | ~~Outgoing webhook retry path recorded pending/logged intent without sending retry~~ **FIXED working tree** | `outgoing_webhooks/service.rs`; `api/handlers/outgoing_webhooks.rs` | Endpoint target returns 5xx or manual retry clicked | Delivery not actually retried; docs overstated retry behavior | Bounded in-process retry + manual retry calls delivery service |
+| BE-22 | P3 | ~~OpenAPI retry/worker schemas drifted from runtime lease/response contracts~~ **FIXED working tree** | `docs/openapi.yaml` | OpenAPI clients/codegen use docs | Clients omit `lease_id` or misread retry response | Schema synced to runtime response/request fields |
 
 ## Live gap re-verify (2026-07-15 on `0.1.107`)
 
