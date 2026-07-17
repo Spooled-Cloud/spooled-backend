@@ -774,8 +774,8 @@ async fn handle_invoice_paid(state: &AppState, event: &StripeEvent) -> AppResult
                 stripe_subscription_status = 'active',
                 updated_at = NOW()
             WHERE stripe_customer_id = $1
+              AND stripe_subscription_id IS NOT NULL
               AND COALESCE(stripe_subscription_status, '') NOT IN ('canceled', 'cancelled')
-              AND plan_tier <> 'free'
             "#,
         )
         .bind(customer_id)
@@ -785,7 +785,7 @@ async fn handle_invoice_paid(state: &AppState, event: &StripeEvent) -> AppResult
         if result.rows_affected() == 0 {
             // No org linked yet (event raced ahead of checkout linkage): return 5xx so
             // Stripe retries — a paying customer must not get stuck on the free tier
-            // because a one-shot event was dropped. Already-canceled / free / orphaned
+            // because a one-shot event was dropped. Already-canceled / orphaned
             // customers are ACKed instead.
             if !org_linked_to_customer(state, customer_id).await?
                 && should_request_retry_for_unlinked(event_time)
@@ -795,7 +795,7 @@ async fn handle_invoice_paid(state: &AppState, event: &StripeEvent) -> AppResult
                     customer_id
                 )));
             }
-            info!(customer_id = %customer_id, event_id = %event.id, "Ignoring invoice.paid for unlinked, free, or canceled org");
+            info!(customer_id = %customer_id, event_id = %event.id, "Ignoring invoice.paid for unlinked or canceled org");
             return Ok(());
         }
 
@@ -830,8 +830,8 @@ async fn handle_payment_failed(state: &AppState, event: &StripeEvent) -> AppResu
                 stripe_subscription_status = 'past_due',
                 updated_at = NOW()
             WHERE stripe_customer_id = $1
+              AND stripe_subscription_id IS NOT NULL
               AND COALESCE(stripe_subscription_status, '') NOT IN ('canceled', 'cancelled')
-              AND plan_tier <> 'free'
             "#,
         )
         .bind(customer_id)
@@ -840,7 +840,7 @@ async fn handle_payment_failed(state: &AppState, event: &StripeEvent) -> AppResu
 
         if result.rows_affected() == 0 {
             // Same retry semantics as invoice.paid: not-linked-yet → 5xx for retry,
-            // free/canceled/orphaned → ACK.
+            // canceled/orphaned → ACK.
             if !org_linked_to_customer(state, customer_id).await?
                 && should_request_retry_for_unlinked(event_time)
             {
@@ -849,7 +849,7 @@ async fn handle_payment_failed(state: &AppState, event: &StripeEvent) -> AppResu
                     customer_id
                 )));
             }
-            info!(customer_id = %customer_id, event_id = %event.id, "Ignoring invoice.payment_failed for unlinked, free, or canceled org");
+            info!(customer_id = %customer_id, event_id = %event.id, "Ignoring invoice.payment_failed for unlinked or canceled org");
             return Ok(());
         }
 
