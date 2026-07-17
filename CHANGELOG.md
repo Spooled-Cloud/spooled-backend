@@ -15,6 +15,7 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - OpenAPI and webhook/gRPC guides now match current request fields, completion webhook envelope shape, gRPC API-key auth, and outgoing webhook headers/events.
 - OpenAPI retry/worker schemas now match runtime response bodies and required lease fencing fields.
 - REST worker heartbeat and detail responses now use the current worker columns while keeping stable public JSON names (`current_jobs`, `max_concurrency`, `registered_at`).
+- Invoice Stripe webhooks no longer advance shared `stripe_last_event_at`, so out-of-order `invoice.*` events cannot suppress a legitimate `subscription.*` plan/status change.
 
 ## [0.1.109] - 2026-07-15
 

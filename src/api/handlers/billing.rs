@@ -761,30 +761,32 @@ async fn handle_invoice_paid(state: &AppState, event: &StripeEvent) -> AppResult
     let subscription_id = invoice_subscription_id(invoice);
 
     if let (Some(customer_id), Some(_sub_id)) = (customer_id, subscription_id) {
-        // Ensure subscription is active. Stale re-deliveries are ignored via the
-        // stripe_last_event_at guard.
+        // Mark active without advancing stripe_last_event_at. Invoice timestamps share
+        // a different stream than subscription.* events; bumping the shared clock here
+        // used to drop a legitimate later plan-tier/subscription update that arrived
+        // with an earlier Stripe `created` (out-of-order delivery).
+        // Do not revive canceled subscriptions (subscription.deleted owns terminal state).
         let event_time = event_created_at(event);
         let result = sqlx::query(
             r#"
             UPDATE organizations
             SET
                 stripe_subscription_status = 'active',
-                stripe_last_event_at = $2,
                 updated_at = NOW()
             WHERE stripe_customer_id = $1
-              AND (stripe_last_event_at IS NULL OR stripe_last_event_at <= $2)
+              AND COALESCE(stripe_subscription_status, '') NOT IN ('canceled', 'cancelled')
+              AND plan_tier <> 'free'
             "#,
         )
         .bind(customer_id)
-        .bind(event_time)
         .execute(state.db.pool())
         .await?;
 
         if result.rows_affected() == 0 {
             // No org linked yet (event raced ahead of checkout linkage): return 5xx so
             // Stripe retries — a paying customer must not get stuck on the free tier
-            // because a one-shot event was dropped. A stale event (org linked but the
-            // ordering guard rejected it) or an orphaned-customer event is ACKed instead.
+            // because a one-shot event was dropped. Already-canceled / free / orphaned
+            // customers are ACKed instead.
             if !org_linked_to_customer(state, customer_id).await?
                 && should_request_retry_for_unlinked(event_time)
             {
@@ -793,7 +795,7 @@ async fn handle_invoice_paid(state: &AppState, event: &StripeEvent) -> AppResult
                     customer_id
                 )));
             }
-            info!(customer_id = %customer_id, event_id = %event.id, "Ignoring stale or unlinked invoice.paid event");
+            info!(customer_id = %customer_id, event_id = %event.id, "Ignoring invoice.paid for unlinked, free, or canceled org");
             return Ok(());
         }
 
@@ -818,28 +820,27 @@ async fn handle_payment_failed(state: &AppState, event: &StripeEvent) -> AppResu
     }
 
     if let Some(customer_id) = customer_id {
-        // Mark as past_due. Stale re-deliveries are ignored via the
-        // stripe_last_event_at guard.
+        // Mark past_due without advancing stripe_last_event_at (see invoice.paid).
+        // Only degrade live paid subscriptions — never after cancel/free.
         let event_time = event_created_at(event);
         let result = sqlx::query(
             r#"
             UPDATE organizations
             SET
                 stripe_subscription_status = 'past_due',
-                stripe_last_event_at = $2,
                 updated_at = NOW()
             WHERE stripe_customer_id = $1
-              AND (stripe_last_event_at IS NULL OR stripe_last_event_at <= $2)
+              AND COALESCE(stripe_subscription_status, '') NOT IN ('canceled', 'cancelled')
+              AND plan_tier <> 'free'
             "#,
         )
         .bind(customer_id)
-        .bind(event_time)
         .execute(state.db.pool())
         .await?;
 
         if result.rows_affected() == 0 {
             // Same retry semantics as invoice.paid: not-linked-yet → 5xx for retry,
-            // stale/orphaned → ACK.
+            // free/canceled/orphaned → ACK.
             if !org_linked_to_customer(state, customer_id).await?
                 && should_request_retry_for_unlinked(event_time)
             {
@@ -848,7 +849,7 @@ async fn handle_payment_failed(state: &AppState, event: &StripeEvent) -> AppResu
                     customer_id
                 )));
             }
-            info!(customer_id = %customer_id, event_id = %event.id, "Ignoring stale or unlinked invoice.payment_failed event");
+            info!(customer_id = %customer_id, event_id = %event.id, "Ignoring invoice.payment_failed for unlinked, free, or canceled org");
             return Ok(());
         }
 
