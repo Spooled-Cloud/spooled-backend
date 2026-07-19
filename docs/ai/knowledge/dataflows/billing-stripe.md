@@ -13,7 +13,7 @@
 1. Verify signature (multi-`v1` support; skew ~300s; any matching `v1` during secret rotation).
 2. Claim event id in `processed_stripe_events` (dedupe migration `20260707000001_stripe_event_dedupe.sql`) **before** handler work; release claim on handler error so Stripe can retry.
 3. Handle checkout completed, subscription created/updated/deleted, invoice paid/failed.
-4. Monotonic guard via `stripe_last_event_at` (`NULL OR <= event.created`) where applicable — equal second timestamps both apply (Stripe has no finer signal).
+4. Monotonic guard via `stripe_last_event_at` (`NULL OR <= event.created`) on subscription.* handlers — equal second timestamps both apply (Stripe has no finer signal). invoice.* handlers are excluded from the guard (they neither check nor advance it) so out-of-order invoice.* events cannot suppress subscription.* events. Residual: distinct out-of-order invoice.paid / invoice.payment_failed events can transiently flip org status against each other until the next subscription.* event corrects it (exact re-deliveries still deduped via `processed_stripe_events`).
 5. On handler error, release claim so Stripe can retry; return 5xx for unlinked/recent subscription updates so events are not ACK-dropped.
 
 ### Regression coverage
