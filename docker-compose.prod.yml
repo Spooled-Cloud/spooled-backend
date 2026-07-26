@@ -80,6 +80,11 @@ services:
   db:
     image: postgres:16-alpine
     container_name: spooled_db
+    # Loopback-only publish so an SSH tunnel has a stable target
+    # (container IPs are Docker-assigned and move between redeploys).
+    # NOT reachable off-host: bound to 127.0.0.1, never 0.0.0.0.
+    ports:
+      - "127.0.0.1:5432:5432"
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-spooled}
