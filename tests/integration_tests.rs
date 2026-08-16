@@ -2303,6 +2303,9 @@ async fn test_grpc_unary_transport_rejects_out_of_scope_settlement() {
         spooled_backend::outgoing_webhooks::service::OutgoingWebhookService::new(
             db.pool().clone(),
             3,
+            // Delivery concurrency ceiling; irrelevant to this test, but the
+            // service now requires an explicit bound rather than spawning freely.
+            8,
         ),
     );
     let service = QueueServiceImpl::new(

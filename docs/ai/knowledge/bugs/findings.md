@@ -16,7 +16,7 @@ Cartography + fix pass: 2026-07-15. Only code-verified items. No amount/formula 
 | BE-08 | P2 | Checkout still trusts `client_reference_id`; **payment_status gate added 0.1.107** (unpaid ignored) | `billing.rs` ~349–351 | Malicious/odd Checkout session | Wrong org link / unpaid grant risk | Verify payment_status + server-side metadata |
 | BE-09 | P2 | Dispute events unhandled | no `charge.dispute` in webhook match ~240 | Chargeback | Entitlements until cancel | Handle dispute → suspend |
 | BE-10 | P2 | Tracked local key; **mitigated** via `certs/README.md` (disposable/dev) | `certs/grpc-key.pem` header `BEGIN PRIVATE KEY` | Key ever used outside disposable local | Key compromise | Confirm disposable; remove/rotate |
-| BE-11 | P3 | Query `?token=`/`?api_key=` on protected routes | `middleware/auth.rs` ~97–111 | Token in URL | Log/Referer leak | Limit to WS/SSE |
+| BE-11 | P3 | ~~Query `?token=`/`?api_key=` on protected routes~~ **FIXED 0.1.111** — query fallback (`authenticate_api_key_allow_query`) mounted only on `/api/v1/ws` + the three `/api/v1/events` routes; everything else is header-only and 401s | `middleware/auth.rs` ~97–111 | Token in URL | Log/Referer leak | Limit to WS/SSE |
 | BE-12 | P3 | ~~admin unthrottled~~ **FIXED 0.1.107** Redis IP window 60/min | `api/mod.rs` admin nest | Brute force admin key | Abuse | Rate limit |
 | BE-13 | P3 | Email check enumeration | `email_login.rs` exists/available | Probe emails | Account enum | Uniform response |
 | BE-14 | P3 | Retention SQL ignores some `SPOOLED_PLAN_*` env windows | `scheduler/mod.rs` ~1010–1017 | Custom env retention | Unexpected purge window | Read settings |

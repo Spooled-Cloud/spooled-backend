@@ -16,8 +16,9 @@ use axum::{
 use serde::Serialize;
 use tracing::{debug, warn};
 
+use crate::api::middleware::client_ip::client_ip;
 use crate::api::AppState;
-use crate::config::PlanLimits;
+use crate::config::{PlanLimits, TrustedProxySettings};
 use crate::models::ApiKeyContext;
 
 /// Rate limit exceeded response (shared shape with existing middleware)
@@ -60,43 +61,47 @@ fn rate_limit_unavailable_response(retry_after_secs: u64) -> Response {
     res
 }
 
-/// Extract a best-effort client id for unauthenticated routes (IP-based).
-fn extract_client_id(request: &Request<Body>) -> String {
-    // X-Forwarded-For (first IP) if present
-    if let Some(forwarded) = request
-        .headers()
-        .get("X-Forwarded-For")
-        .and_then(|v| v.to_str().ok())
-    {
-        if let Some(ip) = forwarded.split(',').next() {
-            let trimmed = ip.trim();
-            if !trimmed.is_empty() && trimmed.len() < 46 {
-                return format!("ip:{}", trimmed);
-            }
+/// Client id for unauthenticated routes, derived from a TRUSTED address only.
+///
+/// Delegates to [`crate::api::middleware::client_ip`], which reads the
+/// configured edge header and counts `X-Forwarded-For` from the right. The
+/// previous implementation took the LEFTMOST `X-Forwarded-For` entry — the one
+/// the caller supplies — so any client could land in a fresh bucket per request
+/// and the limiter guarding `/auth/login`, `/auth/email/*`, `/organizations`
+/// and the admin routes was effectively absent.
+///
+/// The User-Agent fallback was also removed: it is client-controlled too, so it
+/// provided the same bypass one step down.
+fn extract_client_id(request: &Request<Body>, settings: &TrustedProxySettings) -> String {
+    format!("ip:{}", client_ip(request.headers(), settings))
+}
+
+/// Redis key holding an org's cached plan rate limits.
+///
+/// Single source of truth: the key was previously formatted independently in
+/// three modules (here, and both gRPC services), so an invalidation added in one
+/// place would silently miss the others.
+pub fn org_rate_limits_key(org_id: &str) -> String {
+    format!("org_rate_limits:{}", org_id)
+}
+
+/// Drop an org's cached plan limits.
+///
+/// Must be called whenever `plan_tier` or `custom_limits` changes — including
+/// soft/hard delete — otherwise the org keeps its previous rps/burst for up to
+/// the 60 s TTL. Best-effort: a cache miss is harmless (next request re-reads
+/// from the DB), so failures are logged, not propagated.
+pub async fn invalidate_org_rate_limits(cache: Option<&crate::cache::RedisCache>, org_id: &str) {
+    if let Some(cache) = cache {
+        if let Err(e) = cache.delete(&org_rate_limits_key(org_id)).await {
+            debug!(error = %e, org_id = %org_id, "Failed to invalidate cached org rate limits");
         }
     }
-
-    // Fall back to user agent hash (reduces global grouping)
-    if let Some(user_agent) = request
-        .headers()
-        .get("User-Agent")
-        .and_then(|v| v.to_str().ok())
-    {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(user_agent.as_bytes());
-        let hash = hex::encode(&hasher.finalize()[..8]);
-        return format!("ua:{}", hash);
-    }
-
-    // Worst-case fallback: group unknown clients together (don't generate a random key,
-    // otherwise callers can bypass rate limiting by omitting identifying headers).
-    "unknown".to_string()
 }
 
 async fn get_org_rate_limits(state: &AppState, org_id: &str) -> Result<OrgRateLimits, ()> {
     // Cache in Redis for 60s to avoid DB hit per request.
-    let cache_key = format!("org_rate_limits:{}", org_id);
+    let cache_key = org_rate_limits_key(org_id);
 
     if let Some(ref cache) = state.cache {
         if let Ok(Some(cached)) = cache.get_json::<OrgRateLimits>(&cache_key).await {
@@ -243,7 +248,7 @@ pub async fn plan_rate_limit_middleware(
     }
 
     // Public routes: apply a simple global rate limit (settings-based) keyed by IP/UA.
-    let client_id = extract_client_id(&request);
+    let client_id = extract_client_id(&request, &state.settings.trusted_proxy);
     let rps = state.settings.rate_limit.requests_per_second.max(1);
     let burst = state.settings.rate_limit.burst_size.max(1);
     let key = format!("rate_limit:public:{}", client_id);
@@ -299,7 +304,7 @@ pub async fn admin_rate_limit_middleware(
     const WINDOW_SECS: u64 = 60;
     const MAX_REQUESTS: u32 = 60;
 
-    let client_id = extract_client_id(&request);
+    let client_id = extract_client_id(&request, &state.settings.trusted_proxy);
     let key = format!("rate_limit:admin:{}", client_id);
     match cache
         .check_rate_limit(&key, MAX_REQUESTS, WINDOW_SECS)

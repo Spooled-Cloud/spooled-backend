@@ -2361,6 +2361,14 @@ paths:
     put:
       tags: [Outgoing Webhooks]
       summary: Update outgoing webhook
+      description: |
+        Partial update. Omitted fields keep their current value, with one
+        destructive exception: an explicit `"secret": null` clears the signing
+        secret and later deliveries go out unsigned.
+
+        Setting `"enabled": true` on a webhook that was auto-disabled counts
+        against the plan webhook cap, so it can be rejected with
+        429 QUOTA_EXCEEDED.
       operationId: updateOutgoingWebhook
       requestBody:
         required: true
@@ -2377,6 +2385,8 @@ paths:
                 $ref: '#/components/schemas/OutgoingWebhook'
         '404':
           description: Webhook not found
+        '429':
+          description: Plan webhook cap reached (QUOTA_EXCEEDED) when re-enabling
     delete:
       tags: [Outgoing Webhooks]
       summary: Delete outgoing webhook
@@ -2419,7 +2429,13 @@ paths:
     get:
       tags: [Outgoing Webhooks]
       summary: Get webhook delivery history
-      description: Get the delivery history for an outgoing webhook
+      description: |
+        Get the delivery history for an outgoing webhook. The newest 100
+        deliveries per webhook are readable.
+
+        History is retained for the organization's plan history_retention_days
+        (free 1, starter 7, pro 30, enterprise 90); older delivery rows are
+        removed by the retention sweep and can no longer be listed or retried.
       operationId: getOutgoingWebhookDeliveries
       responses:
         '200':
@@ -2453,9 +2469,12 @@ paths:
       description: |
         Trigger a retry for a specific outgoing webhook delivery attempt.
         
+        A successful retry resets the webhook's failure_count to 0.
+
         **Limitations:**
         - Cannot retry successful deliveries (returns 400)
         - Maximum 10 total attempts per delivery (returns 400 when exceeded)
+        - Deliveries removed by the plan retention sweep can no longer be retried
       operationId: retryOutgoingWebhookDelivery
       responses:
         '200':
@@ -3209,6 +3228,19 @@ components:
       type: object
       required: [queue_name, hostname]
       properties:
+        worker_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: '^[A-Za-z0-9._-]+$'
+          description: >-
+            Optional stable worker id. Supply the same value across restarts and
+            registration upserts a single row, so a restarting worker reclaims
+            its identity instead of leaving the old row to occupy the plan's
+            worker cap until the stale-worker reaper clears it (about two
+            minutes). Omit it and the server mints a UUID, which is the previous
+            behaviour. An id already owned by a different organization is
+            rejected with 409.
         queue_name:
           type: string
           minLength: 1
@@ -3277,6 +3309,10 @@ components:
         last_used:
           type: string
           format: date-time
+          description: >-
+            Coarse activity marker, written at most once per key per five
+            minutes rather than on every request. Do not read it as the
+            timestamp of the most recent call.
         expires_at:
           type: string
           format: date-time
@@ -3875,14 +3911,28 @@ components:
               - schedule.triggered
         enabled:
           type: boolean
+          description: >-
+            Set to false automatically after 20 consecutive failed deliveries,
+            together with last_status = auto_disabled. Re-enable with
+            PUT /api/v1/outgoing-webhooks/{id} and {"enabled": true}; that is
+            charged against the plan webhook cap and can return
+            429 QUOTA_EXCEEDED.
         failure_count:
           type: integer
+          description: >-
+            Consecutive failed deliveries. Incremented once per delivery, not
+            once per retry attempt, and reset to 0 by any successful delivery
+            including a successful manual retry.
         last_triggered_at:
           type: string
           format: date-time
         last_status:
           type: string
-          enum: [success, failed]
+          enum: [success, failed, auto_disabled]
+          description: >-
+            Outcome of the most recent delivery. auto_disabled means the
+            consecutive-failure threshold was reached and the webhook was
+            disabled.
         created_at:
           type: string
           format: date-time
@@ -3944,8 +3994,20 @@ components:
         secret:
           type: string
           maxLength: 255
+          nullable: true
+          description: >-
+            Three-state. Omit the field to keep the current secret, send null to
+            CLEAR it (deliveries then go out unsigned, with no
+            X-Spooled-Signature header), or send a string to replace it.
+            Note: clients that serialise unchanged fields as explicit null will
+            clear the secret.
         enabled:
           type: boolean
+          description: >-
+            Set true to re-enable a webhook, including one that was
+            auto-disabled after 20 consecutive failed deliveries. Re-enabling is
+            charged against the plan webhook cap and can return
+            429 QUOTA_EXCEEDED.
 
     TestWebhookResponse:
       type: object

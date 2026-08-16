@@ -17,6 +17,7 @@ use crate::api::handlers::billing::reconcile_org_from_subscription_id;
 use crate::api::middleware::limits::{
     get_resource_counts, get_usage_info, ResourceCounts, UsageInfo,
 };
+use crate::api::middleware::plan_rate_limit::invalidate_org_rate_limits;
 use crate::api::AppState;
 use crate::config::PlanLimits;
 use crate::error::{AppError, AppResult};
@@ -341,27 +342,14 @@ pub struct UpdateOrgRequest {
     /// New settings (merged with existing)
     pub settings: Option<serde_json::Value>,
     /// Custom limit overrides (omit to keep current; null or empty object to reset to plan defaults)
-    #[serde(default, deserialize_with = "double_option")]
+    #[serde(default, deserialize_with = "crate::models::double_option")]
     pub custom_limits: Option<Option<serde_json::Value>>,
     /// Stripe customer ID (omit to keep current; set to null to clear)
-    #[serde(default, deserialize_with = "double_option")]
+    #[serde(default, deserialize_with = "crate::models::double_option")]
     pub stripe_customer_id: Option<Option<String>>,
     /// Stripe subscription ID (omit to keep current; set to null to clear)
-    #[serde(default, deserialize_with = "double_option")]
+    #[serde(default, deserialize_with = "crate::models::double_option")]
     pub stripe_subscription_id: Option<Option<String>>,
-}
-
-/// Deserialize an optional JSON field so an ABSENT key and an explicit `null` are
-/// distinguishable: absent → `None` (keep current), present `null` → `Some(None)`
-/// (clear/reset), present value → `Some(Some(v))` (set). A plain `Option<Option<T>>`
-/// can't do this — serde collapses a present `null` into the outer `None`, identical
-/// to an absent key — so every "set to null to clear" field silently ignored `null`.
-fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
-where
-    T: serde::Deserialize<'de>,
-    D: serde::Deserializer<'de>,
-{
-    <Option<T> as serde::Deserialize>::deserialize(deserializer).map(Some)
 }
 
 /// Update organization plan or settings
@@ -456,6 +444,12 @@ pub async fn update_organization(
                 .await?;
         }
     }
+
+    // plan_tier / custom_limits feed the per-org rate-limit bucket, which is
+    // cached for 60s. Without this the org keeps its OLD rps/burst for up to a
+    // minute after an admin changes its plan — in the downgrade direction that
+    // is a minute of unpaid headroom.
+    invalidate_org_rate_limits(state.cache.as_ref(), &id).await;
 
     tracing::info!(
         org_id = %id,
@@ -619,6 +613,10 @@ pub async fn delete_organization(
 
         tracing::info!(org_id = %id, "Organization soft deleted by admin (API keys revoked)");
     }
+
+    // Both branches: drop the cached plan limits so a deleted org cannot keep
+    // spending its old bucket for the remainder of the 60s TTL.
+    invalidate_org_rate_limits(state.cache.as_ref(), &id).await;
 
     Ok(StatusCode::NO_CONTENT)
 }

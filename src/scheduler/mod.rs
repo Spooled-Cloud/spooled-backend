@@ -18,7 +18,8 @@ use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
 use crate::api::middleware::limits::{
-    check_job_limits_generic, check_payload_size_generic, increment_daily_jobs,
+    check_job_limits_generic, check_payload_size_generic, daily_jobs_limit, refund_daily_jobs,
+    try_increment_daily_jobs,
 };
 use crate::cache::RedisCache;
 use crate::models::CronSchedule;
@@ -499,6 +500,74 @@ impl Scheduler {
                 continue;
             }
 
+            // Reserve the daily quota slot BEFORE inserting the job. The
+            // check_job_limits_generic call above only READS today's counter, so every
+            // schedule firing on the same tick (and every scheduler replica) could see a
+            // count under the cap, insert, and only then increment — overshooting
+            // jobs_per_day by the size of the fan-out. Reserving first makes the decision
+            // atomic: one fire wins each remaining slot, the rest are rejected below.
+            let daily_limit = daily_jobs_limit(&self.db, &schedule.organization_id)
+                .await
+                .unwrap_or(-1);
+            // Tracks whether a slot is actually held, so the abort paths below only refund
+            // quota that was really taken (the counter-outage arm takes none).
+            let mut quota_reserved = false;
+            match try_increment_daily_jobs(&self.db, &schedule.organization_id, 1, daily_limit)
+                .await
+            {
+                Ok(count) if count >= 0 => quota_reserved = true,
+                Ok(_) => {
+                    // Over the cap. Skip this fire the same way the limit checks above do:
+                    // roll back, record the failed run, and STILL advance next_run_at.
+                    // Leaving next_run_at in the past would make this schedule due on every
+                    // 10s tick until midnight, so the scheduler would spin on it instead of
+                    // moving on to the other due schedules.
+                    tx.rollback().await?;
+
+                    warn!(
+                        schedule_id = %schedule.id,
+                        org_id = %schedule.organization_id,
+                        limit = daily_limit,
+                        "Cron schedule blocked by daily job quota"
+                    );
+
+                    let run_id = uuid::Uuid::new_v4().to_string();
+                    let _ = sqlx::query(
+                        r#"
+                        INSERT INTO schedule_runs (id, schedule_id, status, error_message, started_at, completed_at)
+                        VALUES ($1, $2, 'failed', $3, $4, $4)
+                        "#,
+                    )
+                    .bind(&run_id)
+                    .bind(&schedule.id)
+                    .bind(format!("jobs per day limit reached (limit {})", daily_limit))
+                    .bind(now)
+                    .execute(&*self.db)
+                    .await;
+
+                    let _ = sqlx::query(
+                        "UPDATE schedules SET next_run_at = $2, updated_at = NOW() WHERE id = $1",
+                    )
+                    .bind(&schedule.id)
+                    .bind(next_run)
+                    .execute(&*self.db)
+                    .await;
+
+                    continue;
+                }
+                Err(e) => {
+                    // Counter DB error: fire anyway, uncounted. A sick counter must not
+                    // silently halt every cron schedule in the fleet — this matches the
+                    // best-effort behaviour the blind increment had.
+                    warn!(
+                        error = %e,
+                        org_id = %schedule.organization_id,
+                        schedule_id = %schedule.id,
+                        "Failed to reserve daily job quota for cron schedule; enqueueing without quota accounting"
+                    );
+                }
+            }
+
             // Transaction already started with lock - create job from schedule
             let job_id = uuid::Uuid::new_v4().to_string();
             let run_id = uuid::Uuid::new_v4().to_string();
@@ -527,50 +596,65 @@ impl Scheduler {
 
             match job_result {
                 Ok(_) => {
-                    // Record successful run
-                    let _ = sqlx::query(
-                        r#"
+                    // The run row, the schedule bump and the commit are grouped so that any
+                    // failure among them lands on one refund path: the transaction is
+                    // discarded, so no job exists, and the slot reserved above would
+                    // otherwise stay burned for the rest of the day.
+                    let commit_result: Result<(), sqlx::Error> = async {
+                        // Record successful run
+                        sqlx::query(
+                            r#"
                         INSERT INTO schedule_runs (id, schedule_id, job_id, status, started_at, completed_at)
                         VALUES ($1, $2, $3, 'completed', $4, $4)
                         "#
-                    )
-                    .bind(&run_id)
-                    .bind(&schedule.id)
-                    .bind(&job_id)
-                    .bind(now)
-                    .execute(&mut *tx)
-                    .await?;
+                        )
+                        .bind(&run_id)
+                        .bind(&schedule.id)
+                        .bind(&job_id)
+                        .bind(now)
+                        .execute(&mut *tx)
+                        .await?;
 
-                    // Update schedule - MUST succeed for transaction to commit
-                    sqlx::query(
-                        r#"
+                        // Update schedule - MUST succeed for transaction to commit
+                        sqlx::query(
+                            r#"
                         UPDATE schedules
                         SET last_run_at = $2, run_count = run_count + 1, next_run_at = $3, updated_at = $2
                         WHERE id = $1
                         "#
-                    )
-                    .bind(&schedule.id)
-                    .bind(now)
-                    .bind(next_run)
-                    .execute(&mut *tx)
-                    .await?;
+                        )
+                        .bind(&schedule.id)
+                        .bind(now)
+                        .bind(next_run)
+                        .execute(&mut *tx)
+                        .await?;
 
-                    // Commit transaction
-                    tx.commit().await?;
+                        // Commit transaction
+                        tx.commit().await
+                    }
+                    .await;
+
+                    if let Err(e) = commit_result {
+                        // Refund with the dedicated helper: a negative increment would be
+                        // ASSIGNED (not added) if it landed after the daily reset, handing
+                        // the org a negative counter and free quota.
+                        if quota_reserved {
+                            if let Err(refund_err) =
+                                refund_daily_jobs(&self.db, &schedule.organization_id, 1).await
+                            {
+                                warn!(
+                                    error = %refund_err,
+                                    org_id = %schedule.organization_id,
+                                    schedule_id = %schedule.id,
+                                    "Failed to refund daily job quota after cron fire failed to commit"
+                                );
+                            }
+                        }
+                        return Err(e.into());
+                    }
 
                     processed += 1;
                     self.metrics.jobs_enqueued.inc();
-
-                    // Increment daily job counter for plan limit tracking (best-effort).
-                    if let Err(e) =
-                        increment_daily_jobs(&self.db, &schedule.organization_id, 1).await
-                    {
-                        warn!(
-                            error = %e,
-                            org_id = %schedule.organization_id,
-                            "Failed to increment daily job counter for cron schedule job"
-                        );
-                    }
 
                     // Notify queue with org context (outside transaction)
                     if let Some(ref cache) = self.cache {
@@ -613,6 +697,23 @@ impl Scheduler {
                 Err(e) => {
                     // Rollback transaction
                     tx.rollback().await?;
+
+                    // No job was created, so give the reserved slot back — otherwise every
+                    // failed insert would permanently eat a job from the org's daily
+                    // allowance. Use refund_daily_jobs, never a negative increment: that
+                    // path ASSIGNS across a daily reset and would go negative.
+                    if quota_reserved {
+                        if let Err(refund_err) =
+                            refund_daily_jobs(&self.db, &schedule.organization_id, 1).await
+                        {
+                            warn!(
+                                error = %refund_err,
+                                org_id = %schedule.organization_id,
+                                schedule_id = %schedule.id,
+                                "Failed to refund daily job quota after cron job insert failed"
+                            );
+                        }
+                    }
 
                     error!(schedule_id = %schedule.id, error = %e, "Failed to create cron job");
 
@@ -740,6 +841,13 @@ impl Scheduler {
         //   'any' — fatal only when no dependency can still complete.
         // Looped so multi-level chains cascade within one sweep.
         let mut workflow_cancelled = 0u64;
+        // Loop invariants that make this safe, stated because they are load
+        // bearing and not obvious: (a) each iteration's statement is
+        // self-committing, so the rows it returns are durable before we dispatch
+        // their webhooks; (b) a cancelled row leaves the `status IN
+        // ('pending','scheduled')` predicate, so no row can be selected twice and
+        // no duplicate `job.cancelled` webhook can fire. Relaxing either — e.g.
+        // widening the status filter — reintroduces duplicate deliveries.
         for _ in 0..10 {
             let cancelled_batch: Vec<(String, String, String)> = sqlx::query_as(
                 r#"
@@ -809,6 +917,51 @@ impl Scheduler {
             warn!(
                 count = workflow_cancelled,
                 "Cancelled workflow jobs whose dependencies can no longer be met"
+            );
+        }
+
+        // Rescue jobs whose blocker has become UNREACHABLE rather than failed.
+        //
+        // `job_dependencies.depends_on_job_id` is `REFERENCES jobs(id) ON DELETE
+        // CASCADE`, so when retention deletes a parent job the dependency edge
+        // disappears with it. The child is then left `dependencies_met = FALSE`
+        // with no edges at all: the dequeue predicate skips it forever (it
+        // requires `dependencies_met IS NULL OR = TRUE`), and the cancellation
+        // sweep above skips it too because that requires an EXISTS over
+        // `job_dependencies`. The job becomes invisible to both — permanently
+        // pending, permanently counted against the org's `active_jobs` cap, with
+        // no API-reachable way to clear it.
+        //
+        // A job with no dependency edges and no parent has nothing left to wait
+        // for, so mark it runnable rather than cancelling it: if its blocker
+        // genuinely completed (the common case — completion, then retention) the
+        // job SHOULD run. The grace period is essential: `POST /jobs` inserts the
+        // job first and writes its `job_dependencies` row immediately after, so a
+        // job observed mid-creation would otherwise be unblocked before its edges
+        // exist.
+        let unblocked_orphans = sqlx::query(
+            r#"
+            UPDATE jobs child
+            SET
+                dependencies_met = TRUE,
+                updated_at = NOW()
+            WHERE
+                child.status IN ('pending', 'scheduled')
+                AND child.dependencies_met = FALSE
+                AND child.parent_job_id IS NULL
+                AND child.updated_at < NOW() - INTERVAL '1 hour'
+                AND NOT EXISTS (
+                    SELECT 1 FROM job_dependencies jd WHERE jd.job_id = child.id
+                )
+            "#,
+        )
+        .execute(&*self.db)
+        .await?;
+
+        if unblocked_orphans.rows_affected() > 0 {
+            warn!(
+                count = unblocked_orphans.rows_affected(),
+                "Unblocked jobs whose dependency rows no longer exist (dependency job was deleted)"
             );
         }
 
@@ -945,26 +1098,55 @@ impl Scheduler {
             }
         }
 
-        // Move jobs that have exceeded max_retries to deadletter
+        // Move jobs that have exceeded max_retries to deadletter.
+        //
+        // This was the ONE dead-letter path of five that did not write a
+        // `dead_letter_queue` audit row — and it covers the most interesting
+        // cause, "the worker holding this job vanished". Those jobs showed up in
+        // the DLQ view (which reads `jobs`) but left no record once retention
+        // deleted the job row, while jobs that failed through the normal path in
+        // the same incident stayed fully documented. Same single-statement CTE
+        // shape as the expired-lease sweep above, so status and audit row cannot
+        // half-apply.
         let result = sqlx::query(
             r#"
-            UPDATE jobs
-            SET 
-                status = 'deadletter',
-                assigned_worker_id = NULL,
-                lease_id = NULL,
-                lease_expires_at = NULL,
-                last_error = 'Max retries exceeded after worker went offline',
-                updated_at = NOW()
-            WHERE 
-                status = 'processing'
-                AND retry_count >= max_retries
-                AND EXISTS (
-                    SELECT 1 FROM workers w
-                    WHERE w.id = jobs.assigned_worker_id
-                      AND w.status = 'offline'
-                      AND w.organization_id = jobs.organization_id
-                )
+            WITH deadlettered AS (
+                UPDATE jobs
+                SET
+                    status = 'deadletter',
+                    assigned_worker_id = NULL,
+                    lease_id = NULL,
+                    lease_expires_at = NULL,
+                    last_error = 'Max retries exceeded after worker went offline',
+                    updated_at = NOW()
+                WHERE
+                    status = 'processing'
+                    AND retry_count >= max_retries
+                    AND EXISTS (
+                        SELECT 1 FROM workers w
+                        WHERE w.id = jobs.assigned_worker_id
+                          AND w.status = 'offline'
+                          AND w.organization_id = jobs.organization_id
+                    )
+                RETURNING id, organization_id, queue_name, payload, retry_count
+            )
+            INSERT INTO dead_letter_queue (
+                id, job_id, organization_id, queue_name, reason,
+                original_payload, error_details, created_at
+            )
+            SELECT
+                gen_random_uuid()::TEXT,
+                d.id,
+                d.organization_id,
+                d.queue_name,
+                'Max retries exceeded after worker went offline',
+                d.payload,
+                jsonb_build_object(
+                    'final_error', 'Max retries exceeded after worker went offline',
+                    'total_retries', d.retry_count
+                ),
+                NOW()
+            FROM deadlettered d
             "#,
         )
         .execute(&*self.db)
@@ -1071,6 +1253,80 @@ impl Scheduler {
                 "Cleaned up old job history (tier-based retention)"
             );
             total_cleaned += history_cleaned;
+        }
+
+        // Cleanup outgoing webhook delivery records.
+        //
+        // This table had NO retention at all: one row per delivery ATTEMPT, each
+        // storing the full event envelope — i.e. a copy of the job payload,
+        // bounded only by the 1 MiB plan cap. Only the newest 100 per webhook are
+        // ever readable (`GET /outgoing-webhooks/{id}/deliveries` is
+        // `LIMIT 100`), so everything older was write-only storage that also
+        // silently retained customer payloads longer than the `jobs` retention
+        // the plan promises. A delivery record is history, so it follows
+        // `history_retention_days`, and it is batched like the sweeps above so it
+        // cannot hold a long transaction.
+        let result = sqlx::query(
+            r#"
+            DELETE FROM outgoing_webhook_deliveries
+            WHERE id IN (
+                SELECT d.id
+                FROM outgoing_webhook_deliveries d
+                JOIN outgoing_webhooks w ON d.webhook_id = w.id
+                JOIN organizations o ON w.organization_id = o.id
+                WHERE d.created_at < NOW() - (
+                    COALESCE(
+                        (o.custom_limits->>'history_retention_days')::INT,
+                        CASE o.plan_tier
+                            WHEN 'enterprise' THEN 90
+                            WHEN 'pro' THEN 30
+                            WHEN 'starter' THEN 7
+                            ELSE 1  -- free tier default
+                        END
+                    ) || ' days'
+                )::INTERVAL
+                LIMIT 10000
+            )
+            "#,
+        )
+        .execute(&*self.db)
+        .await?;
+
+        let deliveries_cleaned = result.rows_affected();
+        if deliveries_cleaned > 0 {
+            debug!(
+                count = deliveries_cleaned,
+                "Cleaned up old outgoing webhook deliveries (tier-based retention)"
+            );
+            total_cleaned += deliveries_cleaned;
+        }
+
+        // Cleanup expired email login codes.
+        //
+        // Same class of unbounded growth: `email_login_codes` rows were only ever
+        // inserted. `verify()` scans this table on every login attempt, so
+        // letting it grow without bound slows authentication. Codes are useless
+        // once expired; keep a day's tail for support/debugging.
+        let result = sqlx::query(
+            r#"
+            DELETE FROM email_login_codes
+            WHERE ctid IN (
+                SELECT ctid FROM email_login_codes
+                WHERE expires_at < NOW() - INTERVAL '1 day'
+                LIMIT 10000
+            )
+            "#,
+        )
+        .execute(&*self.db)
+        .await?;
+
+        let codes_cleaned = result.rows_affected();
+        if codes_cleaned > 0 {
+            debug!(
+                count = codes_cleaned,
+                "Cleaned up expired email login codes"
+            );
+            total_cleaned += codes_cleaned;
         }
 
         // Cleanup old webhook deliveries using JOIN

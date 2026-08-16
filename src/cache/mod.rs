@@ -88,6 +88,30 @@ impl RedisCache {
         Ok(())
     }
 
+    /// Set a key only if it does not already exist, with a TTL (`SET NX EX`).
+    ///
+    /// Returns `true` when this caller won the race and the key was written,
+    /// `false` when it already existed. This is the primitive for
+    /// "do this work at most once per interval, across all replicas" — used by
+    /// the `last_used` write guard, and safe to reuse for other coalesced
+    /// writes.
+    ///
+    /// Note the key must not collide with a token-bucket key: those are Redis
+    /// HASHes and `SET` against them fails with WRONGTYPE.
+    pub async fn set_if_absent(&self, key: &str, value: &str, ttl_secs: u64) -> Result<bool> {
+        let mut conn = self.get_connection().await?;
+        let written: Option<String> = redis::cmd("SET")
+            .arg(key)
+            .arg(value)
+            .arg("NX")
+            .arg("EX")
+            .arg(ttl_secs)
+            .query_async(&mut conn)
+            .await?;
+        // Redis replies OK on success and nil when NX prevented the write.
+        Ok(written.is_some())
+    }
+
     /// Delete a value from cache
     pub async fn delete(&self, key: &str) -> Result<()> {
         let mut conn = self.get_connection().await?;

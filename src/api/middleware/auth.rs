@@ -84,8 +84,37 @@ struct ApiKeyRecord {
 /// 3. Checks token blacklist (for logged out tokens)
 pub async fn authenticate_api_key(
     State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, Response> {
+    authenticate_inner(state, request, next, false).await
+}
+
+/// Same as [`authenticate_api_key`], but ALSO accepts the credential in the
+/// query string.
+///
+/// Mount this **only** on the realtime routes (`/ws`, `/events*`). Browser
+/// `EventSource` and `WebSocket` cannot set an `Authorization` header, so those
+/// endpoints have no alternative; every other endpoint can and must use the
+/// header.
+///
+/// The distinction matters because query strings are retained by things headers
+/// are not: reverse-proxy and CDN access logs, APM spans that record
+/// `http.url`, browser history, and `Referer`. A long-lived API key (they
+/// default to no expiry) must not travel there. CWE-598.
+pub async fn authenticate_api_key_allow_query(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, Response> {
+    authenticate_inner(state, request, next, true).await
+}
+
+async fn authenticate_inner(
+    state: AppState,
     mut request: Request,
     next: Next,
+    allow_query_credential: bool,
 ) -> Result<Response, Response> {
     // Check Authorization header first
     let token_from_header = request
@@ -94,31 +123,25 @@ pub async fn authenticate_api_key(
         .and_then(|v| v.to_str().ok())
         .and_then(|header| header.strip_prefix("Bearer ").map(|s| s.to_string()));
 
-    // Fallback to query parameter 'token' or 'api_key'
-    let token = if let Some(t) = token_from_header {
-        t
-    } else {
-        let query = request.uri().query().unwrap_or("");
-        let mut found_token = None;
-        for pair in query.split('&') {
-            let mut parts = pair.splitn(2, '=');
-            if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
-                if key == "token" || key == "api_key" {
-                    found_token = Some(value.to_string());
-                    break;
+    let token = match token_from_header {
+        Some(t) => t,
+        None if allow_query_credential => {
+            match extract_query_credential(request.uri().query().unwrap_or("")) {
+                Some(t) => t,
+                None => {
+                    return Err(auth_error_response(
+                        StatusCode::UNAUTHORIZED,
+                        "Missing or invalid Authorization header or token/api_key query parameter"
+                            .to_string(),
+                    ));
                 }
             }
         }
-
-        match found_token {
-            Some(t) => t,
-            None => {
-                return Err(auth_error_response(
-                    StatusCode::UNAUTHORIZED,
-                    "Missing or invalid Authorization header or token/api_key query parameter"
-                        .to_string(),
-                ));
-            }
+        None => {
+            return Err(auth_error_response(
+                StatusCode::UNAUTHORIZED,
+                "Missing or invalid Authorization header".to_string(),
+            ));
         }
     };
 
@@ -137,6 +160,58 @@ pub async fn authenticate_api_key(
     request.extensions_mut().insert(context);
 
     Ok(next.run(request).await)
+}
+
+/// Pull a `token=` / `api_key=` value out of a raw query string.
+///
+/// Percent-decodes the value: credentials are base64url/alphanumeric today, but
+/// a raw pass-through would silently break the moment one is not.
+fn extract_query_credential(query: &str) -> Option<String> {
+    for pair in query.split('&') {
+        let mut parts = pair.splitn(2, '=');
+        if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
+            if key == "token" || key == "api_key" {
+                let decoded = percent_decode(value);
+                if !decoded.is_empty() {
+                    return Some(decoded);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Minimal percent-decoder for query values (`%XX` and `+` for space).
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
+                match hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                    Some(byte) => {
+                        out.push(byte);
+                        i += 3;
+                    }
+                    None => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Authenticate JWT token and return API key context
@@ -279,15 +354,7 @@ async fn authenticate_api_key_token(
         }
     }
 
-    // Update last_used timestamp asynchronously (fire-and-forget)
-    let db = state.db.pool_arc();
-    let key_id = api_key.id.clone();
-    tokio::spawn(async move {
-        let _ = sqlx::query("UPDATE api_keys SET last_used = NOW() WHERE id = $1")
-            .bind(&key_id)
-            .execute(&*db)
-            .await;
-    });
+    touch_last_used(state, &api_key.id).await;
 
     Ok(ApiKeyContext {
         api_key_id: api_key.id,
@@ -460,13 +527,65 @@ async fn fetch_and_cache_api_key(
     Ok(record)
 }
 
-/// Generate a lookup hash for the API key (for fast DB/cache lookup)
-/// This is NOT for security - just for efficient indexing
+/// How coarse `api_keys.last_used` is allowed to be.
+///
+/// The field answers "has this key been used recently", and nothing needs it to
+/// be exact — so it is written at most once per key per interval instead of once
+/// per request.
+const LAST_USED_WRITE_INTERVAL_SECS: u64 = 300;
+
+/// Record that a key was used, at most once per [`LAST_USED_WRITE_INTERVAL_SECS`].
+///
+/// Previously this fired an `UPDATE api_keys SET last_used = NOW()` on EVERY
+/// authenticated request, including cache hits. In Postgres an UPDATE writes a
+/// new row version, so a key doing 500 req/s produced 500 versions/s of one row:
+/// every request serialised on that row's lock (adding latency to the very first
+/// thing each request does), the table bloated, and the unbounded spawned tasks
+/// competed for pool connections with the handlers.
+///
+/// The Redis `SET NX EX` acts as the once-per-interval gate. With no Redis
+/// configured we fall back to writing every time — self-hosted deployments do
+/// not have the request volume this protects against, and silently dropping
+/// `last_used` entirely would be worse.
+async fn touch_last_used(state: &AppState, key_id: &str) {
+    if let Some(ref cache) = state.cache {
+        let guard_key = format!("api_key_last_used:{}", key_id);
+        match cache
+            .set_if_absent(&guard_key, "1", LAST_USED_WRITE_INTERVAL_SECS)
+            .await
+        {
+            // Guard already held: another request wrote within the interval.
+            Ok(false) => return,
+            Ok(true) => {}
+            Err(e) => {
+                // Redis unavailable: fall through and write, matching the
+                // no-cache path rather than losing the field entirely.
+                tracing::debug!(error = %e, "last_used write guard unavailable; writing through");
+            }
+        }
+    }
+
+    let db = state.db.pool_arc();
+    let key_id = key_id.to_string();
+    tokio::spawn(async move {
+        let _ = sqlx::query("UPDATE api_keys SET last_used = NOW() WHERE id = $1")
+            .bind(&key_id)
+            .execute(&*db)
+            .await;
+    });
+}
+
+/// Cache-key digest for an API key.
+///
+/// Uses the FULL SHA-256, same as `api_keys.lookup_hash`. It used to be
+/// truncated to 16 hex chars (64 bits) — and because a cache hit is trusted
+/// without re-running bcrypt, that truncated digest was the only thing between a
+/// presented token and an authenticated context. The DB path deliberately keeps
+/// bcrypt as defence-in-depth behind its full-length hash; there is no reason
+/// for the cache path to hold a weaker margin, and the extra characters cost
+/// nothing.
 fn hash_for_lookup(token: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(token.as_bytes());
-    hex::encode(hasher.finalize())[..16].to_string()
+    crate::models::api_key_lookup_hash(token)
 }
 
 // Implement Serialize/Deserialize for ApiKeyRecord to cache it
@@ -529,6 +648,25 @@ mod tests {
 
         assert_eq!(hash1, hash2);
         assert_ne!(hash1, hash3);
-        assert_eq!(hash1.len(), 16);
+        // Full SHA-256, not a 16-char truncation: a cache hit skips bcrypt, so
+        // this digest is the whole margin on that path.
+        assert_eq!(hash1.len(), 64);
+        assert_eq!(hash1, crate::models::api_key_lookup_hash("sp_test_abc123"));
+    }
+
+    #[test]
+    fn query_credential_is_extracted_and_percent_decoded() {
+        assert_eq!(
+            extract_query_credential("api_key=sp_live_abc"),
+            Some("sp_live_abc".to_string())
+        );
+        assert_eq!(
+            extract_query_credential("foo=1&token=eyJhbGc%3D&bar=2"),
+            Some("eyJhbGc=".to_string())
+        );
+        assert_eq!(extract_query_credential("foo=1&bar=2"), None);
+        assert_eq!(extract_query_credential(""), None);
+        // Empty value must not authenticate as an empty token.
+        assert_eq!(extract_query_credential("api_key="), None);
     }
 }

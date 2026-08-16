@@ -123,7 +123,15 @@ pub async fn register(
         );
     }
 
-    let worker_id = Uuid::new_v4().to_string();
+    // A caller-supplied id makes this a true upsert, so a restarting worker
+    // reclaims its row instead of leaking a new one that occupies the plan's
+    // worker cap until the stale-worker reaper catches it. When omitted we mint
+    // a fresh UUID, which cannot collide — the `ON CONFLICT` guard below is then
+    // unreachable, and that is fine: it exists for the supplied-id case.
+    let worker_id = request
+        .worker_id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     let now = Utc::now();
     let max_concurrency = request.max_concurrency.unwrap_or(5);
 
@@ -131,8 +139,26 @@ pub async fn register(
     // registrations for this org cannot overshoot the plan limit.
     let mut tx = state.db.pool().begin().await?;
     lock_resource(&mut tx, &ctx.organization_id, "workers").await?;
+
+    // Re-registering an id this org already owns adds no worker, so it must not
+    // be charged against the cap — otherwise a worker at the limit could not
+    // restart. Counted inside the advisory lock so the answer cannot change
+    // between here and the upsert.
+    let already_registered: Option<(i64,)> = sqlx::query_as(
+        "SELECT COUNT(*) FROM workers WHERE id = $1 AND organization_id = $2 AND status IN ('healthy', 'degraded')",
+    )
+    .bind(&worker_id)
+    .bind(&ctx.organization_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let adding = if already_registered.map(|(c,)| c).unwrap_or(0) > 0 {
+        0
+    } else {
+        1
+    };
+
     if let Err(response) =
-        check_resource_limit_conn(&mut tx, &ctx.organization_id, "workers", 1).await
+        check_resource_limit_conn(&mut tx, &ctx.organization_id, "workers", adding).await
     {
         return Err(AppError::LimitExceeded(Box::new(response)));
     }
@@ -152,7 +178,18 @@ pub async fn register(
         ON CONFLICT (id) DO UPDATE SET
             status = 'healthy',
             last_heartbeat = NOW(),
+            -- Re-registration refreshes the worker's declared capabilities: a
+            -- restarted process may target a different queue or concurrency,
+            -- and silently keeping the old row's values would misreport it.
+            queue_name = EXCLUDED.queue_name,
+            queue_names = EXCLUDED.queue_names,
+            hostname = EXCLUDED.hostname,
+            worker_type = EXCLUDED.worker_type,
+            max_concurrent_jobs = EXCLUDED.max_concurrent_jobs,
+            metadata = EXCLUDED.metadata,
+            version = EXCLUDED.version,
             updated_at = NOW()
+        -- Guards a caller-supplied id from hijacking another org's worker row.
         WHERE workers.organization_id = EXCLUDED.organization_id
         "#,
     )
@@ -176,8 +213,14 @@ pub async fn register(
 
     tx.commit().await?;
 
-    state.metrics.workers_active.inc();
-    state.metrics.workers_healthy.inc();
+    // Only a NEW worker moves the gauges. Registration is an upsert now, so a
+    // restart re-registering its stable id would otherwise increment on every
+    // restart while `deregister` decrements once — the exact drift B-09 fixed
+    // from the other direction. `adding` already encodes "did this add a row".
+    if adding > 0 {
+        state.metrics.workers_active.inc();
+        state.metrics.workers_healthy.inc();
+    }
 
     state.outgoing_webhooks.spawn_dispatch(
         ctx.organization_id.clone(),
@@ -324,8 +367,13 @@ pub async fn deregister(
         .execute(state.db.pool())
         .await?;
 
-    // Only decrement healthy metric if worker was actually healthy
-    state.metrics.workers_active.dec();
+    // Deregistering an already-offline worker is a no-op for the gauges: this
+    // endpoint is idempotent from a client's perspective (a second DELETE also
+    // returns 204), so an unguarded decrement drifted `workers_active` negative
+    // and it never recovered until process restart.
+    if previous_status != "offline" {
+        state.metrics.workers_active.dec();
+    }
     if previous_status == "healthy" {
         state.metrics.workers_healthy.dec();
     }
@@ -379,6 +427,7 @@ mod tests {
     fn test_register_worker_request_validation() {
         // Valid request
         let valid = RegisterWorkerRequest {
+            worker_id: None,
             queue_name: "emails".to_string(),
             hostname: "worker-host-1".to_string(),
             worker_type: Some("http".to_string()),
@@ -390,6 +439,7 @@ mod tests {
 
         // Queue name too short
         let short_queue = RegisterWorkerRequest {
+            worker_id: None,
             queue_name: "".to_string(),
             hostname: "host".to_string(),
             worker_type: Some("http".to_string()),
@@ -401,6 +451,7 @@ mod tests {
 
         // Hostname too short
         let short_host = RegisterWorkerRequest {
+            worker_id: None,
             queue_name: "default".to_string(),
             hostname: "".to_string(),
             worker_type: Some("http".to_string()),

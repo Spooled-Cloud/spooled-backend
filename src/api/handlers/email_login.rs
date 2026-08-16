@@ -55,77 +55,45 @@ pub async fn check_email(
     headers: axum::http::HeaderMap,
     axum::extract::Query(query): axum::extract::Query<CheckEmailRequest>,
 ) -> AppResult<Json<CheckEmailResponse>> {
-    let email = query.email.to_lowercase().trim().to_string();
+    // The derive was present but `.validate()` was never called, so arbitrary
+    // strings reached the query (and, before this rewrite, the database).
+    query
+        .validate()
+        .map_err(|e| AppError::Validation(e.to_string()))?;
+
+    let email = query.email.trim().to_lowercase();
 
     // Extract IP for rate limiting
-    let client_ip = extract_client_ip(&headers);
+    let client_ip = extract_client_ip(&state, &headers);
 
-    // Rate limit: check per-minute limit
-    let recent_minute: (i64,) = sqlx::query_as(
-        r#"
-        SELECT COUNT(*) 
-        FROM email_login_codes 
-        WHERE email LIKE 'check:%' 
-          AND code = $1 
-          AND created_at > NOW() - INTERVAL '1 minute'
-        "#,
+    // Rate limiting lives in Redis, like every other limiter in this codebase.
+    //
+    // It used to be implemented by INSERTing a marker row into
+    // `email_login_codes` per request (with `code` holding the IP and `email`
+    // holding "check:<address>") and then COUNTing those rows twice per request.
+    // That made an unauthenticated endpoint write a permanent row per call, into
+    // a table it also scanned — so it got slower the more it was abused, and it
+    // slowed the login path with it. `verify()` even carries a defensive
+    // `code NOT LIKE 'signup:%'` filter because this column overloading has
+    // already broken login once.
+    check_email_rate_limit(
+        &state,
+        &client_ip,
+        "minute",
+        MAX_EMAIL_CHECKS_PER_MINUTE,
+        60,
+        "Too many requests. Please try again in a minute.",
     )
-    .bind(&client_ip)
-    .fetch_one(state.db.pool())
-    .await
-    .map_err(|e| {
-        warn!(error = %e, "Failed to check email rate limit (minute)");
-        e
-    })
-    .unwrap_or((0,));
-
-    if recent_minute.0 >= MAX_EMAIL_CHECKS_PER_MINUTE {
-        warn!(ip = %client_ip, "Email check rate limit exceeded (per minute)");
-        return Err(AppError::RateLimit(
-            "Too many requests. Please try again in a minute.".to_string(),
-        ));
-    }
-
-    // Rate limit: check per-hour limit
-    let recent_hour: (i64,) = sqlx::query_as(
-        r#"
-        SELECT COUNT(*) 
-        FROM email_login_codes 
-        WHERE email LIKE 'check:%' 
-          AND code = $1 
-          AND created_at > NOW() - INTERVAL '1 hour'
-        "#,
+    .await?;
+    check_email_rate_limit(
+        &state,
+        &client_ip,
+        "hour",
+        MAX_EMAIL_CHECKS_PER_HOUR,
+        3600,
+        "Too many requests. Please try again later.",
     )
-    .bind(&client_ip)
-    .fetch_one(state.db.pool())
-    .await
-    .map_err(|e| {
-        warn!(error = %e, "Failed to check email rate limit (hour)");
-        e
-    })
-    .unwrap_or((0,));
-
-    if recent_hour.0 >= MAX_EMAIL_CHECKS_PER_HOUR {
-        warn!(ip = %client_ip, "Email check rate limit exceeded (per hour)");
-        return Err(AppError::RateLimit(
-            "Too many requests. Please try again later.".to_string(),
-        ));
-    }
-
-    // Log the check for rate limiting (using email_login_codes table with special prefix)
-    if let Err(e) = sqlx::query(
-        r#"
-        INSERT INTO email_login_codes (email, code, expires_at, used_at)
-        VALUES ($1, $2, NOW() + INTERVAL '1 hour', NOW())
-        "#,
-    )
-    .bind(format!("check:{}", email))
-    .bind(&client_ip)
-    .execute(state.db.pool())
-    .await
-    {
-        warn!(error = %e, "Failed to log email check for rate limiting");
-    }
+    .await?;
 
     // Check if email is associated with any organization
     let exists: Option<(String,)> = sqlx::query_as(
@@ -141,32 +109,60 @@ pub async fn check_email(
     }))
 }
 
-/// Extract client IP from headers for rate limiting
-fn extract_client_ip(headers: &axum::http::HeaderMap) -> String {
-    // Check CF-Connecting-IP (Cloudflare)
-    if let Some(cf_ip) = headers
-        .get("CF-Connecting-IP")
-        .and_then(|v| v.to_str().ok())
+/// One window of the `check-email` per-IP throttle.
+///
+/// Fails OPEN when Redis is unavailable, matching the self-host default in
+/// `plan_rate_limit` — this endpoint gates signup UX, and breaking signup for
+/// every self-hosted deployment without Redis would be worse than the
+/// enumeration risk it mitigates. When `RATE_LIMIT_FAIL_CLOSED` is set (hosted
+/// SaaS), it denies instead.
+async fn check_email_rate_limit(
+    state: &AppState,
+    client_ip: &str,
+    window_label: &str,
+    max_requests: i64,
+    window_secs: u64,
+    message: &str,
+) -> AppResult<()> {
+    let Some(ref cache) = state.cache else {
+        if state.settings.rate_limit.fail_closed_on_redis_error {
+            warn!("Redis not configured; denying check-email (RATE_LIMIT_FAIL_CLOSED)");
+            return Err(AppError::RateLimit(message.to_string()));
+        }
+        return Ok(());
+    };
+
+    let key = format!("check_email:{}:{}", window_label, client_ip);
+    match cache
+        .check_rate_limit(&key, max_requests.max(1) as u32, window_secs)
+        .await
     {
-        return cf_ip.trim().to_string();
-    }
-
-    // Check X-Real-IP
-    if let Some(real_ip) = headers.get("X-Real-IP").and_then(|v| v.to_str().ok()) {
-        return real_ip.trim().to_string();
-    }
-
-    // Check X-Forwarded-For (first IP)
-    if let Some(forwarded) = headers.get("X-Forwarded-For").and_then(|v| v.to_str().ok()) {
-        if let Some(first_ip) = forwarded.split(',').next() {
-            let trimmed = first_ip.trim();
-            if !trimmed.is_empty() {
-                return trimmed.to_string();
+        Ok(result) if !result.allowed => {
+            warn!(ip = %client_ip, window = %window_label, "Email check rate limit exceeded");
+            Err(AppError::RateLimit(message.to_string()))
+        }
+        Ok(_) => Ok(()),
+        Err(e) => {
+            if state.settings.rate_limit.fail_closed_on_redis_error {
+                warn!(error = %e, "Redis error during check-email rate limit; denying (fail-closed)");
+                return Err(AppError::RateLimit(message.to_string()));
             }
+            warn!(error = %e, "Redis error during check-email rate limit; allowing");
+            Ok(())
         }
     }
+}
 
-    "unknown".to_string()
+/// Client IP for abuse controls.
+///
+/// Delegates to the shared, trusted-proxy-aware extractor so this endpoint and
+/// the rate-limit middleware agree on who the caller is. This module previously
+/// had its own extractor that (correctly) preferred `CF-Connecting-IP` while the
+/// middleware's (incorrectly) took the client-supplied leftmost
+/// `X-Forwarded-For` — two implementations, and the security-critical one was
+/// the weaker.
+fn extract_client_ip(state: &AppState, headers: &axum::http::HeaderMap) -> String {
+    crate::api::middleware::client_ip::client_ip(headers, &state.settings.trusted_proxy)
 }
 
 /// Start email login request
@@ -330,8 +326,20 @@ pub async fn verify(
     let email = request.email.to_lowercase().trim().to_string();
     let code = request.code.trim().to_string();
 
-    // Find valid, unused code
-    let login_code: Option<(Uuid, String, Option<String>, i32)> = sqlx::query_as(
+    // Consider EVERY live code for this address, not just the newest.
+    //
+    // Selecting only the newest coupled two unrelated things: issuing a code and
+    // invalidating the previous one. Because `start()` is unauthenticated and
+    // keyed solely on someone else's address, anyone who knew a victim's email
+    // could call it to supersede the code the victim had just received — the
+    // victim's code would then never be the newest and could never verify. After
+    // MAX_CODES_PER_HOUR issuances the victim also could not obtain a fresh one,
+    // producing an hour-long login lockout repeatable indefinitely.
+    //
+    // The per-code attempt cap is unchanged (each row still allows at most
+    // MAX_CODE_ATTEMPTS), so this grants the attacker no extra guesses: the
+    // ceiling is still MAX_CODES_PER_HOUR × MAX_CODE_ATTEMPTS per address.
+    let candidates: Vec<(Uuid, String, Option<String>, i32)> = sqlx::query_as(
         r#"
         SELECT id, code, organization_id, attempts
         FROM email_login_codes
@@ -339,22 +347,68 @@ pub async fn verify(
           AND expires_at > NOW()
           AND used_at IS NULL
           -- Signup tokens ("signup:<token>") live in this same table; excluding them
-          -- stops a pending signup row from shadowing the real 6-digit login code
-          -- (ORDER BY created_at DESC would otherwise pick it and reject valid logins).
+          -- stops a pending signup row from shadowing the real 6-digit login code.
           AND code NOT LIKE 'signup:%'
         ORDER BY created_at DESC
-        LIMIT 1
+        LIMIT $2
         "#,
     )
     .bind(&email)
-    .fetch_optional(state.db.pool())
+    .bind(MAX_CODES_PER_HOUR)
+    .fetch_all(state.db.pool())
     .await?;
 
-    let Some((code_id, stored_code, org_id, _attempts)) = login_code else {
+    if candidates.is_empty() {
         warn!(email = %mask_email(&email), "No valid login code found");
         return Err(AppError::Authentication(
             "Invalid or expired code. Please request a new one.".to_string(),
         ));
+    }
+
+    // Per-ADDRESS attempt budget.
+    //
+    // Comparing a guess against every live code (which is what stops a third
+    // party from invalidating the victim's code) would otherwise multiply the
+    // attacker's reach: with five codes outstanding, one request tests five
+    // values while burning one per-code attempt. This budget makes the total
+    // number of guesses against an address independent of how many codes exist.
+    //
+    // Deliberately NOT implemented by charging every candidate row: that would
+    // let an attacker burn all live codes with five wrong guesses and re-create
+    // the lockout this change exists to remove.
+    if let Some(ref cache) = state.cache {
+        let key = format!("email_verify_attempts:{}", email);
+        let window_secs = (CODE_VALIDITY_MINUTES.max(1) as u64) * 60;
+        match cache
+            .check_rate_limit(&key, MAX_CODE_ATTEMPTS.max(1) as u32, window_secs)
+            .await
+        {
+            Ok(result) if !result.allowed => {
+                warn!(email = %mask_email(&email), "Login verify attempt budget exhausted");
+                return Err(AppError::Authentication(
+                    "Too many attempts. Please request a new code.".to_string(),
+                ));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                // Redis unavailable: the per-code cap below is still enforced in
+                // Postgres, so brute force stays bounded — just less tightly.
+                warn!(error = %e, "Login verify attempt budget unavailable; relying on per-code cap");
+            }
+        }
+    }
+
+    // Constant-time compare against each candidate. On a match we charge the
+    // attempt to THAT row; with no match we charge the newest, so a wrong guess
+    // still burns exactly one attempt and the cap cannot be sidestepped by
+    // spreading guesses across rows.
+    let matched = candidates
+        .iter()
+        .find(|(_, stored, _, _)| constant_time_compare(&code, stored));
+
+    let (code_id, stored_code, org_id, _attempts) = match matched {
+        Some(hit) => hit.clone(),
+        None => candidates[0].clone(),
     };
 
     // Atomically consume one attempt. Combining the cap check and the increment into a
@@ -1528,28 +1582,44 @@ mod tests {
         assert!(json.contains("billing@neworg.com"));
     }
 
+    // Client-IP extraction now lives in `crate::api::middleware::client_ip` and
+    // is shared with the rate limiters, which is the point: this module used to
+    // have its own (correct) extractor while the security-critical middleware
+    // had a different, spoofable one. These tests pin the behaviour this module
+    // depends on; the exhaustive table is in the shared module.
+    //
+    // Note the deleted test `test_extract_client_ip_forwarded_for` asserted that
+    // the LEFTMOST `X-Forwarded-For` entry wins. That was the bug: the leftmost
+    // entry is supplied by the caller, so it must never be trusted.
+    use crate::api::middleware::client_ip::client_ip;
+    use crate::config::TrustedProxySettings;
+
+    fn edge_settings() -> TrustedProxySettings {
+        TrustedProxySettings {
+            client_ip_header: Some("CF-Connecting-IP".to_string()),
+            forwarded_hops: 1,
+        }
+    }
+
     #[test]
-    fn test_extract_client_ip_cloudflare() {
+    fn client_ip_prefers_the_edge_header_over_forwarded_for() {
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("CF-Connecting-IP", "203.0.113.50".parse().unwrap());
         headers.insert("X-Forwarded-For", "10.0.0.1, 172.16.0.1".parse().unwrap());
 
-        let ip = extract_client_ip(&headers);
-        assert_eq!(ip, "203.0.113.50");
+        assert_eq!(client_ip(&headers, &edge_settings()), "203.0.113.50");
     }
 
     #[test]
-    fn test_extract_client_ip_real_ip() {
+    fn client_ip_trims_whitespace() {
         let mut headers = axum::http::HeaderMap::new();
-        headers.insert("X-Real-IP", "192.168.1.100".parse().unwrap());
-        headers.insert("X-Forwarded-For", "10.0.0.1".parse().unwrap());
+        headers.insert("CF-Connecting-IP", "  192.168.1.1  ".parse().unwrap());
 
-        let ip = extract_client_ip(&headers);
-        assert_eq!(ip, "192.168.1.100");
+        assert_eq!(client_ip(&headers, &edge_settings()), "192.168.1.1");
     }
 
     #[test]
-    fn test_extract_client_ip_forwarded_for() {
+    fn client_ip_ignores_untrusted_forwarded_for_by_default() {
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
             "X-Forwarded-For",
@@ -1558,32 +1628,24 @@ mod tests {
                 .unwrap(),
         );
 
-        let ip = extract_client_ip(&headers);
-        assert_eq!(ip, "203.0.113.195");
+        // Default config trusts no proxy, so a client-supplied chain buys nothing.
+        assert_eq!(
+            client_ip(&headers, &TrustedProxySettings::default()),
+            "unknown"
+        );
+
+        // With one trusted hop the entry OUR proxy appended is the last one —
+        // everything to its left was supplied by the caller.
+        assert_eq!(client_ip(&headers, &edge_settings()), "150.172.238.178");
     }
 
     #[test]
-    fn test_extract_client_ip_unknown() {
+    fn client_ip_falls_back_to_unknown() {
         let headers = axum::http::HeaderMap::new();
-        let ip = extract_client_ip(&headers);
-        assert_eq!(ip, "unknown");
-    }
+        assert_eq!(client_ip(&headers, &edge_settings()), "unknown");
 
-    #[test]
-    fn test_extract_client_ip_empty_forwarded() {
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert("X-Forwarded-For", "".parse().unwrap());
-
-        let ip = extract_client_ip(&headers);
-        assert_eq!(ip, "unknown");
-    }
-
-    #[test]
-    fn test_extract_client_ip_whitespace_handling() {
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert("CF-Connecting-IP", "  192.168.1.1  ".parse().unwrap());
-
-        let ip = extract_client_ip(&headers);
-        assert_eq!(ip, "192.168.1.1");
+        let mut empty_xff = axum::http::HeaderMap::new();
+        empty_xff.insert("X-Forwarded-For", "".parse().unwrap());
+        assert_eq!(client_ip(&empty_xff, &edge_settings()), "unknown");
     }
 }

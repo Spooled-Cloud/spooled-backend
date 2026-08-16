@@ -13,6 +13,25 @@ pub const MAX_WORKER_METADATA_SIZE: usize = 64 * 1024;
 /// Valid worker statuses
 pub const VALID_WORKER_STATUSES: &[&str] = &["healthy", "degraded", "draining", "offline"];
 
+/// Validate a client-supplied worker id.
+///
+/// Kept deliberately narrow: the id is a primary key that ends up in log lines,
+/// Redis channel names and error messages, so only characters that are safe in
+/// all three are allowed.
+fn validate_worker_id(worker_id: &str) -> Result<(), validator::ValidationError> {
+    if !worker_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        let mut err = validator::ValidationError::new("invalid_worker_id");
+        err.message = Some(std::borrow::Cow::Borrowed(
+            "Worker ID can only contain alphanumeric characters, dashes, underscores, and dots",
+        ));
+        return Err(err);
+    }
+    Ok(())
+}
+
 /// Validate hostname for safe characters
 fn validate_hostname(hostname: &str) -> Result<(), validator::ValidationError> {
     // Hostnames should only contain alphanumeric, dots, dashes, and underscores
@@ -137,6 +156,18 @@ pub struct Worker {
 ///
 #[derive(Debug, Deserialize, Validate)]
 pub struct RegisterWorkerRequest {
+    /// Stable worker id (optional).
+    ///
+    /// Supply the same id across restarts and registration becomes an upsert of
+    /// one row, matching the gRPC `RegisterWorker` contract. Omit it and the
+    /// server mints a fresh UUID, which is the historical behaviour — but then
+    /// every restart leaks a row that stays `healthy` until the reaper's
+    /// two-minute window, and those rows count against the org's worker cap. A
+    /// crash-looping worker on a tight plan can quota itself out of registering.
+    #[validate(length(min = 1, max = 128, message = "Worker ID must be 1-128 characters"))]
+    #[validate(custom(function = "validate_worker_id"))]
+    pub worker_id: Option<String>,
+
     /// Queue to process (required)
     #[validate(length(min = 1, max = 100, message = "Queue name must be 1-100 characters"))]
     pub queue_name: String,

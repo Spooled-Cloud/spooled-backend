@@ -261,12 +261,11 @@ curl -X POST https://api.spooled.cloud/api/v1/workers/register \
   -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "id": "worker-abc123",
-    "queue_names": ["emails", "notifications"],
-    "max_concurrent_jobs": 10,
+    "worker_id": "emails-worker-1",
+    "queue_name": "emails",
     "hostname": "worker-1.example.com",
+    "max_concurrency": 10,
     "metadata": {
-      "version": "1.0.0",
       "region": "us-east-1"
     }
   }'
@@ -276,17 +275,40 @@ Response:
 
 ```json
 {
-  "id": "worker-abc123",
-  "status": "healthy",
-  "registered_at": "2024-01-15T10:00:00Z",
-  "heartbeat_interval_seconds": 10
+  "id": "emails-worker-1",
+  "queue_name": "emails",
+  "lease_duration_secs": 30,
+  "heartbeat_interval_secs": 10
 }
 ```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `queue_name` | string | Yes | Queue this worker processes (1-100 chars) |
+| `hostname` | string | Yes | Host the worker runs on (1-255 chars) |
+| `worker_id` | string | No | Stable worker id, 1-128 chars from `A-Z a-z 0-9 . _ -` |
+| `worker_type` | string | No | Free-form label (max 50 chars) |
+| `max_concurrency` | integer | No | 1-100 (default: 5) |
+| `metadata` | object | No | Arbitrary JSON (max 64KB) |
+| `version` | string | No | Worker build version (max 50 chars) |
+
+### Pick a Stable `worker_id`
+
+Supplying `worker_id` makes registration an **upsert**: a worker that restarts reuses its
+existing row instead of creating another one. Re-registering an id you already own is not
+charged against your plan's worker limit.
+
+Omit it and the server mints a fresh UUID, which is the older behaviour — but then every
+restart leaves the previous row behind, counting against your worker cap until the
+stale-worker reaper clears it about two minutes later. On a tight plan a crash-looping
+worker can therefore quota itself out of registering and start getting `429` responses.
+
+A `worker_id` already registered by a **different** organization is rejected with `409`.
 
 ### Deregister Worker
 
 ```bash
-curl -X POST https://api.spooled.cloud/api/v1/workers/worker-abc123/deregister \
+curl -X POST https://api.spooled.cloud/api/v1/workers/emails-worker-1/deregister \
   -H "Authorization: Bearer sp_live_YOUR_API_KEY"
 ```
 
@@ -302,7 +324,7 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs/claim \
   -H "Content-Type: application/json" \
   -d '{
     "queue_name": "emails",
-    "worker_id": "worker-abc123",
+    "worker_id": "emails-worker-1",
     "limit": 10
   }'
 ```
@@ -394,7 +416,7 @@ async def worker_loop():
 Registered workers should send heartbeats every 10 seconds:
 
 ```bash
-curl -X POST https://api.spooled.cloud/api/v1/workers/worker-abc123/heartbeat \
+curl -X POST https://api.spooled.cloud/api/v1/workers/emails-worker-1/heartbeat \
   -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
@@ -418,7 +440,7 @@ curl -X POST https://api.spooled.cloud/api/v1/workers/worker-abc123/heartbeat \
 ### Worker Health Check
 
 ```bash
-curl https://api.spooled.cloud/api/v1/workers/worker-abc123 \
+curl https://api.spooled.cloud/api/v1/workers/emails-worker-1 \
   -H "Authorization: Bearer sp_live_YOUR_API_KEY"
 ```
 
@@ -426,7 +448,7 @@ Response:
 
 ```json
 {
-  "id": "worker-abc123",
+  "id": "emails-worker-1",
   "status": "healthy",
   "queue_names": ["emails"],
   "current_jobs": 5,
@@ -555,13 +577,27 @@ for response in stub.ProcessJobs(process_jobs(), metadata=metadata):
 
 ## Best Practices
 
-### 1. Use Worker IDs
+### 1. Use Stable Worker IDs
 
-Always include a unique worker ID for debugging:
+Always include a worker ID, and make it survive restarts — derive it from something fixed
+about the deployment, such as the hostname or the ordinal your orchestrator assigns:
 
 ```python
-WORKER_ID = f"{hostname}-{pid}-{uuid.uuid4().hex[:8]}"
+WORKER_ID = f"emails-{hostname}"          # bare metal / VM
+WORKER_ID = os.environ["POD_NAME"]        # Kubernetes StatefulSet
 ```
+
+Do **not** mix in the pid or a random suffix:
+
+```python
+WORKER_ID = f"{hostname}-{pid}-{uuid.uuid4().hex[:8]}"  # new identity every restart
+```
+
+If you call `/workers/register`, a fresh id per restart registers a fresh worker row each
+time, and the old one keeps a slot in your plan's worker limit until the stale-worker
+reaper clears it about two minutes later. A worker in a crash loop can pile up enough of
+those rows to hit the cap and get `429` on the very registration it needs. A stable id
+upserts one row instead, and re-registering an id you already own is free.
 
 ### 2. Handle Lease Expiry
 

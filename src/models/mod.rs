@@ -8,9 +8,12 @@ mod job;
 mod organization;
 mod queue_config;
 mod schedule;
+mod serde_helpers;
 mod webhook;
 mod worker;
 mod workflow;
+
+pub use serde_helpers::double_option;
 
 pub use api_key::*;
 pub use job::*;

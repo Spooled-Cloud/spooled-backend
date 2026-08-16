@@ -106,12 +106,20 @@ Authorization: Bearer sp_live_xxxxxxxxxxxxxxxxxxxx
 ```
 
 The `Authorization: Bearer` header accepts **either** an API key or a JWT — the
-API auto-detects a JWT by its `eyJ` prefix. You can also pass credentials as a
-query parameter (`?api_key=sp_live_...` or `?token=<jwt>`) when a header isn't
-convenient.
+API auto-detects a JWT by its `eyJ` prefix.
+
+> **Credentials in the query string are only accepted on the realtime endpoints**
+> (`/api/v1/ws`, `/api/v1/events`, `/api/v1/events/jobs/{id}`,
+> `/api/v1/events/queues/{name}`), because browser `EventSource` and `WebSocket`
+> cannot set request headers. Since **0.1.111**, every other endpoint requires the
+> header and returns `401` for `?api_key=` / `?token=`.
+>
+> Query strings are recorded by reverse-proxy and CDN access logs, tracing spans,
+> browser history and the `Referer` header. An API key does not expire by default,
+> so one leaked log line is a lasting compromise.
 
 > The `X-API-Key` header is **gRPC-only** and returns `401` on REST endpoints.
-> Use `Authorization: Bearer` (or the query parameters above) for the REST API.
+> Use `Authorization: Bearer` for the REST API.
 
 API keys may be restricted to specific queues. Restricted keys can only grant a
 subset of their own queues when creating or updating keys; omitting or emptying the
@@ -509,16 +517,33 @@ Content-Type: application/json
 Authorization: Bearer <token>
 
 {
-  "id": "worker-abc123",
-  "queue_names": ["emails", "notifications"],
-  "max_concurrent_jobs": 5,
+  "worker_id": "emails-worker-1",
+  "queue_name": "emails",
   "hostname": "worker-1.example.com",
+  "max_concurrency": 5,
   "metadata": {
-    "version": "1.0.0",
     "region": "us-east-1"
   }
 }
 ```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `queue_name` | string | Yes | Queue this worker processes (1-100 chars) |
+| `hostname` | string | Yes | Host the worker runs on (1-255 chars) |
+| `worker_id` | string | No | Stable worker id, 1-128 chars from `A-Z a-z 0-9 . _ -` |
+| `worker_type` | string | No | Free-form label (max 50 chars) |
+| `max_concurrency` | integer | No | 1-100 (default: 5) |
+| `metadata` | object | No | Arbitrary JSON (max 64KB) |
+| `version` | string | No | Worker build version (max 50 chars) |
+
+`worker_id` is optional but worth setting. Send the same id across restarts and
+registration upserts a single row, so the worker reclaims its identity. Omit it and the
+server mints a UUID — the previous behaviour — but each restart then leaves the old row
+occupying a slot in your plan's worker limit until the stale-worker reaper clears it
+(about two minutes), which is enough for a crash-looping worker on a small plan to `429`
+itself out of registering. Re-registering an id you already own is not charged against the
+cap. An id owned by a different organization returns `409`.
 
 ### Worker Heartbeat
 
@@ -1528,6 +1553,11 @@ Response:
 | Webhooks | 1 | 10 | 50 | Unlimited |
 | Payload size | 64KB | 256KB | 1MB | 1MB |
 | Job retention | 3 days | 14 days | 30 days | 90 days |
+| History retention | 1 day | 7 days | 30 days | 90 days |
+
+History retention covers the delivery history behind
+`GET /api/v1/outgoing-webhooks/{id}/deliveries`. Older delivery records are removed, so on
+Free a failure from yesterday is no longer listed and can no longer be retried.
 
 ---
 

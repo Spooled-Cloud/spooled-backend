@@ -58,6 +58,9 @@ echo $JWT_EXPIRATION_HOURS  # Default: 24
 ```sql
 -- List recent API keys for an organization (recommended)
 -- Note: API keys are stored as bcrypt hashes; you generally cannot search by the raw key value.
+-- Note: last_used is coarse — written at most once per key per 5 minutes, not per request.
+--       A key in active use can show a timestamp several minutes old, so never use it to
+--       decide whether a specific request arrived.
 SELECT
   id,
   organization_id,

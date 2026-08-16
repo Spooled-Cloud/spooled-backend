@@ -202,6 +202,8 @@ pub async fn update(
     request
         .validate()
         .map_err(|e| AppError::Validation(e.to_string()))?;
+    // `secret` is Option<Option<String>> so the derive cannot reach it.
+    request.validate_secret().map_err(AppError::Validation)?;
 
     // Validate event types if provided
     if let Some(ref events) = request.events {
@@ -244,8 +246,29 @@ pub async fn update(
     let name = request.name.unwrap_or(existing.name);
     let url = request.url.unwrap_or(existing.url);
     let events = request.events.unwrap_or(existing.events);
-    let secret = request.secret.or(existing.secret);
+    // Three-state: absent → keep, null → clear, value → replace.
+    let secret = match request.secret {
+        None => existing.secret,
+        Some(new_secret) => new_secret,
+    };
     let enabled = request.enabled.unwrap_or(existing.enabled);
+
+    // The plan cap counts ENABLED webhooks (see get_org_resource_counts), and
+    // create() charges 0 for a disabled one. Without this check an org could
+    // create N disabled webhooks for free and then enable them all, so the
+    // false→true transition is where the cap must actually be paid. Turning a
+    // webhook OFF must never fail on quota, hence the narrow condition.
+    let is_enabling = enabled && !existing.enabled;
+
+    let mut tx = state.db.pool().begin().await?;
+    if is_enabling {
+        lock_resource(&mut tx, &ctx.organization_id, "webhooks").await?;
+        if let Err(response) =
+            check_resource_limit_conn(&mut tx, &ctx.organization_id, "webhooks", 1).await
+        {
+            return Err(AppError::LimitExceeded(Box::new(response)));
+        }
+    }
 
     let webhook: OutgoingWebhook = sqlx::query_as(
         r#"
@@ -263,8 +286,10 @@ pub async fn update(
     .bind(enabled)
     .bind(&id)
     .bind(&ctx.organization_id)
-    .fetch_one(state.db.pool())
+    .fetch_one(&mut *tx)
     .await?;
+
+    tx.commit().await?;
 
     tracing::info!(
         webhook_id = %id,
@@ -443,6 +468,12 @@ pub async fn deliveries(
     Extension(ctx): Extension<ApiKeyContext>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Vec<OutgoingWebhookDelivery>>> {
+    // Delivery rows carry the full event envelope, including the job payload of
+    // whichever queue produced the event. There is no queue column to filter on,
+    // so reading delivery history is an org-admin operation — a queue-scoped key
+    // must not use it to observe queues outside its scope.
+    require_unrestricted_key(&ctx, "manage outgoing webhooks")?;
+
     // Verify webhook belongs to organization
     let webhook_exists: Option<(String,)> = sqlx::query_as(
         r#"
@@ -500,6 +531,10 @@ pub async fn retry_delivery(
     Extension(ctx): Extension<ApiKeyContext>,
     Path((webhook_id, delivery_id)): Path<(String, String)>,
 ) -> AppResult<Json<RetryDeliveryResponse>> {
+    // Re-firing a stored delivery re-sends another queue's event payload to the
+    // org endpoint, so this is an org-admin operation like the rest of this file.
+    require_unrestricted_key(&ctx, "manage outgoing webhooks")?;
+
     // Validate UUID shape, but bind as TEXT — columns are TEXT PKs (BE-15).
     Uuid::parse_str(&webhook_id)
         .map_err(|_| AppError::Validation("Invalid webhook ID format".to_string()))?;

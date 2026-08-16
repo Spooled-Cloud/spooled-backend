@@ -8,7 +8,7 @@
 {"id": "BE-08", "sev": "P2", "summary": "checkout trusts client_reference_id; payment_status gate exists but org linkage remains sensitive", "path": "src/api/handlers/billing.rs", "lines": "349-351", "status": "open"}
 {"id": "BE-09", "sev": "P2", "summary": "charge.dispute unhandled", "path": "src/api/handlers/billing.rs", "lines": "240", "status": "open"}
 {"id": "BE-10", "sev": "P2", "summary": "tracked grpc-key.pem private key", "path": "certs/grpc-key.pem", "lines": "1", "status": "mitigated", "note": "certs/README.md documents disposable local-dev key; rotate if ever used in prod"}
-{"id": "BE-11", "sev": "P3", "summary": "query token on protected routes", "path": "src/api/middleware/auth.rs", "lines": "97-111", "status": "open"}
+{"id": "BE-11", "sev": "P3", "summary": "query token on protected routes", "path": "src/api/middleware/auth.rs", "lines": "97-111", "status": "fixed", "fixed_in": "0.1.111", "note": "query credentials survive only on /api/v1/ws and the three /api/v1/events routes via authenticate_api_key_allow_query; all other protected routes use header-only authenticate_api_key and return 401"}
 {"id": "BE-12", "sev": "P3", "summary": "admin routes unthrottled", "path": "src/api/mod.rs", "lines": "375-406", "status": "fixed", "fixed_in": "0.1.107"}
 {"id": "BE-13", "sev": "P3", "summary": "email check enumeration", "path": "src/api/handlers/email_login.rs", "lines": "130-139", "status": "open"}
 {"id": "BE-14", "sev": "P3", "summary": "retention SQL ignores some plan env windows", "path": "src/scheduler/mod.rs", "lines": "1010-1017", "status": "open"}

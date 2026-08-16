@@ -85,6 +85,9 @@ These are current actions, not instructions to expose either credential. Coordin
 - Use short-lived JWT tokens
 - Implement proper rate limiting
 - Validate and sanitize all inputs
+- Send REST credentials in the `Authorization: Bearer` header. Query-string credentials (`?api_key=`, `?token=`) are rejected with `401` on every REST endpoint except the four realtime routes — `/api/v1/ws`, `/api/v1/events`, `/api/v1/events/jobs/{id}`, `/api/v1/events/queues/{name}` — where browser `EventSource` and `WebSocket` cannot set headers. Query strings are captured by reverse-proxy and CDN access logs, tracing spans, browser history and the `Referer` header, and API keys do not expire by default (CWE-598)
+- Prefer a short-lived JWT over an API key on the realtime routes, and treat any key that has appeared in a URL as compromised
+- Behind a reverse proxy, set `TRUSTED_CLIENT_IP_HEADER` or `TRUSTED_PROXY_HOPS` so per-IP rate limiting sees the real client. The leftmost `X-Forwarded-For` entry is caller-supplied and is never trusted
 - For gRPC API-key authentication, send the API key credential as the value of the `x-api-key` metadata field; `x-api-key` is the metadata name, not a separate credential
 - Alternatively, send a JWT credential as `authorization: Bearer <jwt-token>` metadata
 - gRPC health and reflection services are public by default (disable in production if needed)
@@ -100,7 +103,8 @@ These are current actions, not instructions to expose either credential. Coordin
 
 Spooled Backend includes several security features:
 
-- **Multi-tenant isolation** via PostgreSQL Row-Level Security
+- **Multi-tenant isolation** enforced in the application layer: every query filters on the authenticated `organization_id` (RLS policies exist in the migrations but are inert at runtime — see [docs/guides/architecture.md](docs/guides/architecture.md))
+- **Header-only REST credentials**, so keys and tokens stay out of access logs and `Referer` headers
 - **Bcrypt password hashing** for API keys (used by both REST and gRPC)
 - **JWT authentication** with configurable expiration
 - **Rate limiting** per API key

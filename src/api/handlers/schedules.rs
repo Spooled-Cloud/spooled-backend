@@ -15,7 +15,7 @@ use tracing::{error, info};
 use crate::api::handlers::require_queue_access;
 use crate::api::middleware::limits::{
     check_job_limits, check_payload_size, check_payload_size_generic, check_resource_limit_conn,
-    increment_daily_jobs, lock_resource, LimitCheckError,
+    daily_jobs_limit, lock_resource, refund_daily_jobs, try_increment_daily_jobs, LimitCheckError,
 };
 use crate::api::middleware::validation::ValidatedJson;
 use crate::api::AppState;
@@ -570,7 +570,47 @@ pub async fn trigger(
     let job_id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now();
 
-    sqlx::query(
+    // Reserve the daily quota slot BEFORE inserting. check_job_limits above only reads a
+    // snapshot of today's count: N concurrent triggers can each observe a count under the
+    // cap, all insert, and all increment afterwards, so the cap was only ever enforced
+    // against stale data and got overshot in proportion to concurrency. This atomic
+    // reserve-then-insert is the real gate; the check above stays because it still guards
+    // the soft active_jobs limit and produces the structured error body.
+    let daily_limit = daily_jobs_limit(state.db.pool(), &ctx.organization_id)
+        .await
+        .unwrap_or(-1);
+    let quota_reserved = match try_increment_daily_jobs(
+        state.db.pool(),
+        &ctx.organization_id,
+        1,
+        daily_limit,
+    )
+    .await
+    {
+        Ok(count) if count >= 0 => true,
+        Ok(_) => {
+            // Over the daily cap. Rebuild the body via check_job_limits so this keeps
+            // answering 429 `QUOTA_EXCEEDED` as of v0.1.91 — SDKs classify a bare
+            // plain-text rejection as UNKNOWN_ERROR and do not surface it as a quota
+            // problem. Nothing was inserted yet, so there is nothing to unwind.
+            let response = check_job_limits(state.db.pool(), &ctx.organization_id, 1)
+                .await
+                .err()
+                .unwrap_or_else(|| {
+                    (StatusCode::TOO_MANY_REQUESTS, "Daily job limit reached").into_response()
+                });
+            return Err(response);
+        }
+        Err(e) => {
+            // Counter DB error: fall through and trigger anyway, as this endpoint always
+            // has. A counter outage must not turn into a refused trigger. No reservation
+            // was taken, so a later insert failure must not refund one.
+            tracing::warn!(error = %e, org_id = %ctx.organization_id, "Failed to reserve daily job quota for schedule trigger");
+            false
+        }
+    };
+
+    let insert_result = sqlx::query(
         r#"
         INSERT INTO jobs (
             id, organization_id, queue_name, status, payload, priority,
@@ -589,12 +629,24 @@ pub async fn trigger(
     .bind(&schedule.tags)
     .bind(now)
     .execute(state.db.pool())
-    .await
-    // Don't expose database error details
-    .map_err(|e| {
+    .await;
+
+    if let Err(e) = insert_result {
+        // Hand the reservation back: no job exists, so keeping the slot would shrink the
+        // org's day for every failed insert. Must go through refund_daily_jobs — a negative
+        // increment_daily_jobs assigns rather than adds across the daily reset, so a refund
+        // landing after midnight would drive the counter negative and hand out free quota.
+        if quota_reserved {
+            if let Err(refund_err) =
+                refund_daily_jobs(state.db.pool(), &ctx.organization_id, 1).await
+            {
+                tracing::warn!(error = %refund_err, org_id = %ctx.organization_id, "Failed to refund reserved daily job quota after schedule trigger insert failed");
+            }
+        }
+        // Don't expose database error details
         error!(error = %e, "Failed to create job from schedule trigger");
-        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to create job").into_response()
-    })?;
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, "Failed to create job").into_response());
+    }
 
     // Update schedule's last_run_at and run_count
     sqlx::query(
@@ -630,10 +682,7 @@ pub async fn trigger(
 
     info!(schedule_id = %id, job_id = %job_id, org_id = %ctx.organization_id, "Schedule triggered manually");
 
-    // Increment daily job counter for plan limit tracking
-    if let Err(e) = increment_daily_jobs(state.db.pool(), &ctx.organization_id, 1).await {
-        tracing::warn!(error = %e, org_id = %ctx.organization_id, "Failed to increment daily job counter");
-    }
+    // Daily counter already reserved before the insert above — no post-hoc increment here.
 
     // Publish to Redis to notify workers of new job
     if let Some(ref cache) = state.cache {

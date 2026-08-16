@@ -7,6 +7,145 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.111] - 2026-08-16
+
+Remediation of a full-backend audit (35 findings; see `AUDIT_2026-08-16_BUG_PLAN.md`).
+Four of the 35 were proved invalid during verification and one new finding was
+discovered while implementing.
+
+### Breaking
+
+- **API keys are no longer accepted in the query string on REST endpoints.** Use
+  `Authorization: Bearer <key>`. The realtime endpoints (`/api/v1/ws`,
+  `/api/v1/events`, `/api/v1/events/jobs/{id}`, `/api/v1/events/queues/{name}`)
+  still accept `?token=` / `?api_key=`, because browser `EventSource` and
+  `WebSocket` cannot set headers. Query strings are retained by proxy and CDN
+  access logs, tracing spans, browser history and `Referer`, which is not an
+  acceptable resting place for a credential that defaults to never expiring
+  (CWE-598). Query-string auth was never part of the OpenAPI contract.
+- `PUT /api/v1/outgoing-webhooks/{id}` with `{"secret": null}` now **clears** the
+  signing secret instead of being ignored. Omit the field to keep the current
+  value. Clients that serialise unchanged fields as explicit `null` will clear
+  secrets they meant to keep.
+
+### Security
+
+- Outgoing-webhook DNS is now resolved by a validating resolver that checks every
+  address the HTTP client is about to connect to, on every lookup and on every
+  redirect hop. Validating the URL and then letting the client resolve the name
+  again independently left a DNS-rebinding window that the previous code's own
+  doc comment claimed to close.
+- Public and admin rate limits no longer key on the leftmost `X-Forwarded-For`
+  entry, which the caller supplies: a rotating header value put every request in
+  a fresh bucket, removing rather than degrading the limiter in front of
+  `/auth/login`, `/auth/email/*`, `/organizations` and the admin routes. Client
+  IP now comes from a configured edge header, or from `X-Forwarded-For` counted
+  from the right past a configured number of trusted hops. Default is to trust
+  nothing, which is correct for self-hosting.
+- A queue-scoped API key can no longer read outgoing-webhook delivery history or
+  re-fire deliveries; those rows carry job payloads from every queue and the two
+  handlers were missing the `require_unrestricted_key` check the rest of the file
+  has.
+- Anyone who knew an email address could invalidate that account's in-flight
+  login code by requesting a new one, and after five requests in an hour lock the
+  account out entirely. Verification now accepts any live code for the address.
+  The per-code attempt cap is unchanged, so this grants an attacker no additional
+  guesses.
+- The API-key cache key is now the full SHA-256 rather than a 64-bit truncation.
+  A cache hit is trusted without re-running bcrypt, so that digest was the only
+  margin on the cached path.
+- `/api/v1/auth/check-email` now validates its input and throttles through Redis
+  instead of writing a permanent row per request into `email_login_codes` — a
+  table it also scanned twice per request, and which the login path scans on
+  every attempt.
+
+### Fixed
+
+- **Billing:** a crash, OOM kill or deploy between claiming a Stripe event and
+  running its handler permanently discarded that event — every retry was answered
+  `200 OK, already processed`. Claims now record completion, and a stale
+  in-flight claim is re-claimable.
+- **Billing:** the Stripe signature HMAC is computed over the raw request body
+  rather than a lossy UTF-8 conversion of it.
+- **Quota:** the bulk-enqueue refund called the increment function with a negative
+  count. That function assigns rather than adds across a daily reset, so a refund
+  landing after midnight set the day's counter negative and granted free quota,
+  and it also decremented the lifetime `total_jobs_created`. Refunds now go
+  through a dedicated function that floors at zero, never crosses a reset
+  boundary, and leaves lifetime totals alone. Existing drift is repaired by the
+  migration, and a `CHECK` constraint prevents recurrence.
+- **Quota:** the schedule-trigger, custom-webhook, workflow-create and cron paths
+  still used the pre-`v0.1.91` read-then-blind-write pattern and could overshoot
+  `jobs_per_day` in proportion to concurrency. All four now use the atomic
+  reservation, reserving before insert and refunding on failure.
+- **Dead letters:** the stale-worker sweep moved jobs to `deadletter` without
+  writing the `dead_letter_queue` audit row — the one dead-letter path of five
+  that skipped it, and the one covering "the worker holding this job vanished".
+  Every dead-letter path is now atomic in a single statement, so status and audit
+  row cannot half-apply. Dead-lettered jobs also clear `lease_expires_at`.
+- **Workflows:** a job whose dependency was deleted by retention became invisible
+  to both the dequeue predicate and the cancellation sweep — permanently pending
+  and permanently counted against `active_jobs`. The sweep now releases such jobs
+  after a grace period.
+- **Workers:** the built-in worker's heartbeat wrote the deprecated
+  `current_jobs`/`max_concurrency` columns, so the API always reported zero active
+  jobs and any worker above five concurrent jobs marked itself `degraded`.
+- `POST /api/v1/workers/register` accepts an optional `worker_id`, so a restarting
+  worker reclaims its row instead of leaking one that occupies the plan's worker
+  cap until the reaper clears it. Re-registration is not charged against the cap.
+- The `workers_active` gauge no longer drifts negative when an already-offline
+  worker is deregistered again.
+
+### Changed
+
+- Outgoing-webhook deliveries are bounded by a semaphore
+  (`OUTGOING_WEBHOOK_MAX_CONCURRENT_DELIVERIES`, default 64). Delivery tasks were
+  spawned without limit from the enqueue and complete hot paths and each held a
+  payload clone for up to a minute, so one tenant pointing a webhook at a
+  black-holing endpoint could exhaust process memory and sockets.
+- **Outgoing webhooks now auto-disable after 20 consecutive failed deliveries**,
+  with `last_status = "auto_disabled"`. `failure_count` is also counted once per
+  delivery rather than once per attempt — it was previously inflated by the retry
+  count and read by nothing.
+- `outgoing_webhook_deliveries` and expired `email_login_codes` are covered by the
+  per-organization retention sweep. Neither had any retention; delivery rows store
+  a copy of the job payload and only the newest 100 per webhook are ever readable.
+- `api_keys.last_used` is written at most once per key per five minutes instead of
+  once per request. Every authenticated request previously issued an `UPDATE` to
+  the same row, serialising requests on that row's lock during authentication.
+- Cached per-organization rate limits are invalidated on plan change and on
+  organization delete; they were cached for 60 seconds and never invalidated.
+- Removed `src/api/middleware/rate_limit.rs`, which was never mounted and failed
+  open in every degraded branch while its doc comment claimed the opposite, and
+  `EventBroadcaster`, which was never constructed outside its own tests and
+  advertised org isolation it did not implement.
+
+### Added
+
+- `OUTGOING_WEBHOOK_MAX_ATTEMPTS` (default 5) and
+  `OUTGOING_WEBHOOK_MAX_CONCURRENT_DELIVERIES` (default 64).
+- `TRUSTED_CLIENT_IP_HEADER` and `TRUSTED_PROXY_HOPS`. When unset, `CF-Connecting-IP`
+  and `X-Real-IP` are consulted by default, so a deployment behind Cloudflare or
+  nginx gets per-client rate limiting without configuration; `X-Forwarded-For` is
+  used only when `TRUSTED_PROXY_HOPS` says how many entries our own proxies
+  appended, and is counted from the right.
+- Migration `20260816120000_quota_refund_and_stripe_claim_state.sql`.
+- The integration suite can now run without Docker. `TEST_DATABASE_URL` and
+  `TEST_REDIS_URL` point the harness at existing services; each test still gets
+  its own freshly-migrated database, dropped afterwards. Previously the suite was
+  silently unrunnable whenever the Docker engine was unavailable.
+
+### Testing
+
+- Full suite verified on both paths — **1098 passed, 0 failed, 3 ignored** against
+  local PostgreSQL 17 + Redis, and identically via testcontainers (PostgreSQL 16,
+  the CI path). Clippy and rustfmt clean with `--all-features`.
+- Note for future changes: six of the eight files in `tests/` are behind the
+  `docker-tests` feature and `default = []`, so **`cargo test` without
+  `--all-features` compiles only a fraction of the suite and can report success
+  while the integration tests are unbuilt**. Two compile errors in this release
+  were only exposed by adding the flag.
+
 ## [0.1.110] - 2026-07-19
 
 ### Fixed

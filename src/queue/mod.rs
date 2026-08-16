@@ -514,9 +514,14 @@ impl QueueManager {
             ));
         }
 
-        // Update dependencies_met for child jobs that depend on this job
-        // A child job's dependencies are met when ALL its parent jobs are completed
-        // This runs in the same transaction to ensure atomicity
+        // Unblock children gated on this job via the LEGACY scalar `parent_job_id`
+        // edge only. This is not the workflow dependency mechanism: workflow jobs
+        // express many-to-many dependencies in the `job_dependencies` table with a
+        // `dependency_mode` of 'all'/'any', and those are resolved by the
+        // `update_dependent_jobs` DB trigger (migrations/20241209000003_job_dependencies.sql)
+        // plus the safety-net sweep in `Scheduler::update_job_dependencies`
+        // (src/scheduler/mod.rs). Changing the query below does NOT change
+        // workflow dependency behaviour.
         // SECURITY: Include organization_id when available for defense-in-depth
         let update_result = if let Some(oid) = org_id {
             sqlx::query(
@@ -530,8 +535,8 @@ impl QueueManager {
                   AND status IN ('pending', 'scheduled')
                   AND dependencies_met = FALSE
                   AND NOT EXISTS (
-                      -- Check if there are any other incomplete parent jobs
-                      -- For now, we only support single-parent dependencies via parent_job_id
+                      -- Single-parent (`parent_job_id`) edges only; multi-parent
+                      -- workflow dependencies live in `job_dependencies`.
                       -- SECURITY: Include organization_id in subquery for cross-tenant isolation
                       SELECT 1 FROM jobs parent
                       WHERE parent.id = jobs.parent_job_id
@@ -890,23 +895,50 @@ impl QueueManager {
                 new_status: Some("pending".to_string()),
             })
         } else {
+            // Status change and audit row are ONE statement: a crash between two
+            // separate statements used to leave the job `deadletter` with no
+            // `dead_letter_queue` row, and that table is the only place holding
+            // `original_payload`/`error_details` after retention deletes the job.
+            // The data-modifying CTE makes the pair atomic without a transaction.
             let updated = sqlx::query(
                 r#"
-                UPDATE jobs
-                SET
-                    status = 'deadletter',
-                    last_error = $1,
-                    assigned_worker_id = NULL,
-                    lease_id = NULL,
-                    updated_at = NOW()
-                WHERE id = $2
-                  AND organization_id = $3
-                  AND assigned_worker_id = $4
-                  AND status = 'processing'
-                  AND lease_expires_at IS NOT NULL
-                  AND lease_expires_at > NOW()
-                  AND lease_id = $5
-                  AND ($6::TEXT[] IS NULL OR queue_name = ANY($6))
+                WITH deadlettered AS (
+                    UPDATE jobs
+                    SET
+                        status = 'deadletter',
+                        last_error = $1,
+                        assigned_worker_id = NULL,
+                        lease_id = NULL,
+                        -- Terminal rows carry no lease. Leaving a stale
+                        -- `lease_expires_at` behind made the column mean
+                        -- something different for dead-lettered jobs than for
+                        -- every other status.
+                        lease_expires_at = NULL,
+                        updated_at = NOW()
+                    WHERE id = $2
+                      AND organization_id = $3
+                      AND assigned_worker_id = $4
+                      AND status = 'processing'
+                      AND lease_expires_at IS NOT NULL
+                      AND lease_expires_at > NOW()
+                      AND lease_id = $5
+                      AND ($6::TEXT[] IS NULL OR queue_name = ANY($6))
+                    RETURNING id, organization_id, queue_name, payload
+                )
+                INSERT INTO dead_letter_queue (
+                    id, job_id, organization_id, queue_name, reason,
+                    original_payload, error_details, created_at
+                )
+                SELECT
+                    gen_random_uuid()::TEXT,
+                    d.id,
+                    d.organization_id,
+                    d.queue_name,
+                    $1,
+                    d.payload,
+                    $7::JSONB,
+                    NOW()
+                FROM deadlettered d
                 "#,
             )
             .bind(error)
@@ -915,9 +947,12 @@ impl QueueManager {
             .bind(worker_id)
             .bind(lease_id)
             .bind(allowed_queues)
+            .bind(serde_json::json!({"final_error": error, "total_retries": retry_count}))
             .execute(&*self.db)
             .await?;
 
+            // rows_affected is the INSERT's row count, which equals the number of
+            // rows the inner UPDATE matched — zero means the job was not ours.
             if updated.rows_affected() == 0 {
                 return Ok(FailByWorkerOutcome {
                     outcome: self
@@ -927,28 +962,6 @@ impl QueueManager {
                     new_status: None,
                 });
             }
-
-            sqlx::query(
-                r#"
-                INSERT INTO dead_letter_queue (id, job_id, organization_id, queue_name, reason, original_payload, error_details, created_at)
-                SELECT
-                    gen_random_uuid()::TEXT,
-                    id,
-                    organization_id,
-                    queue_name,
-                    $1,
-                    payload,
-                    $2::JSONB,
-                    NOW()
-                FROM jobs WHERE id = $3 AND organization_id = $4
-                "#,
-            )
-            .bind(error)
-            .bind(serde_json::json!({"final_error": error, "total_retries": retry_count}))
-            .bind(job_id)
-            .bind(org_id)
-            .execute(&*self.db)
-            .await?;
 
             self.record_history(
                 job_id,
@@ -1062,45 +1075,43 @@ impl QueueManager {
                 "Job will retry"
             );
         } else {
-            // Max retries exceeded: move to dead-letter queue
+            // Max retries exceeded: move to dead-letter queue.
+            // Status change + audit row in ONE statement — see the equivalent
+            // comment in `fail_by_worker`. Two statements could half-apply.
             sqlx::query(
                 r#"
-                UPDATE jobs
-                SET
-                    status = 'deadletter',
-                    last_error = $1,
-                    assigned_worker_id = NULL,
-                    lease_id = NULL,
-                    updated_at = NOW()
-                WHERE id = $2 AND organization_id = $3
-                "#,
-            )
-            .bind(error)
-            .bind(job_id)
-            .bind(organization_id)
-            .execute(&*self.db)
-            .await?;
-
-            // Also insert into dead_letter_queue table - organization check via subquery
-            sqlx::query(
-                r#"
-                INSERT INTO dead_letter_queue (id, job_id, organization_id, queue_name, reason, original_payload, error_details, created_at)
+                WITH deadlettered AS (
+                    UPDATE jobs
+                    SET
+                        status = 'deadletter',
+                        last_error = $1,
+                        assigned_worker_id = NULL,
+                        lease_id = NULL,
+                        lease_expires_at = NULL,
+                        updated_at = NOW()
+                    WHERE id = $2 AND organization_id = $3
+                    RETURNING id, organization_id, queue_name, payload
+                )
+                INSERT INTO dead_letter_queue (
+                    id, job_id, organization_id, queue_name, reason,
+                    original_payload, error_details, created_at
+                )
                 SELECT
                     gen_random_uuid()::TEXT,
-                    id,
-                    organization_id,
-                    queue_name,
+                    d.id,
+                    d.organization_id,
+                    d.queue_name,
                     $1,
-                    payload,
-                    $2::JSONB,
+                    d.payload,
+                    $4::JSONB,
                     NOW()
-                FROM jobs WHERE id = $3 AND organization_id = $4
+                FROM deadlettered d
                 "#,
             )
             .bind(error)
-            .bind(serde_json::json!({"final_error": error, "total_retries": job.retry_count}))
             .bind(job_id)
             .bind(organization_id)
+            .bind(serde_json::json!({"final_error": error, "total_retries": job.retry_count}))
             .execute(&*self.db)
             .await?;
 

@@ -137,7 +137,7 @@ impl QueueServiceImpl {
             burst: u32,
         }
 
-        let cache_key = format!("org_rate_limits:{}", org_id);
+        let cache_key = crate::api::middleware::plan_rate_limit::org_rate_limits_key(org_id);
         let org_limits: OrgRateLimits = match cache.get_json(&cache_key).await {
             Ok(Some(v)) => v,
             _ => {
@@ -742,41 +742,86 @@ impl QueueService for QueueServiceImpl {
             retry_delay_secs: Option<i64>,
         }
 
+        // Settle the job AND write its dead-letter audit row in ONE statement.
+        //
+        // These used to be two independent statements on the pool, so a crash or
+        // a DB error between them left the job `deadletter` with no
+        // `dead_letter_queue` row — and that table is the only place holding
+        // `original_payload`/`error_details` once retention deletes the job. The
+        // INSERT's error was merely logged, so the RPC reported success while
+        // the audit trail silently lost the most interesting failures.
+        //
+        // The data-modifying CTE also removes a second latent bug: the old
+        // INSERT re-read the job with `SELECT ... FROM jobs WHERE id = ...`
+        // AFTER the UPDATE committed, so a concurrent purge in that window
+        // inserted zero rows and reported no error at all.
         let result: Option<UpdateResult> = sqlx::query_as(
             r#"
-            UPDATE jobs
-            SET
-                status = CASE
-                    WHEN $1 = FALSE OR retry_count >= max_retries THEN 'deadletter'
-                    ELSE 'pending'
-                END,
-                last_error = $2,
-                retry_count = retry_count + 1,
-                scheduled_at = CASE
-                    WHEN $1 = TRUE AND retry_count < max_retries
-                    THEN NOW() + (LEAST(POWER(2, LEAST(retry_count, 6)), 60) || ' seconds')::INTERVAL
-                    ELSE scheduled_at
-                END,
-                assigned_worker_id = NULL,
-                lease_id = NULL,
-                lease_expires_at = NULL,
-                updated_at = NOW()
-            WHERE id = $3
-              AND assigned_worker_id = $4
-              AND organization_id = $5
-              AND status = 'processing'
-              AND lease_expires_at IS NOT NULL
-              AND lease_expires_at > NOW()
-              AND lease_id = $6
-              AND ($7::TEXT[] IS NULL OR queue_name = ANY($7))
-            RETURNING
-                status as new_status,
-                retry_count as new_retry_count,
+            WITH updated AS (
+                UPDATE jobs
+                SET
+                    status = CASE
+                        WHEN $1 = FALSE OR retry_count >= max_retries THEN 'deadletter'
+                        ELSE 'pending'
+                    END,
+                    last_error = $2,
+                    retry_count = retry_count + 1,
+                    scheduled_at = CASE
+                        WHEN $1 = TRUE AND retry_count < max_retries
+                        THEN NOW() + (LEAST(POWER(2, LEAST(retry_count, 6)), 60) || ' seconds')::INTERVAL
+                        ELSE scheduled_at
+                    END,
+                    assigned_worker_id = NULL,
+                    lease_id = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = NOW()
+                WHERE id = $3
+                  AND assigned_worker_id = $4
+                  AND organization_id = $5
+                  AND status = 'processing'
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at > NOW()
+                  AND lease_id = $6
+                  AND ($7::TEXT[] IS NULL OR queue_name = ANY($7))
+                RETURNING
+                    id,
+                    organization_id,
+                    queue_name,
+                    payload,
+                    status,
+                    retry_count,
+                    scheduled_at
+            ),
+            dlq AS (
+                -- Parity with REST: DLQ listings must surface gRPC failures too.
+                INSERT INTO dead_letter_queue (
+                    id, job_id, organization_id, queue_name, reason,
+                    original_payload, error_details, created_at
+                )
+                SELECT
+                    gen_random_uuid()::TEXT,
+                    u.id,
+                    u.organization_id,
+                    u.queue_name,
+                    $2,
+                    u.payload,
+                    jsonb_build_object(
+                        'final_error', $2::TEXT,
+                        'total_retries', u.retry_count
+                    ),
+                    NOW()
+                FROM updated u
+                WHERE u.status = 'deadletter'
+            )
+            SELECT
+                u.status as new_status,
+                u.retry_count as new_retry_count,
                 CASE
-                    WHEN status = 'pending'
-                    THEN EXTRACT(EPOCH FROM (scheduled_at - NOW()))::BIGINT
+                    WHEN u.status = 'pending'
+                    THEN EXTRACT(EPOCH FROM (u.scheduled_at - NOW()))::BIGINT
                     ELSE NULL
                 END as retry_delay_secs
+            FROM updated u
             "#,
         )
         .bind(req.retry)
@@ -813,39 +858,9 @@ impl QueueService for QueueServiceImpl {
 
         let will_retry = result.new_status == "pending";
         if result.new_status == "deadletter" {
+            // The dead_letter_queue row was written by the same statement that
+            // set this status — see the CTE above.
             self.metrics.jobs_deadlettered.inc();
-
-            // Parity with REST: also insert a dead_letter_queue row so DLQ
-            // listings surface failures made via gRPC. Best-effort — errors
-            // here are logged but do not fail the RPC (the job status has
-            // already been moved to deadletter above).
-            if let Err(e) = sqlx::query(
-                r#"
-                INSERT INTO dead_letter_queue (id, job_id, organization_id, queue_name, reason, original_payload, error_details, created_at)
-                SELECT
-                    gen_random_uuid()::TEXT,
-                    id,
-                    organization_id,
-                    queue_name,
-                    $1,
-                    payload,
-                    $2::JSONB,
-                    NOW()
-                FROM jobs WHERE id = $3 AND organization_id = $4
-                "#,
-            )
-            .bind(&error_message)
-            .bind(serde_json::json!({
-                "final_error": error_message,
-                "total_retries": result.new_retry_count,
-            }))
-            .bind(&req.job_id)
-            .bind(&auth.organization_id)
-            .execute(self.pool.as_ref())
-            .await
-            {
-                error!(error = %e, job_id = %req.job_id, "Failed to insert dead_letter_queue row via gRPC");
-            }
         }
 
         info!(
@@ -2005,6 +2020,16 @@ async fn handle_process_fail(
             let will_retry = update_result.new_status == "pending";
             if update_result.new_status == "deadletter" {
                 // Parity with REST: insert into dead_letter_queue.
+                //
+                // This runs INSIDE the transaction, so a failure here must abort
+                // the settlement rather than be logged and stepped over: in
+                // Postgres a failed statement poisons the surrounding
+                // transaction, and the previous log-and-continue therefore
+                // guaranteed that the `tx.commit()` below would fail anyway —
+                // rolling back the status update too and returning INTERNAL,
+                // while the log line claimed only the audit row was lost.
+                // Returning here makes that outcome explicit and releases the
+                // transaction immediately.
                 if let Err(e) = sqlx::query(
                     r#"
                     INSERT INTO dead_letter_queue (id, job_id, organization_id, queue_name, reason, original_payload, error_details, created_at)
@@ -2030,7 +2055,9 @@ async fn handle_process_fail(
                 .execute(&mut *tx)
                 .await
                 {
-                    error!(error = %e, job_id = %req.job_id, "Failed to insert dead_letter_queue row in ProcessJobs");
+                    error!(error = %e, job_id = %req.job_id, "Failed to insert dead_letter_queue row in ProcessJobs; rolling back settlement");
+                    let _ = tx.rollback().await;
+                    return process_error("INTERNAL", "Failed to update job");
                 }
             }
             if let Err(e) = tx.commit().await {

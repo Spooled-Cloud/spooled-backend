@@ -57,7 +57,11 @@ impl AppState {
         settings: Settings,
     ) -> Self {
         let stripe = settings.stripe.clone();
-        let outgoing_webhooks = Arc::new(OutgoingWebhookService::new(db.pool().clone(), 5));
+        let outgoing_webhooks = Arc::new(OutgoingWebhookService::new(
+            db.pool().clone(),
+            settings.outgoing_webhooks.max_attempts,
+            settings.outgoing_webhooks.max_concurrent_deliveries,
+        ));
         Self {
             db,
             cache,
@@ -285,17 +289,6 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
         .route("/api-keys/{id}", get(handlers::api_keys::get))
         .route("/api-keys/{id}", put(handlers::api_keys::update))
         .route("/api-keys/{id}", delete(handlers::api_keys::revoke))
-        // Real-time endpoints (WebSocket and SSE)
-        .route("/ws", get(handlers::realtime::websocket_handler))
-        .route("/events", get(handlers::realtime::sse_events_handler))
-        .route(
-            "/events/jobs/{id}",
-            get(handlers::realtime::sse_job_handler),
-        )
-        .route(
-            "/events/queues/{name}",
-            get(handlers::realtime::sse_queue_handler),
-        )
         // Workflows
         .route("/workflows", get(handlers::workflows::list))
         .route("/workflows", post(handlers::workflows::create))
@@ -371,6 +364,34 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
             middleware::auth::authenticate_api_key,
         ));
 
+    // Realtime endpoints are the ONLY routes that may carry the credential in
+    // the query string: browser `EventSource`/`WebSocket` cannot set an
+    // `Authorization` header. Everything else is header-only, so long-lived API
+    // keys stop appearing in proxy access logs, CDN logs and tracing spans.
+    //
+    // NOTE: the Go SDK's SSE client sends `?api_key=` with no header
+    // (spooled-sdk-go realtime/sse.go), and the dashboard's EventSource/WebSocket
+    // send `?token=<jwt>` — both keep working through this router.
+    let realtime_routes = Router::new()
+        .route("/ws", get(handlers::realtime::websocket_handler))
+        .route("/events", get(handlers::realtime::sse_events_handler))
+        .route(
+            "/events/jobs/{id}",
+            get(handlers::realtime::sse_job_handler),
+        )
+        .route(
+            "/events/queues/{name}",
+            get(handlers::realtime::sse_queue_handler),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::plan_rate_limit::plan_rate_limit_middleware,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::auth::authenticate_api_key_allow_query,
+        ));
+
     // Admin routes (require X-Admin-Key authentication)
     // Layer order: last added runs first → rate limit, then admin auth.
     let admin_routes = Router::new()
@@ -409,6 +430,9 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
             middleware::plan_rate_limit::admin_rate_limit_middleware,
         ));
 
-    // Merge public, protected, and admin routes
-    public_routes.merge(protected_routes).merge(admin_routes)
+    // Merge public, protected, realtime, and admin routes
+    public_routes
+        .merge(protected_routes)
+        .merge(realtime_routes)
+        .merge(admin_routes)
 }

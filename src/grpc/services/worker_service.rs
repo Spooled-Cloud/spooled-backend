@@ -79,7 +79,7 @@ impl WorkerServiceImpl {
             burst: u32,
         }
 
-        let cache_key = format!("org_rate_limits:{}", org_id);
+        let cache_key = crate::api::middleware::plan_rate_limit::org_rate_limits_key(org_id);
         let org_limits: OrgRateLimits = match cache.get_json(&cache_key).await {
             Ok(Some(v)) => v,
             _ => {

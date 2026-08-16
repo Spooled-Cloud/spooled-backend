@@ -20,13 +20,9 @@ use futures::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 use crate::api::AppState;
-
-/// Maximum number of events to buffer in broadcast channel
-const BROADCAST_CAPACITY: usize = 1000;
 
 /// Maximum SSE connection duration (30 minutes)
 const MAX_SSE_DURATION_SECS: u64 = 1800;
@@ -174,65 +170,20 @@ impl RealtimeEvent {
     }
 }
 
-/// Event with organization context
-#[derive(Debug, Clone)]
-pub struct OrgScopedEvent {
-    /// Organization ID for filtering
-    pub organization_id: String,
-    /// The actual event
-    pub event: RealtimeEvent,
-}
-
-/// Event broadcaster for real-time updates
-///
-/// Now supports organization-scoped event broadcasting
-#[derive(Clone)]
-pub struct EventBroadcaster {
-    /// Sender for broadcasting events (now org-scoped)
-    sender: broadcast::Sender<OrgScopedEvent>,
-}
-
-impl EventBroadcaster {
-    /// Create a new event broadcaster
-    pub fn new() -> Self {
-        let (sender, _) = broadcast::channel(BROADCAST_CAPACITY);
-        Self { sender }
-    }
-
-    /// Broadcast an event to all subscribers (with organization context)
-    ///
-    /// Now requires organization_id to prevent cross-tenant leakage
-    pub fn broadcast(&self, organization_id: &str, event: RealtimeEvent) {
-        let scoped_event = OrgScopedEvent {
-            organization_id: organization_id.to_string(),
-            event,
-        };
-        // Ignore errors if there are no receivers
-        let _ = self.sender.send(scoped_event);
-    }
-
-    /// Subscribe to events (returns org-scoped events)
-    ///
-    /// Subscribers must filter by their organization_id
-    pub fn subscribe(&self) -> broadcast::Receiver<OrgScopedEvent> {
-        self.sender.subscribe()
-    }
-
-    /// Subscribe to events for a specific organization
-    ///
-    /// Convenience method that filters events by org
-    pub fn subscribe_for_org(&self, _org_id: &str) -> broadcast::Receiver<OrgScopedEvent> {
-        // Note: Actual filtering happens on receive side
-        // In production, consider using separate channels per org for better performance
-        self.sender.subscribe()
-    }
-}
-
-impl Default for EventBroadcaster {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// `EventBroadcaster` / `OrgScopedEvent` were removed here. They were never
+// constructed outside their own unit tests — the live realtime path is Redis
+// pub/sub plus DB polling in the handlers below — while their doc comments
+// advertised org-scoped isolation ("Now requires organization_id to prevent
+// cross-tenant leakage") that the code did not implement: `subscribe_for_org`
+// ignored its argument and handed back a receiver on ONE global
+// `broadcast::channel` shared by every tenant.
+//
+// If a broadcaster is wanted later, two things must be solved first, neither of
+// which the deleted version did:
+//   1. Per-org channels (or a per-org filter applied before the channel), so one
+//      tenant's burst cannot evict another tenant's events from the ring buffer.
+//   2. Explicit `RecvError::Lagged` handling, so a slow subscriber is told it
+//      missed events instead of having its stream silently terminated.
 
 /// Validate queue filter name for safe characters
 fn validate_queue_filter(queue: &Option<String>) -> Result<(), &'static str> {
@@ -1119,26 +1070,6 @@ mod tests {
             timestamp: chrono::Utc::now(),
         };
         assert_eq!(event.event_type(), "queue.stats");
-    }
-
-    /// Updated test to use org-scoped broadcast
-    #[test]
-    fn test_event_broadcaster() {
-        let broadcaster = EventBroadcaster::new();
-        let mut rx = broadcaster.subscribe();
-
-        let event = RealtimeEvent::Ping {
-            timestamp: chrono::Utc::now(),
-        };
-        // Use org-scoped broadcast
-        broadcaster.broadcast("test-org", event.clone());
-
-        // Should receive the event
-        let received = rx.try_recv();
-        assert!(received.is_ok());
-        // Verify org_id is set
-        let scoped_event = received.unwrap();
-        assert_eq!(scoped_event.organization_id, "test-org");
     }
 
     #[test]

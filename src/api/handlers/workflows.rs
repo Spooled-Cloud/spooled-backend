@@ -4,6 +4,8 @@
 
 use axum::{
     extract::{Extension, Path, Query, State},
+    http::StatusCode,
+    response::IntoResponse,
     Json,
 };
 use chrono::Utc;
@@ -15,7 +17,8 @@ use crate::{
     api::{
         middleware::{
             limits::{
-                check_job_limits, check_payload_size, check_resource_limit_conn, lock_resource,
+                check_job_limits, check_payload_size, check_resource_limit_conn, daily_jobs_limit,
+                lock_resource, refund_daily_jobs, try_increment_daily_jobs,
             },
             ValidatedJson,
         },
@@ -342,111 +345,182 @@ pub async fn create(
         ));
     }
 
+    // Reserve this workflow's entire daily-job allowance BEFORE writing anything.
+    // One request enqueues every job here, so the old check-then-blind-increment left
+    // the widest window of any enqueue path: N concurrent creates all read a count
+    // under the cap from check_job_limits above, then each added its full job_count on
+    // top, overshooting jobs_per_day by up to N*job_count. Reserving first makes the
+    // cap authoritative; the build below is all-or-nothing, so failure refunds.
+    let daily_limit = daily_jobs_limit(state.db.pool(), &ctx.organization_id)
+        .await
+        .unwrap_or(-1);
+    let reserved = match try_increment_daily_jobs(
+        state.db.pool(),
+        &ctx.organization_id,
+        job_count as i32,
+        daily_limit,
+    )
+    .await
+    {
+        Ok(count) if count >= 0 => true,
+        Ok(_) => {
+            // The whole workflow does not fit under the cap. Nothing is written yet, so
+            // reject outright; re-run check_job_limits purely to build the plan-aware
+            // body (current/limit/upgrade hints) clients already parse.
+            let response = check_job_limits(state.db.pool(), &ctx.organization_id, job_count)
+                .await
+                .err()
+                .unwrap_or_else(|| {
+                    (StatusCode::TOO_MANY_REQUESTS, "Daily job limit reached").into_response()
+                });
+            return Err(AppError::LimitExceeded(Box::new(response)));
+        }
+        Err(e) => {
+            // Counter outage: build the workflow anyway, preserving the warn-only
+            // behaviour this path has always had. A broken counter must not turn a
+            // valid enqueue into a rejection. Nothing was reserved, so nothing to
+            // refund if the build below fails.
+            warn!(error = %e, org_id = %ctx.organization_id, "Failed to reserve daily job quota");
+            false
+        }
+    };
+
     // Build the whole workflow (workflow row + jobs + dependency edges) in ONE
     // transaction. Previously each INSERT ran on the pool independently, so a
     // mid-sequence failure (e.g. a duplicate dependency edge) left a half-built
     // workflow committed — root jobs already runnable, others missing. All-or-nothing.
-    let mut tx = state.db.pool().begin().await?;
+    //
+    // The result is captured rather than `?`-ed straight out so every exit inside —
+    // the workflows-cap rejection, a job INSERT, a dependency INSERT — funnels through
+    // the single refund site below. The transaction rolls the jobs back, so a charged
+    // reservation left behind would burn quota for a workflow that never existed.
+    let built: AppResult<(HashMap<String, String>, Vec<WorkflowJobMapping>)> = async {
+        let mut tx = state.db.pool().begin().await?;
 
-    // Enforce workflow count / feature availability (Free disables workflows)
-    // atomically: the advisory lock serializes concurrent creates for this org so
-    // the count + inserts cannot overshoot the plan cap.
-    lock_resource(&mut tx, &ctx.organization_id, "workflows").await?;
-    if let Err(response) =
-        check_resource_limit_conn(&mut tx, &ctx.organization_id, "workflows", 1).await
-    {
-        return Err(AppError::LimitExceeded(Box::new(response)));
-    }
+        // Enforce workflow count / feature availability (Free disables workflows)
+        // atomically: the advisory lock serializes concurrent creates for this org so
+        // the count + inserts cannot overshoot the plan cap.
+        lock_resource(&mut tx, &ctx.organization_id, "workflows").await?;
+        if let Err(response) =
+            check_resource_limit_conn(&mut tx, &ctx.organization_id, "workflows", 1).await
+        {
+            return Err(AppError::LimitExceeded(Box::new(response)));
+        }
 
-    sqlx::query(
-        r#"
-        INSERT INTO workflows (id, organization_id, name, description, status, total_jobs, metadata, created_at)
-        VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7)
-        "#,
-    )
-    .bind(&workflow_id)
-    .bind(&ctx.organization_id) // Use authenticated org context
-    .bind(&request.name)
-    .bind(&request.description)
-    .bind(request.jobs.len() as i32)
-    .bind(&request.metadata)
-    .bind(now)
-    .execute(&mut *tx)
-    .await?;
-
-    // Create jobs and track their IDs
-    let mut job_mappings: HashMap<String, String> = HashMap::new();
-    let mut response_mappings = Vec::new();
-
-    for (step, job_def) in request.jobs.iter().enumerate() {
-        let job_id = uuid::Uuid::new_v4().to_string();
-        let has_dependencies = !job_def.depends_on.is_empty();
-
-        // Create the job
         sqlx::query(
             r#"
-            INSERT INTO jobs (
-                id, organization_id, queue_name, status, payload, priority,
-                max_retries, timeout_seconds, expires_at, workflow_id, workflow_step,
-                dependency_mode, dependencies_met, created_at, updated_at
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $14)
+            INSERT INTO workflows (id, organization_id, name, description, status, total_jobs, metadata, created_at)
+            VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7)
             "#,
         )
-        .bind(&job_id)
-        .bind(&ctx.organization_id) // Use authenticated org context
-        .bind(&job_def.queue_name)
-        .bind("pending") // All jobs start as pending, dependencies_met controls processing
-        .bind(&job_def.payload)
-        .bind(job_def.priority)
-        .bind(
-            job_def
-                .max_retries
-                .unwrap_or(state.settings.queue.default_max_retries)
-                .clamp(0, 100),
-        )
-        .bind(
-            job_def
-                .timeout_seconds
-                .unwrap_or(state.settings.queue.default_timeout_secs)
-                .clamp(1, 86400),
-        )
-        .bind(job_def.expires_at)
         .bind(&workflow_id)
-        .bind(step as i32)
-        .bind(job_def.dependency_mode.to_string())
-        .bind(!has_dependencies) // dependencies_met = true if no dependencies
+        .bind(&ctx.organization_id) // Use authenticated org context
+        .bind(&request.name)
+        .bind(&request.description)
+        .bind(request.jobs.len() as i32)
+        .bind(&request.metadata)
         .bind(now)
         .execute(&mut *tx)
         .await?;
 
-        job_mappings.insert(job_def.key.clone(), job_id.clone());
-        response_mappings.push(WorkflowJobMapping {
-            key: job_def.key.clone(),
-            job_id,
-        });
-    }
+        // Create jobs and track their IDs
+        let mut job_mappings: HashMap<String, String> = HashMap::new();
+        let mut response_mappings = Vec::new();
 
-    // Create job dependencies
-    for job_def in &request.jobs {
-        let job_id = &job_mappings[&job_def.key];
-        for dep_key in &job_def.depends_on {
-            let dep_job_id = &job_mappings[dep_key];
+        for (step, job_def) in request.jobs.iter().enumerate() {
+            let job_id = uuid::Uuid::new_v4().to_string();
+            let has_dependencies = !job_def.depends_on.is_empty();
+
+            // Create the job
             sqlx::query(
                 r#"
-                INSERT INTO job_dependencies (job_id, depends_on_job_id, dependency_type)
-                VALUES ($1, $2, $3)
+                INSERT INTO jobs (
+                    id, organization_id, queue_name, status, payload, priority,
+                    max_retries, timeout_seconds, expires_at, workflow_id, workflow_step,
+                    dependency_mode, dependencies_met, created_at, updated_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $14)
                 "#,
             )
-            .bind(job_id)
-            .bind(dep_job_id)
+            .bind(&job_id)
+            .bind(&ctx.organization_id) // Use authenticated org context
+            .bind(&job_def.queue_name)
+            .bind("pending") // All jobs start as pending, dependencies_met controls processing
+            .bind(&job_def.payload)
+            .bind(job_def.priority)
+            .bind(
+                job_def
+                    .max_retries
+                    .unwrap_or(state.settings.queue.default_max_retries)
+                    .clamp(0, 100),
+            )
+            .bind(
+                job_def
+                    .timeout_seconds
+                    .unwrap_or(state.settings.queue.default_timeout_secs)
+                    .clamp(1, 86400),
+            )
+            .bind(job_def.expires_at)
+            .bind(&workflow_id)
+            .bind(step as i32)
             .bind(job_def.dependency_mode.to_string())
+            .bind(!has_dependencies) // dependencies_met = true if no dependencies
+            .bind(now)
             .execute(&mut *tx)
             .await?;
-        }
-    }
 
-    tx.commit().await?;
+            job_mappings.insert(job_def.key.clone(), job_id.clone());
+            response_mappings.push(WorkflowJobMapping {
+                key: job_def.key.clone(),
+                job_id,
+            });
+        }
+
+        // Create job dependencies
+        for job_def in &request.jobs {
+            let job_id = &job_mappings[&job_def.key];
+            for dep_key in &job_def.depends_on {
+                let dep_job_id = &job_mappings[dep_key];
+                sqlx::query(
+                    r#"
+                    INSERT INTO job_dependencies (job_id, depends_on_job_id, dependency_type)
+                    VALUES ($1, $2, $3)
+                    "#,
+                )
+                .bind(job_id)
+                .bind(dep_job_id)
+                .bind(job_def.dependency_mode.to_string())
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+
+        tx.commit().await?;
+
+        Ok::<(HashMap<String, String>, Vec<WorkflowJobMapping>), AppError>((
+            job_mappings,
+            response_mappings,
+        ))
+    }
+    .await;
+
+    let (job_mappings, response_mappings) = match built {
+        Ok(built) => built,
+        Err(e) => {
+            // Nothing was committed, so hand the reserved quota back. Refunding via
+            // refund_daily_jobs (never a negative increment) keeps a refund that lands
+            // after the daily reset from driving the new day's counter negative.
+            if reserved {
+                if let Err(refund_err) =
+                    refund_daily_jobs(state.db.pool(), &ctx.organization_id, job_count as i32).await
+                {
+                    warn!(error = %refund_err, org_id = %ctx.organization_id,
+                        "Failed to refund daily job quota after workflow rollback");
+                }
+            }
+            return Err(e);
+        }
+    };
 
     info!(
         workflow_id = %workflow_id,
@@ -460,16 +534,8 @@ pub async fn create(
         .jobs_enqueued
         .inc_by(request.jobs.len() as u64);
 
-    // Increment daily job counter for plan limit tracking
-    if let Err(e) = crate::api::middleware::limits::increment_daily_jobs(
-        state.db.pool(),
-        &ctx.organization_id,
-        job_count as i32,
-    )
-    .await
-    {
-        warn!(error = %e, org_id = %ctx.organization_id, "Failed to increment daily job counter");
-    }
+    // (The daily job counter was already charged by the reservation above — a
+    // post-commit increment here could only re-add what is already counted.)
 
     // Notify Redis about new workflow and pending jobs
     if let Some(ref cache) = state.cache {

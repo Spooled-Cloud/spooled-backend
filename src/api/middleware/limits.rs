@@ -443,6 +443,29 @@ pub async fn increment_daily_jobs(
     Ok(row.0)
 }
 
+/// Return unused daily-quota credits reserved by a batch that did not fully
+/// materialise (in-batch duplicates, idempotency hits, or a failed insert).
+///
+/// `count` is POSITIVE. Do **not** call [`increment_daily_jobs`] with a negative
+/// value to achieve this: that function assigns rather than adds when the daily
+/// reset date has rolled over, so a refund crossing midnight set the day's
+/// counter negative and granted free quota, and it also decremented the
+/// lifetime `total_jobs_created`. `refund_daily_jobs` floors at zero, leaves
+/// lifetime totals alone, and is a no-op once the reservation's day has passed.
+pub async fn refund_daily_jobs(
+    pool: &PgPool,
+    org_id: &str,
+    count: i32,
+) -> Result<i64, sqlx::Error> {
+    let row: (i64,) = sqlx::query_as("SELECT refund_daily_jobs($1, $2)")
+        .bind(org_id)
+        .bind(count)
+        .fetch_one(pool)
+        .await?;
+
+    Ok(row.0)
+}
+
 /// The org plan's daily jobs cap as an `i64` (`-1` = unlimited).
 pub async fn daily_jobs_limit(pool: &PgPool, org_id: &str) -> Result<i64, sqlx::Error> {
     let (plan_tier, custom_limits) = get_org_plan_and_limits(pool, org_id).await?;

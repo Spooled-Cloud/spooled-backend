@@ -63,8 +63,29 @@ Configure via environment variables:
 
 Rate limits are tracked per client:
 - **API Key**: Hash of the API key
-- **IP Address**: From `X-Forwarded-For` header
+- **IP Address**: See [Client IP Resolution](#client-ip-resolution) below
 - **User-Agent**: Fallback for unidentified clients
+
+### Client IP Resolution
+
+For unauthenticated traffic the limiter buckets by client IP, so where that IP comes from
+decides whether the limiter works at all. Headers are consulted in this order:
+
+1. `TRUSTED_CLIENT_IP_HEADER`, if you set it (e.g. `CF-Connecting-IP`).
+2. Otherwise the built-in edge headers, `CF-Connecting-IP` then `X-Real-IP` — which is why
+   a deployment behind Cloudflare or nginx is covered without configuration.
+3. `X-Forwarded-For`, read from the **right**, skipping `TRUSTED_PROXY_HOPS` entries.
+4. The socket peer address.
+
+`X-Forwarded-For` is **not** consulted unless you set `TRUSTED_PROXY_HOPS`, and the default
+is `0`. Every proxy appends to that header, so its leftmost entry is whatever the caller
+sent: trusting it lets a caller mint a fresh rate-limit bucket per request, which removes
+the limiter rather than degrading it. Count only the hops **your own** proxies add — `1`
+behind a single reverse proxy, `2` behind e.g. Cloudflare → nginx.
+
+If you run behind a proxy that sets neither `CF-Connecting-IP` nor `X-Real-IP` and you
+leave `TRUSTED_PROXY_HOPS` at `0`, every request arrives with the proxy's address and all
+unauthenticated traffic shares one bucket. Set one of the two variables.
 
 ### Request Size Limits
 
@@ -393,6 +414,32 @@ custom webhooks must include the `X-Webhook-Token` header with the correct value
 | `WORKER_LEASE_DURATION_SECS` | `30` | Job lock timeout |
 | `WORKER_MAX_CONCURRENCY` | `5` | Max jobs per worker |
 | `WORKER_FALLBACK_POLL_INTERVAL_SECS` | `5` | Poll interval when Redis unavailable |
+
+### Outgoing Webhooks
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OUTGOING_WEBHOOK_MAX_ATTEMPTS` | `5` | Delivery attempts per event before giving up (exponential backoff between them) |
+| `OUTGOING_WEBHOOK_MAX_CONCURRENT_DELIVERIES` | `64` | Hard ceiling on deliveries in flight process-wide; beyond it, deliveries queue |
+
+Each in-flight delivery holds a copy of the job payload for up to the request timeout plus
+retry backoff, so raise the concurrency ceiling only with memory and socket headroom to
+match. Without it, one webhook pointed at a black-holing endpoint grows tasks and sockets
+until the process dies.
+
+A webhook is disabled automatically after 20 consecutive failed deliveries
+(`enabled = false`, `last_status = "auto_disabled"`); re-enable it with
+`PUT /api/v1/outgoing-webhooks/{id}` and `{"enabled": true}`.
+
+### Trusted Proxy / Client IP
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TRUSTED_CLIENT_IP_HEADER` | Unset | Edge header carrying the real client IP. Unset falls back to `CF-Connecting-IP`, then `X-Real-IP` |
+| `TRUSTED_PROXY_HOPS` | `0` | Entries **your own** proxies append to `X-Forwarded-For`, counted from the right. `0` means that header is never consulted |
+
+See [Client IP Resolution](#client-ip-resolution) for why the leftmost `X-Forwarded-For`
+entry is not trusted.
 
 ### gRPC
 

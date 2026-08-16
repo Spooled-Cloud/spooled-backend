@@ -23,6 +23,8 @@ pub struct Settings {
     pub worker: WorkerSettings,
     pub queue: QueueSettings,
     pub webhooks: WebhookSettings,
+    pub outgoing_webhooks: OutgoingWebhookSettings,
+    pub trusted_proxy: TrustedProxySettings,
     pub tracing: TracingSettings,
     pub registration: RegistrationSettings,
     pub stripe: StripeSettings,
@@ -181,6 +183,57 @@ pub struct WebhookSettings {
     // Fields removed - /webhooks/{org_id}/stripe endpoint was removed
     // Billing webhook uses stripe.webhook_secret from StripeSettings instead
 }
+
+/// Outgoing (org-configured) webhook delivery settings.
+///
+/// Kept separate from the legacy [`WebhookSettings`] marker struct, which is
+/// about *inbound* webhook verification.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OutgoingWebhookSettings {
+    /// Delivery attempts per event before giving up (`OUTGOING_WEBHOOK_MAX_ATTEMPTS`).
+    pub max_attempts: i32,
+    /// Hard ceiling on deliveries in flight process-wide
+    /// (`OUTGOING_WEBHOOK_MAX_CONCURRENT_DELIVERIES`).
+    ///
+    /// Delivery tasks are spawned from the enqueue/complete hot paths and live
+    /// for the request timeout plus the retry backoff, holding a payload clone
+    /// the whole time. Without a ceiling, one tenant pointing a webhook at a
+    /// black-holing endpoint grows tasks and sockets until the process dies.
+    pub max_concurrent_deliveries: usize,
+}
+
+impl Default for OutgoingWebhookSettings {
+    fn default() -> Self {
+        Self {
+            max_attempts: 5,
+            max_concurrent_deliveries: 64,
+        }
+    }
+}
+
+/// How to determine the client IP for rate limiting and abuse controls.
+///
+/// `X-Forwarded-For` is APPENDED to by each proxy, so its leftmost entry is
+/// whatever the original caller sent — attacker-controlled. Trusting it let a
+/// caller land in a fresh rate-limit bucket per request simply by varying the
+/// header, which removes the limiter rather than degrading it.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct TrustedProxySettings {
+    /// Header set by the edge proxy that carries the real client IP, e.g.
+    /// `CF-Connecting-IP` (Cloudflare) or `X-Real-IP` (nginx).
+    /// Set via `TRUSTED_CLIENT_IP_HEADER`. Checked first when present.
+    pub client_ip_header: Option<String>,
+    /// Number of trusted proxy hops appended to `X-Forwarded-For`.
+    ///
+    /// `0` (default) means **do not trust `X-Forwarded-For` at all** — correct
+    /// for self-hosting with no proxy. `1` means the last entry was added by our
+    /// own edge, so the client address is the second-from-last, and so on.
+    /// Set via `TRUSTED_PROXY_HOPS`.
+    pub forwarded_hops: usize,
+}
+
+// `Default` is derived: `None` + `0` hops is exactly the intended
+// trust-nothing default, and deriving keeps it that way if fields are added.
 
 /// OpenTelemetry/Tracing settings
 #[derive(Debug, Clone, Deserialize)]
@@ -387,6 +440,26 @@ impl Settings {
                     .context("Invalid QUEUE_MAX_PAYLOAD_SIZE_BYTES")?,
             },
             webhooks: WebhookSettings::default(),
+            outgoing_webhooks: OutgoingWebhookSettings {
+                max_attempts: env::var("OUTGOING_WEBHOOK_MAX_ATTEMPTS")
+                    .unwrap_or_else(|_| "5".to_string())
+                    .parse()
+                    .context("Invalid OUTGOING_WEBHOOK_MAX_ATTEMPTS")?,
+                max_concurrent_deliveries: env::var("OUTGOING_WEBHOOK_MAX_CONCURRENT_DELIVERIES")
+                    .unwrap_or_else(|_| "64".to_string())
+                    .parse()
+                    .context("Invalid OUTGOING_WEBHOOK_MAX_CONCURRENT_DELIVERIES")?,
+            },
+            trusted_proxy: TrustedProxySettings {
+                client_ip_header: env::var("TRUSTED_CLIENT_IP_HEADER").ok().and_then(|v| {
+                    let trimmed = v.trim().to_string();
+                    (!trimmed.is_empty()).then_some(trimmed)
+                }),
+                forwarded_hops: env::var("TRUSTED_PROXY_HOPS")
+                    .unwrap_or_else(|_| "0".to_string())
+                    .parse()
+                    .context("Invalid TRUSTED_PROXY_HOPS")?,
+            },
             tracing: TracingSettings {
                 otlp_endpoint: env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok(),
                 service_name: env::var("OTEL_SERVICE_NAME")
@@ -616,6 +689,8 @@ impl Settings {
                 max_payload_size_bytes: 1048576,
             },
             webhooks: WebhookSettings::default(),
+            outgoing_webhooks: OutgoingWebhookSettings::default(),
+            trusted_proxy: TrustedProxySettings::default(),
             tracing: TracingSettings {
                 otlp_endpoint: None,
                 service_name: "spooled-backend".to_string(),

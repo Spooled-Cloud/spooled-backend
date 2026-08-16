@@ -99,6 +99,12 @@ Portainer details (Git stacks, ephemeral checkouts, recreate): [docs/guides/prod
 | `GRPC_TLS_KEY_PATH` | ❌ | (Compose sets `/run/secrets/grpc-key.pem`) | Path to TLS private key (PEM); production Compose mounts the generated volume read-only |
 | `METRICS_PORT` | ❌ | `9090` | Prometheus metrics port |
 | `METRICS_TOKEN` | ❌ | - | If set, requires `Authorization: Bearer <token>` for `/metrics` |
+| `TRUSTED_CLIENT_IP_HEADER` | ❌ | - | Edge header carrying the real client IP. Unset falls back to `CF-Connecting-IP`, then `X-Real-IP` |
+| `TRUSTED_PROXY_HOPS` | ❌ | `0` | Entries **your own** proxies append to `X-Forwarded-For`, counted from the right. `0` = never consult that header |
+| `OUTGOING_WEBHOOK_MAX_ATTEMPTS` | ❌ | `5` | Delivery attempts per outgoing webhook event |
+| `OUTGOING_WEBHOOK_MAX_CONCURRENT_DELIVERIES` | ❌ | `64` | Process-wide ceiling on webhook deliveries in flight |
+
+The leftmost `X-Forwarded-For` entry is whatever the caller sent, so it is never trusted for rate limiting: set `TRUSTED_CLIENT_IP_HEADER` or `TRUSTED_PROXY_HOPS` if you terminate behind a proxy that sets neither `CF-Connecting-IP` nor `X-Real-IP`. Details in [docs/guides/operations.md](docs/guides/operations.md).
 
 ### Plan Limits via Environment Variables (Self-Hosted)
 
@@ -353,6 +359,8 @@ curl -X POST http://localhost:8080/api/v1/outgoing-webhooks \
     "secret": "your-hmac-secret"
   }'
 ```
+
+Deliveries retry with exponential backoff (`OUTGOING_WEBHOOK_MAX_ATTEMPTS`, default 5). After 20 consecutive failed deliveries the webhook is disabled automatically (`enabled: false`, `last_status: "auto_disabled"`) and receives no further events until you re-enable it with `PUT /api/v1/outgoing-webhooks/{id}` and `{"enabled": true}`. See [docs/guides/webhooks.md](docs/guides/webhooks.md).
 
 ## 🔌 gRPC API
 

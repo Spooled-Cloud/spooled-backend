@@ -128,11 +128,38 @@ pub struct UpdateOutgoingWebhookRequest {
     pub url: Option<String>,
     /// Event types to subscribe to
     pub events: Option<Vec<String>>,
-    /// Optional secret for HMAC signing
-    #[validate(length(max = 255, message = "Secret must be at most 255 characters"))]
-    pub secret: Option<String>,
+    /// Optional secret for HMAC signing.
+    ///
+    /// Three-state on purpose: omit the key to keep the current secret, send
+    /// `null` to CLEAR it (deliveries then go out unsigned), or send a string to
+    /// replace it. A plain `Option<String>` collapsed `null` into "omitted", so
+    /// there was no representable request that removed a secret.
+    ///
+    /// `validator`'s derive cannot see through `Option<Option<T>>`, so the length
+    /// bound is enforced by [`UpdateOutgoingWebhookRequest::validate_secret`].
+    #[serde(default, deserialize_with = "crate::models::double_option")]
+    pub secret: Option<Option<String>>,
     /// Whether the webhook is enabled
     pub enabled: Option<bool>,
+}
+
+/// Maximum length of a webhook signing secret.
+pub const MAX_WEBHOOK_SECRET_LEN: usize = 255;
+
+impl UpdateOutgoingWebhookRequest {
+    /// Length-check the three-state `secret` field, which `#[derive(Validate)]`
+    /// cannot reach. Call this alongside `validate()`.
+    pub fn validate_secret(&self) -> Result<(), String> {
+        if let Some(Some(secret)) = &self.secret {
+            if secret.len() > MAX_WEBHOOK_SECRET_LEN {
+                return Err(format!(
+                    "Secret must be at most {} characters",
+                    MAX_WEBHOOK_SECRET_LEN
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Response for webhook test endpoint

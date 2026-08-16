@@ -13,15 +13,37 @@ use crate::security::{
     build_outbound_http_client, validate_webhook_url as validate_url_ssrf, UrlValidationOptions,
 };
 
+/// Consecutive failed deliveries after which a webhook is auto-disabled.
+///
+/// Without this, a webhook pointing at a permanently dead host is retried at full
+/// rate forever: `failure_count` was recorded but never read by anything.
+pub const AUTO_DISABLE_FAILURE_THRESHOLD: i32 = 20;
+
+/// `last_status` written when the breaker trips, so the user can tell an
+/// auto-disable apart from a manual one.
+pub const AUTO_DISABLED_STATUS: &str = "auto_disabled";
+
 #[derive(Clone)]
 pub struct OutgoingWebhookService {
     pool: Pool<Postgres>,
     client: Client,
     max_attempts: i32,
+    /// Caps deliveries in flight across the whole process.
+    ///
+    /// Delivery tasks are spawned from the hot enqueue/complete paths and each
+    /// one can live for tens of seconds (request timeout plus retry backoff)
+    /// while holding a clone of the job payload. Unbounded, a single tenant
+    /// pointing a webhook at a black-holing endpoint grows tasks, sockets and
+    /// resident memory without limit until the process dies. This is the
+    /// backpressure that turns that into "deliveries queue up" instead.
+    delivery_slots: Arc<tokio::sync::Semaphore>,
+    /// Total slots, kept so in-flight count can be derived from the semaphore.
+    delivery_capacity: usize,
 }
 
 impl OutgoingWebhookService {
-    pub fn new(pool: Pool<Postgres>, max_attempts: i32) -> Self {
+    pub fn new(pool: Pool<Postgres>, max_attempts: i32, max_concurrent_deliveries: usize) -> Self {
+        let delivery_capacity = max_concurrent_deliveries.max(1);
         Self {
             pool,
             // SECURITY: Never fall back to a default client. A default client may have no timeouts
@@ -32,7 +54,15 @@ impl OutgoingWebhookService {
                 "Spooled-OutgoingWebhook/1.0",
             ),
             max_attempts,
+            delivery_slots: Arc::new(tokio::sync::Semaphore::new(delivery_capacity)),
+            delivery_capacity,
         }
+    }
+
+    /// Deliveries currently holding a slot. Exposed for metrics/diagnostics.
+    pub fn deliveries_in_flight(&self) -> usize {
+        self.delivery_capacity
+            .saturating_sub(self.delivery_slots.available_permits())
     }
 
     /// Best-effort fire-and-forget dispatch used by REST/gRPC handlers.
@@ -90,14 +120,31 @@ impl OutgoingWebhookService {
 
         for webhook in webhooks {
             let delivery_id = uuid::Uuid::new_v4();
-            let payload = payload.clone();
 
-            // Spawn a task for each delivery to not block the main request
+            // Acquire the slot BEFORE spawning and hand the permit to the task.
+            //
+            // Acquiring inside the spawned task would bound concurrent HTTP but
+            // not the number of tasks: they would pile up parked on the
+            // semaphore, each retaining its own clone of the job payload, and
+            // the memory exhaustion this is meant to prevent would happen
+            // anyway. Awaiting here is safe — `dispatch_event` is itself already
+            // running on a detached task (see `spawn_dispatch`), so the caller's
+            // request is never blocked; backpressure lands on the dispatcher,
+            // which is exactly where it belongs.
+            let permit = match Arc::clone(&self.delivery_slots).acquire_owned().await {
+                Ok(p) => p,
+                Err(e) => {
+                    error!(error = %e, "Outgoing webhook delivery semaphore closed");
+                    break;
+                }
+            };
+
+            let payload = payload.clone();
             let service = self.clone();
             let event_clone = event.clone();
             tokio::spawn(async move {
                 if let Err(e) = service
-                    .deliver(webhook, event_clone, payload, delivery_id)
+                    .deliver_with_permit(webhook, event_clone, payload, delivery_id, permit)
                     .await
                 {
                     error!(error = %e, "Failed to deliver webhook");
@@ -108,6 +155,9 @@ impl OutgoingWebhookService {
         Ok(())
     }
 
+    /// Deliver one event, acquiring a delivery slot first.
+    ///
+    /// Use this from paths that are NOT already holding a permit.
     pub async fn deliver(
         &self,
         webhook: OutgoingWebhook,
@@ -115,6 +165,29 @@ impl OutgoingWebhookService {
         payload: serde_json::Value,
         delivery_id: uuid::Uuid,
     ) -> Result<()> {
+        let permit = Arc::clone(&self.delivery_slots)
+            .acquire_owned()
+            .await
+            .context("Outgoing webhook delivery semaphore closed")?;
+        self.deliver_with_permit(webhook, event, payload, delivery_id, permit)
+            .await
+    }
+
+    /// Deliver one event using an already-acquired slot.
+    ///
+    /// The permit is held for the WHOLE delivery — retries and backoff sleeps
+    /// included, since those sleeps are the window that made unbounded spawning
+    /// dangerous — and released when this future completes.
+    pub async fn deliver_with_permit(
+        &self,
+        webhook: OutgoingWebhook,
+        event: String,
+        payload: serde_json::Value,
+        delivery_id: uuid::Uuid,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<()> {
+        let _permit = permit;
+
         let body = serde_json::json!({
             "id": delivery_id,
             "event": event,
@@ -123,9 +196,10 @@ impl OutgoingWebhookService {
         });
 
         let max_attempts = self.max_attempts.max(1);
+        let mut delivered = false;
         for attempt in 1..=max_attempts {
-            let success = self.try_deliver(&webhook, &body, attempt).await?;
-            if success || attempt >= max_attempts {
+            delivered = self.try_deliver(&webhook, &body, attempt).await?;
+            if delivered || attempt >= max_attempts {
                 break;
             }
 
@@ -139,7 +213,66 @@ impl OutgoingWebhookService {
             tokio::time::sleep(backoff).await;
         }
 
+        // Account the DELIVERY, not each attempt. Bumping failure_count inside
+        // try_deliver multiplied every failed event by the retry count, so the
+        // number the API reports was never "how many deliveries failed".
+        self.record_delivery_outcome(&webhook.id, delivered).await;
+
         Ok(())
+    }
+
+    /// Update per-webhook health after a delivery resolves, and trip the breaker.
+    ///
+    /// Success resets the counter; failure increments it once. Crossing
+    /// [`AUTO_DISABLE_FAILURE_THRESHOLD`] disables the webhook so a permanently
+    /// dead endpoint stops consuming delivery slots — `dispatch_event` only
+    /// selects `enabled = true` rows, so this is self-enforcing.
+    async fn record_delivery_outcome(&self, webhook_id: &str, delivered: bool) {
+        let result = sqlx::query(
+            r#"
+            UPDATE outgoing_webhooks
+            SET failure_count = CASE WHEN $2 THEN 0 ELSE failure_count + 1 END,
+                enabled = CASE
+                    WHEN NOT $2 AND failure_count + 1 >= $3 THEN FALSE
+                    ELSE enabled
+                END,
+                last_status = CASE
+                    WHEN NOT $2 AND failure_count + 1 >= $3 THEN $4
+                    ELSE last_status
+                END,
+                updated_at = NOW()
+            WHERE id = $1
+            RETURNING failure_count, enabled
+            "#,
+        )
+        .bind(webhook_id)
+        .bind(delivered)
+        .bind(AUTO_DISABLE_FAILURE_THRESHOLD)
+        .bind(AUTO_DISABLED_STATUS)
+        .fetch_optional(&self.pool)
+        .await;
+
+        match result {
+            Ok(Some(row)) => {
+                use sqlx::Row;
+                let failure_count: i32 = row.get("failure_count");
+                let enabled: bool = row.get("enabled");
+                if !delivered && !enabled {
+                    error!(
+                        webhook_id,
+                        failure_count,
+                        threshold = AUTO_DISABLE_FAILURE_THRESHOLD,
+                        "Outgoing webhook auto-disabled after consecutive delivery failures"
+                    );
+                }
+            }
+            Ok(None) => {
+                // Webhook deleted mid-delivery; nothing to record.
+            }
+            Err(e) => {
+                warn!(error = %e, webhook_id, "Failed to record webhook delivery outcome");
+            }
+        }
     }
 
     pub async fn retry_delivery(&self, delivery_id: uuid::Uuid) -> Result<bool> {
@@ -199,7 +332,21 @@ impl OutgoingWebhookService {
             })
         };
 
-        self.try_deliver(&webhook, &body, attempts + 1).await
+        // A manual retry is a real outbound request, so it must occupy a
+        // delivery slot like any other — otherwise the cap is not process-wide
+        // and the retry endpoint becomes an unmetered path to the same
+        // exhaustion the semaphore exists to prevent.
+        let _permit = Arc::clone(&self.delivery_slots)
+            .acquire_owned()
+            .await
+            .context("Outgoing webhook delivery semaphore closed")?;
+
+        let delivered = self.try_deliver(&webhook, &body, attempts + 1).await?;
+        // A manual retry is a delivery too: a success here must clear the
+        // failure streak, otherwise a webhook the user just fixed stays one
+        // failure away from the auto-disable breaker.
+        self.record_delivery_outcome(&webhook.id, delivered).await;
+        Ok(delivered)
     }
 
     async fn try_deliver(
@@ -320,15 +467,14 @@ impl OutgoingWebhookService {
         .await?;
 
         // Keep webhook summary fields current for dashboard / list views.
+        // `failure_count` is deliberately NOT touched here: this runs once per
+        // ATTEMPT, and the counter must move once per DELIVERY. It is owned by
+        // `record_delivery_outcome`, which also owns the auto-disable breaker.
         sqlx::query(
             r#"
             UPDATE outgoing_webhooks
             SET last_triggered_at = NOW(),
                 last_status = $2,
-                failure_count = CASE
-                    WHEN $2 = 'success' THEN 0
-                    ELSE failure_count + 1
-                END,
                 updated_at = NOW()
             WHERE id = $1
             "#,
@@ -341,11 +487,25 @@ impl OutgoingWebhookService {
         Ok(())
     }
 
-    /// Validate webhook URL to prevent SSRF attacks
+    /// Validate webhook URL to prevent SSRF attacks.
     ///
-    /// Uses the centralized URL validator from the security module.
+    /// Scheme/hostname/literal-IP checks only: `check_dns_resolution` is OFF
+    /// here deliberately. That check calls the blocking `to_socket_addrs()`, and
+    /// this runs on every delivery ATTEMPT on the async runtime — an
+    /// attacker-supplied hostname served by a nameserver that never answers
+    /// would park a runtime worker thread for the resolver's full timeout.
+    ///
+    /// The IP policy is still enforced for every connection, by
+    /// `SsrfGuardedResolver` inside the HTTP client (`security::http_client`),
+    /// which is async, covers redirect hops, and — unlike a check performed here
+    /// — validates the address actually connected to rather than one resolved
+    /// moments earlier. DNS validation still runs at configure time
+    /// (create/update/test), where the user gets an immediate, clear error.
     fn validate_url(&self, url: &str) -> Result<()> {
-        let options = UrlValidationOptions::default();
+        let options = UrlValidationOptions {
+            check_dns_resolution: false,
+            ..UrlValidationOptions::default()
+        };
         validate_url_ssrf(url, &options).map_err(|e| {
             warn!(url = %url, error = %e, "Webhook URL validation failed (SSRF protection)");
             anyhow::anyhow!("Invalid webhook URL: {}", e)
@@ -370,6 +530,10 @@ fn sign_payload(secret: &str, timestamp: i64, payload_json: &str) -> Result<Stri
 /// When `secret` is `Some` and non-empty, signs with the same HMAC scheme as org
 /// outgoing webhooks (`X-Spooled-Timestamp` + `X-Spooled-Signature`). Unsigned
 /// when secret is absent — backward compatible with existing receivers.
+///
+/// The envelope matches org webhooks exactly (`id`/`event`/`created_at`/`data`)
+/// so a receiver can dedupe on `body.id` for BOTH kinds. It previously omitted
+/// `id`, which silently degraded id-keyed dedupe to a constant key.
 pub fn spawn_completion_webhook(
     url: String,
     event: String,
@@ -390,7 +554,12 @@ async fn deliver_completion_webhook(
     payload: &serde_json::Value,
     secret: Option<&str>,
 ) -> Result<()> {
-    let options = UrlValidationOptions::default();
+    // No blocking DNS on the delivery path — the client's SsrfGuardedResolver
+    // enforces the IP policy at connect time. See `validate_url` above.
+    let options = UrlValidationOptions {
+        check_dns_resolution: false,
+        ..UrlValidationOptions::default()
+    };
     validate_url_ssrf(url, &options).map_err(|e| anyhow::anyhow!("Invalid webhook URL: {}", e))?;
 
     let client = build_outbound_http_client(
@@ -398,7 +567,9 @@ async fn deliver_completion_webhook(
         Duration::from_secs(5),
         "Spooled-CompletionWebhook/1.0",
     );
+    let delivery_id = uuid::Uuid::new_v4();
     let body = serde_json::json!({
+        "id": delivery_id,
         "event": event,
         "created_at": Utc::now(),
         "data": payload,
@@ -408,7 +579,8 @@ async fn deliver_completion_webhook(
     let mut request_builder = client
         .post(url)
         .header("Content-Type", "application/json")
-        .header("X-Spooled-Event", event);
+        .header("X-Spooled-Event", event)
+        .header("X-Spooled-Delivery-Attempt", "1");
 
     if let Some(secret) = secret.filter(|s| !s.is_empty()) {
         let timestamp = Utc::now().timestamp();

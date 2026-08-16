@@ -97,63 +97,34 @@ pub async fn check_slug(
     let slug = query.slug.to_lowercase().trim().to_string();
 
     // Extract IP for rate limiting
-    let client_ip = extract_client_ip(&headers);
+    let client_ip = extract_client_ip(&state, &headers);
 
-    // Rate limit: check per-minute limit
-    let recent_minute: (i64,) = sqlx::query_as(
-        r#"
-        SELECT COUNT(*) 
-        FROM email_login_codes 
-        WHERE email LIKE 'slug_check:%' 
-          AND code = $1 
-          AND created_at > NOW() - INTERVAL '1 minute'
-        "#,
+    // Rate limiting lives in Redis, like every other limiter in this codebase.
+    //
+    // It used to INSERT a marker row into `email_login_codes` per request (with
+    // `code` holding the IP) and COUNT those rows twice per request with a
+    // `LIKE 'slug_check:%'` scan. This is the highest-frequency public endpoint
+    // in the product — the signup form calls it as the user types — so it was
+    // the largest contributor to unbounded growth of a table the LOGIN path
+    // scans on every attempt, and it got slower the more it was used.
+    check_slug_rate_limit(
+        &state,
+        &client_ip,
+        "minute",
+        MAX_SLUG_CHECKS_PER_MINUTE,
+        60,
+        "Too many requests. Please try again in a minute.",
     )
-    .bind(&client_ip)
-    .fetch_one(state.db.pool())
-    .await
-    .unwrap_or((0,));
-
-    if recent_minute.0 >= MAX_SLUG_CHECKS_PER_MINUTE {
-        warn!(ip = %client_ip, "Slug check rate limit exceeded (per minute)");
-        return Err(AppError::RateLimit(
-            "Too many requests. Please try again in a minute.".to_string(),
-        ));
-    }
-
-    // Rate limit: check per-hour limit
-    let recent_hour: (i64,) = sqlx::query_as(
-        r#"
-        SELECT COUNT(*) 
-        FROM email_login_codes 
-        WHERE email LIKE 'slug_check:%' 
-          AND code = $1 
-          AND created_at > NOW() - INTERVAL '1 hour'
-        "#,
+    .await?;
+    check_slug_rate_limit(
+        &state,
+        &client_ip,
+        "hour",
+        MAX_SLUG_CHECKS_PER_HOUR,
+        3600,
+        "Too many requests. Please try again later.",
     )
-    .bind(&client_ip)
-    .fetch_one(state.db.pool())
-    .await
-    .unwrap_or((0,));
-
-    if recent_hour.0 >= MAX_SLUG_CHECKS_PER_HOUR {
-        warn!(ip = %client_ip, "Slug check rate limit exceeded (per hour)");
-        return Err(AppError::RateLimit(
-            "Too many requests. Please try again later.".to_string(),
-        ));
-    }
-
-    // Log the check for rate limiting (using email_login_codes table with special prefix)
-    let _ = sqlx::query(
-        r#"
-        INSERT INTO email_login_codes (email, code, expires_at, used_at)
-        VALUES ($1, $2, NOW() + INTERVAL '1 hour', NOW())
-        "#,
-    )
-    .bind(format!("slug_check:{}", slug))
-    .bind(&client_ip)
-    .execute(state.db.pool())
-    .await;
+    .await?;
 
     // Validate slug format
     if let Err(e) = validate_slug(&slug) {
@@ -306,32 +277,57 @@ fn constant_time_compare(a: &str, b: &str) -> bool {
     len_eq && bytes_eq
 }
 
-/// Extract client IP from headers for rate limiting
-fn extract_client_ip(headers: &axum::http::HeaderMap) -> String {
-    // Check CF-Connecting-IP (Cloudflare)
-    if let Some(cf_ip) = headers
-        .get("CF-Connecting-IP")
-        .and_then(|v| v.to_str().ok())
+/// One window of the `check-slug` per-IP throttle.
+///
+/// Fails OPEN when Redis is unavailable (unless `RATE_LIMIT_FAIL_CLOSED`),
+/// matching `check-email`: this endpoint gates the signup form, and breaking
+/// signup for every self-hosted deployment without Redis would be worse than
+/// the enumeration risk it mitigates.
+async fn check_slug_rate_limit(
+    state: &AppState,
+    client_ip: &str,
+    window_label: &str,
+    max_requests: i64,
+    window_secs: u64,
+    message: &str,
+) -> AppResult<()> {
+    let Some(ref cache) = state.cache else {
+        if state.settings.rate_limit.fail_closed_on_redis_error {
+            warn!("Redis not configured; denying check-slug (RATE_LIMIT_FAIL_CLOSED)");
+            return Err(AppError::RateLimit(message.to_string()));
+        }
+        return Ok(());
+    };
+
+    let key = format!("check_slug:{}:{}", window_label, client_ip);
+    match cache
+        .check_rate_limit(&key, max_requests.max(1) as u32, window_secs)
+        .await
     {
-        return cf_ip.trim().to_string();
-    }
-
-    // Check X-Real-IP
-    if let Some(real_ip) = headers.get("X-Real-IP").and_then(|v| v.to_str().ok()) {
-        return real_ip.trim().to_string();
-    }
-
-    // Check X-Forwarded-For (first IP)
-    if let Some(forwarded) = headers.get("X-Forwarded-For").and_then(|v| v.to_str().ok()) {
-        if let Some(first_ip) = forwarded.split(',').next() {
-            let trimmed = first_ip.trim();
-            if !trimmed.is_empty() {
-                return trimmed.to_string();
+        Ok(result) if !result.allowed => {
+            warn!(ip = %client_ip, window = %window_label, "Slug check rate limit exceeded");
+            Err(AppError::RateLimit(message.to_string()))
+        }
+        Ok(_) => Ok(()),
+        Err(e) => {
+            if state.settings.rate_limit.fail_closed_on_redis_error {
+                warn!(error = %e, "Redis error during check-slug rate limit; denying (fail-closed)");
+                return Err(AppError::RateLimit(message.to_string()));
             }
+            warn!(error = %e, "Redis error during check-slug rate limit; allowing");
+            Ok(())
         }
     }
+}
 
-    "unknown".to_string()
+/// Client IP for abuse controls.
+///
+/// Delegates to the shared, trusted-proxy-aware extractor. This module used to
+/// carry its own copy that trusted the LEFTMOST `X-Forwarded-For` entry — the
+/// one the caller supplies — so `check-slug`'s per-IP limits could be bypassed
+/// by varying a header, and each bypassed request still wrote a permanent row.
+fn extract_client_ip(state: &AppState, headers: &axum::http::HeaderMap) -> String {
+    crate::api::middleware::client_ip::client_ip(headers, &state.settings.trusted_proxy)
 }
 
 /// List organizations (returns only the authenticated user's organization)
@@ -1122,62 +1118,9 @@ mod tests {
         assert!(json.contains("Initial Admin Key"));
     }
 
-    #[test]
-    fn test_extract_client_ip_cloudflare() {
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert("CF-Connecting-IP", "203.0.113.50".parse().unwrap());
-        headers.insert("X-Forwarded-For", "10.0.0.1, 172.16.0.1".parse().unwrap());
-
-        let ip = extract_client_ip(&headers);
-        assert_eq!(ip, "203.0.113.50");
-    }
-
-    #[test]
-    fn test_extract_client_ip_real_ip() {
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert("X-Real-IP", "192.168.1.100".parse().unwrap());
-        headers.insert("X-Forwarded-For", "10.0.0.1".parse().unwrap());
-
-        let ip = extract_client_ip(&headers);
-        assert_eq!(ip, "192.168.1.100");
-    }
-
-    #[test]
-    fn test_extract_client_ip_forwarded_for() {
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert(
-            "X-Forwarded-For",
-            "203.0.113.195, 70.41.3.18, 150.172.238.178"
-                .parse()
-                .unwrap(),
-        );
-
-        let ip = extract_client_ip(&headers);
-        assert_eq!(ip, "203.0.113.195");
-    }
-
-    #[test]
-    fn test_extract_client_ip_unknown() {
-        let headers = axum::http::HeaderMap::new();
-        let ip = extract_client_ip(&headers);
-        assert_eq!(ip, "unknown");
-    }
-
-    #[test]
-    fn test_extract_client_ip_empty_forwarded() {
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert("X-Forwarded-For", "".parse().unwrap());
-
-        let ip = extract_client_ip(&headers);
-        assert_eq!(ip, "unknown");
-    }
-
-    #[test]
-    fn test_extract_client_ip_whitespace_handling() {
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert("CF-Connecting-IP", "  192.168.1.1  ".parse().unwrap());
-
-        let ip = extract_client_ip(&headers);
-        assert_eq!(ip, "192.168.1.1");
-    }
+    // Client-IP extraction moved to crate::api::middleware::client_ip, which is
+    // trusted-proxy aware and shared with the rate limiters. The exhaustive
+    // table lives there; the removed tests here asserted the old behaviour,
+    // including that the LEFTMOST X-Forwarded-For entry wins — which was the
+    // bypass, since that entry is supplied by the caller.
 }

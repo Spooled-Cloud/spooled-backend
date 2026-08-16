@@ -1,7 +1,7 @@
 # Spooled Backend — Agent Knowledge Base
 
 **Repo:** public OSS (`Spooled-Cloud/spooled-backend`)  
-**Version at cartography:** `0.1.109` (live re-verified 2026-07-15 ~06:07Z; tip `fa5e157` CI green; SaaS `RATE_LIMIT_FAIL_CLOSED=true`)  
+**Version at cartography:** `0.1.111` (auth, outgoing-webhook and worker-registration surfaces re-surveyed for 0.1.111; the underlying 0.1.109 cartography was live re-verified 2026-07-15 ~06:07Z, tip `fa5e157` CI green, SaaS `RATE_LIMIT_FAIL_CLOSED=true`)  
 **Load this folder before editing queue, auth, billing, gRPC, or webhooks.**
 
 ## Read order

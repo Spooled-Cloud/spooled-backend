@@ -178,6 +178,35 @@ curl -X POST https://api.spooled.cloud/api/v1/outgoing-webhooks \
   }'
 ```
 
+### Updating a Webhook
+
+`PUT /api/v1/outgoing-webhooks/{id}` is a partial update: fields you omit keep their
+current value.
+
+```bash
+# Rotate the signing secret
+curl -X PUT https://api.spooled.cloud/api/v1/outgoing-webhooks/{id} \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
+  -d '{"secret": "your_new_webhook_secret"}'
+```
+
+The `secret` field has three states:
+
+| You send | Result |
+|----------|--------|
+| Field omitted | Current secret is kept |
+| `"secret": "new_value"` | Secret is replaced |
+| `"secret": null` | Secret is **removed** |
+
+> **⚠️ Sending `"secret": null` deletes the secret.** Deliveries then go out unsigned,
+> with no `X-Spooled-Signature` header at all, and any receiver that enforces signature
+> verification will reject every one of them. This is how you deliberately remove a
+> secret. It is also a trap for clients that round-trip the whole object and serialise
+> unchanged fields as explicit `null` — send only the fields you mean to change, or set
+> the secret to a string rather than `null`.
+
+### Delivery History
+
 You can inspect deliveries and retry individual delivery attempts:
 
 ```bash
@@ -191,6 +220,19 @@ curl -X POST https://api.spooled.cloud/api/v1/outgoing-webhooks/{id}/retry/{deli
 ```
 
 > **Note:** You cannot retry successful deliveries, and each delivery has a maximum of 10 total delivery attempts across automatic and manual retries.
+
+Delivery history is kept for your plan's history retention window, then removed:
+
+| Plan | Delivery history kept |
+|------|----------------------|
+| Free | 1 day |
+| Starter | 7 days |
+| Pro | 30 days |
+| Enterprise | 90 days |
+
+Once a delivery row is swept it disappears from the list and can no longer be retried,
+so on Free you are debugging today's failures, not last week's. Only the newest 100
+deliveries per webhook are returned in any case — export anything you need to keep.
 
 ### Event Types
 
@@ -266,7 +308,46 @@ Outgoing webhooks use best-effort in-process retry with short exponential backof
 | 4 | 4 seconds |
 | 5 | 8 seconds |
 
-After the configured attempt limit, the delivery remains failed. You can also use the manual retry endpoint above; manual retry sends immediately and records the new result.
+Five attempts is the default; on a self-hosted deployment the limit is
+`OUTGOING_WEBHOOK_MAX_ATTEMPTS`. After the attempt limit, the delivery remains failed.
+You can also use the manual retry endpoint above; manual retry sends immediately and
+records the new result.
+
+Deliveries in flight are capped process-wide (`OUTGOING_WEBHOOK_MAX_CONCURRENT_DELIVERIES`,
+default 64), so a burst of events queues rather than firing all at once. Delivery order
+is not guaranteed — use the event `created_at` if you need ordering.
+
+### Automatic Disabling
+
+**After 20 consecutive failed deliveries, Spooled disables the webhook.** It is set to
+`enabled: false` with `last_status: "auto_disabled"` and stops receiving events entirely
+— no further deliveries, no further retries, and nothing queued up for later. An endpoint
+that stays down through a long outage will therefore go quiet rather than being retried
+forever.
+
+`last_status` is one of `success`, `failed` or `auto_disabled`. Poll the webhook, or watch
+for `failure_count` climbing, to notice before the threshold is reached:
+
+```bash
+curl https://api.spooled.cloud/api/v1/outgoing-webhooks/{id} \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY"
+```
+
+`failure_count` counts **consecutive failed deliveries**, one per delivery rather than one
+per retry attempt, and any successful delivery — including a successful manual retry —
+resets it to 0.
+
+To turn the webhook back on once your endpoint is healthy:
+
+```bash
+curl -X PUT https://api.spooled.cloud/api/v1/outgoing-webhooks/{id} \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
+  -d '{"enabled": true}'
+```
+
+> **Note:** Re-enabling counts against your plan's webhook limit. If you created other
+> webhooks while this one was disabled you may already be at the cap, and the request
+> returns `429` with `QUOTA_EXCEEDED` — delete or disable another webhook first.
 
 ---
 
@@ -378,15 +459,17 @@ This ensures webhooks can only target legitimate external services.
 
 ### Webhook Not Received
 
-1. Check endpoint is publicly accessible
-2. Verify HTTPS certificate is valid
-3. Check firewall allows incoming connections
-4. Verify webhook token is correct
+1. Check the webhook is still enabled — a run of 20 consecutive failed deliveries sets
+   `enabled: false` and `last_status: "auto_disabled"` (see [Automatic Disabling](#automatic-disabling))
+2. Check endpoint is publicly accessible
+3. Verify HTTPS certificate is valid
+4. Check firewall allows incoming connections
+5. Verify webhook token is correct
 
 ### Signature Verification Failing
 
 1. Ensure you're using the raw request body (not parsed JSON)
-2. Check secret hasn't been rotated
+2. Check secret hasn't been rotated — or cleared, if something sent `"secret": null` on an update
 3. Verify timestamp is within acceptable range (5 minutes)
 
 ### Duplicate Events

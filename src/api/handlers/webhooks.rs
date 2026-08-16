@@ -3,11 +3,15 @@
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
+    response::IntoResponse,
 };
 use chrono::Utc;
 use uuid::Uuid;
 
-use crate::api::middleware::limits::{check_job_limits, check_payload_size, increment_daily_jobs};
+use crate::api::middleware::limits::{
+    check_job_limits, check_payload_size, daily_jobs_limit, refund_daily_jobs,
+    try_increment_daily_jobs,
+};
 use crate::api::middleware::ValidatedJson;
 use crate::api::AppState;
 use crate::config::Environment;
@@ -134,10 +138,43 @@ pub async fn custom(
         return Err(AppError::LimitExceeded(Box::new(response)));
     }
 
+    // Reserve the daily quota slot *before* inserting. check_job_limits above only
+    // reads a snapshot of today's count, so N concurrent deliveries all observe a
+    // count under the cap, all insert, and all increment afterwards — the cap is
+    // overshot in proportion to concurrency. This endpoint is reachable by any
+    // upstream holding the webhook token and providers replay events in parallel
+    // bursts, so that window is the normal case here, not a rarity.
+    let daily_limit = daily_jobs_limit(state.db.pool(), &org_id)
+        .await
+        .unwrap_or(-1);
+    let quota_reserved =
+        match try_increment_daily_jobs(state.db.pool(), &org_id, 1, daily_limit).await {
+            Ok(count) if count >= 0 => true,
+            Ok(_) => {
+                // Over the cap and nothing inserted yet, so there is nothing to unwind.
+                // Reuse check_job_limits for the response so the body matches the
+                // pre-insert rejection above instead of inventing a second shape.
+                let response = check_job_limits(state.db.pool(), &org_id, 1)
+                    .await
+                    .err()
+                    .unwrap_or_else(|| {
+                        (StatusCode::TOO_MANY_REQUESTS, "Daily job limit reached").into_response()
+                    });
+                return Err(AppError::LimitExceeded(Box::new(response)));
+            }
+            Err(e) => {
+                // A counter outage must not bounce an accepted delivery — the sender
+                // would just retry it forever. Proceed uncounted, as before, and
+                // remember there is no reservation to refund below.
+                tracing::warn!(error = %e, org_id = %org_id, "Failed to reserve daily job quota");
+                false
+            }
+        };
+
     // Insert job with idempotency support and return ID to detect new vs duplicate.
     let max_retries = state.settings.queue.default_max_retries.clamp(0, 100);
     let timeout_seconds = state.settings.queue.default_timeout_secs.clamp(1, 86400);
-    let (returned_id,): (String,) = sqlx::query_as(
+    let insert_result = sqlx::query_as::<_, (String,)>(
         r#"
         INSERT INTO jobs (
             id, organization_id, queue_name, status, payload, priority,
@@ -159,9 +196,34 @@ pub async fn custom(
     .bind(now)
     .bind(&request.idempotency_key)
     .fetch_one(state.db.pool())
-    .await?;
+    .await;
+
+    let (returned_id,): (String,) = match insert_result {
+        Ok(row) => row,
+        Err(e) => {
+            // No job exists, so the slot we reserved would be lost quota forever.
+            if quota_reserved {
+                if let Err(refund_err) = refund_daily_jobs(state.db.pool(), &org_id, 1).await {
+                    tracing::warn!(error = %refund_err, org_id = %org_id,
+                        "Failed to refund daily job quota after webhook insert failure");
+                }
+            }
+            return Err(e.into());
+        }
+    };
 
     let created = returned_id == job_id;
+
+    // The insert is an idempotent upsert, so a replayed delivery resolves to the
+    // existing job and consumes no new quota. Give the reservation back — Stripe
+    // and GitHub retry the same event repeatedly, so keeping it would ratchet the
+    // day's counter up on traffic that never created a job.
+    if !created && quota_reserved {
+        if let Err(e) = refund_daily_jobs(state.db.pool(), &org_id, 1).await {
+            tracing::warn!(error = %e, org_id = %org_id,
+                "Failed to refund daily job quota for deduplicated webhook delivery");
+        }
+    }
 
     // Record webhook delivery
     let event_type = request.event_type.unwrap_or_else(|| "custom".to_string());
@@ -181,11 +243,8 @@ pub async fn custom(
     .await?;
 
     if created {
+        // Quota was already accounted for by the reservation above.
         state.metrics.jobs_enqueued.inc();
-        // Increment daily job counter for plan limit tracking
-        if let Err(e) = increment_daily_jobs(state.db.pool(), &org_id, 1).await {
-            tracing::warn!(error = %e, org_id = %org_id, "Failed to increment daily job counter");
-        }
 
         state.outgoing_webhooks.spawn_dispatch(
             org_id.clone(),

@@ -18,6 +18,7 @@ use sha2::Sha256;
 use tracing::{error, info, warn};
 
 use crate::api::handlers::require_unrestricted_key;
+use crate::api::middleware::plan_rate_limit::invalidate_org_rate_limits;
 use crate::api::AppState;
 use crate::config::Environment;
 use crate::error::{AppError, AppResult};
@@ -37,6 +38,17 @@ type OrgBillingData = (
 
 /// Maximum age for Stripe webhook timestamps (5 minutes)
 const STRIPE_TIMESTAMP_TOLERANCE_SECS: i64 = 300;
+
+/// How long a `processing` claim on a Stripe event is respected before a retry
+/// may take it over.
+///
+/// Must comfortably exceed the slowest handler. `handle_checkout_completed`
+/// makes outbound Stripe API calls (see `cancel_stripe_subscription`), so this
+/// is sized for a slow round trip plus retries rather than for local DB work.
+/// Too low and a genuinely in-flight event gets processed twice concurrently;
+/// too high and a crashed attempt stays stuck for that long. The handlers are
+/// idempotent, so erring high costs only latency-to-recovery.
+const STRIPE_CLAIM_STALE_AFTER_SECS: i64 = 300;
 
 /// Billing status response
 #[derive(Debug, Serialize)]
@@ -249,22 +261,82 @@ pub async fn webhook(
             | "invoice.payment_failed"
     );
 
-    // Idempotency: atomically CLAIM the event id before processing. `INSERT ... ON
-    // CONFLICT DO NOTHING` is atomic on the primary key, so concurrent re-deliveries of
-    // the same event id race and exactly one wins; the losers skip. (The previous
-    // SELECT-then-INSERT let two concurrent duplicates both pass the SELECT and both
-    // process the event.) The claim is only made durable on success — see below.
+    // Idempotency: atomically CLAIM the event id before processing.
+    //
+    // The claim records COMPLETION, not merely an attempt. Previously the row was
+    // inserted, the handler ran, and the row was DELETEd only if the handler
+    // returned `Err`. That compensation covers exactly one failure mode: a
+    // crash, OOM kill, or a deploy rolling the container between the claim and
+    // the handler left the claim committed with the work never done. Stripe then
+    // retried for up to three days and every retry was answered "200 OK, already
+    // processed" — silently discarding a paid invoice, a cancellation, or a
+    // checkout completion, with a log line indistinguishable from ordinary
+    // duplicate suppression.
+    //
+    // So: claim as 'processing'; mark 'done' only after the handler succeeds. A
+    // duplicate is suppressed only when the existing row is 'done', or is
+    // 'processing' and fresh enough to be a genuinely concurrent attempt. A
+    // 'processing' row older than the stale window is a crashed attempt and is
+    // re-claimed. Reprocessing is safe because the handlers are idempotent and
+    // ordering-guarded (see `stripe_event_applies`).
+    // Timestamp of OUR claim, used to release only our own claim later.
+    let mut claim_token: Option<DateTime<Utc>> = None;
+
     if handled {
-        let claimed = sqlx::query(
-            "INSERT INTO processed_stripe_events (event_id) VALUES ($1) ON CONFLICT (event_id) DO NOTHING",
+        let claimed: Option<(DateTime<Utc>,)> = sqlx::query_as(
+            r#"
+            INSERT INTO processed_stripe_events (event_id, status, claimed_at)
+            VALUES ($1, 'processing', NOW())
+            ON CONFLICT (event_id) DO UPDATE
+                SET claimed_at = NOW()
+                WHERE processed_stripe_events.status = 'processing'
+                  AND processed_stripe_events.claimed_at < NOW() - ($2 || ' seconds')::INTERVAL
+            RETURNING claimed_at
+            "#,
         )
         .bind(&event.id)
-        .execute(state.db.pool())
+        .bind(STRIPE_CLAIM_STALE_AFTER_SECS.to_string())
+        .fetch_optional(state.db.pool())
         .await?;
 
-        if claimed.rows_affected() == 0 {
-            info!(event_id = %event.id, event_type = %event.event_type, "Skipping already-claimed Stripe event");
-            return Ok(StatusCode::OK);
+        match claimed {
+            Some((claimed_at,)) => claim_token = Some(claimed_at),
+            None => {
+                // We did not get the claim. Distinguish the two reasons, because
+                // they need OPPOSITE responses: a finished event must be
+                // acknowledged so Stripe stops retrying, while an event held by
+                // an attempt that may have died must NOT be acknowledged — a
+                // 200 there would tell Stripe the event was handled when nobody
+                // is handling it, and the only thing that could still rescue it
+                // is a later retry.
+                let existing: Option<(String,)> = sqlx::query_as(
+                    "SELECT status FROM processed_stripe_events WHERE event_id = $1",
+                )
+                .bind(&event.id)
+                .fetch_optional(state.db.pool())
+                .await?;
+
+                return match existing.as_ref().map(|(s,)| s.as_str()) {
+                    Some("done") => {
+                        info!(event_id = %event.id, event_type = %event.event_type, "Skipping already-processed Stripe event");
+                        Ok(StatusCode::OK)
+                    }
+                    _ => {
+                        // Fresh 'processing' claim held by a concurrent attempt
+                        // (or the row vanished under us). Ask Stripe to retry;
+                        // if the holder died, the retry after the stale window
+                        // takes the claim over.
+                        warn!(
+                            event_id = %event.id,
+                            event_type = %event.event_type,
+                            "Stripe event is claimed by an in-flight attempt; asking Stripe to retry"
+                        );
+                        Err(AppError::Conflict(
+                            "Event is already being processed; retry shortly".to_string(),
+                        ))
+                    }
+                };
+            }
         }
     }
 
@@ -283,24 +355,53 @@ pub async fn webhook(
         }
     };
 
-    // On a handler error, RELEASE the claim so Stripe's retry of the same event id is
-    // reprocessed rather than skipped as a duplicate (handlers are idempotent + ordering
-    // guarded, so reprocessing is safe). The claim only becomes durable on success.
+    // On a handler error, RELEASE the claim immediately so Stripe's retry is
+    // reprocessed rather than skipped. This is now an optimisation rather than
+    // the only safety net: even if this DELETE fails (or the process dies before
+    // reaching it), the row is still 'processing' and the stale-claim window
+    // above will let a later retry take it over.
     if let Err(e) = outcome {
-        if handled {
-            if let Err(del) = sqlx::query("DELETE FROM processed_stripe_events WHERE event_id = $1")
-                .bind(&event.id)
-                .execute(state.db.pool())
-                .await
+        if let Some(token) = claim_token {
+            // Release ONLY our own claim. Matching on `claimed_at` matters: if
+            // this attempt outlived the stale window, a retry may already have
+            // taken the claim over and be processing right now — deleting by
+            // event_id alone would remove that live claim and let a third
+            // delivery start the same work concurrently.
+            if let Err(del) = sqlx::query(
+                "DELETE FROM processed_stripe_events \
+                 WHERE event_id = $1 AND status = 'processing' AND claimed_at = $2",
+            )
+            .bind(&event.id)
+            .bind(token)
+            .execute(state.db.pool())
+            .await
             {
-                error!(error = %del, event_id = %event.id, "Failed to release Stripe event claim after handler error; retry may be skipped");
+                error!(error = %del, event_id = %event.id, "Failed to release Stripe event claim after handler error; retry will wait for the stale-claim window");
             }
         }
         return Err(e);
     }
 
-    // Success: the claim stays. Opportunistically prune rows far beyond Stripe's retry window.
-    if handled {
+    if let Some(token) = claim_token {
+        // Only NOW is the event actually processed. Until this commits, a retry
+        // is allowed to take the claim over. Guarded on our own claim for the
+        // same reason as the release above.
+        if let Err(e) = sqlx::query(
+            "UPDATE processed_stripe_events SET status = 'done' \
+             WHERE event_id = $1 AND claimed_at = $2",
+        )
+        .bind(&event.id)
+        .bind(token)
+        .execute(state.db.pool())
+        .await
+        {
+            // The work IS done; we simply failed to record that. A retry will
+            // re-run the (idempotent, ordering-guarded) handler, which is the
+            // safe direction to fail in.
+            error!(error = %e, event_id = %event.id, "Failed to finalize Stripe event claim; event may be reprocessed");
+        }
+
+        // Opportunistically prune rows far beyond Stripe's retry window.
         if let Err(e) = sqlx::query(
             "DELETE FROM processed_stripe_events WHERE received_at < NOW() - INTERVAL '30 days'",
         )
@@ -504,6 +605,7 @@ async fn handle_subscription_updated(state: &AppState, event: &StripeEvent) -> A
                 updated_at = NOW()
             WHERE stripe_customer_id = $6
               AND (stripe_last_event_at IS NULL OR stripe_last_event_at <= $7)
+            RETURNING id
             "#,
         )
         .bind(subscription_id)
@@ -513,10 +615,18 @@ async fn handle_subscription_updated(state: &AppState, event: &StripeEvent) -> A
         .bind(&plan_tier)
         .bind(customer_id)
         .bind(event_time)
-        .execute(state.db.pool())
+        .fetch_all(state.db.pool())
         .await?;
 
-        if result.rows_affected() == 0 {
+        // plan_tier feeds the 60s-cached rate-limit bucket; drop it so a
+        // downgrade takes effect now rather than up to a minute later.
+        for row in &result {
+            use sqlx::Row;
+            let org_id: String = row.get("id");
+            invalidate_org_rate_limits(state.cache.as_ref(), &org_id).await;
+        }
+
+        if result.is_empty() {
             // No org linked to this customer yet (event arrived before
             // checkout.session.completed): return 5xx so Stripe retries until the
             // linkage exists. Without the retry this event is dropped forever and a
@@ -633,6 +743,12 @@ pub(crate) async fn reconcile_org_from_subscription_id(
     .execute(state.db.pool())
     .await?;
 
+    // plan_tier drives the org's rate-limit bucket, which is cached for 60s.
+    // Without this, a downgrade (or a cancellation) leaves the paid rps/burst in
+    // force for up to a minute — the admin path already invalidates, and the
+    // Stripe path is the one real customers actually take.
+    invalidate_org_rate_limits(state.cache.as_ref(), org_id).await;
+
     info!(
         org_id = %org_id,
         subscription_id = %subscription_id,
@@ -695,7 +811,7 @@ async fn handle_subscription_deleted(state: &AppState, event: &StripeEvent) -> A
         // subscription. NULL id is matched for legacy rows linked by customer only.
         // The stripe_last_event_at guard additionally ignores stale re-deliveries.
         let event_time = event_created_at(event);
-        sqlx::query(
+        let downgraded = sqlx::query(
             r#"
             UPDATE organizations
             SET
@@ -708,13 +824,22 @@ async fn handle_subscription_deleted(state: &AppState, event: &StripeEvent) -> A
             WHERE stripe_customer_id = $1
               AND (stripe_subscription_id IS NULL OR stripe_subscription_id = $2)
               AND (stripe_last_event_at IS NULL OR stripe_last_event_at <= $3)
+            RETURNING id
             "#,
         )
         .bind(customer_id)
         .bind(subscription_id)
         .bind(event_time)
-        .execute(state.db.pool())
+        .fetch_all(state.db.pool())
         .await?;
+
+        // A cancellation is the sharpest case for stale limits: without this the
+        // org keeps its paid rps/burst for up to the 60s cache TTL.
+        for row in &downgraded {
+            use sqlx::Row;
+            let org_id: String = row.get("id");
+            invalidate_org_rate_limits(state.cache.as_ref(), &org_id).await;
+        }
 
         info!(customer_id = %customer_id, subscription_id = ?subscription_id, "Subscription canceled, downgraded to free tier");
     }
@@ -1027,12 +1152,17 @@ fn verify_stripe_signature(secret: &str, body: &[u8], signature: &str) -> AppRes
         ));
     }
 
-    // Create signed payload
-    let signed_payload = format!("{}.{}", timestamp_str, String::from_utf8_lossy(body));
-
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
         .map_err(|_| AppError::Internal("Invalid HMAC key".to_string()))?;
-    mac.update(signed_payload.as_bytes());
+
+    // MAC over the RAW body bytes. The previous version built the signed payload
+    // through `String::from_utf8_lossy`, which substitutes U+FFFD for any invalid
+    // byte sequence — so the bytes fed to the HMAC were not guaranteed to be the
+    // bytes Stripe signed. Stripe sends UTF-8 JSON so it never diverged in
+    // practice, but a signature check must never transform its input.
+    mac.update(timestamp_str.as_bytes());
+    mac.update(b".");
+    mac.update(body);
 
     let computed = hex::encode(mac.finalize().into_bytes());
 

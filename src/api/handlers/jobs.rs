@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::api::handlers::require_queue_access;
 use crate::api::middleware::limits::{
     check_job_limits, check_payload_size, daily_jobs_limit, increment_daily_jobs,
-    try_increment_daily_jobs,
+    refund_daily_jobs, try_increment_daily_jobs,
 };
 use crate::api::middleware::ValidatedJson;
 use crate::api::AppState;
@@ -1270,7 +1270,11 @@ pub async fn bulk_enqueue(
         // failed insert (successful_count == 0) — so the net credit equals the creations.
         let unused = job_count as i64 - successful_count as i64;
         if unused > 0 {
-            if let Err(e) = increment_daily_jobs(state.db.pool(), &org_id, -(unused as i32)).await {
+            // Refund via the dedicated sign-safe function. Calling
+            // increment_daily_jobs with a negative count assigned instead of
+            // adding across a reset boundary (negative daily counter = free
+            // quota) and decremented the lifetime total.
+            if let Err(e) = refund_daily_jobs(state.db.pool(), &org_id, unused as i32).await {
                 tracing::warn!(
                     error = %e,
                     org_id = %org_id,

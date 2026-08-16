@@ -191,11 +191,35 @@ pub fn validate_webhook_url(
     }
 
     // 5. DNS resolution check (optional but recommended)
+    //
+    // NOTE ON WHAT THIS DOES AND DOES NOT GUARANTEE: resolving here proves the
+    // name pointed somewhere acceptable AT THIS INSTANT. It is not, on its own,
+    // rebinding protection — the HTTP client resolves independently when it
+    // opens the connection, and an attacker controlling the zone can answer
+    // differently the second time. The actual protection is
+    // `SsrfGuardedResolver` in `crate::security::http_client`, which validates
+    // every address the client is about to connect to, on every lookup,
+    // including redirects. Keep this check anyway: it rejects bad URLs at
+    // configuration time, where the user gets a clear error instead of a
+    // delivery failure hours later.
     if options.check_dns_resolution {
         validate_dns_resolution(host, parsed.port_or_known_default().unwrap_or(443), options)?;
     }
 
     Ok(())
+}
+
+/// Validate an already-resolved address against the same policy the URL
+/// validator applies.
+///
+/// Exposed so the outbound HTTP client's resolver can reuse the exact IP
+/// policy — two implementations of "is this address allowed" would inevitably
+/// drift.
+pub fn is_ip_allowed(
+    ip: &IpAddr,
+    options: &UrlValidationOptions,
+) -> Result<(), UrlValidationError> {
+    validate_ip_address(ip, options)
 }
 
 /// Validate URL scheme

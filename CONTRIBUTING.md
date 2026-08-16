@@ -182,6 +182,31 @@ cargo test -- --nocapture
 cargo test --test '*'
 ```
 
+> **`--all-features` matters.** Six of the eight files in `tests/` are gated behind
+> the `docker-tests` feature, and `default = []`. A plain `cargo test` therefore
+> compiles a small fraction of the suite and can report success while leaving the
+> integration tests unbuilt.
+
+#### Running without Docker
+
+By default the integration tests start throwaway PostgreSQL and Redis containers
+via `testcontainers`, which needs a working Docker engine. When Docker is
+unavailable — and that tends to be exactly when you most want to run the suite —
+point the harness at services you already have:
+
+```bash
+TEST_DATABASE_URL="postgres://$USER@localhost:5432/postgres" \
+TEST_REDIS_URL="redis://127.0.0.1:6379" \
+cargo test --all-features
+```
+
+`TEST_DATABASE_URL` must point at a server the suite may **create databases on**,
+not at the database to use. Each `TestDatabase` creates its own uniquely-named
+database there, runs the full migration set against it, and drops it afterwards,
+so tests stay isolated from each other and from anything already on that server.
+Both paths run identical tests; the containerised one pins PostgreSQL 16, so
+prefer it when you are checking version-sensitive behaviour.
+
 ### Documentation
 
 - Add doc comments to public APIs

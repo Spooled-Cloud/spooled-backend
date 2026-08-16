@@ -305,16 +305,23 @@ impl WorkerLoop {
     /// Send heartbeat to renew lease and report status
     ///
     async fn send_heartbeat(&self, active_job_count: usize) -> Result<()> {
+        // Write the LIVE columns. `current_jobs`/`max_concurrency` are the
+        // deprecated pair (see migrations/20241209000007_worker_column_aliases.sql):
+        // registration only ever populates `max_concurrent_jobs`, so comparing
+        // against `max_concurrency` compared against its schema default of 5 and
+        // flipped high-concurrency workers to 'degraded', while the API — which
+        // reads `current_job_count` — always reported 0 active jobs.
         let result = sqlx::query(
             r#"
-            UPDATE workers 
-            SET 
+            UPDATE workers
+            SET
                 last_heartbeat = NOW(),
-                current_jobs = $1,
-                status = CASE 
-                    WHEN $1 > max_concurrency THEN 'degraded'
+                current_job_count = $1,
+                status = CASE
+                    WHEN $1 > max_concurrent_jobs THEN 'degraded'
                     ELSE 'healthy'
-                END
+                END,
+                updated_at = NOW()
             WHERE id = $2 AND organization_id = $3
             "#,
         )
