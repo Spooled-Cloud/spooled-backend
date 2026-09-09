@@ -173,14 +173,15 @@ pub async fn update_config(
     let mut tx = state.db.pool().begin().await?;
     lock_resource(&mut tx, &ctx.organization_id, "queues").await?;
 
-    // Check if queue already exists (to distinguish create vs update)
-    let existing: Option<(String,)> = sqlx::query_as(
-        "SELECT id FROM queue_config WHERE queue_name = $1 AND organization_id = $2",
-    )
-    .bind(&name)
-    .bind(&ctx.organization_id)
-    .fetch_optional(&mut *tx)
-    .await?;
+    // Check if queue already exists (to distinguish create vs update).
+    // Load the row so omitted upsert fields keep current values — unwrap_or(default)
+    // would re-enable a paused queue and replace settings with {}.
+    let existing: Option<QueueConfig> =
+        sqlx::query_as("SELECT * FROM queue_config WHERE queue_name = $1 AND organization_id = $2")
+            .bind(&name)
+            .bind(&ctx.organization_id)
+            .fetch_optional(&mut *tx)
+            .await?;
 
     // Only check limit when creating a NEW queue
     if existing.is_none() {
@@ -191,17 +192,25 @@ pub async fn update_config(
         }
     }
 
-    let max_retries = request
-        .max_retries
-        .unwrap_or(state.settings.queue.default_max_retries);
-    let default_timeout = request
-        .default_timeout
-        .unwrap_or(state.settings.queue.default_timeout_secs);
-    let enabled = request.enabled.unwrap_or(true);
+    let max_retries = request.max_retries.unwrap_or_else(|| {
+        existing
+            .as_ref()
+            .map(|e| e.max_retries)
+            .unwrap_or(state.settings.queue.default_max_retries)
+    });
+    let default_timeout = request.default_timeout.unwrap_or_else(|| {
+        existing
+            .as_ref()
+            .map(|e| e.default_timeout)
+            .unwrap_or(state.settings.queue.default_timeout_secs)
+    });
+    let enabled = request
+        .enabled
+        .unwrap_or_else(|| existing.as_ref().map(|e| e.enabled).unwrap_or(true));
 
-    // Validate rate_limit if provided
-    let rate_limit = request.rate_limit.map(|rl| {
-        if rl < 0 {
+    // Validate rate_limit if provided; omit keeps the existing override.
+    let rate_limit = match request.rate_limit {
+        Some(rl) => Some(if rl < 0 {
             tracing::warn!(rate_limit = rl, queue = %name, "Invalid negative rate limit, using 0");
             0
         } else if rl > MAX_RATE_LIMIT {
@@ -209,8 +218,14 @@ pub async fn update_config(
             MAX_RATE_LIMIT
         } else {
             rl
-        }
-    });
+        }),
+        None => existing.as_ref().and_then(|e| e.rate_limit),
+    };
+
+    let settings = merge_queue_settings(
+        existing.as_ref().map(|e| &e.settings),
+        request.settings.as_ref(),
+    );
 
     let config = sqlx::query_as::<_, QueueConfig>(
         r#"
@@ -236,7 +251,7 @@ pub async fn update_config(
     .bind(default_timeout)
     .bind(rate_limit) // Use validated rate_limit
     .bind(enabled)
-    .bind(request.settings.unwrap_or(serde_json::json!({})))
+    .bind(&settings)
     .fetch_one(&mut *tx)
     .await?;
 
@@ -485,6 +500,27 @@ pub async fn delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
+fn merge_queue_settings(
+    existing: Option<&serde_json::Value>,
+    incoming: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    match (existing, incoming) {
+        (Some(old), Some(new)) => match (old.as_object(), new.as_object()) {
+            (Some(old_obj), Some(new_obj)) => {
+                let mut merged = old_obj.clone();
+                for (k, v) in new_obj {
+                    merged.insert(k.clone(), v.clone());
+                }
+                serde_json::Value::Object(merged)
+            }
+            _ => new.clone(),
+        },
+        (None, Some(new)) => new.clone(),
+        (Some(old), None) => old.clone(),
+        (None, None) => serde_json::json!({}),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,5 +541,23 @@ mod tests {
         let json = serde_json::to_string(&stats).unwrap();
         assert!(json.contains("default"));
         assert!(json.contains("pending_jobs"));
+    }
+
+    #[test]
+    fn merge_queue_settings_keeps_existing_when_omitted() {
+        let existing = serde_json::json!({"paused": true, "concurrency": 10});
+        let merged = merge_queue_settings(Some(&existing), None);
+        assert_eq!(merged["paused"], true);
+        assert_eq!(merged["concurrency"], 10);
+    }
+
+    #[test]
+    fn merge_queue_settings_overlays_incoming_keys() {
+        let existing = serde_json::json!({"paused": true, "concurrency": 10});
+        let incoming = serde_json::json!({"description": "mail", "concurrency": 4});
+        let merged = merge_queue_settings(Some(&existing), Some(&incoming));
+        assert_eq!(merged["paused"], true);
+        assert_eq!(merged["concurrency"], 4);
+        assert_eq!(merged["description"], "mail");
     }
 }

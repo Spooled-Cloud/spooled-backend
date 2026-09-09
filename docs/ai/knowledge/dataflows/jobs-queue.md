@@ -22,6 +22,8 @@
 
 REST validation allows `max_retries` range `min = 0` (`models/job.rs` ~214).
 
+`PUT /queues/{name}/config` is an upsert. Omitted `max_retries`/`default_timeout`/`enabled`/`rate_limit`/`settings` keep the existing row. Incoming `settings` objects are merged into the current JSON (pause metadata lives there).
+
 ## Idempotency
 
 `ON CONFLICT (organization_id, idempotency_key) WHERE idempotency_key IS NOT NULL` in queue enqueue path.

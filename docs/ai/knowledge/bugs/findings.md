@@ -33,6 +33,7 @@ Cartography + fix pass: 2026-07-15. Only code-verified items. No amount/formula 
 | BE-25 | P1 | ~~`complete_signup` treated `REGISTRATION_MODE=closed` as always-off~~ **FIXED unreleased** — matching `X-Admin-Key` now allowed, same as `POST /organizations` | `src/api/handlers/email_login.rs` `authorize_email_signup` | SaaS `REGISTRATION_MODE=closed` + `EMAIL_SIGNUP_ENABLED=true`; Pages Function sends admin key | Email signup complete always 403 on production | Closed mode + valid `X-Admin-Key`; `EMAIL_SIGNUP_ENABLED=false` still blocks |
 | BE-26 | P2 | ~~`GET /jobs` JobSummary omitted `job_type`~~ **FIXED** | `src/models/job.rs` `JobSummary` | Dashboard Type column / clients listing jobs | Type always blank; type lives in `payload.job_type` | `JobSummary.job_type` from payload |
 | BE-27 | P2 | ~~`JobSummary` omitted `last_error`~~ **FIXED** | `src/models/job.rs` `JobSummary` | Dashboard DLQ Error column | Always blank; error only on full GET | `JobSummary.last_error` from job row |
+| BE-28 | P1 | ~~`PUT /queues/{name}/config` treated omit as defaults (`enabled=true`, `settings={}`)~~ **FIXED** | `src/api/handlers/queues.rs` `update_config` | Dashboard/SDK update without enabled/settings | Paused queues re-enabled; pause metadata wiped | Keep existing fields; merge settings |
 
 ## Live gap re-verify (2026-07-15 on `0.1.107`)
 
