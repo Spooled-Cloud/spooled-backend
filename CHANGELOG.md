@@ -7,6 +7,20 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **Email signup in `REGISTRATION_MODE=closed` rejected every completion, including
+  the marketing-site Pages Function that sends `X-Admin-Key`.** `complete_signup`
+  was tightened in 0.1.111 to honour registration controls, but it treated
+  anything other than `open` as disabled and never looked at the admin key.
+  `POST /organizations` already accepts a matching `X-Admin-Key` in closed mode;
+  signup complete now does the same. `EMAIL_SIGNUP_ENABLED=false` still blocks
+  the email flow entirely.
+
+---
+
 ## [0.1.111] - 2026-08-16
 
 Remediation of a full-backend audit (35 findings; see `AUDIT_2026-08-16_BUG_PLAN.md`).

@@ -30,6 +30,7 @@ Cartography + fix pass: 2026-07-15. Only code-verified items. No amount/formula 
 | BE-22 | P3 | ~~OpenAPI retry/worker schemas drifted from runtime lease/response contracts~~ **FIXED working tree** | `docs/openapi.yaml` | OpenAPI clients/codegen use docs | Clients omit `lease_id` or misread retry response | Schema synced to runtime response/request fields |
 | BE-23 | P2 | ~~REST worker heartbeat/detail used stale worker field names~~ **FIXED working tree** | `src/api/handlers/workers.rs` | REST workers heartbeat or SDK `Workers().Get` | Heartbeat failed/stale counts; detail decoded zero fields | Update `current_job_count`; map detail DTO to public JSON names |
 | BE-24 | P2 | ~~Invoice webhooks advanced shared stripe_last_event_at~~ **FIXED working tree** | `src/api/handlers/billing.rs` | invoice.paid/failed out-of-order vs subscription.* | Plan/status change dropped | Invoice handlers update status only, gated on active `stripe_subscription_id` (not plan_tier); no shared clock bump |
+| BE-25 | P1 | ~~`complete_signup` treated `REGISTRATION_MODE=closed` as always-off~~ **FIXED unreleased** — matching `X-Admin-Key` now allowed, same as `POST /organizations` | `src/api/handlers/email_login.rs` `authorize_email_signup` | SaaS `REGISTRATION_MODE=closed` + `EMAIL_SIGNUP_ENABLED=true`; Pages Function sends admin key | Email signup complete always 403 on production | Closed mode + valid `X-Admin-Key`; `EMAIL_SIGNUP_ENABLED=false` still blocks |
 
 ## Live gap re-verify (2026-07-15 on `0.1.107`)
 

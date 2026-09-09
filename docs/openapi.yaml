@@ -382,9 +382,20 @@ paths:
     post:
       tags: [Authentication]
       summary: Complete signup
-      description: Complete the signup process by creating an organization
+      description: |
+        Complete the signup process by creating an organization.
+        When `REGISTRATION_MODE=closed`, the request must include `X-Admin-Key`
+        matching `ADMIN_API_KEY` (same rule as `POST /organizations`).
+        `EMAIL_SIGNUP_ENABLED=false` rejects the email flow entirely.
       operationId: completeSignup
       security: []
+      parameters:
+        - name: X-Admin-Key
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Required when REGISTRATION_MODE=closed; must match ADMIN_API_KEY
       requestBody:
         required: true
         content:
@@ -400,6 +411,8 @@ paths:
                 $ref: '#/components/schemas/CompleteSignupResponse'
         '400':
           description: Invalid token or organization name
+        '403':
+          description: Email signup disabled, or closed-mode request missing a valid X-Admin-Key
 
   # Billing Endpoints
   /api/v1/billing/status:

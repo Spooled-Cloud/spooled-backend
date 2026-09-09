@@ -11,6 +11,20 @@
 
 `X-Admin-Key` compared to configured `ADMIN_API_KEY` (SHA-256 then constant-time compare).
 
+## Email signup (`api/handlers/email_login.rs` `complete_signup`)
+
+`POST /api/v1/auth/signup/complete` creates an org + API key, so it uses the same
+registration controls as `POST /organizations`:
+
+- `EMAIL_SIGNUP_ENABLED=false` → 403, even with an admin key.
+- `REGISTRATION_MODE=open` → public.
+- `REGISTRATION_MODE=closed` → matching `X-Admin-Key` (the marketing Pages Function
+  `functions/api/auth/signup/complete.ts` attaches it). Missing/wrong key → 403.
+- `invite` → 403 (not implemented).
+
+0.1.111 rejected every non-`open` completion and ignored the admin header, which
+broke SaaS (`REGISTRATION_MODE=closed`, `EMAIL_SIGNUP_ENABLED=true`).
+
 ## API key bookkeeping
 
 `api_keys.last_used` is written at most **once per key per 5 minutes**, not once per request (`touch_last_used` + Redis write guard, `src/api/middleware/auth.rs` ~530–575). Deliberate write-amplification cap. Treat it as "was active in this 5-minute bucket", never as a live request timestamp.

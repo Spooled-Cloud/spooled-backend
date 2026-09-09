@@ -15,7 +15,7 @@ use validator::Validate;
 
 use crate::api::middleware::validation::ValidatedJson;
 use crate::api::AppState;
-use crate::config::EmailProvider;
+use crate::config::{EmailProvider, RegistrationMode};
 use crate::error::{AppError, AppResult};
 
 /// Maximum login code attempts before invalidation
@@ -617,27 +617,60 @@ pub struct SignupOrganization {
     pub billing_email: String,
 }
 
+/// Gate for `POST /api/v1/auth/signup/complete`.
+///
+/// Matches `POST /organizations`: `EMAIL_SIGNUP_ENABLED=false` blocks the
+/// email flow entirely; `REGISTRATION_MODE=closed` still allows it when
+/// `X-Admin-Key` matches (the marketing site Pages Function does this).
+fn authorize_email_signup(
+    email_signup_enabled: bool,
+    mode: &RegistrationMode,
+    configured_admin_key: Option<&str>,
+    headers: &axum::http::HeaderMap,
+) -> AppResult<()> {
+    if !email_signup_enabled {
+        return Err(AppError::Authorization(
+            "Email signup is currently disabled".to_string(),
+        ));
+    }
+
+    match mode {
+        RegistrationMode::Open => Ok(()),
+        RegistrationMode::Closed => {
+            let provided = headers.get("X-Admin-Key").and_then(|v| v.to_str().ok());
+            match (configured_admin_key, provided) {
+                (Some(expected), Some(provided)) if constant_time_compare(expected, provided) => {
+                    Ok(())
+                }
+                (Some(_), _) => Err(AppError::Authorization(
+                    "Email signup is currently disabled. Contact admin for access.".to_string(),
+                )),
+                (None, _) => Err(AppError::Authorization(
+                    "Email signup is currently disabled and no admin key is configured."
+                        .to_string(),
+                )),
+            }
+        }
+        RegistrationMode::Invite => Err(AppError::Authorization(
+            "Invite-based registration is not yet implemented.".to_string(),
+        )),
+    }
+}
+
 /// Complete signup with verified email
 ///
 /// POST /api/v1/auth/signup/complete
 pub async fn complete_signup(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     ValidatedJson(request): ValidatedJson<CompleteSignupRequest>,
 ) -> AppResult<(axum::http::StatusCode, Json<CompleteSignupResponse>)> {
-    // Registration gate: self-serve email signup creates a brand-new org + API key, so
-    // it must honor the same registration controls as POST /organizations (which the
-    // email path previously ignored — `email_signup_enabled` was defined but never
-    // enforced). Reject when email signup is disabled or registration is not open.
-    if !state.settings.registration.email_signup_enabled
-        || !matches!(
-            state.settings.registration.mode,
-            crate::config::RegistrationMode::Open
-        )
-    {
-        return Err(AppError::Authorization(
-            "Email signup is currently disabled".to_string(),
-        ));
-    }
+    authorize_email_signup(
+        state.settings.registration.email_signup_enabled,
+        &state.settings.registration.mode,
+        state.settings.registration.admin_api_key.as_deref(),
+        &headers,
+    )?;
 
     // Validate signup token
     let token_code = format!("signup:{}", request.signup_token);
@@ -1647,5 +1680,90 @@ mod tests {
         let mut empty_xff = axum::http::HeaderMap::new();
         empty_xff.insert("X-Forwarded-For", "".parse().unwrap());
         assert_eq!(client_ip(&empty_xff, &edge_settings()), "unknown");
+    }
+
+    fn admin_headers(key: &str) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("X-Admin-Key", key.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn email_signup_open_mode_does_not_need_admin_key() {
+        assert!(authorize_email_signup(
+            true,
+            &RegistrationMode::Open,
+            Some("secret"),
+            &axum::http::HeaderMap::new(),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn email_signup_disabled_is_blocked_even_in_open_mode() {
+        let err = authorize_email_signup(
+            false,
+            &RegistrationMode::Open,
+            Some("secret"),
+            &admin_headers("secret"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::Authorization(_)));
+    }
+
+    #[test]
+    fn email_signup_closed_mode_accepts_matching_admin_key() {
+        assert!(authorize_email_signup(
+            true,
+            &RegistrationMode::Closed,
+            Some("secret"),
+            &admin_headers("secret"),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn email_signup_closed_mode_rejects_missing_or_wrong_admin_key() {
+        let no_header = authorize_email_signup(
+            true,
+            &RegistrationMode::Closed,
+            Some("secret"),
+            &axum::http::HeaderMap::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(no_header, AppError::Authorization(_)));
+
+        let wrong = authorize_email_signup(
+            true,
+            &RegistrationMode::Closed,
+            Some("secret"),
+            &admin_headers("nope"),
+        )
+        .unwrap_err();
+        assert!(matches!(wrong, AppError::Authorization(_)));
+    }
+
+    #[test]
+    fn email_signup_closed_mode_rejects_when_no_admin_key_is_configured() {
+        let err = authorize_email_signup(
+            true,
+            &RegistrationMode::Closed,
+            None,
+            &admin_headers("anything"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::Authorization(_)));
+    }
+
+    #[test]
+    fn email_signup_invite_mode_is_not_implemented() {
+        let err = authorize_email_signup(
+            true,
+            &RegistrationMode::Invite,
+            Some("secret"),
+            &admin_headers("secret"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::Authorization(_)));
     }
 }
