@@ -498,10 +498,12 @@ Authorization: Bearer <token>
 
 ### Delete Queue
 
-Deletes all jobs in the queue:
+Removes the queue configuration. Fails with 409 if the queue still has pending or processing jobs.
+
+To also delete every job in the queue (including pending, processing, completed, and dead-lettered):
 
 ```bash
-DELETE /api/v1/queues/{queue_name}
+DELETE /api/v1/queues/{queue_name}?delete_jobs=true
 Authorization: Bearer <token>
 ```
 

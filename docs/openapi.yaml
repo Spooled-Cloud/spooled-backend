@@ -1415,6 +1415,8 @@ paths:
           description: Queue deleted
         '404':
           description: Queue not found
+        '409':
+          description: Queue has pending or processing jobs (only when delete_jobs is false)
 
   /api/v1/queues/{name}/config:
     parameters:

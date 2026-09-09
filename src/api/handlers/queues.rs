@@ -1,11 +1,12 @@
 //! Queue handlers
 
 use axum::{
-    extract::{Extension, Path, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     Json,
 };
 use chrono::Utc;
+use serde::Deserialize;
 
 use crate::api::handlers::require_queue_access;
 use crate::api::middleware::limits::{check_resource_limit_conn, lock_resource};
@@ -453,40 +454,81 @@ pub async fn resume(
     }))
 }
 
+/// Query for `DELETE /queues/{name}`. OpenAPI and the dashboard already send
+/// `delete_jobs`; omitting it keeps the historical "config only, must be idle" path.
+#[derive(Debug, Default, Deserialize)]
+pub struct DeleteQueueQuery {
+    #[serde(default)]
+    pub delete_jobs: Option<bool>,
+}
+
 /// Delete queue configuration
 ///
 pub async fn delete(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
     Path(name): Path<String>,
+    Query(query): Query<DeleteQueueQuery>,
 ) -> AppResult<StatusCode> {
     require_queue_access(&ctx, &name)?;
-    // Check if queue has pending jobs
-    let (pending_count,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM jobs WHERE queue_name = $1 AND organization_id = $2 AND status IN ('pending', 'processing')"
-    )
-    .bind(&name)
-    .bind(&ctx.organization_id)
-    .fetch_one(state.db.pool())
-    .await?;
 
-    if pending_count > 0 {
-        return Err(AppError::Conflict(format!(
-            "Cannot delete queue {} with {} pending/processing jobs",
-            name, pending_count
-        )));
-    }
+    if query.delete_jobs.unwrap_or(false) {
+        let mut tx = state.db.pool().begin().await?;
+        lock_resource(&mut tx, &ctx.organization_id, "queues").await?;
 
-    let result =
-        sqlx::query("DELETE FROM queue_config WHERE queue_name = $1 AND organization_id = $2")
+        let jobs = sqlx::query("DELETE FROM jobs WHERE queue_name = $1 AND organization_id = $2")
             .bind(&name)
             .bind(&ctx.organization_id)
-            .execute(state.db.pool())
+            .execute(&mut *tx)
             .await?;
 
-    if result.rows_affected() == 0 {
-        // Don't expose queue name in error
-        return Err(AppError::NotFound("Queue not found".to_string()));
+        // No FK from dead_letter_queue.job_id → jobs, so those rows would linger.
+        sqlx::query("DELETE FROM dead_letter_queue WHERE queue_name = $1 AND organization_id = $2")
+            .bind(&name)
+            .bind(&ctx.organization_id)
+            .execute(&mut *tx)
+            .await?;
+
+        let config =
+            sqlx::query("DELETE FROM queue_config WHERE queue_name = $1 AND organization_id = $2")
+                .bind(&name)
+                .bind(&ctx.organization_id)
+                .execute(&mut *tx)
+                .await?;
+
+        if jobs.rows_affected() == 0 && config.rows_affected() == 0 {
+            return Err(AppError::NotFound("Queue not found".to_string()));
+        }
+
+        tx.commit().await?;
+    } else {
+        // Check if queue has pending jobs
+        let (pending_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM jobs WHERE queue_name = $1 AND organization_id = $2 AND status IN ('pending', 'processing')"
+        )
+        .bind(&name)
+        .bind(&ctx.organization_id)
+        .fetch_one(state.db.pool())
+        .await?;
+
+        if pending_count > 0 {
+            return Err(AppError::Conflict(format!(
+                "Cannot delete queue {} with {} pending/processing jobs",
+                name, pending_count
+            )));
+        }
+
+        let result =
+            sqlx::query("DELETE FROM queue_config WHERE queue_name = $1 AND organization_id = $2")
+                .bind(&name)
+                .bind(&ctx.organization_id)
+                .execute(state.db.pool())
+                .await?;
+
+        if result.rows_affected() == 0 {
+            // Don't expose queue name in error
+            return Err(AppError::NotFound("Queue not found".to_string()));
+        }
     }
 
     // Invalidate cache for deleted queue
@@ -559,5 +601,19 @@ mod tests {
         assert_eq!(merged["paused"], true);
         assert_eq!(merged["concurrency"], 4);
         assert_eq!(merged["description"], "mail");
+    }
+
+    #[test]
+    fn delete_queue_query_omitted_does_not_delete_jobs() {
+        let query: DeleteQueueQuery = serde_json::from_str("{}").unwrap();
+        assert_ne!(query.delete_jobs, Some(true));
+        assert!(!query.delete_jobs.unwrap_or(false));
+    }
+
+    #[test]
+    fn delete_queue_query_true_deletes_jobs() {
+        let query: DeleteQueueQuery = serde_json::from_str(r#"{"delete_jobs":true}"#).unwrap();
+        assert_eq!(query.delete_jobs, Some(true));
+        assert!(query.delete_jobs.unwrap_or(false));
     }
 }
