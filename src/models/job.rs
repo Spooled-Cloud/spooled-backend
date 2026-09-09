@@ -394,14 +394,26 @@ pub struct JobSummary {
     /// Renamed from retry_count to match frontend expectations
     pub attempt: i32,
     pub max_retries: i32,
+    /// From payload.job_type when present (no job_type column).
+    pub job_type: String,
     pub created_at: DateTime<Utc>,
     pub scheduled_at: Option<DateTime<Utc>>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
 }
 
+fn job_type_from_payload(payload: &serde_json::Value) -> String {
+    payload
+        .get("job_type")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
 impl From<Job> for JobSummary {
     fn from(job: Job) -> Self {
+        let job_type = job_type_from_payload(&job.payload);
         Self {
             id: job.id,
             queue_name: job.queue_name,
@@ -409,6 +421,7 @@ impl From<Job> for JobSummary {
             priority: job.priority,
             attempt: job.retry_count,
             max_retries: job.max_retries,
+            job_type,
             created_at: job.created_at,
             scheduled_at: job.scheduled_at,
             started_at: job.started_at,
@@ -794,6 +807,44 @@ mod tests {
         let summary = JobSummary::from(job.clone());
         assert_eq!(summary.id, job.id);
         assert_eq!(summary.queue_name, job.queue_name);
+        assert_eq!(summary.job_type, "");
+    }
+
+    #[test]
+    fn test_job_summary_reads_job_type_from_payload() {
+        let now = Utc::now();
+        let job = Job {
+            id: "job_1".to_string(),
+            organization_id: "org_1".to_string(),
+            queue_name: "emails".to_string(),
+            status: "pending".to_string(),
+            payload: serde_json::json!({"job_type": "send_email", "to": "a@b.c"}),
+            result: None,
+            retry_count: 0,
+            max_retries: 3,
+            last_error: None,
+            created_at: now,
+            scheduled_at: None,
+            started_at: None,
+            completed_at: None,
+            expires_at: None,
+            priority: 0,
+            tags: None,
+            timeout_seconds: 300,
+            parent_job_id: None,
+            completion_webhook: None,
+            completion_webhook_secret: None,
+            assigned_worker_id: None,
+            lease_id: None,
+            lease_expires_at: None,
+            idempotency_key: None,
+            updated_at: now,
+            workflow_id: None,
+            dependency_mode: None,
+            dependencies_met: None,
+        };
+        let summary = JobSummary::from(job);
+        assert_eq!(summary.job_type, "send_email");
     }
 
     #[test]

@@ -1,5 +1,7 @@
 # Dataflow: Jobs / Queue
 
+`GET /jobs` summaries include `job_type` from `payload.job_type` (no column). Empty string when absent.
+
 ## Happy path
 
 1. **Enqueue** — REST `POST /api/v1/jobs` (`handlers/jobs.rs`) or gRPC `Enqueue` (`grpc/services/queue_service.rs`) or `QueueManager::enqueue` (`queue/mod.rs`).

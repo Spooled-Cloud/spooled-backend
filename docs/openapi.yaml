@@ -2957,7 +2957,7 @@ components:
 
     JobSummary:
       type: object
-      required: [id, queue_name, status, priority, retry_count, created_at]
+      required: [id, queue_name, status, priority, attempt, max_retries, job_type, created_at]
       properties:
         id:
           type: string
@@ -2967,8 +2967,14 @@ components:
           type: string
         priority:
           type: integer
-        retry_count:
+        attempt:
           type: integer
+          description: Retry count (serialized as attempt, not retry_count)
+        max_retries:
+          type: integer
+        job_type:
+          type: string
+          description: From payload.job_type when present; empty string otherwise
         created_at:
           type: string
           format: date-time
