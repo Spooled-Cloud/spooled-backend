@@ -396,6 +396,8 @@ pub struct JobSummary {
     pub max_retries: i32,
     /// From payload.job_type when present (no job_type column).
     pub job_type: String,
+    /// Last failure message; DLQ UI reads this (list has no payload/last_error otherwise).
+    pub last_error: Option<String>,
     pub created_at: DateTime<Utc>,
     pub scheduled_at: Option<DateTime<Utc>>,
     pub started_at: Option<DateTime<Utc>>,
@@ -422,6 +424,7 @@ impl From<Job> for JobSummary {
             attempt: job.retry_count,
             max_retries: job.max_retries,
             job_type,
+            last_error: job.last_error,
             created_at: job.created_at,
             scheduled_at: job.scheduled_at,
             started_at: job.started_at,
@@ -845,6 +848,45 @@ mod tests {
         };
         let summary = JobSummary::from(job);
         assert_eq!(summary.job_type, "send_email");
+        assert_eq!(summary.last_error, None);
+    }
+
+    #[test]
+    fn test_job_summary_copies_last_error() {
+        let now = Utc::now();
+        let job = Job {
+            id: "job_1".to_string(),
+            organization_id: "org_1".to_string(),
+            queue_name: "emails".to_string(),
+            status: "deadletter".to_string(),
+            payload: serde_json::json!({"job_type": "send_email"}),
+            result: None,
+            retry_count: 3,
+            max_retries: 3,
+            last_error: Some("Connection refused".to_string()),
+            created_at: now,
+            scheduled_at: None,
+            started_at: None,
+            completed_at: None,
+            expires_at: None,
+            priority: 0,
+            tags: None,
+            timeout_seconds: 300,
+            parent_job_id: None,
+            completion_webhook: None,
+            completion_webhook_secret: None,
+            assigned_worker_id: None,
+            lease_id: None,
+            lease_expires_at: None,
+            idempotency_key: None,
+            updated_at: now,
+            workflow_id: None,
+            dependency_mode: None,
+            dependencies_met: None,
+        };
+        let summary = JobSummary::from(job);
+        assert_eq!(summary.last_error.as_deref(), Some("Connection refused"));
+        assert_eq!(summary.attempt, 3);
     }
 
     #[test]

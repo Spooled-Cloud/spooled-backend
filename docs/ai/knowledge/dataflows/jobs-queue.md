@@ -1,6 +1,6 @@
 # Dataflow: Jobs / Queue
 
-`GET /jobs` summaries include `job_type` from `payload.job_type` (no column). Empty string when absent.
+`GET /jobs` and `GET /jobs/dlq` summaries include `job_type` from `payload.job_type` (no column; empty string when absent) and `last_error` (null when none).
 
 ## Happy path
 

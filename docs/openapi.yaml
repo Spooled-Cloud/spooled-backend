@@ -2975,6 +2975,10 @@ components:
         job_type:
           type: string
           description: From payload.job_type when present; empty string otherwise
+        last_error:
+          type: string
+          nullable: true
+          description: Last failure message when the job has failed or dead-lettered
         created_at:
           type: string
           format: date-time
