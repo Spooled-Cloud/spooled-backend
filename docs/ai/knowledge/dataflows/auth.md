@@ -25,6 +25,10 @@ registration controls as `POST /organizations`:
 0.1.111 rejected every non-`open` completion and ignored the admin header, which
 broke SaaS (`REGISTRATION_MODE=closed`, `EMAIL_SIGNUP_ENABLED=true`).
 
+`GET /api/v1/auth/check-email` returns `available`, `exists`, and `signup_enabled`
+(`EMAIL_SIGNUP_ENABLED`). The marketing signup page gates on `signup_enabled === false`
+before sending a verification code.
+
 ## API key bookkeeping
 
 `api_keys.last_used` is written at most **once per key per 5 minutes**, not once per request (`touch_last_used` + Redis write guard, `src/api/middleware/auth.rs` ~530–575). Deliberate write-amplification cap. Treat it as "was active in this 5-minute bucket", never as a live request timestamp.

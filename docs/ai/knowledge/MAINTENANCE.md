@@ -7,6 +7,7 @@ Update the KB in the **same change** when you touch these areas.
 | `src/api/handlers/jobs.rs`, `src/queue/` | `dataflows/jobs-queue.md`, `contracts/invariants.md` |
 | `src/grpc/services/queue_service.rs`, `proto/` | `dataflows/grpc-rest.md`, `contracts/invariants.md`, findings if defaults change |
 | `src/api/middleware/auth.rs`, `admin_auth.rs` | `dataflows/auth.md` |
+| `src/api/handlers/email_login.rs` | `dataflows/auth.md` |
 | `src/api/handlers/billing.rs`, Stripe migrations | `dataflows/billing-stripe.md`, findings |
 | `src/outgoing_webhooks/`, `handlers/webhooks.rs` | `dataflows/webhooks.md` |
 | `src/api/middleware/limits.rs`, `config/plans.rs` | `dataflows/billing-stripe.md`, `contracts/invariants.md` |

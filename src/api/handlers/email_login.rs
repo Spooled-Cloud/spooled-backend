@@ -43,6 +43,12 @@ pub struct CheckEmailResponse {
     pub available: bool,
     /// Whether an account exists with this email
     pub exists: bool,
+    /// Whether the email signup flow is accepting new accounts.
+    ///
+    /// The marketing signup page already gates on this field. Without it the
+    /// form sent a verification code and then failed at `signup/complete` when
+    /// `EMAIL_SIGNUP_ENABLED=false`.
+    pub signup_enabled: bool,
 }
 
 /// Check if an email is already registered
@@ -106,6 +112,7 @@ pub async fn check_email(
     Ok(Json(CheckEmailResponse {
         available: exists.is_none(),
         exists: exists.is_some(),
+        signup_enabled: state.settings.registration.email_signup_enabled,
     }))
 }
 
@@ -1473,19 +1480,23 @@ mod tests {
         let exists_response = CheckEmailResponse {
             available: false,
             exists: true,
+            signup_enabled: true,
         };
         let json = serde_json::to_string(&exists_response).unwrap();
         assert!(json.contains("\"available\":false"));
         assert!(json.contains("\"exists\":true"));
+        assert!(json.contains("\"signup_enabled\":true"));
 
         // Email available
         let available_response = CheckEmailResponse {
             available: true,
             exists: false,
+            signup_enabled: false,
         };
         let json = serde_json::to_string(&available_response).unwrap();
         assert!(json.contains("\"available\":true"));
         assert!(json.contains("\"exists\":false"));
+        assert!(json.contains("\"signup_enabled\":false"));
     }
 
     #[test]

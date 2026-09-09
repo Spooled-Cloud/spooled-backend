@@ -18,6 +18,11 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `POST /organizations` already accepts a matching `X-Admin-Key` in closed mode;
   signup complete now does the same. `EMAIL_SIGNUP_ENABLED=false` still blocks
   the email flow entirely.
+- **`GET /auth/check-email` never told the signup page that email signup was off.**
+  The marketing form already stops when `signup_enabled === false`, but the
+  handler only returned `available`/`exists`, so a disabled flow still sent a
+  code and failed at `signup/complete`. The response now includes
+  `signup_enabled` from `EMAIL_SIGNUP_ENABLED`.
 
 ---
 

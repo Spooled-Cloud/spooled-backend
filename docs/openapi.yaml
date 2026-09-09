@@ -4465,7 +4465,7 @@ components:
 
     CheckEmailResponse:
       type: object
-      required: [available, exists]
+      required: [available, exists, signup_enabled]
       properties:
         available:
           type: boolean
@@ -4473,6 +4473,11 @@ components:
         exists:
           type: boolean
           description: Whether an account exists with this email
+        signup_enabled:
+          type: boolean
+          description: >-
+            Whether EMAIL_SIGNUP_ENABLED is on. The marketing signup page uses this
+            to stop the form before sending a verification code.
 
     StartEmailLoginRequest:
       type: object
