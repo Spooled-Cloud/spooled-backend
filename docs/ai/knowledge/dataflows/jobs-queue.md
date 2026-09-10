@@ -26,6 +26,8 @@ REST validation allows `max_retries` range `min = 0` (`models/job.rs` ~214).
 
 `DELETE /queues/{name}` without `delete_jobs` removes the `queue_config` row only and 409s while pending/processing jobs exist. `?delete_jobs=true` deletes every job in that org+queue, matching `dead_letter_queue` rows, and the config (OpenAPI + dashboard checkbox).
 
+`POST /jobs/{id}/dependencies` sets `dependencies_met` from `check_job_dependencies_met`. A SQL/decode error fails the request; it must not default to met.
+
 ## Idempotency
 
 `ON CONFLICT (organization_id, idempotency_key) WHERE idempotency_key IS NOT NULL` in queue enqueue path.

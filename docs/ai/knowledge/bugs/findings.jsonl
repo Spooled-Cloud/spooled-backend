@@ -26,4 +26,5 @@
 {"id":"BE-26","sev":"P2","summary":"GET /jobs JobSummary omitted job_type so list UIs could not show the type stored in payload","path":"src/models/job.rs","status":"fixed","note":"JobSummary.job_type is payload.job_type when present; empty string otherwise"}
 {"id":"BE-29","sev":"P1","summary":"DELETE /queues/{name} ignored OpenAPI/dashboard delete_jobs=true and never deleted jobs","path":"src/api/handlers/queues.rs","status":"fixed","note":"delete_jobs=true deletes jobs + dead_letter_queue rows + queue_config in one tx; omit keeps idle-config-only path"}
 {"id":"BE-30","sev":"P1","summary":"POST /webhooks/{org_id}/custom returned empty 200; OpenAPI WebhookResponse documents job_id queue_name status","path":"src/api/handlers/webhooks.rs","status":"fixed","note":"Handler already computed returned_id then discarded it; now Json CustomWebhookResponse"}
+{"id":"BE-31","sev":"P1","summary":"add_dependencies marked dependencies_met true when check_job_dependencies_met failed","path":"src/api/handlers/workflows.rs","status":"fixed","note":"query_scalar unwrap_or(true) fail-open; now propagate SQL/decode errors"}
 

@@ -992,12 +992,12 @@ pub async fn add_dependencies(
         added += result.rows_affected() as i32;
     }
 
-    // Check if dependencies are met
+    // Check if dependencies are met. Fail closed: a decode/SQL error must not
+    // mark the job runnable (unwrap_or(true) would enqueue it with unmet deps).
     let dependencies_met: bool = sqlx::query_scalar("SELECT check_job_dependencies_met($1)")
         .bind(&job_id)
         .fetch_one(&mut *tx)
-        .await
-        .unwrap_or(true);
+        .await?;
 
     // Update job's dependencies_met flag
     // SECURITY: Include organization_id for defense-in-depth
