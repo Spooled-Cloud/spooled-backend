@@ -11,6 +11,10 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`POST /webhooks/{org_id}/custom` discarded the job id.** The handler already
+  computed `returned_id` and whether the insert created a row, then answered
+  `200` with an empty body. OpenAPI `WebhookResponse` documents `job_id`,
+  `queue_name`, and `status`; the response now sends those fields.
 - **Email signup in `REGISTRATION_MODE=closed` rejected every completion, including
   the marketing-site Pages Function that sends `X-Admin-Key`.** `complete_signup`
   was tightened in 0.1.111 to honour registration controls, but it treated

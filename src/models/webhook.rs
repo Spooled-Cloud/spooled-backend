@@ -347,6 +347,17 @@ pub struct CustomWebhookRequest {
     pub priority: Option<i32>,
 }
 
+/// POST /webhooks/{org_id}/custom — OpenAPI `WebhookResponse`.
+#[derive(Debug, Serialize)]
+pub struct CustomWebhookResponse {
+    /// ID of the created (or idempotent existing) job
+    pub job_id: String,
+    /// Queue the job was enqueued to
+    pub queue_name: String,
+    /// Job status (`pending` for a newly inserted row)
+    pub status: String,
+}
+
 /// Webhook delivery summary for list responses
 #[derive(Debug, Serialize)]
 pub struct WebhookDeliverySummary {

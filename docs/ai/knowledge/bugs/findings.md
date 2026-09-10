@@ -35,6 +35,7 @@ Cartography + fix pass: 2026-07-15. Only code-verified items. No amount/formula 
 | BE-27 | P2 | ~~`JobSummary` omitted `last_error`~~ **FIXED** | `src/models/job.rs` `JobSummary` | Dashboard DLQ Error column | Always blank; error only on full GET | `JobSummary.last_error` from job row |
 | BE-28 | P1 | ~~`PUT /queues/{name}/config` treated omit as defaults (`enabled=true`, `settings={}`)~~ **FIXED** | `src/api/handlers/queues.rs` `update_config` | Dashboard/SDK update without enabled/settings | Paused queues re-enabled; pause metadata wiped | Keep existing fields; merge settings |
 | BE-29 | P1 | ~~`DELETE /queues/{name}?delete_jobs=true` ignored the flag~~ **FIXED** | `src/api/handlers/queues.rs` `delete` | Dashboard "Also delete all jobs" checkbox / OpenAPI `delete_jobs` | Jobs left behind; pending/processing still 409; implicit queue reappears | Honor `delete_jobs`; delete jobs + DLQ rows + config |
+| BE-30 | P1 | ~~`POST /webhooks/{org_id}/custom` returned empty 200; OpenAPI documents `job_id`/`queue_name`/`status`~~ **FIXED** | `src/api/handlers/webhooks.rs` `custom` | Incoming webhook ingest | Callers could not see which job was created | Return `CustomWebhookResponse` |
 
 ## Live gap re-verify (2026-07-15 on `0.1.107`)
 

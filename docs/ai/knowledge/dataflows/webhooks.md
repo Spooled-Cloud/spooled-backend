@@ -2,7 +2,7 @@
 
 ## Incoming (job ingest)
 
-`POST /api/v1/webhooks/{org_id}/custom` — requires `X-Webhook-Token`; production HTTPS via `X-Forwarded-Proto`. Inserts jobs using configured queue defaults (`QUEUE_DEFAULT_MAX_RETRIES` / `QUEUE_DEFAULT_TIMEOUT_SECS` via settings).
+`POST /api/v1/webhooks/{org_id}/custom` — requires `X-Webhook-Token`; production HTTPS via `X-Forwarded-Proto`. Inserts jobs using configured queue defaults (`QUEUE_DEFAULT_MAX_RETRIES` / `QUEUE_DEFAULT_TIMEOUT_SECS` via settings). Response is `{ job_id, queue_name, status }` (OpenAPI `WebhookResponse`), not an empty 200.
 
 ## Outgoing org webhooks (`outgoing_webhooks/service.rs`)
 

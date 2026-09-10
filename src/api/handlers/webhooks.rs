@@ -4,6 +4,7 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
+    Json,
 };
 use chrono::Utc;
 use uuid::Uuid;
@@ -16,7 +17,7 @@ use crate::api::middleware::ValidatedJson;
 use crate::api::AppState;
 use crate::config::Environment;
 use crate::error::{AppError, AppResult};
-use crate::models::CustomWebhookRequest;
+use crate::models::{CustomWebhookRequest, CustomWebhookResponse};
 
 /// Maximum webhook payload size (5MB)
 const MAX_WEBHOOK_PAYLOAD_SIZE: usize = 5 * 1024 * 1024;
@@ -89,7 +90,7 @@ pub async fn custom(
     Path(org_id): Path<String>,
     headers: HeaderMap,
     ValidatedJson(request): ValidatedJson<CustomWebhookRequest>,
-) -> AppResult<StatusCode> {
+) -> AppResult<Json<CustomWebhookResponse>> {
     // In production, require HTTPS for webhooks
     validate_https_in_production(&state, &headers)?;
     // Validate webhook authorization token
@@ -270,7 +271,11 @@ pub async fn custom(
             .await;
     }
 
-    Ok(StatusCode::OK)
+    Ok(Json(CustomWebhookResponse {
+        job_id: returned_id,
+        queue_name: request.queue_name,
+        status: "pending".to_string(),
+    }))
 }
 
 /// Constant-time string comparison to prevent timing attacks
@@ -364,5 +369,18 @@ mod tests {
     #[test]
     fn test_require_webhook_token_accepts_correct_token() {
         require_webhook_token(Some("whk_expected"), Some("whk_expected")).unwrap();
+    }
+
+    #[test]
+    fn test_custom_webhook_response_json_matches_openapi() {
+        let json = serde_json::to_value(&CustomWebhookResponse {
+            job_id: "job_1".to_string(),
+            queue_name: "payments".to_string(),
+            status: "pending".to_string(),
+        })
+        .unwrap();
+        assert_eq!(json["job_id"], "job_1");
+        assert_eq!(json["queue_name"], "payments");
+        assert_eq!(json["status"], "pending");
     }
 }
