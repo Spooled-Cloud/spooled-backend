@@ -34,7 +34,7 @@ async fn setup_test_org_and_key(db: &TestDatabase) -> (String, String) {
     // Generate unique hash based on key_id to avoid unique constraint violations
     let key_hash = format!(
         "$2b$12${}AAAAAAAAAAAAAAAAAAAAA",
-        &api_key_id[..22].replace("-", "A")
+        api_key_id[..22].replace("-", "A")
     );
 
     sqlx::query(
@@ -814,7 +814,7 @@ async fn test_api_key_crud_and_revocation() {
     // Generate unique hash
     let key_hash = format!(
         "$2b$12${}BBBBBBBBBBBBBBBBBBBB",
-        &key_id[..22].replace("-", "B")
+        key_id[..22].replace("-", "B")
     );
 
     // Create API key

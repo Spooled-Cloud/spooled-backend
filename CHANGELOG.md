@@ -11,6 +11,30 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.113] - 2026-09-10
+
+Toolchain and dependency maintenance. No API or behaviour change.
+
+### Security
+
+- **`h2` bumped to 0.4.19** for [RUSTSEC-2026-0258](https://rustsec.org/advisories/RUSTSEC-2026-0258)
+  (unbounded empty `DATA` frames — an HTTP/2 denial-of-service reachable on any
+  public listener). `cargo audit` had started failing on the 0.1.112 tree; the
+  advisory is newer than the release, not a regression in it.
+
+### Fixed
+
+- **CI clippy failed on Rust 1.98.** `clippy::result_large_err` now fires on
+  `Result<Response, Response>` — the signature axum requires for `from_fn`
+  middleware and rejections — because `axum::http::Response<Body>` is exactly
+  the lint's 128-byte threshold. The return type is fixed by the framework and
+  cannot be boxed, so the lint is allowed in `Cargo.toml` (not in the CI
+  invocation, so a local `cargo clippy` matches the runner). Two pre-existing
+  `useless_borrows_in_formatting` hits in `tests/real_api_tests.rs` are fixed
+  properly.
+
+---
+
 ## [0.1.112] - 2026-09-10
 
 Contract and correctness pass driven by an SDK/dashboard parity review: every

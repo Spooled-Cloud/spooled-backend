@@ -1,6 +1,6 @@
 [package]
 name = "spooled-backend"
-version = "0.1.112"
+version = "0.1.113"
 edition = "2021"
 authors = ["Spooled Cloud Team"]
 description = "Production-ready webhook queue service built with Rust + PostgreSQL"
@@ -100,6 +100,15 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14"
+
+[lints.clippy]
+# axum fixes the shape of middleware and rejection signatures as
+# `Result<Response, Response>`, and `axum::http::Response<Body>` is 128 bytes —
+# exactly this lint's default threshold. It therefore fires on correct,
+# framework-mandated code that cannot be boxed (`from_fn` will not accept a
+# `Box<Response>`). Enforced here rather than in the CI clippy invocation so a
+# local `cargo clippy` agrees with the runner. Reported by clippy 1.98.
+result_large_err = "allow"
 
 [features]
 default = []
