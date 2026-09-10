@@ -28,4 +28,5 @@
 {"id":"BE-30","sev":"P1","summary":"POST /webhooks/{org_id}/custom returned empty 200; OpenAPI WebhookResponse documents job_id queue_name status","path":"src/api/handlers/webhooks.rs","status":"fixed","note":"Handler already computed returned_id then discarded it; now Json CustomWebhookResponse"}
 {"id":"BE-31","sev":"P1","summary":"add_dependencies marked dependencies_met true when check_job_dependencies_met failed","path":"src/api/handlers/workflows.rs","status":"fixed","note":"query_scalar unwrap_or(true) fail-open; now propagate SQL/decode errors"}
 {"id":"BE-32","sev":"P1","summary":"PUT /organizations/{id} dropped webhook_token when settings was non-object JSON","path":"src/api/handlers/organizations.rs","status":"fixed","note":"as_object_mut skipped array/string bodies; reject those while a token is configured"}
+{"id":"BE-33","sev":"P1","summary":"PATCH /admin/organizations/{id} replaced settings and dropped webhook_token","path":"src/api/handlers/admin.rs","status":"fixed","note":"unwrap_or existing.settings; now preserve_webhook_token like public PUT"}
 

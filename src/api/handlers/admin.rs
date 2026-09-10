@@ -382,7 +382,15 @@ pub async fn update_organization(
     let old_plan = existing.plan_tier.clone();
     let plan_tier = request.plan_tier.unwrap_or(existing.plan_tier);
     let billing_email = request.billing_email.or(existing.billing_email);
-    let settings = request.settings.unwrap_or(existing.settings);
+    let settings = match request.settings {
+        Some(incoming) => {
+            crate::api::handlers::organizations::preserve_webhook_token(
+                &existing.settings,
+                incoming,
+            )?
+        }
+        None => existing.settings,
+    };
     let stripe_customer_id = request
         .stripe_customer_id
         .unwrap_or(existing.stripe_customer_id);
@@ -1136,6 +1144,16 @@ fn generate_webhook_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admin_settings_replace_keeps_webhook_token() {
+        let existing = serde_json::json!({"webhook_token": "whk_keep", "description": "old"});
+        let incoming = serde_json::json!({"description": "new"});
+        let got = crate::api::handlers::organizations::preserve_webhook_token(&existing, incoming)
+            .unwrap();
+        assert_eq!(got["webhook_token"], "whk_keep");
+        assert_eq!(got["description"], "new");
+    }
 
     #[test]
     fn test_update_org_request_distinguishes_absent_null_and_value() {

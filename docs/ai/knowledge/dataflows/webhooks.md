@@ -2,7 +2,7 @@
 
 ## Incoming (job ingest)
 
-`POST /api/v1/webhooks/{org_id}/custom` — requires `X-Webhook-Token`; production HTTPS via `X-Forwarded-Proto`. Inserts jobs using configured queue defaults (`QUEUE_DEFAULT_MAX_RETRIES` / `QUEUE_DEFAULT_TIMEOUT_SECS` via settings). Response is `{ job_id, queue_name, status }` (OpenAPI `WebhookResponse`), not an empty 200. The token lives in `organizations.settings.webhook_token`. `PUT /organizations/{id}` preserves it on object settings (omit keeps it); a non-object `settings` body is 400 while a token is configured, because that replace would drop it. `POST .../webhook-token/clear` is not allowed (rotate instead).
+`POST /api/v1/webhooks/{org_id}/custom` — requires `X-Webhook-Token`; production HTTPS via `X-Forwarded-Proto`. Inserts jobs using configured queue defaults (`QUEUE_DEFAULT_MAX_RETRIES` / `QUEUE_DEFAULT_TIMEOUT_SECS` via settings). Response is `{ job_id, queue_name, status }` (OpenAPI `WebhookResponse`), not an empty 200. The token lives in `organizations.settings.webhook_token`. `PUT /organizations/{id}` and `PATCH /admin/organizations/{id}` preserve it on object settings (omit keeps it); a non-object `settings` body is 400 while a token is configured, because that replace would drop it. `POST .../webhook-token/clear` is not allowed (rotate instead).
 
 ## Outgoing org webhooks (`outgoing_webhooks/service.rs`)
 

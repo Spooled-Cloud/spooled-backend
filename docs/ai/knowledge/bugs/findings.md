@@ -38,6 +38,7 @@ Cartography + fix pass: 2026-07-15. Only code-verified items. No amount/formula 
 | BE-30 | P1 | ~~`POST /webhooks/{org_id}/custom` returned empty 200; OpenAPI documents `job_id`/`queue_name`/`status`~~ **FIXED** | `src/api/handlers/webhooks.rs` `custom` | Incoming webhook ingest | Callers could not see which job was created | Return `CustomWebhookResponse` |
 | BE-31 | P1 | ~~`POST /jobs/{id}/dependencies` treated a failed `check_job_dependencies_met` as met~~ **FIXED** | `src/api/handlers/workflows.rs` `add_dependencies` | Adding DAG edges | Job could be marked runnable when the check errored | Propagate the SQL error (`?`) |
 | BE-32 | P1 | ~~`PUT /organizations/{id}` dropped `webhook_token` when `settings` was non-object JSON~~ **FIXED** | `src/api/handlers/organizations.rs` `preserve_webhook_token` | PUT settings array/string | Inbound webhook ingest secret wiped; clear is not allowed | Reject non-object settings while a token is configured |
+| BE-33 | P1 | ~~`PATCH /admin/organizations/{id}` replaced `settings` and dropped `webhook_token`~~ **FIXED** | `src/api/handlers/admin.rs` `update_organization` | Admin PATCH with settings omit token | Same ingest secret wipe | Reuse `preserve_webhook_token` |
 
 ## Live gap re-verify (2026-07-15 on `0.1.107`)
 

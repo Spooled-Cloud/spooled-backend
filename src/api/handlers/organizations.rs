@@ -935,11 +935,11 @@ pub async fn clear_webhook_token(
 
 /// Carry `webhook_token` across a settings replace.
 ///
-/// `PUT /organizations/{id}` replaces `settings` wholesale. `as_object_mut()`
-/// is None for a JSON array/string/number, so the previous merge skipped those
-/// bodies and dropped the token — even though `clear_webhook_token` is not
-/// allowed to remove it.
-fn preserve_webhook_token(
+/// `PUT /organizations/{id}` and `PATCH /admin/organizations/{id}` replace
+/// `settings` wholesale. `as_object_mut()` is None for a JSON array/string/number,
+/// so a merge that only touched objects dropped the token — even though
+/// `clear_webhook_token` is not allowed to remove it.
+pub(crate) fn preserve_webhook_token(
     existing: &serde_json::Value,
     incoming: serde_json::Value,
 ) -> Result<serde_json::Value, AppError> {
