@@ -669,18 +669,7 @@ pub async fn update(
                 MAX_SETTINGS_SIZE
             )));
         }
-        // Preserve the security-critical webhook_token. This handler replaces the whole
-        // settings object, so a PUT that omits webhook_token would silently delete it —
-        // even though clear_webhook_token is meant to be the only way to remove it. Carry
-        // the existing token over unless the caller explicitly provides a new one.
-        let mut merged = new_settings.clone();
-        if let Some(existing_tok) = existing.settings.get("webhook_token").cloned() {
-            if let Some(obj) = merged.as_object_mut() {
-                obj.entry("webhook_token".to_string())
-                    .or_insert(existing_tok);
-            }
-        }
-        merged
+        preserve_webhook_token(&existing.settings, new_settings.clone())?
     } else {
         existing.settings
     };
@@ -944,6 +933,37 @@ pub async fn clear_webhook_token(
     ))
 }
 
+/// Carry `webhook_token` across a settings replace.
+///
+/// `PUT /organizations/{id}` replaces `settings` wholesale. `as_object_mut()`
+/// is None for a JSON array/string/number, so the previous merge skipped those
+/// bodies and dropped the token — even though `clear_webhook_token` is not
+/// allowed to remove it.
+fn preserve_webhook_token(
+    existing: &serde_json::Value,
+    incoming: serde_json::Value,
+) -> Result<serde_json::Value, AppError> {
+    let existing_tok = existing.get("webhook_token").cloned();
+    match incoming {
+        serde_json::Value::Object(mut obj) => {
+            if let Some(tok) = existing_tok {
+                obj.entry("webhook_token".to_string()).or_insert(tok);
+            }
+            Ok(serde_json::Value::Object(obj))
+        }
+        other => {
+            if existing_tok.is_some() {
+                Err(AppError::BadRequest(
+                    "settings must be a JSON object while a webhook token is configured"
+                        .to_string(),
+                ))
+            } else {
+                Ok(other)
+            }
+        }
+    }
+}
+
 /// Generate a secure webhook token for incoming webhooks
 fn generate_webhook_token() -> String {
     use rand::RngExt;
@@ -959,6 +979,32 @@ fn generate_webhook_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preserve_webhook_token_keeps_token_on_object_replace() {
+        let existing = serde_json::json!({"webhook_token": "whk_keep", "description": "old"});
+        let incoming = serde_json::json!({"description": "new"});
+        let got = preserve_webhook_token(&existing, incoming).unwrap();
+        assert_eq!(got["webhook_token"], "whk_keep");
+        assert_eq!(got["description"], "new");
+    }
+
+    #[test]
+    fn preserve_webhook_token_rejects_array_that_would_drop_token() {
+        let existing = serde_json::json!({"webhook_token": "whk_keep"});
+        let err = preserve_webhook_token(&existing, serde_json::json!(["theme"])).unwrap_err();
+        match err {
+            AppError::BadRequest(msg) => assert!(msg.contains("webhook token")),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preserve_webhook_token_allows_non_object_when_no_token() {
+        let existing = serde_json::json!({"description": "x"});
+        let got = preserve_webhook_token(&existing, serde_json::json!(["theme"])).unwrap();
+        assert_eq!(got, serde_json::json!(["theme"]));
+    }
 
     #[test]
     fn test_organization_summary_conversion() {
