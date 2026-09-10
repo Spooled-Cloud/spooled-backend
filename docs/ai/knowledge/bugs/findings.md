@@ -39,6 +39,7 @@ Cartography + fix pass: 2026-07-15. Only code-verified items. No amount/formula 
 | BE-31 | P1 | ~~`POST /jobs/{id}/dependencies` treated a failed `check_job_dependencies_met` as met~~ **FIXED** | `src/api/handlers/workflows.rs` `add_dependencies` | Adding DAG edges | Job could be marked runnable when the check errored | Propagate the SQL error (`?`) |
 | BE-32 | P1 | ~~`PUT /organizations/{id}` dropped `webhook_token` when `settings` was non-object JSON~~ **FIXED** | `src/api/handlers/organizations.rs` `preserve_webhook_token` | PUT settings array/string | Inbound webhook ingest secret wiped; clear is not allowed | Reject non-object settings while a token is configured |
 | BE-33 | P1 | ~~`PATCH /admin/organizations/{id}` replaced `settings` and dropped `webhook_token`~~ **FIXED** | `src/api/handlers/admin.rs` `update_organization` | Admin PATCH with settings omit token | Same ingest secret wipe | Reuse `preserve_webhook_token` |
+| BE-34 | P1 | ~~`POST .../webhook-token/regenerate` skipped the write when `settings` was non-object~~ **FIXED** | `src/api/handlers/organizations.rs` `settings_with_webhook_token` | Regenerate while settings is array/string | Response showed a new token that was not stored | Always persist into an object |
 
 ## Live gap re-verify (2026-07-15 on `0.1.107`)
 

@@ -878,10 +878,7 @@ pub async fn regenerate_webhook_token(
         .await
         .map_err(|_| AppError::NotFound("Organization not found".to_string()))?;
 
-    let mut settings = org.settings.clone();
-    if let Some(obj) = settings.as_object_mut() {
-        obj.insert("webhook_token".to_string(), serde_json::json!(new_token));
-    }
+    let settings = settings_with_webhook_token(org.settings, &new_token);
 
     sqlx::query("UPDATE organizations SET settings = $1, updated_at = $2 WHERE id = $3")
         .bind(&settings)
@@ -933,6 +930,25 @@ pub async fn clear_webhook_token(
     ))
 }
 
+/// Insert `webhook_token` into settings, even when settings is not an object.
+///
+/// `POST .../webhook-token/regenerate` used `as_object_mut()` and skipped the
+/// write when settings was an array/string, then still returned the new token.
+fn settings_with_webhook_token(existing: serde_json::Value, token: &str) -> serde_json::Value {
+    let mut settings = if existing.is_object() {
+        existing
+    } else {
+        serde_json::json!({})
+    };
+    if let Some(obj) = settings.as_object_mut() {
+        obj.insert(
+            "webhook_token".to_string(),
+            serde_json::Value::String(token.to_string()),
+        );
+    }
+    settings
+}
+
 /// Carry `webhook_token` across a settings replace.
 ///
 /// `PUT /organizations/{id}` and `PATCH /admin/organizations/{id}` replace
@@ -979,6 +995,20 @@ fn generate_webhook_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_with_webhook_token_writes_into_object() {
+        let existing = serde_json::json!({"description": "keep"});
+        let got = settings_with_webhook_token(existing, "whk_new");
+        assert_eq!(got["webhook_token"], "whk_new");
+        assert_eq!(got["description"], "keep");
+    }
+
+    #[test]
+    fn settings_with_webhook_token_replaces_non_object() {
+        let got = settings_with_webhook_token(serde_json::json!(["theme"]), "whk_new");
+        assert_eq!(got, serde_json::json!({"webhook_token": "whk_new"}));
+    }
 
     #[test]
     fn preserve_webhook_token_keeps_token_on_object_replace() {
