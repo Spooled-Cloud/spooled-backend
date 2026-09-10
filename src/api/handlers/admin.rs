@@ -383,12 +383,10 @@ pub async fn update_organization(
     let plan_tier = request.plan_tier.unwrap_or(existing.plan_tier);
     let billing_email = request.billing_email.or(existing.billing_email);
     let settings = match request.settings {
-        Some(incoming) => {
-            crate::api::handlers::organizations::preserve_webhook_token(
-                &existing.settings,
-                incoming,
-            )?
-        }
+        Some(incoming) => crate::api::handlers::organizations::preserve_webhook_token(
+            &existing.settings,
+            incoming,
+        )?,
         None => existing.settings,
     };
     let stripe_customer_id = request

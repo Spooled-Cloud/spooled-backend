@@ -9,24 +9,87 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+---
+
+## [0.1.112] - 2026-09-10
+
+Contract and correctness pass driven by an SDK/dashboard parity review: every
+finding below is a place where a documented or client-consumed response field
+disagreed with what the handler actually did. No endpoint was removed or
+renamed, and every response change is additive except where noted.
+
 ### Fixed
 
-- **`POST /webhooks/{org_id}/custom` discarded the job id.** The handler already
-  computed `returned_id` and whether the insert created a row, then answered
-  `200` with an empty body. OpenAPI `WebhookResponse` documents `job_id`,
-  `queue_name`, and `status`; the response now sends those fields.
 - **Email signup in `REGISTRATION_MODE=closed` rejected every completion, including
   the marketing-site Pages Function that sends `X-Admin-Key`.** `complete_signup`
   was tightened in 0.1.111 to honour registration controls, but it treated
   anything other than `open` as disabled and never looked at the admin key.
-  `POST /organizations` already accepts a matching `X-Admin-Key` in closed mode;
-  signup complete now does the same. `EMAIL_SIGNUP_ENABLED=false` still blocks
-  the email flow entirely.
+  Production runs `REGISTRATION_MODE=closed` with `EMAIL_SIGNUP_ENABLED=true`, so
+  from 0.1.111 until this release every email signup returned
+  `403 ACCESS_DENIED`. `POST /organizations` already accepts a matching
+  `X-Admin-Key` in closed mode; signup complete now does the same.
+  `EMAIL_SIGNUP_ENABLED=false` still blocks the email flow entirely, admin key
+  or not, and `invite` mode still returns 403.
 - **`GET /auth/check-email` never told the signup page that email signup was off.**
   The marketing form already stops when `signup_enabled === false`, but the
   handler only returned `available`/`exists`, so a disabled flow still sent a
   code and failed at `signup/complete`. The response now includes
   `signup_enabled` from `EMAIL_SIGNUP_ENABLED`.
+- **`POST /webhooks/{org_id}/custom` discarded the job id.** The handler already
+  computed `returned_id` and whether the insert created a row, then answered
+  `200` with an empty body. OpenAPI `WebhookResponse` documents `job_id`,
+  `queue_name`, and `status`; the response now sends those fields, all three read
+  back from the upsert's `RETURNING`. A replayed delivery therefore reports the
+  existing job's real queue and current status (`processing`, `completed`, …)
+  rather than the request's queue and a hardcoded `pending`.
+- **`GET /jobs` and `GET /jobs/dlq` summaries omitted `job_type` and `last_error`.**
+  `JobSummary` carried neither, so any client listing jobs showed a blank type
+  column and a blank error column on dead-lettered jobs; the error was reachable
+  only through a per-job `GET`. `job_type` is read from `payload.job_type` (there
+  is no column) and is an empty string when absent; `last_error` is null when the
+  job has never failed.
+- **`PUT /queues/{name}/config` treated an omitted field as a request to reset it.**
+  The upsert filled omitted values from configuration defaults, so an update that
+  sent only `max_retries` re-enabled a paused queue (`enabled` defaulted to true)
+  and replaced `settings` with `{}`, discarding the pause metadata stored there.
+  Omitted `max_retries`, `default_timeout`, `enabled`, `rate_limit`, and
+  `settings` now keep the queue's current values, and an incoming `settings`
+  object is merged over the stored one rather than replacing it.
+- **`DELETE /queues/{name}?delete_jobs=true` ignored the flag.** The parameter is
+  in OpenAPI and the dashboard's "also delete all jobs" checkbox sends it, but the
+  handler only ever deleted the `queue_config` row and still returned `409` while
+  pending or processing jobs existed. It now deletes the queue's jobs, its
+  `dead_letter_queue` rows (which have no foreign key to `jobs`), and the config,
+  in one transaction. Without the flag the previous config-only, 409-if-busy
+  behaviour is unchanged.
+- **`POST /jobs/{id}/dependencies` could mark a job runnable when the dependency
+  check failed.** The `check_job_dependencies_met` result used
+  `unwrap_or(true)`, so a SQL or decode error was read as "dependencies met" and
+  the job was released with its dependencies unsatisfied. The error now fails the
+  request.
+- **`PUT /organizations/{id}` and `PATCH /admin/organizations/{id}` could silently
+  destroy the inbound webhook token.** Both replace `settings` wholesale and
+  preserved `webhook_token` through `as_object_mut()`, which is `None` for a JSON
+  array, string, or number — so a non-object `settings` body dropped the ingest
+  secret even though `POST .../webhook-token/clear` deliberately refuses to remove
+  it. A non-object `settings` is now rejected with `400` while a token is
+  configured; object bodies keep preserving an omitted token.
+- **`POST /organizations/webhook-token/regenerate` reported a token it had not
+  stored.** The same `as_object_mut()` guard skipped the write when `settings` was
+  a non-object, and the handler still returned the new token, so the caller
+  configured a secret the server would never accept. Regeneration now always
+  persists into an object.
+- **`GET /organizations/usage` returned `500` for free-plan organizations.** Free
+  caps workflows at `0`, and `current / 0` is `NaN` (or `Inf` above zero), which
+  `serde_json` refuses to serialize. A limit of `0` now means "disabled" and
+  reports `percentage: null`, which also stops an infinite percentage from
+  raising a bogus "limit reached" warning.
+
+### Changed
+
+- `JobSummary` is documented in OpenAPI with the field names it actually
+  serializes: `attempt` (not `retry_count`), plus `max_retries`, `job_type`, and
+  `last_error`.
 
 ---
 

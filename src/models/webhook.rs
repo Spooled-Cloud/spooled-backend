@@ -352,9 +352,11 @@ pub struct CustomWebhookRequest {
 pub struct CustomWebhookResponse {
     /// ID of the created (or idempotent existing) job
     pub job_id: String,
-    /// Queue the job was enqueued to
+    /// Queue the job is in. Read from the stored row, so an idempotent replay
+    /// reports the original job's queue rather than the queue in the request.
     pub queue_name: String,
-    /// Job status (`pending` for a newly inserted row)
+    /// Job status read back from the row: `pending` for a newly inserted job,
+    /// the current status (`processing`, `completed`, ...) for an idempotent replay.
     pub status: String,
 }
 

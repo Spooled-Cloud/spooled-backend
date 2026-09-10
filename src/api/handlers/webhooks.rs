@@ -175,7 +175,11 @@ pub async fn custom(
     // Insert job with idempotency support and return ID to detect new vs duplicate.
     let max_retries = state.settings.queue.default_max_retries.clamp(0, 100);
     let timeout_seconds = state.settings.queue.default_timeout_secs.clamp(1, 86400);
-    let insert_result = sqlx::query_as::<_, (String,)>(
+    // RETURNING carries queue_name and status as well: on an idempotent replay the
+    // conflicting row is an existing job that may already be processing/completed and
+    // may live in a different queue, so answering a hardcoded "pending" and echoing the
+    // request's queue would report a state the caller does not have.
+    let insert_result = sqlx::query_as::<_, (String, String, String)>(
         r#"
         INSERT INTO jobs (
             id, organization_id, queue_name, status, payload, priority,
@@ -184,7 +188,7 @@ pub async fn custom(
         VALUES ($1, $2, $3, 'pending', $4::JSONB, $5, $6, $7, $8, $8, $9)
         ON CONFLICT (organization_id, idempotency_key) WHERE idempotency_key IS NOT NULL
         DO UPDATE SET updated_at = NOW()
-        RETURNING id
+        RETURNING id, queue_name, status
         "#,
     )
     .bind(&job_id)
@@ -199,19 +203,20 @@ pub async fn custom(
     .fetch_one(state.db.pool())
     .await;
 
-    let (returned_id,): (String,) = match insert_result {
-        Ok(row) => row,
-        Err(e) => {
-            // No job exists, so the slot we reserved would be lost quota forever.
-            if quota_reserved {
-                if let Err(refund_err) = refund_daily_jobs(state.db.pool(), &org_id, 1).await {
-                    tracing::warn!(error = %refund_err, org_id = %org_id,
-                        "Failed to refund daily job quota after webhook insert failure");
+    let (returned_id, returned_queue, returned_status): (String, String, String) =
+        match insert_result {
+            Ok(row) => row,
+            Err(e) => {
+                // No job exists, so the slot we reserved would be lost quota forever.
+                if quota_reserved {
+                    if let Err(refund_err) = refund_daily_jobs(state.db.pool(), &org_id, 1).await {
+                        tracing::warn!(error = %refund_err, org_id = %org_id,
+                            "Failed to refund daily job quota after webhook insert failure");
+                    }
                 }
+                return Err(e.into());
             }
-            return Err(e.into());
-        }
-    };
+        };
 
     let created = returned_id == job_id;
 
@@ -273,8 +278,8 @@ pub async fn custom(
 
     Ok(Json(CustomWebhookResponse {
         job_id: returned_id,
-        queue_name: request.queue_name,
-        status: "pending".to_string(),
+        queue_name: returned_queue,
+        status: returned_status,
     }))
 }
 

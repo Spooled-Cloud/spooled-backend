@@ -3418,13 +3418,20 @@ components:
       properties:
         job_id:
           type: string
-          description: ID of the created job
+          description: >-
+            ID of the created job, or of the existing job when the request
+            replays an already-seen idempotency_key
         queue_name:
           type: string
-          description: Name of the queue the job was enqueued to
+          description: >-
+            Queue the job is in, read back from the stored row (an idempotent
+            replay reports the original job's queue, not the request's)
         status:
           type: string
-          description: Job status (pending, scheduled)
+          description: >-
+            Job status read back from the stored row. `pending` for a newly
+            enqueued job; an idempotent replay reports the existing job's
+            current status (processing, completed, failed, deadletter).
 
     # Bulk Operations
     BulkEnqueueRequest:

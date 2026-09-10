@@ -488,6 +488,71 @@ async fn test_job_idempotency() {
     println!("✅ Job idempotency passed");
 }
 
+/// `POST /webhooks/{org_id}/custom` answers from the upsert's `RETURNING`.
+///
+/// A replayed delivery conflicts with an existing job that may already have moved
+/// on and may sit in a different queue, so the handler must report the stored row
+/// rather than a hardcoded `pending` plus the request's queue name.
+#[tokio::test]
+async fn test_custom_webhook_upsert_returns_existing_row_state() {
+    let db = TestDatabase::new().await;
+    let (org_id, _) = setup_test_org_and_key(&db).await;
+
+    let idempotency_key = format!("webhook-replay-{}", uuid::Uuid::new_v4());
+    let first_id = uuid::Uuid::new_v4().to_string();
+    let replay_id = uuid::Uuid::new_v4().to_string();
+
+    let upsert = r#"
+        INSERT INTO jobs (id, organization_id, queue_name, status, payload, priority, max_retries, timeout_seconds, idempotency_key, created_at, updated_at)
+        VALUES ($1, $2, $3, 'pending', '{}'::JSONB, 0, 3, 300, $4, NOW(), NOW())
+        ON CONFLICT (organization_id, idempotency_key) WHERE idempotency_key IS NOT NULL
+        DO UPDATE SET updated_at = NOW()
+        RETURNING id, queue_name, status
+        "#;
+
+    // First delivery: a new row, reported as pending in the requested queue.
+    let created: (String, String, String) = sqlx::query_as(upsert)
+        .bind(&first_id)
+        .bind(&org_id)
+        .bind("webhook-original")
+        .bind(&idempotency_key)
+        .fetch_one(db.pool())
+        .await
+        .expect("Should create first job");
+    assert_eq!(created.0, first_id);
+    assert_eq!(created.1, "webhook-original");
+    assert_eq!(created.2, "pending");
+
+    // The job runs to completion before the provider retries the same event.
+    sqlx::query("UPDATE jobs SET status = 'completed', completed_at = NOW() WHERE id = $1")
+        .bind(&first_id)
+        .execute(db.pool())
+        .await
+        .expect("Should complete job");
+
+    // Replayed delivery, this time naming a different queue.
+    let replayed: (String, String, String) = sqlx::query_as(upsert)
+        .bind(&replay_id)
+        .bind(&org_id)
+        .bind("webhook-different")
+        .bind(&idempotency_key)
+        .fetch_one(db.pool())
+        .await
+        .expect("Should return existing job");
+
+    assert_eq!(replayed.0, first_id, "Replay must resolve to the first job");
+    assert_eq!(
+        replayed.1, "webhook-original",
+        "Replay must report the stored queue, not the request's"
+    );
+    assert_eq!(
+        replayed.2, "completed",
+        "Replay must report the stored status, not a hardcoded pending"
+    );
+
+    println!("✅ Custom webhook upsert reports stored row state on replay");
+}
+
 #[tokio::test]
 async fn test_job_priority_ordering() {
     let db = TestDatabase::new().await;
