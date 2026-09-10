@@ -686,7 +686,10 @@ impl PlanLimits {
             _ => return None,
         };
 
-        limit.map(|max| (current as f64 / max as f64) * 100.0)
+        match limit {
+            Some(max) if max > 0 => Some((current as f64 / max as f64) * 100.0),
+            _ => None,
+        }
     }
 
     /// Get warning threshold percentage for this plan

@@ -27,7 +27,7 @@ Residual: same-second `<=` ambiguity; no live Stripe `events resend` proof (fixt
 
 ## Entitlements
 
-Enqueue/resource gates use **plan_tier quotas** (`middleware/limits.rs` + `config/plans.rs`), not a Stripe usage meter API.  
+Enqueue/resource gates use **plan_tier quotas** (`middleware/limits.rs` + `config/plans.rs`), not a Stripe usage meter API. `GET /organizations/usage` treats a limit of `0` (free workflows) as disabled with `percentage: null`; dividing by zero is NaN/Inf, not a usage percent.  
 `past_due` updates subscription status fields but does **not** automatically revoke paid quotas until cancel/downgrade — runbook-dependent (P2 / owner question).
 
 ## Known contract gaps (verified)

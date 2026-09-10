@@ -542,22 +542,29 @@ pub async fn get_usage_info(pool: &PgPool, org_id: &str) -> Result<UsageInfo, sq
 
     // Helper to create usage item and check for warnings
     let mut make_item = |resource: &str, current: u64, limit: Option<u64>| -> UsageItem {
-        let percentage = limit.map(|l| (current as f64 / l as f64) * 100.0);
         let is_disabled = limits.is_disabled(resource);
+        // Free workflows are capped at 0 (disabled). 0/0 is NaN and serde_json
+        // refuses to serialize it, so GET /organizations/usage 500'd on free.
+        let percentage = match limit {
+            Some(max) if max > 0 => Some((current as f64 / max as f64) * 100.0),
+            _ => None,
+        };
 
-        if let Some(pct) = percentage {
-            if pct >= 100.0 {
-                warnings.push(UsageWarning {
-                    resource: resource.to_string(),
-                    message: format!("{} limit reached", resource.replace('_', " ")),
-                    severity: "critical".to_string(),
-                });
-            } else if pct >= warning_threshold {
-                warnings.push(UsageWarning {
-                    resource: resource.to_string(),
-                    message: format!("{} at {:.0}% of limit", resource.replace('_', " "), pct),
-                    severity: "warning".to_string(),
-                });
+        if !is_disabled {
+            if let Some(pct) = percentage {
+                if pct >= 100.0 {
+                    warnings.push(UsageWarning {
+                        resource: resource.to_string(),
+                        message: format!("{} limit reached", resource.replace('_', " ")),
+                        severity: "critical".to_string(),
+                    });
+                } else if pct >= warning_threshold {
+                    warnings.push(UsageWarning {
+                        resource: resource.to_string(),
+                        message: format!("{} at {:.0}% of limit", resource.replace('_', " "), pct),
+                        severity: "warning".to_string(),
+                    });
+                }
             }
         }
 
@@ -760,6 +767,20 @@ mod tests {
 
         let json = serde_json::to_string(&item).unwrap();
         assert!(json.contains("\"is_disabled\":true"));
+    }
+
+    #[test]
+    fn usage_item_zero_limit_percentage_is_null_and_serializes() {
+        let item = UsageItem {
+            current: 0,
+            limit: Some(0),
+            percentage: None,
+            is_disabled: true,
+        };
+        let json = serde_json::to_value(&item).unwrap();
+        assert_eq!(json["limit"], 0);
+        assert_eq!(json["percentage"], serde_json::Value::Null);
+        assert_eq!(json["is_disabled"], true);
     }
 
     #[test]

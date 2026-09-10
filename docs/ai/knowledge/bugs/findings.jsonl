@@ -30,4 +30,5 @@
 {"id":"BE-32","sev":"P1","summary":"PUT /organizations/{id} dropped webhook_token when settings was non-object JSON","path":"src/api/handlers/organizations.rs","status":"fixed","note":"as_object_mut skipped array/string bodies; reject those while a token is configured"}
 {"id":"BE-33","sev":"P1","summary":"PATCH /admin/organizations/{id} replaced settings and dropped webhook_token","path":"src/api/handlers/admin.rs","status":"fixed","note":"unwrap_or existing.settings; now preserve_webhook_token like public PUT"}
 {"id":"BE-34","sev":"P1","summary":"POST webhook-token/regenerate skipped write when settings was non-object","path":"src/api/handlers/organizations.rs","status":"fixed","note":"as_object_mut skipped array/string; response still returned the unused token"}
+{"id":"BE-35","sev":"P1","summary":"Free-tier max_workflows=0 made usage percentage 0/0 NaN or n/0 Inf","path":"src/api/middleware/limits.rs","status":"fixed","note":"limit 0 is the disabled-workflows sentinel; Inf also fired a bogus workflows-limit-reached warning"}
 

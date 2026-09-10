@@ -228,6 +228,14 @@ fn test_usage_percentage_unknown_resource_returns_none() {
     assert!(free.usage_percentage("unknown", 100).is_none());
 }
 
+#[test]
+fn test_usage_percentage_disabled_workflows_is_none() {
+    let free = PlanLimits::free();
+    assert_eq!(free.max_workflows, Some(0));
+    assert!(free.usage_percentage("workflows", 0).is_none());
+    assert!(free.usage_percentage("workflows", 1).is_none());
+}
+
 // ============================================================================
 // Warning Threshold Tests
 // ============================================================================
