@@ -1,5 +1,8 @@
 # Spooled Backend — Agent Entry
 
+Walk-up: `~/work/AGENTS.md`. **SSH:** host confirm (`ssh-and-hosts.md`). **Azure Foundry ON** (`azure_image`; `azure-enabled.md`).
+
+
 1. Read `docs/ai/knowledge/00-START-HERE.md` before changing queue, auth, billing, gRPC, or webhooks.
 2. Follow `docs/ai/knowledge/MAINTENANCE.md` when those areas change.
 3. Workspace multi-repo rules (deploy, QA, secrets): `../AGENTS.md` when this repo sits in the `spooled-cloud` workspace.
