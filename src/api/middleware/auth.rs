@@ -237,9 +237,14 @@ async fn authenticate_jwt_token(
 
     // Check if token is blacklisted (logged out)
     if let Some(ref cache) = state.cache {
-        let blacklist_key = format!("token_blacklist:{}", token_data.claims.jti);
-        if let Ok(Some(_)) = cache.get(&blacklist_key).await {
-            tracing::warn!(jti = %token_data.claims.jti, "Attempted to use blacklisted token");
+        if crate::api::handlers::auth::is_token_revoked(
+            cache,
+            &token_data.claims.jti,
+            token_data.claims.sid.as_deref(),
+        )
+        .await
+        {
+            tracing::warn!(jti = %token_data.claims.jti, "Attempted to use revoked token");
             return Err((
                 StatusCode::UNAUTHORIZED,
                 "Token has been revoked".to_string(),

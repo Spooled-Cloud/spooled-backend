@@ -3,6 +3,7 @@
 pub mod admin_auth;
 pub mod auth;
 pub mod client_ip;
+pub mod error_body;
 pub mod limits;
 pub mod plan_rate_limit;
 pub mod security;

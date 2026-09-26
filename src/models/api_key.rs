@@ -59,6 +59,24 @@ fn validate_queues(queues: &Vec<String>) -> Result<(), validator::ValidationErro
     Ok(())
 }
 
+/// Reject the `permissions` field on API key create/update.
+///
+/// Spooled API keys have no per-permission scopes: every key can call every
+/// tenant route of its organization, and the only way to narrow a key is its
+/// `queues` list. Earlier docs advertised `jobs:read`-style permissions, and the
+/// field was silently dropped, so a caller asking for a read-only key received
+/// a full-access one. Failing the request is the only honest answer until real
+/// scopes exist.
+fn reject_permissions(_permissions: &serde_json::Value) -> Result<(), validator::ValidationError> {
+    let mut err = validator::ValidationError::new("unsupported_field");
+    err.message = Some(std::borrow::Cow::Borrowed(
+        "API keys do not support per-permission scopes: every key has full access to its \
+         organization's API. Restrict a key to specific queues with `queues` instead, and \
+         remove `permissions` from the request",
+    ));
+    Err(err)
+}
+
 /// Validate expiration date is in the future
 fn validate_expires_at(expires_at: &DateTime<Utc>) -> Result<(), validator::ValidationError> {
     if *expires_at <= Utc::now() {
@@ -142,6 +160,12 @@ pub struct CreateApiKeyRequest {
     /// Now validated to be in the future
     #[validate(custom(function = "validate_expires_at"))]
     pub expires_at: Option<DateTime<Utc>>,
+
+    /// Not supported; present only so a request that sends it is rejected
+    /// instead of silently creating a full-access key. See [`reject_permissions`].
+    #[serde(default)]
+    #[validate(custom(function = "reject_permissions"))]
+    pub permissions: Option<serde_json::Value>,
 }
 
 /// Response after creating an API key
@@ -285,6 +309,11 @@ pub struct UpdateApiKeyRequest {
 
     /// Whether the key is active
     pub is_active: Option<bool>,
+
+    /// Not supported; rejected like on create. See [`reject_permissions`].
+    #[serde(default)]
+    #[validate(custom(function = "reject_permissions"))]
+    pub permissions: Option<serde_json::Value>,
 }
 
 #[cfg(test)]
@@ -431,6 +460,7 @@ mod tests {
             queues: Some(vec!["default".to_string()]),
             rate_limit: Some(1000),
             expires_at: None,
+            permissions: None,
         };
         assert!(valid.validate().is_ok());
 
@@ -440,6 +470,7 @@ mod tests {
             queues: None,
             rate_limit: None,
             expires_at: None,
+            permissions: None,
         };
         assert!(short_name.validate().is_err());
     }
@@ -452,6 +483,7 @@ mod tests {
             queues: None,
             rate_limit: Some(0),
             expires_at: None,
+            permissions: None,
         };
         assert!(low_rate.validate().is_err());
 
@@ -461,6 +493,7 @@ mod tests {
             queues: None,
             rate_limit: Some(10000),
             expires_at: None,
+            permissions: None,
         };
         assert!(max_rate.validate().is_ok());
 
@@ -470,6 +503,7 @@ mod tests {
             queues: None,
             rate_limit: Some(10001),
             expires_at: None,
+            permissions: None,
         };
         assert!(over_max.validate().is_err());
     }
@@ -521,8 +555,31 @@ mod tests {
             queues: None,
             rate_limit: None,
             is_active: Some(false),
+            permissions: None,
         };
         assert!(valid.validate().is_ok());
+    }
+
+    #[test]
+    fn test_permissions_field_is_rejected_not_ignored() {
+        // A caller asking for a read-only key must not silently receive a
+        // full-access one: the request fails validation instead.
+        let create: CreateApiKeyRequest = serde_json::from_value(serde_json::json!({
+            "name": "ro",
+            "permissions": ["jobs:read"]
+        }))
+        .unwrap();
+        let err = create.validate().unwrap_err();
+        assert!(err.field_errors().contains_key("permissions"));
+
+        let update: UpdateApiKeyRequest =
+            serde_json::from_value(serde_json::json!({ "permissions": [] })).unwrap();
+        assert!(update.validate().is_err());
+
+        // Omitting the field keeps working.
+        let plain: CreateApiKeyRequest =
+            serde_json::from_value(serde_json::json!({ "name": "plain" })).unwrap();
+        assert!(plain.validate().is_ok());
     }
 
     #[test]

@@ -14,8 +14,8 @@ use uuid::Uuid;
 
 use crate::api::handlers::require_queue_access;
 use crate::api::middleware::limits::{
-    check_job_limits, check_payload_size, daily_jobs_limit, increment_daily_jobs,
-    refund_daily_jobs, try_increment_daily_jobs,
+    check_job_limits, check_new_queue_limit, check_payload_size, daily_jobs_limit,
+    increment_daily_jobs, queue_job_defaults, refund_daily_jobs, try_increment_daily_jobs,
 };
 use crate::api::middleware::ValidatedJson;
 use crate::api::AppState;
@@ -75,6 +75,23 @@ async fn publish_realtime_event(
     if let Ok(payload) = serde_json::to_string(&event) {
         let _ = cache.publish(&channel, &payload).await;
     }
+}
+
+/// A worker presented a `lease_id` that is not the job's current lease while that
+/// lease is still live. Same `LEASE_EXPIRED` code as a timed-out lease — SDK worker
+/// runtimes treat both as "this worker no longer holds the job" — but a message
+/// that says what actually happened.
+fn lease_mismatch_error() -> AppError {
+    AppError::LeaseExpired(
+        "lease_id does not match the job's current lease; this worker no longer holds it"
+            .to_string(),
+    )
+}
+
+/// A worker acted on a job it owned that already reached a terminal status
+/// (a duplicate `complete`, for example): 409 rather than a misleading 404.
+fn already_finished_error(status: &str) -> AppError {
+    AppError::Conflict(format!("Job is already {}", status))
 }
 
 /// List jobs with optional filtering
@@ -191,16 +208,29 @@ pub async fn create(
         return Err(AppError::LimitExceeded(Box::new(response)));
     }
 
+    // Omitted retry/timeout come from the queue's config; a job into a queue that
+    // does not exist yet creates it, which is charged against the plan's queue cap.
+    let queue_defaults = queue_job_defaults(
+        state.db.pool(),
+        &state.settings.queue,
+        &org_id,
+        &request.queue_name,
+    )
+    .await?;
+    if !queue_defaults.exists {
+        if let Err(response) = check_new_queue_limit(state.db.pool(), &org_id, 1).await {
+            return Err(AppError::LimitExceeded(Box::new(response)));
+        }
+    }
+
     let job_id = Uuid::new_v4().to_string();
     let now = Utc::now();
 
     let priority = request.priority.unwrap_or(0);
-    let max_retries = request
-        .max_retries
-        .unwrap_or(state.settings.queue.default_max_retries);
+    let max_retries = request.max_retries.unwrap_or(queue_defaults.max_retries);
     let timeout_seconds = request
         .timeout_seconds
-        .unwrap_or(state.settings.queue.default_timeout_secs);
+        .unwrap_or(queue_defaults.timeout_seconds);
 
     // If a parent job is declared, the child must not run until the parent completes.
     // Validate the parent belongs to THIS org, then gate the child
@@ -449,7 +479,11 @@ pub async fn claim(
         .limit
         .unwrap_or(1)
         .clamp(1, MAX_JOBS_PER_PAGE as i32);
-    let lease_duration_secs = request.lease_duration_secs.unwrap_or(30);
+    // Default lease: WORKER_LEASE_DURATION_SECS (30 s unless configured). Workers
+    // that run longer pass `lease_duration_secs` (5-3600) or heartbeat.
+    let lease_duration_secs = request
+        .lease_duration_secs
+        .unwrap_or(state.settings.worker.lease_duration_secs as i64);
 
     let queue = QueueManager::new(
         state.db.pool_arc(),
@@ -525,6 +559,10 @@ pub async fn complete(
                 "Job lease expired before completion".to_string(),
             ));
         }
+        WorkerOpOutcome::LeaseMismatch => return Err(lease_mismatch_error()),
+        WorkerOpOutcome::AlreadyFinished(status) => {
+            return Err(already_finished_error(&status));
+        }
         WorkerOpOutcome::NotOwned => {
             return Err(AppError::NotFound(
                 "Job not found or not owned by worker".to_string(),
@@ -542,9 +580,14 @@ pub async fn complete(
         Option<serde_json::Value>,
         Option<String>,
         Option<String>,
+        Option<i64>,
     );
     let job_data: Option<CompletionJobRow> = sqlx::query_as(
-        "SELECT queue_name, result, completion_webhook, completion_webhook_secret FROM jobs WHERE id = $1 AND organization_id = $2",
+        r#"
+        SELECT queue_name, result, completion_webhook, completion_webhook_secret,
+               (EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000)::BIGINT
+        FROM jobs WHERE id = $1 AND organization_id = $2
+        "#,
     )
     .bind(&id)
     .bind(&ctx.organization_id)
@@ -552,8 +595,10 @@ pub async fn complete(
     .await
     .unwrap_or(None);
 
-    let (queue_name, result, completion_webhook, completion_webhook_secret) =
-        job_data.unwrap_or_else(|| ("unknown".to_string(), None, None, None));
+    let (queue_name, result, completion_webhook, completion_webhook_secret, duration_ms) =
+        job_data.unwrap_or_else(|| ("unknown".to_string(), None, None, None, None));
+    // Processing time (claim -> completion). Was hard-coded to 0 before 0.1.114.
+    let duration_ms = duration_ms.unwrap_or(0).max(0);
 
     // Best-effort realtime publish
     if let Some(ref cache) = state.cache {
@@ -565,7 +610,7 @@ pub async fn complete(
                 "data": {
                     "job_id": id,
                     "queue_name": queue_name,
-                    "duration_ms": 0,
+                    "duration_ms": duration_ms,
                     "result": result,
                     "timestamp": Utc::now().to_rfc3339()
                 }
@@ -639,6 +684,10 @@ pub async fn fail(
                 "Job lease expired before failure was reported".to_string(),
             ));
         }
+        WorkerOpOutcome::LeaseMismatch => return Err(lease_mismatch_error()),
+        WorkerOpOutcome::AlreadyFinished(status) => {
+            return Err(already_finished_error(&status));
+        }
         WorkerOpOutcome::NotOwned => {
             return Err(AppError::NotFound(
                 "Job not found or not owned by worker".to_string(),
@@ -650,9 +699,9 @@ pub async fn fail(
     state.metrics.jobs_processing.dec();
 
     // Best-effort realtime publish (status after fail may be pending (retry), failed, or deadletter)
-    type FailJobRow = (String, String, Option<String>, Option<String>);
+    type FailJobRow = (String, String, i32, Option<String>, Option<String>);
     let updated: Option<FailJobRow> = sqlx::query_as(
-        "SELECT status, queue_name, completion_webhook, completion_webhook_secret FROM jobs WHERE id = $1 AND organization_id = $2",
+        "SELECT status, queue_name, retry_count, completion_webhook, completion_webhook_secret FROM jobs WHERE id = $1 AND organization_id = $2",
     )
     .bind(&id)
     .bind(&ctx.organization_id)
@@ -660,8 +709,16 @@ pub async fn fail(
     .await
     .unwrap_or(None);
 
-    if let Some((new_status, queue_name, completion_webhook, completion_webhook_secret)) = updated {
+    if let Some((
+        new_status,
+        queue_name,
+        retry_count,
+        completion_webhook,
+        completion_webhook_secret,
+    )) = updated
+    {
         if let Some(ref cache) = state.cache {
+            let now = Utc::now().to_rfc3339();
             publish_realtime_event(
                 cache,
                 &ctx.organization_id,
@@ -672,7 +729,25 @@ pub async fn fail(
                         "queue_name": queue_name,
                         "old_status": "processing",
                         "new_status": new_status,
-                        "timestamp": Utc::now().to_rfc3339()
+                        "timestamp": now
+                    }
+                }),
+            )
+            .await;
+            // `job.failed` is documented as "job failed (may retry)", so it fires on
+            // every reported failure — `retry_count` and the status event above tell
+            // a scheduled retry apart from a dead-lettered job.
+            publish_realtime_event(
+                cache,
+                &ctx.organization_id,
+                serde_json::json!({
+                    "type": "JobFailed",
+                    "data": {
+                        "job_id": id,
+                        "queue_name": queue_name,
+                        "error": request.error,
+                        "retry_count": retry_count,
+                        "timestamp": now
                     }
                 }),
             )
@@ -743,6 +818,8 @@ pub async fn heartbeat(
         WorkerOpOutcome::LeaseExpired => Err(AppError::LeaseExpired(
             "Job lease expired and cannot be extended".to_string(),
         )),
+        WorkerOpOutcome::LeaseMismatch => Err(lease_mismatch_error()),
+        WorkerOpOutcome::AlreadyFinished(status) => Err(already_finished_error(&status)),
         WorkerOpOutcome::NotOwned => Err(AppError::NotFound(
             "Job not found or not owned by worker".to_string(),
         )),
@@ -918,7 +995,10 @@ pub async fn retry(
         UPDATE jobs
         SET
             status = 'pending',
-            retry_count = retry_count + 1,
+            -- A manual retry grants a fresh retry budget, exactly like
+            -- POST /jobs/dlq/retry. Incrementing here left dead-lettered jobs with
+            -- retry_count > max_retries, so one more failure skipped every retry.
+            retry_count = 0,
             last_error = NULL,
             updated_at = NOW()
         WHERE id = $1 AND organization_id = $2 AND status IN ('failed', 'deadletter')
@@ -936,6 +1016,18 @@ pub async fn retry(
             AppError::Conflict("Job cannot be retried (not in failed/deadletter state)".to_string())
         }
     })?;
+
+    // The job is live again: drop its dead_letter_queue audit row, as the DLQ
+    // retry path does, so GET /jobs/dlq stops listing it.
+    if let Err(e) =
+        sqlx::query("DELETE FROM dead_letter_queue WHERE job_id = $1 AND organization_id = $2")
+            .bind(&id)
+            .bind(&ctx.organization_id)
+            .execute(state.db.pool())
+            .await
+    {
+        warn!(error = %e, job_id = %id, "Failed to clean dead_letter_queue row after job retry");
+    }
 
     state.metrics.jobs_retried.inc();
     state.metrics.jobs_pending.inc();
@@ -1053,14 +1145,27 @@ pub async fn bulk_enqueue(
         return Err(AppError::LimitExceeded(Box::new(response)));
     }
 
+    let queue_defaults = queue_job_defaults(
+        state.db.pool(),
+        &state.settings.queue,
+        &org_id,
+        &request.queue_name,
+    )
+    .await?;
+    if !queue_defaults.exists {
+        if let Err(response) = check_new_queue_limit(state.db.pool(), &org_id, 1).await {
+            return Err(AppError::LimitExceeded(Box::new(response)));
+        }
+    }
+
     let now = Utc::now();
     let default_priority = request.default_priority.unwrap_or(0);
     let default_max_retries = request
         .default_max_retries
-        .unwrap_or(state.settings.queue.default_max_retries);
+        .unwrap_or(queue_defaults.max_retries);
     let default_timeout = request
         .default_timeout_seconds
-        .unwrap_or(state.settings.queue.default_timeout_secs);
+        .unwrap_or(queue_defaults.timeout_seconds);
 
     // Prepare arrays for batch INSERT using UNNEST
     let mut job_ids: Vec<String> = Vec::with_capacity(request.jobs.len());

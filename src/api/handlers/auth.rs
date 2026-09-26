@@ -44,6 +44,35 @@ pub struct Claims {
     pub queues: Vec<String>,
     /// Token type (access or refresh)
     pub token_type: String,
+    /// Login session id, shared by the access and refresh token a login mints
+    /// and by every access token later refreshed from them. Logout revokes the
+    /// session, so a refresh token cannot outlive it. Absent on tokens issued
+    /// before 0.1.114, which fall back to per-token (`jti`) revocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
+}
+
+/// Redis key that marks a whole login session as logged out.
+pub fn session_revocation_key(sid: &str) -> String {
+    format!("session_revoked:{}", sid)
+}
+
+/// Whether a token was revoked by logout — the token itself (its `jti`) or the
+/// login session it belongs to (its `sid`).
+pub async fn is_token_revoked(
+    cache: &crate::cache::RedisCache,
+    jti: &str,
+    sid: Option<&str>,
+) -> bool {
+    if let Ok(Some(_)) = cache.get(&format!("token_blacklist:{}", jti)).await {
+        return true;
+    }
+    if let Some(sid) = sid {
+        if let Ok(Some(_)) = cache.get(&session_revocation_key(sid)).await {
+            return true;
+        }
+    }
+    false
 }
 
 /// Login request
@@ -285,6 +314,7 @@ pub async fn login(
     let access_expiration = state.settings.jwt.expiration_hours as i64;
     let refresh_expiration = access_expiration * 24; // Refresh token lasts 24x longer
 
+    let sid = uuid::Uuid::new_v4().to_string();
     let access_claims = Claims {
         sub: api_key.organization_id.clone(),
         api_key_id: api_key.id.clone(),
@@ -295,6 +325,7 @@ pub async fn login(
         jti: uuid::Uuid::new_v4().to_string(),
         queues: api_key.queues.clone(),
         token_type: "access".to_string(),
+        sid: Some(sid.clone()),
     };
 
     let refresh_claims = Claims {
@@ -307,6 +338,7 @@ pub async fn login(
         jti: uuid::Uuid::new_v4().to_string(),
         queues: api_key.queues.clone(),
         token_type: "refresh".to_string(),
+        sid: Some(sid),
     };
 
     let access_token = encode(
@@ -386,11 +418,16 @@ pub async fn refresh_token(
         ));
     }
 
-    // Check if token is blacklisted (in Redis)
+    // Check if the token or its login session was revoked (in Redis)
     if let Some(ref cache) = state.cache {
-        let blacklist_key = format!("token_blacklist:{}", token_data.claims.jti);
-        if let Ok(Some(_)) = cache.get(&blacklist_key).await {
-            warn!(jti = %token_data.claims.jti, "Attempted to use blacklisted token");
+        if is_token_revoked(
+            cache,
+            &token_data.claims.jti,
+            token_data.claims.sid.as_deref(),
+        )
+        .await
+        {
+            warn!(jti = %token_data.claims.jti, "Attempted to use revoked refresh token");
             return Err((
                 StatusCode::UNAUTHORIZED,
                 Json(ErrorResponse::unauthorized()),
@@ -480,6 +517,7 @@ pub async fn refresh_token(
         jti: uuid::Uuid::new_v4().to_string(),
         queues: token_data.claims.queues,
         token_type: "access".to_string(),
+        sid: token_data.claims.sid,
     };
 
     let access_token = encode(
@@ -573,6 +611,29 @@ pub async fn logout(
         )
     })?;
 
+    // Revoke the whole login session: the refresh token minted with this access
+    // token (and any access token refreshed from it) shares its `sid`, so the
+    // session ends even when the client does not send its refresh token. The TTL
+    // covers the longest-lived token of a session (the refresh token).
+    if let Some(ref sid) = token_data.claims.sid {
+        let session_ttl = state
+            .settings
+            .jwt
+            .expiration_hours
+            .saturating_mul(24 * 3600)
+            .max(1);
+        cache
+            .set(&session_revocation_key(sid), "1", session_ttl)
+            .await
+            .map_err(|e| {
+                error!(error = %e, "Failed to revoke login session on logout");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorResponse::internal()),
+                )
+            })?;
+    }
+
     // Soft-parse optional body so empty JSON + Content-Type still logs out.
     // Blacklist the refresh token as well when the client supplies it —
     // otherwise the session survives logout via /auth/refresh.
@@ -661,9 +722,14 @@ pub async fn me(
 
     // Check if token is blacklisted (logged out)
     if let Some(ref cache) = state.cache {
-        let blacklist_key = format!("token_blacklist:{}", token_data.claims.jti);
-        if let Ok(Some(_)) = cache.get(&blacklist_key).await {
-            warn!(jti = %token_data.claims.jti, "Attempted to use blacklisted token on /me");
+        if is_token_revoked(
+            cache,
+            &token_data.claims.jti,
+            token_data.claims.sid.as_deref(),
+        )
+        .await
+        {
+            warn!(jti = %token_data.claims.jti, "Attempted to use revoked token on /me");
             return Err((
                 StatusCode::UNAUTHORIZED,
                 Json(ErrorResponse::unauthorized()),
@@ -749,8 +815,13 @@ pub async fn validate_token(
         Ok(token_data) => {
             // Check blacklist
             if let Some(ref cache) = state.cache {
-                let blacklist_key = format!("token_blacklist:{}", token_data.claims.jti);
-                if let Ok(Some(_)) = cache.get(&blacklist_key).await {
+                if is_token_revoked(
+                    cache,
+                    &token_data.claims.jti,
+                    token_data.claims.sid.as_deref(),
+                )
+                .await
+                {
                     return Ok(Json(ValidateTokenResponse {
                         valid: false,
                         error: Some("Token has been revoked".to_string()),
@@ -830,6 +901,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_claims_without_sid_still_decode() {
+        // Tokens issued before 0.1.114 carry no `sid`; they must keep working
+        // (and keep per-jti revocation) instead of failing to decode.
+        let legacy = serde_json::json!({
+            "sub": "org", "api_key_id": "key", "org_id": "org",
+            "iat": 1, "exp": 2, "nbf": 1, "jti": "j",
+            "queues": [], "token_type": "refresh"
+        });
+        let claims: Claims = serde_json::from_value(legacy).unwrap();
+        assert!(claims.sid.is_none());
+        // And a sid-less token serializes without the field.
+        assert!(!serde_json::to_string(&claims).unwrap().contains("sid"));
+        assert_eq!(session_revocation_key("abc"), "session_revoked:abc");
+    }
+
+    #[test]
     fn test_claims_serialization() {
         let claims = Claims {
             sub: "org-123".to_string(),
@@ -841,6 +928,7 @@ mod tests {
             jti: "jti-789".to_string(),
             queues: vec!["emails".to_string(), "notifications".to_string()],
             token_type: "access".to_string(),
+            sid: Some("sid-1".to_string()),
         };
 
         let json = serde_json::to_string(&claims).unwrap();
@@ -905,6 +993,7 @@ mod tests {
                 jti: "jti-789".to_string(),
                 queues: vec![],
                 token_type: "access".to_string(),
+                sid: None,
             }),
         };
 

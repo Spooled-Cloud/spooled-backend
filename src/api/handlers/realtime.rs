@@ -923,119 +923,221 @@ pub async fn sse_queue_handler(
     )
 }
 
-/// SSE stream for all system events
+/// How long the global SSE stream trusts its last authorization check before
+/// re-reading the key from the database. Bounds revocation latency without one
+/// query per forwarded event.
+const SSE_AUTH_RECHECK_SECS: u64 = 2;
+
+/// Interval between `system.health` events on the global SSE stream.
+const SSE_HEALTH_INTERVAL_SECS: u64 = 10;
+
+/// Maximum concurrent global SSE streams per organization. Each one holds a
+/// Redis pub/sub connection, so it is capped like WebSocket connections.
+const MAX_SSE_CONNECTIONS_PER_ORG: usize = 100;
+
+/// Releases one slot of the per-org global-SSE connection counter when the
+/// stream is dropped (client disconnect, timeout or revocation).
+struct SseConnectionSlot {
+    cache: Option<crate::cache::RedisCache>,
+    key: String,
+}
+
+impl Drop for SseConnectionSlot {
+    fn drop(&mut self) {
+        if let Some(cache) = self.cache.take() {
+            let key = std::mem::take(&mut self.key);
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    if let Err(e) = cache.decr(&key).await {
+                        warn!(error = %e, "Failed to decrement SSE connection count");
+                    }
+                });
+            }
+        }
+    }
+}
+
+/// Wait for the next payload on the org pub/sub channel. Resolves to `None` once
+/// the channel closes; pends forever when there is no channel (no Redis).
+async fn next_pubsub_payload(messages: &mut Option<redis::aio::PubSubStream>) -> Option<String> {
+    match messages {
+        Some(stream) => {
+            while let Some(msg) = stream.next().await {
+                if let Ok(payload) = msg.get_payload::<String>() {
+                    return Some(payload);
+                }
+            }
+            None
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// SSE stream for all events of the authenticated organization
 ///
-/// to system health information which could be used for reconnaissance
+/// Forwards the same Redis pub/sub events the WebSocket receives (`job.created`,
+/// `job.status`, `job.completed`, `job.failed`, ...). Each is sent as a named SSE
+/// event whose `data:` is the `{"type": ..., "data": {...}}` envelope documented on
+/// /docs/realtime. A `system.health` event follows every 10 seconds. The optional
+/// `queue`, `job_id` and `events` (comma-separated names) query parameters narrow
+/// the stream, and the key's queue scope always applies.
+///
+/// Before 0.1.114 this stream only ever emitted `system.health`, so SSE clients
+/// following the docs never saw a job event.
 pub async fn sse_events_handler(
     Extension(ctx): Extension<crate::models::ApiKeyContext>,
     Query(query): Query<SubscribeQuery>,
     State(state): State<AppState>,
-) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+) -> Result<
+    Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>,
+    (StatusCode, &'static str),
+> {
+    if let Err(e) = validate_queue_filter(&query.queue) {
+        return Err((StatusCode::BAD_REQUEST, e));
+    }
+    if query
+        .queue
+        .as_deref()
+        .is_some_and(|queue| !ctx.can_access_queue(queue))
+    {
+        return Err((StatusCode::FORBIDDEN, "Queue is outside API key scope"));
+    }
+
     let org_id = ctx.organization_id.clone();
     let api_key_id = ctx.api_key_id.clone();
+
+    // Per-org cap, checked read-only here and incremented once the stream starts;
+    // the slot guard decrements it when the stream is dropped.
+    let conn_key = format!("sse_connections:{}", org_id);
+    if let Some(ref cache) = state.cache {
+        if let Ok(Some(v)) = cache.get(&conn_key).await {
+            if v.parse::<usize>()
+                .map(|c| c >= MAX_SSE_CONNECTIONS_PER_ORG)
+                .unwrap_or(false)
+            {
+                warn!(org_id = %org_id, count = %v, "SSE connection limit exceeded");
+                return Err((StatusCode::TOO_MANY_REQUESTS, "Too many SSE connections"));
+            }
+        }
+    }
+
     info!(org_id = %org_id, "SSE connection for all events (authenticated)");
 
-    // Parse event filter
-    let event_filter: Option<Vec<String>> = query
-        .events
-        .map(|e| e.split(',').map(|s| s.trim().to_lowercase()).collect());
-
-    // Track connection start time for timeout
-    let start_time = std::time::Instant::now();
-
-    // Flush an initial SSE comment so headers/first chunk make it past
-    // proxies before the first 10s poll cycle. See sse_job_handler for context.
-    let initial = stream::once(async {
-        Ok::<_, std::convert::Infallible>(Event::default().comment("connected"))
+    let event_filter: Option<Vec<String>> = query.events.map(|e| {
+        e.split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
     });
+    let subscription = SubscriptionFilter {
+        queue: query.queue,
+        job_id: query.job_id,
+    };
 
-    // Create a stream that emits periodic health checks and simulated events
-    let body = stream::unfold(
-        (
-            state.clone(),
-            event_filter,
-            org_id.clone(),
-            api_key_id,
-            0u64,
-            start_time,
-        ),
-        |(state, event_filter, org_id, api_key_id, counter, start_time)| async move {
-            // Close connection after max duration
-            if start_time.elapsed().as_secs() > MAX_SSE_DURATION_SECS {
-                tracing::debug!(org_id = %org_id, "SSE events stream timeout - closing");
-                return None;
+    let stream = async_stream::stream! {
+        let _slot = match state.cache {
+            Some(ref cache) => {
+                let _ = cache.incr_with_ttl(&conn_key, MAX_SSE_DURATION_SECS + 60).await;
+                SseConnectionSlot { cache: Some(cache.clone()), key: conn_key.clone() }
             }
-            // Poll interval
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            None => SseConnectionSlot { cache: None, key: String::new() },
+        };
 
-            // Revalidate the key and organization before revealing system health.
-            match load_current_realtime_scope(state.db.pool(), &api_key_id, &org_id).await {
-                Ok(Some(_)) => {}
-                Ok(None) => return None,
+        // Subscribe before the first frame, so a client that has seen `: connected`
+        // does not miss an event published right after.
+        let mut messages = match state.cache {
+            Some(ref cache) => match cache.subscribe(&format!("org:{}:events", org_id)).await {
+                Ok(pubsub) => Some(pubsub.into_on_message()),
                 Err(e) => {
-                    error!(error = %e, org_id = %org_id, "SSE events authorization lookup failed");
-                    return None;
+                    warn!(error = %e, org_id = %org_id, "SSE could not subscribe to org events; health only");
+                    None
+                }
+            },
+            None => None,
+        };
+
+        // Flush headers and a first chunk right away so proxies (Cloudflare) do not
+        // buffer the response. See sse_job_handler.
+        yield Ok(Event::default().comment("connected"));
+
+        let health_every = std::time::Duration::from_secs(SSE_HEALTH_INTERVAL_SECS);
+        let mut health = tokio::time::interval_at(tokio::time::Instant::now() + health_every, health_every);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(MAX_SSE_DURATION_SECS);
+        let recheck = std::time::Duration::from_secs(SSE_AUTH_RECHECK_SECS);
+        let mut scope: Vec<String> = Vec::new();
+        let mut checked_at: Option<tokio::time::Instant> = None;
+
+        loop {
+            // `None` = health tick, `Some(payload)` = pub/sub event.
+            let payload: Option<String> = tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => {
+                    debug!(org_id = %org_id, "SSE events stream timeout - closing");
+                    break;
+                }
+                _ = health.tick() => None,
+                msg = next_pubsub_payload(&mut messages) => match msg {
+                    Some(payload) => Some(payload),
+                    None => {
+                        warn!(org_id = %org_id, "SSE org event channel closed; health only");
+                        messages = None;
+                        continue;
+                    }
+                },
+            };
+
+            // Re-authorize (revoked/expired key, deleted org, narrowed scope) before
+            // revealing anything, at most once per SSE_AUTH_RECHECK_SECS.
+            if checked_at.is_none_or(|at| at.elapsed() >= recheck) {
+                match load_current_realtime_scope(state.db.pool(), &api_key_id, &org_id).await {
+                    Ok(Some(current)) => {
+                        scope = current;
+                        checked_at = Some(tokio::time::Instant::now());
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        error!(error = %e, org_id = %org_id, "SSE events authorization lookup failed");
+                        break;
+                    }
                 }
             }
 
-            // Query system health
-            let db_ok = sqlx::query("SELECT 1")
-                .execute(state.db.pool())
-                .await
-                .is_ok();
-
-            let redis_ok = if let Some(ref cache) = state.cache {
-                cache.ping().await.is_ok()
-            } else {
-                false
+            let event = match payload {
+                Some(payload) => match serde_json::from_str::<RealtimeEvent>(&payload) {
+                    Ok(event) if event_matches_subscription(&event, &subscription, &scope) => event,
+                    _ => continue,
+                },
+                None => {
+                    let db_ok = sqlx::query("SELECT 1").execute(state.db.pool()).await.is_ok();
+                    let redis_ok = match state.cache {
+                        Some(ref cache) => cache.ping().await.is_ok(),
+                        None => false,
+                    };
+                    RealtimeEvent::SystemHealth {
+                        database: db_ok,
+                        redis: redis_ok,
+                        timestamp: chrono::Utc::now(),
+                    }
+                }
             };
 
-            let event = RealtimeEvent::SystemHealth {
-                database: db_ok,
-                redis: redis_ok,
-                timestamp: chrono::Utc::now(),
-            };
-
-            // Check if event passes filter
-            let should_emit = event_filter
+            let event_type = event.event_type();
+            if !event_filter
                 .as_ref()
-                .is_none_or(|filter| filter.iter().any(|f| f == "system.health" || f == "*"));
-
-            if should_emit {
-                let json = serde_json::to_string(&event).unwrap_or_default();
-                Some((
-                    Ok(Event::default().event("system.health").data(json)),
-                    (
-                        state,
-                        event_filter,
-                        org_id,
-                        api_key_id,
-                        counter + 1,
-                        start_time,
-                    ),
-                ))
-            } else {
-                // Send keepalive
-                Some((
-                    Ok(Event::default().comment("keepalive")),
-                    (
-                        state,
-                        event_filter,
-                        org_id,
-                        api_key_id,
-                        counter + 1,
-                        start_time,
-                    ),
-                ))
+                .is_none_or(|filter| filter.iter().any(|f| f == event_type || f == "*"))
+            {
+                continue;
             }
-        },
-    );
 
-    Sse::new(initial.chain(body)).keep_alive(
+            let json = serde_json::to_string(&event).unwrap_or_default();
+            yield Ok(Event::default().event(event_type).data(json));
+        }
+    };
+
+    Ok(Sse::new(stream).keep_alive(
         axum::response::sse::KeepAlive::new()
             .interval(std::time::Duration::from_secs(15))
             .text("ping"),
-    )
+    ))
 }
 
 #[cfg(test)]

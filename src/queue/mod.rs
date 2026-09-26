@@ -19,13 +19,22 @@ use crate::models::Job;
 /// working — HTTP 409 LEASE_EXPIRED / gRPC FAILED_PRECONDITION) from "job
 /// missing or not owned by this worker" (HTTP 404 NOT_FOUND / gRPC NOT_FOUND),
 /// which was previously collapsed into a single failure path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerOpOutcome {
     /// The row was updated successfully.
     Ok,
     /// A row exists for this (job, org, worker) but its `lease_expires_at`
-    /// is null or already in the past.
+    /// is null or already in the past, or the job was requeued after the lease
+    /// ran out.
     LeaseExpired,
+    /// The lease is still live, but the caller's `lease_id` is not the job's
+    /// current lease — it was superseded by a newer claim, or is simply wrong.
+    /// Reported with the same `LEASE_EXPIRED` code (the worker no longer holds
+    /// the job) but a message that does not claim a timeout.
+    LeaseMismatch,
+    /// The job belongs to this worker but already reached a terminal status
+    /// (e.g. a second `complete`). Carries that status.
+    AlreadyFinished(String),
     /// No row matched the (job, org, worker, status = 'processing') filter.
     NotOwned,
 }
@@ -735,8 +744,10 @@ impl QueueManager {
             Some((status, lease, current_lease_id)) if status == "processing" => {
                 let expired = lease.map(|t| t <= Utc::now()).unwrap_or(true);
                 let fenced_out = current_lease_id.as_deref() != lease_id;
-                if expired || fenced_out {
+                if expired {
                     Ok(WorkerOpOutcome::LeaseExpired)
+                } else if fenced_out {
+                    Ok(WorkerOpOutcome::LeaseMismatch)
                 } else {
                     // Row exists, is processing, lease still valid — but the
                     // UPDATE missed. This is only reachable via a benign race
@@ -745,10 +756,13 @@ impl QueueManager {
                     Ok(WorkerOpOutcome::NotOwned)
                 }
             }
-            // Row exists but is not in 'processing' (e.g. already completed,
-            // reclaimed, cancelled) — from the worker's perspective the job
-            // is no longer theirs to act on.
-            Some(_) => Ok(WorkerOpOutcome::NotOwned),
+            // Requeued after its lease ran out: the worker lost the job.
+            Some((status, _, _)) if status == "pending" || status == "scheduled" => {
+                Ok(WorkerOpOutcome::LeaseExpired)
+            }
+            // Already completed, failed, dead-lettered or cancelled — e.g. a
+            // duplicate `complete`. Say so instead of pretending the job is gone.
+            Some((status, _, _)) => Ok(WorkerOpOutcome::AlreadyFinished(status)),
             None => Ok(WorkerOpOutcome::NotOwned),
         }
     }

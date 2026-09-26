@@ -102,12 +102,20 @@ pub async fn list_organizations(
     let offset = query.offset.unwrap_or(0).max(0);
 
     // Validate sort fields against allowlist to prevent SQL injection
+    // An unknown value is a 400, not a silent fallback: a caller sorting by a
+    // field that does not exist would otherwise read created_at order as theirs.
     let sort_by = match query.sort_by.as_deref().unwrap_or("created_at") {
         "name" => "name",
         "slug" => "slug",
         "plan_tier" => "plan_tier",
         "updated_at" => "updated_at",
-        _ => "created_at",
+        "created_at" => "created_at",
+        other => {
+            return Err(AppError::Validation(format!(
+            "Invalid sort_by '{}'. Must be one of: created_at, updated_at, name, slug, plan_tier",
+            other
+        )))
+        }
     };
     let sort_order = match query
         .sort_order
@@ -117,7 +125,13 @@ pub async fn list_organizations(
         .as_str()
     {
         "asc" => "ASC",
-        _ => "DESC",
+        "desc" => "DESC",
+        other => {
+            return Err(AppError::Validation(format!(
+                "Invalid sort_order '{}'. Must be asc or desc",
+                other
+            )))
+        }
     };
 
     // Validate plan_tier against allowlist if provided
@@ -376,6 +390,22 @@ pub async fn update_organization(
                 tier,
                 valid_tiers.join(", ")
             )));
+        }
+    }
+
+    if let Some(ref email) = request.billing_email {
+        if crate::api::handlers::organizations::billing_email_taken(
+            state.db.pool(),
+            email,
+            Some(&id),
+        )
+        .await?
+        {
+            return Err(AppError::Conflict(
+                "Another organization already uses this billing email; email login resolves \
+                 an account by it, so it must be unique"
+                    .to_string(),
+            ));
         }
     }
 
@@ -855,6 +885,18 @@ pub async fn create_organization(
     }
 
     // Validate plan tier if provided
+    if let Some(ref email) = request.billing_email {
+        if crate::api::handlers::organizations::billing_email_taken(state.db.pool(), email, None)
+            .await?
+        {
+            return Err(AppError::Conflict(
+                "Another organization already uses this billing email; email login resolves \
+                 an account by it, so it must be unique"
+                    .to_string(),
+            ));
+        }
+    }
+
     let plan_tier = match &request.plan_tier {
         Some(tier) => {
             let valid_plans = ["free", "starter", "pro", "enterprise"];

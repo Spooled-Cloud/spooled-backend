@@ -258,8 +258,22 @@ paths:
     post:
       tags: [Authentication]
       summary: Logout
-      description: Invalidate the current access token
+      description: |
+        Ends the login session: the access token, the refresh token minted with it,
+        and every access token refreshed from that refresh token stop working (they
+        share a session id). Sending `refresh_token` in the body is optional; tokens
+        issued before 0.1.114 carry no session id, so for those only the access
+        token (and a refresh token passed in the body) are revoked.
       operationId: logout
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                refresh_token:
+                  type: string
       responses:
         '204':
           description: Logged out successfully
@@ -2043,16 +2057,27 @@ paths:
     get:
       tags: [Real-time]
       summary: Server-Sent Events stream
-      description: Subscribe to all system events via SSE
+      description: |
+        Every realtime event of the organization, as named SSE events
+        (`event: job.created`, `job.status`, `job.completed`, `job.failed`, ...,
+        plus `system.health` every 10 s). Each `data:` is the
+        `{"type": "<Variant>", "data": {...}}` envelope. The key's queue scope
+        always applies. Before 0.1.114 this stream only emitted `system.health`.
       operationId: sseEventsHandler
       parameters:
         - name: queue
           in: query
+          description: Only events for this queue (must be inside the key's scope, else 403)
+          schema:
+            type: string
+        - name: job_id
+          in: query
+          description: Only events for this job
           schema:
             type: string
         - name: events
           in: query
-          description: Comma-separated event types to filter
+          description: Comma-separated event names to keep (e.g. `job.created,job.completed`)
           schema:
             type: string
       responses:
@@ -2788,6 +2813,7 @@ components:
         status:
           type: string
           enum: [pending, running, completed, failed]
+          description: Outcome of the run itself — `completed` means the job was enqueued, not that it finished
         error_message:
           type: string
         started_at:
@@ -2796,9 +2822,18 @@ components:
         completed_at:
           type: string
           format: date-time
+        job_status:
+          type: string
+          nullable: true
+          description: Current status of the job this run enqueued (null if none, or purged by retention)
 
     ErrorResponse:
       type: object
+      description: |
+        Every 4xx/5xx response is JSON with at least `code` and `message` (since
+        0.1.114 this also covers extractor rejections, unknown routes and 405s).
+        Some errors add fields — `details` for validation, `resource`/`limit` for
+        quotas, a legacy `error` string on auth routes.
       required: [code, message]
       properties:
         code:
@@ -3014,11 +3049,13 @@ components:
           minimum: 0
           maximum: 100
           default: 3
+          description: Omitted → the queue's `max_retries` from `PUT /queues/{name}/config`, else the server default (3)
         timeout_seconds:
           type: integer
           minimum: 1
           maximum: 86400
           default: 300
+          description: Omitted → the queue's `default_timeout`, else the server default (300)
         scheduled_at:
           type: string
           format: date-time
@@ -3361,6 +3398,10 @@ components:
         expires_at:
           type: string
           format: date-time
+      description: |
+        API keys have no per-permission scopes; narrow a key with `queues`. A
+        request that sends `permissions` is rejected with 400 VALIDATION_ERROR
+        rather than silently creating a full-access key.
 
     CreateApiKeyResponse:
       type: object
@@ -4385,7 +4426,7 @@ components:
           minimum: 5
           maximum: 3600
           default: 30
-          description: Lease duration in seconds
+          description: Lease duration in seconds. Omitted → `WORKER_LEASE_DURATION_SECS` (30). gRPC `Dequeue` defaults to 300.
 
     ClaimJobsResponse:
       type: object

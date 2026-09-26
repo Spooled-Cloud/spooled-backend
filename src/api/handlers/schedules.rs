@@ -167,6 +167,28 @@ pub async fn create(
             .into_response()
     })?;
 
+    // Omitted retry/timeout come from the target queue's config. A schedule into a
+    // queue that does not exist yet creates it (active schedules count as queues),
+    // so it is charged against the plan's queue cap like a first enqueue.
+    let queue_defaults = crate::api::middleware::limits::queue_job_defaults(
+        state.db.pool(),
+        &state.settings.queue,
+        org_id,
+        &req.queue_name,
+    )
+    .await
+    .map_err(|e| {
+        error!(error = %e, "Failed to read queue defaults for schedule creation");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to check limits".to_string(),
+        )
+            .into_response()
+    })?;
+    if !queue_defaults.exists {
+        crate::api::middleware::limits::check_new_queue_limit(state.db.pool(), org_id, 1).await?;
+    }
+
     // Calculate next run time in the schedule's timezone (stored as UTC)
     let next_run =
         cron.next_run_after_in_timezone(Utc::now(), req.timezone.as_deref().unwrap_or("UTC"));
@@ -219,12 +241,12 @@ pub async fn create(
     .bind(req.priority.unwrap_or(0))
     .bind(
         req.max_retries
-            .unwrap_or(state.settings.queue.default_max_retries)
+            .unwrap_or(queue_defaults.max_retries)
             .clamp(0, 100),
     )
     .bind(
         req.timeout_seconds
-            .unwrap_or(state.settings.queue.default_timeout_secs)
+            .unwrap_or(queue_defaults.timeout_seconds)
             .clamp(1, 86400),
     )
     .bind(next_run)
@@ -749,10 +771,16 @@ pub async fn history(
     }
 
     // Use safe_limit() to enforce maximum
+    // `status` is the outcome of the run itself (was the job enqueued?), so a
+    // manual trigger reads `completed` as soon as the job exists. `job_status`
+    // carries what the enqueued job is doing now, so a still-pending job is not
+    // mistaken for a finished one.
     let runs: Vec<ScheduleRunRecord> = sqlx::query_as(
         r#"
-        SELECT sr.*
+        SELECT sr.id, sr.schedule_id, sr.job_id, sr.status, sr.error_message,
+               sr.started_at, sr.completed_at, j.status AS job_status
         FROM schedule_runs sr
+        LEFT JOIN jobs j ON j.id = sr.job_id AND j.organization_id = $3
         WHERE sr.schedule_id = $1
         ORDER BY sr.started_at DESC
         LIMIT $2
@@ -760,6 +788,7 @@ pub async fn history(
     )
     .bind(&id)
     .bind(params.safe_limit()) // Use bounded limit
+    .bind(&ctx.organization_id)
     .fetch_all(state.db.pool())
     .await
     // Don't leak database error details
@@ -833,6 +862,10 @@ pub struct ScheduleRunRecord {
     pub error_message: Option<String>,
     pub started_at: chrono::DateTime<Utc>,
     pub completed_at: Option<chrono::DateTime<Utc>>,
+    /// Current status of the job this run enqueued (`pending`, `processing`,
+    /// `completed`, ...). `None` when the run created no job or the job has
+    /// since been removed by retention.
+    pub job_status: Option<String>,
 }
 
 #[cfg(test)]

@@ -345,6 +345,24 @@ pub async fn create(
         ));
     }
 
+    // Per-queue defaults for job definitions that omit retry/timeout, and the
+    // plan's queue cap for queues this workflow would create.
+    let mut queue_defaults: HashMap<String, crate::api::middleware::limits::QueueJobDefaults> =
+        HashMap::new();
+    for job_def in &request.jobs {
+        if !queue_defaults.contains_key(&job_def.queue_name) {
+            let defaults = crate::api::middleware::limits::queue_job_defaults(
+                state.db.pool(),
+                &state.settings.queue,
+                &ctx.organization_id,
+                &job_def.queue_name,
+            )
+            .await?;
+            queue_defaults.insert(job_def.queue_name.clone(), defaults);
+        }
+    }
+    let new_queues = queue_defaults.values().filter(|d| !d.exists).count() as u64;
+
     // Reserve this workflow's entire daily-job allowance BEFORE writing anything.
     // One request enqueues every job here, so the old check-then-blind-increment left
     // the widest window of any enqueue path: N concurrent creates all read a count
@@ -406,6 +424,18 @@ pub async fn create(
         {
             return Err(AppError::LimitExceeded(Box::new(response)));
         }
+        // Queues this workflow would create count against the plan's queue cap —
+        // checked after the workflow feature/cap so a plan without workflows still
+        // gets `feature_disabled`, not a queue error.
+        if let Err(response) = crate::api::middleware::limits::check_new_queue_limit(
+            state.db.pool(),
+            &ctx.organization_id,
+            new_queues,
+        )
+        .await
+        {
+            return Err(AppError::LimitExceeded(Box::new(response)));
+        }
 
         sqlx::query(
             r#"
@@ -451,12 +481,16 @@ pub async fn create(
             .bind(
                 job_def
                     .max_retries
+                    .or(queue_defaults.get(&job_def.queue_name).map(|d| d.max_retries))
                     .unwrap_or(state.settings.queue.default_max_retries)
                     .clamp(0, 100),
             )
             .bind(
                 job_def
                     .timeout_seconds
+                    .or(queue_defaults
+                        .get(&job_def.queue_name)
+                        .map(|d| d.timeout_seconds))
                     .unwrap_or(state.settings.queue.default_timeout_secs)
                     .clamp(1, 86400),
             )

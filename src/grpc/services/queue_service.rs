@@ -19,8 +19,8 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info, warn};
 
 use crate::api::middleware::limits::{
-    check_job_limits_generic, check_payload_size_generic, daily_jobs_limit,
-    try_increment_daily_jobs, LimitCheckError,
+    check_job_limits_generic, check_new_queue_limit_generic, check_payload_size_generic,
+    daily_jobs_limit, queue_job_defaults, try_increment_daily_jobs, LimitCheckError,
 };
 use crate::cache::RedisCache;
 use crate::config::{PlanLimits, QueueSettings};
@@ -393,6 +393,44 @@ impl QueueService for QueueServiceImpl {
                 }
             })?;
 
+        // Queue config supplies omitted retry/timeout (0 on the wire), and a job into
+        // a queue that does not exist yet is charged against the plan's queue cap —
+        // same as REST `POST /jobs`.
+        let queue_defaults = queue_job_defaults(
+            self.pool.as_ref(),
+            &self.queue_defaults,
+            &auth.organization_id,
+            &req.queue_name,
+        )
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Failed to read queue defaults");
+            Status::internal("Failed to check limits")
+        })?;
+        if !queue_defaults.exists {
+            check_new_queue_limit_generic(self.pool.as_ref(), &auth.organization_id, 1)
+                .await
+                .map_err(|e| match e {
+                    LimitCheckError::LimitExceeded(err) => {
+                        Status::resource_exhausted(err.to_string())
+                    }
+                    other => {
+                        error!(error = %other, "Failed to check queue limit");
+                        Status::internal("Failed to check limits")
+                    }
+                })?;
+        }
+        let max_retries = if req.max_retries <= 0 {
+            queue_defaults.max_retries.clamp(0, 100)
+        } else {
+            self.resolve_max_retries(req.max_retries)
+        };
+        let timeout_seconds = if req.timeout_seconds <= 0 {
+            queue_defaults.timeout_seconds.clamp(1, 86400)
+        } else {
+            self.resolve_timeout_seconds(req.timeout_seconds)
+        };
+
         let job_id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now();
         let scheduled_at = timestamp_to_datetime_opt(req.scheduled_at);
@@ -430,11 +468,11 @@ impl QueueService for QueueServiceImpl {
         .bind(status)
         .bind(&payload)
         .bind(req.priority)
-        // proto3 int32 is 0 when the field is omitted; treat 0 as "use
-        // QUEUE_DEFAULT_*" (same as REST omit) instead of "no retries".
+        // proto3 int32 is 0 when the field is omitted; treat 0 as "use the
+        // queue's default" (same as REST omit) instead of "no retries".
         // Explicit zero retries are not expressible on gRPC.
-        .bind(self.resolve_max_retries(req.max_retries))
-        .bind(self.resolve_timeout_seconds(req.timeout_seconds))
+        .bind(max_retries)
+        .bind(timeout_seconds)
         .bind(scheduled_at)
         .bind(if req.idempotency_key.is_empty() {
             None

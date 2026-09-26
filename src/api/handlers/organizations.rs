@@ -375,6 +375,35 @@ fn validate_slug(slug: &str) -> Result<(), AppError> {
 /// Maximum settings JSON size
 const MAX_SETTINGS_SIZE: usize = 64 * 1024; // 64KB
 
+/// Whether another live organization already uses this billing email.
+///
+/// Email login resolves an account by billing email (lower-cased), so two live
+/// orgs sharing one would make the login land in an arbitrary one of them. Every
+/// path that sets a billing email — public create, admin create, and both update
+/// routes — must refuse a duplicate. Soft-deleted orgs do not count, matching the
+/// email-login lookups.
+pub async fn billing_email_taken(
+    pool: &sqlx::PgPool,
+    email: &str,
+    exclude_org_id: Option<&str>,
+) -> Result<bool, sqlx::Error> {
+    let (taken,): (bool,) = sqlx::query_as(
+        r#"
+        SELECT EXISTS (
+            SELECT 1 FROM organizations
+            WHERE lower(billing_email) = lower($1)
+              AND plan_tier <> 'deleted'
+              AND ($2::TEXT IS NULL OR id <> $2)
+        )
+        "#,
+    )
+    .bind(email.trim())
+    .bind(exclude_org_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(taken)
+}
+
 /// Create a new organization
 ///
 /// Registration mode controls access:
@@ -429,13 +458,7 @@ pub async fn create(
 
     // Check for duplicate billing email
     if let Some(ref email) = request.billing_email {
-        let existing: Option<(String,)> =
-            sqlx::query_as("SELECT id FROM organizations WHERE billing_email = $1")
-                .bind(email)
-                .fetch_optional(state.db.pool())
-                .await?;
-
-        if existing.is_some() {
+        if billing_email_taken(state.db.pool(), email, None).await? {
             return Err(AppError::Conflict(
                 "An account with this email already exists. Please log in instead.".to_string(),
             ));
@@ -654,6 +677,14 @@ pub async fn update(
         .fetch_optional(state.db.pool())
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Organization {} not found", id)))?;
+
+    if let Some(ref email) = request.billing_email {
+        if billing_email_taken(state.db.pool(), email, Some(&id)).await? {
+            return Err(AppError::Conflict(
+                "Another account already uses this billing email".to_string(),
+            ));
+        }
+    }
 
     let name = request.name.unwrap_or(existing.name);
     let billing_email = request.billing_email.or(existing.billing_email);

@@ -173,8 +173,24 @@ pub async fn custom(
         };
 
     // Insert job with idempotency support and return ID to detect new vs duplicate.
-    let max_retries = state.settings.queue.default_max_retries.clamp(0, 100);
-    let timeout_seconds = state.settings.queue.default_timeout_secs.clamp(1, 86400);
+    // Retry/timeout come from the target queue's config when it has one. Webhook
+    // ingest is not charged against the queue cap: bouncing a delivery would only
+    // make the sender retry it. A lookup failure falls back to server defaults
+    // rather than rejecting the delivery.
+    let queue_defaults = crate::api::middleware::limits::queue_job_defaults(
+        state.db.pool(),
+        &state.settings.queue,
+        &org_id,
+        &request.queue_name,
+    )
+    .await
+    .unwrap_or(crate::api::middleware::limits::QueueJobDefaults {
+        max_retries: state.settings.queue.default_max_retries,
+        timeout_seconds: state.settings.queue.default_timeout_secs,
+        exists: true,
+    });
+    let max_retries = queue_defaults.max_retries.clamp(0, 100);
+    let timeout_seconds = queue_defaults.timeout_seconds.clamp(1, 86400);
     // RETURNING carries queue_name and status as well: on an idempotent replay the
     // conflicting row is an existing job that may already be processing/completed and
     // may live in a different queue, so answering a hardcoded "pending" and echoing the

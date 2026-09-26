@@ -2831,7 +2831,7 @@ async fn test_complete_by_worker_rejects_stale_lease_id() {
         .complete_by_worker(&job_id, &worker_id, org_id, Some("lease-old"), None, None)
         .await
         .expect("complete_by_worker should not error on stale lease_id");
-    assert_eq!(outcome, WorkerOpOutcome::LeaseExpired);
+    assert_eq!(outcome, WorkerOpOutcome::LeaseMismatch);
 
     let (status,): (String,) = sqlx::query_as("SELECT status FROM jobs WHERE id = $1")
         .bind(&job_id)
@@ -2879,7 +2879,7 @@ async fn test_fail_by_worker_rejects_stale_lease_id() {
         )
         .await
         .expect("fail_by_worker should not error on stale lease_id");
-    assert_eq!(outcome.outcome, WorkerOpOutcome::LeaseExpired);
+    assert_eq!(outcome.outcome, WorkerOpOutcome::LeaseMismatch);
     assert!(!outcome.will_retry);
 
     let (status, retries): (String, i32) =
@@ -2918,7 +2918,7 @@ async fn test_renew_lease_rejects_stale_or_missing_lease_id() {
         .renew_lease(&job_id, &worker_id, org_id, Some("lease-old"), None, 120)
         .await
         .expect("renew_lease should not error on stale lease_id");
-    assert_eq!(outcome, WorkerOpOutcome::LeaseExpired);
+    assert_eq!(outcome, WorkerOpOutcome::LeaseMismatch);
     let stored: (chrono::DateTime<chrono::Utc>,) =
         sqlx::query_as("SELECT lease_expires_at FROM jobs WHERE id = $1")
             .bind(&job_id)
@@ -2936,7 +2936,7 @@ async fn test_renew_lease_rejects_stale_or_missing_lease_id() {
         .renew_lease(&job_id, &worker_id, org_id, None, None, 120)
         .await
         .expect("renew_lease should not error on missing lease_id");
-    assert_eq!(outcome, WorkerOpOutcome::LeaseExpired);
+    assert_eq!(outcome, WorkerOpOutcome::LeaseMismatch);
 
     // Current token → renews too.
     let outcome = queue

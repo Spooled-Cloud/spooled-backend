@@ -147,6 +147,12 @@ pub fn router(state: AppState) -> Router {
         // existed but was never mounted, so the API served none of them.
         .layer(axum::middleware::from_fn(
             middleware::security_headers_middleware,
+        ))
+        // Innermost: give every 4xx/5xx the standard `{code, message}` JSON body
+        // before compression sees it (extractor rejections, plain-text handler
+        // errors and empty router 404/405s were not JSON).
+        .layer(axum::middleware::from_fn(
+            middleware::error_body::normalize_error_body,
         ));
 
     Router::new()
@@ -164,6 +170,8 @@ pub fn router(state: AppState) -> Router {
             api_v1_router(state.clone())
                 .layer(axum::middleware::from_fn(api_versioning_middleware)),
         )
+        .fallback(middleware::error_body::route_not_found)
+        .method_not_allowed_fallback(middleware::error_body::method_not_allowed)
         .layer(middleware)
         .with_state(state)
 }

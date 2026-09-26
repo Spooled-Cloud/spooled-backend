@@ -184,8 +184,10 @@ pub async fn update_config(
             .fetch_optional(&mut *tx)
             .await?;
 
-    // Only check limit when creating a NEW queue
-    if existing.is_none() {
+    // Only check the limit when this creates a NEW queue. A queue that already
+    // exists implicitly (it holds jobs, or an active schedule targets it) is
+    // already counted, so configuring it must not be charged a second slot.
+    if existing.is_none() && !queue_exists_implicitly(&mut tx, &ctx.organization_id, &name).await? {
         if let Err(response) =
             check_resource_limit_conn(&mut tx, &ctx.organization_id, "queues", 1).await
         {
@@ -261,6 +263,27 @@ pub async fn update_config(
     Ok(Json(config))
 }
 
+/// Whether a queue without a `queue_config` row exists anyway: it holds jobs, or
+/// an active schedule targets it.
+async fn queue_exists_implicitly(
+    conn: &mut sqlx::PgConnection,
+    org_id: &str,
+    name: &str,
+) -> Result<bool, sqlx::Error> {
+    let (exists,): (bool,) = sqlx::query_as(
+        r#"
+        SELECT EXISTS (SELECT 1 FROM jobs WHERE organization_id = $1 AND queue_name = $2)
+            OR EXISTS (SELECT 1 FROM schedules
+                       WHERE organization_id = $1 AND queue_name = $2 AND is_active = TRUE)
+        "#,
+    )
+    .bind(org_id)
+    .bind(name)
+    .fetch_one(conn)
+    .await?;
+    Ok(exists)
+}
+
 /// Get queue statistics
 ///
 pub async fn stats(
@@ -315,8 +338,26 @@ pub async fn pause(
     body: Option<Json<PauseQueueRequest>>,
 ) -> AppResult<Json<PauseQueueResponse>> {
     require_queue_access(&ctx, &name)?;
+    validate_queue_name_param(&name)?;
     let now = Utc::now();
     let reason = body.and_then(|Json(r)| r.reason);
+
+    // Pausing a queue that does not exist would silently create it (and a config
+    // row that dodges the plan's queue cap). Create-and-pause is
+    // `PUT /queues/{name}/config` with `{"enabled": false}`, which is cap-checked.
+    let (configured,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM queue_config WHERE organization_id = $1 AND queue_name = $2)",
+    )
+    .bind(&ctx.organization_id)
+    .bind(&name)
+    .fetch_one(state.db.pool())
+    .await?;
+    if !configured {
+        let mut conn = state.db.pool().acquire().await?;
+        if !queue_exists_implicitly(&mut conn, &ctx.organization_id, &name).await? {
+            return Err(AppError::NotFound("Queue not found".to_string()));
+        }
+    }
 
     // Upsert queue config with enabled=false and paused metadata
     let paused_settings = serde_json::json!({
@@ -331,7 +372,7 @@ pub async fn pause(
             id, organization_id, queue_name, max_retries, default_timeout,
             enabled, settings, created_at, updated_at
         )
-        VALUES (gen_random_uuid()::TEXT, $1, $2, 3, 300, false, $3, NOW(), NOW())
+        VALUES (gen_random_uuid()::TEXT, $1, $2, $4, $5, false, $3, NOW(), NOW())
         ON CONFLICT (organization_id, queue_name)
         DO UPDATE SET
             enabled = false,
@@ -342,6 +383,10 @@ pub async fn pause(
     .bind(&ctx.organization_id)
     .bind(&name)
     .bind(&paused_settings)
+    // A first config row for an implicit queue keeps the server defaults jobs
+    // already get, rather than hard-coded 3 / 300.
+    .bind(state.settings.queue.default_max_retries)
+    .bind(state.settings.queue.default_timeout_secs)
     .execute(state.db.pool())
     .await?;
 
@@ -526,6 +571,17 @@ pub async fn delete(
                 .await?;
 
         if result.rows_affected() == 0 {
+            // No config row. If the queue still exists through its (finished) jobs,
+            // say how to remove it instead of claiming it does not exist.
+            let mut conn = state.db.pool().acquire().await?;
+            if queue_exists_implicitly(&mut conn, &ctx.organization_id, &name).await? {
+                return Err(AppError::Conflict(
+                    "Queue has no configuration to delete; it exists through its jobs or an \
+                     active schedule. Delete it with ?delete_jobs=true, which also deletes \
+                     its jobs (and remove any schedule that targets it)"
+                        .to_string(),
+                ));
+            }
             // Don't expose queue name in error
             return Err(AppError::NotFound("Queue not found".to_string()));
         }

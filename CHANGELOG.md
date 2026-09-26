@@ -11,6 +11,80 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.114] - 2026-09-26
+
+Fixes from a production QA pass (2026-09-26). Every item was re-verified against
+the code before changing it; regression tests are in `tests/qa_regression_tests.rs`.
+
+### Security
+
+- **`permissions` on an API key is rejected instead of ignored.** Spooled keys have
+  no per-permission scopes, but `POST /api-keys {"permissions": ["jobs:read"]}`
+  returned 201 and a key with full write access. The field is now a 400
+  `VALIDATION_ERROR` on create and update; `queues` remains the way to narrow a key.
+- **Logout ends the whole session.** Access and refresh tokens from one login share
+  a session id (`sid` claim, carried through `/auth/refresh`), and `POST /auth/logout`
+  revokes it — so the refresh token no longer keeps minting access tokens for ~24
+  days when the client does not send it in the logout body. Tokens issued before
+  this release keep the previous per-token behaviour.
+- **`rustls` 0.23.45** for [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285).
+
+### Fixed
+
+- **`GET /api/v1/events` now streams job events.** It only ever emitted
+  `system.health`; it now forwards the organization's realtime events (the same
+  Redis channel the WebSocket reads) as named SSE events — `job.created`,
+  `job.status`, `job.completed`, `job.failed` — with the documented
+  `{"type", "data"}` envelope, honouring `queue`, `job_id`, `events` and the key's
+  queue scope. The subscription is live before the first `: connected` frame.
+  Capped at 100 streams per organization.
+- **`job.failed` is published on every reported failure** (docs: "may retry"), and
+  `job.completed` carries the real `duration_ms` (claim → completion) instead of 0.
+- **The queue quota counts implicit queues.** A queue exists once it has a config
+  row, holds jobs, or is targeted by an active schedule. `max_queues` is enforced
+  when an enqueue (REST, bulk, gRPC), schedule or workflow would create a new queue,
+  and `GET /organizations/usage` reports the real count (a free org showed "1/2"
+  while using 4). Jobs into existing queues are never blocked, so an org already
+  over its cap keeps working; configuring an implicit queue is not charged twice.
+- **Queue config defaults apply to new jobs.** Jobs that omit `max_retries` /
+  `timeout_seconds` take them from `PUT /queues/{name}/config` before falling back
+  to the server defaults (REST, bulk, gRPC, webhook ingest, schedules, workflows).
+- **Worker outcomes say what happened.** A `lease_id` that does not match a still
+  live lease is `409 LEASE_EXPIRED` with a "does not match" message (not "expired");
+  completing an already-completed job is `409 CONFLICT` "Job is already completed"
+  (was 404).
+- **Manual `POST /jobs/{id}/retry` resets `retry_count` to 0** and clears the DLQ
+  audit row, like `POST /jobs/dlq/retry`. It used to increment, leaving
+  `retry_count > max_retries` so the next failure skipped every retry.
+- **Every error response is JSON with `code` and `message`.** Extractor rejections
+  (e.g. a missing field on `/billing/portal`), plain-text handler errors ("Invalid
+  cron expression", "Schedule not found"), unknown routes and 405s now share the
+  standard body; legacy fields such as `error` and `details` are kept. Truncated
+  JSON is reported as malformed, not "Request body is empty".
+- **Schedule history** rows carry `job_status`, the live status of the job the run
+  enqueued; `status: completed` only ever meant the enqueue succeeded.
+- **`POST /queues/{name}/pause` on a queue that does not exist is 404** (it created
+  a config row that bypassed the queue cap). `DELETE /queues/{name}` on a queue with
+  no config but finished jobs is a 409 pointing at `?delete_jobs=true`, not a 404.
+- **Billing emails are unique among live organizations** on every create/update
+  path, including admin; email login resolves an account by that address and used
+  to land in an arbitrary org when two shared it. Comparison is case-insensitive.
+- **Admin `GET /admin/organizations` rejects an unknown `sort_by` / `sort_order`**
+  with 400 instead of silently sorting by `created_at`.
+- **Closed-registration signup message.** Completing signup directly against the API
+  without the admin key now explains that signup finishes on the website and that
+  the verified signup token was not consumed.
+- REST claim's default lease reads `WORKER_LEASE_DURATION_SECS` (30 s, unchanged)
+  instead of a hard-coded 30.
+
+### Migration
+
+- `20260926120000_count_implicit_queues.sql` adds `get_org_queue_count()` (loose
+  index scan over `jobs(organization_id, queue_name, …)`) and redefines
+  `get_org_resource_counts()` to use it.
+
+---
+
 ## [0.1.113] - 2026-09-10
 
 Toolchain and dependency maintenance. No API or behaviour change.

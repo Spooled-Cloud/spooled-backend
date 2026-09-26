@@ -24,7 +24,31 @@ pub struct ValidatedJson<T>(pub T);
 pub struct ValidationErrorResponse {
     pub error: String,
     pub code: String,
+    /// Human-readable summary (the first field error), so this body carries the
+    /// same `code` + `message` pair as every other error response.
+    pub message: String,
     pub details: Vec<ValidationFieldError>,
+}
+
+impl ValidationErrorResponse {
+    fn new(error: &str, code: &str, details: Vec<ValidationFieldError>) -> Self {
+        let message = details
+            .first()
+            .map(|d| {
+                if d.message.contains(&d.field) {
+                    d.message.clone()
+                } else {
+                    format!("{}: {}", d.field, d.message)
+                }
+            })
+            .unwrap_or_else(|| error.to_string());
+        Self {
+            error: error.to_string(),
+            code: code.to_string(),
+            message,
+            details,
+        }
+    }
 }
 
 /// Individual field validation error
@@ -59,11 +83,8 @@ impl IntoResponse for ValidationRejection {
             })
             .collect();
 
-        let response = ValidationErrorResponse {
-            error: "Validation failed".to_string(),
-            code: "VALIDATION_ERROR".to_string(),
-            details: field_errors,
-        };
+        let response =
+            ValidationErrorResponse::new("Validation failed", "VALIDATION_ERROR", field_errors);
 
         (StatusCode::BAD_REQUEST, Json(response)).into_response()
     }
@@ -89,15 +110,15 @@ fn parse_json_error(body_text: &str) -> (StatusCode, ValidationErrorResponse) {
         if let Some(field) = rest.split('`').next() {
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
-                ValidationErrorResponse {
-                    error: "Validation failed".to_string(),
-                    code: "VALIDATION_ERROR".to_string(),
-                    details: vec![ValidationFieldError {
+                ValidationErrorResponse::new(
+                    "Validation failed",
+                    "VALIDATION_ERROR",
+                    vec![ValidationFieldError {
                         field: field.to_string(),
                         message: format!("Field `{}` is required", field),
                         code: Some("missing_field".to_string()),
                     }],
-                },
+                ),
             );
         }
     }
@@ -120,15 +141,34 @@ fn parse_json_error(body_text: &str) -> (StatusCode, ValidationErrorResponse) {
             .trim_end_matches(',');
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
-            ValidationErrorResponse {
-                error: "Validation failed".to_string(),
-                code: "VALIDATION_ERROR".to_string(),
-                details: vec![ValidationFieldError {
+            ValidationErrorResponse::new(
+                "Validation failed",
+                "VALIDATION_ERROR",
+                vec![ValidationFieldError {
                     field,
                     message: format!("Invalid type: {}", msg),
                     code: Some("invalid_type".to_string()),
                 }],
-            },
+            ),
+        );
+    }
+
+    // Truncated JSON: EOF after some input ("EOF while parsing an object at line 1
+    // column 17") is malformed, not empty.
+    let eof_at_start = lower.contains("line 1 column 0");
+    if lower.contains("eof") && !eof_at_start {
+        return (
+            StatusCode::BAD_REQUEST,
+            ValidationErrorResponse::new(
+                "Invalid JSON",
+                "INVALID_JSON",
+                vec![ValidationFieldError {
+                    field: "body".to_string(),
+                    message: "Malformed JSON: the body ends before the JSON value is complete"
+                        .to_string(),
+                    code: Some("invalid_json".to_string()),
+                }],
+            ),
         );
     }
 
@@ -136,15 +176,15 @@ fn parse_json_error(body_text: &str) -> (StatusCode, ValidationErrorResponse) {
     if lower.contains("eof") || lower.contains("empty") {
         return (
             StatusCode::BAD_REQUEST,
-            ValidationErrorResponse {
-                error: "Invalid JSON".to_string(),
-                code: "INVALID_JSON".to_string(),
-                details: vec![ValidationFieldError {
+            ValidationErrorResponse::new(
+                "Invalid JSON",
+                "INVALID_JSON",
+                vec![ValidationFieldError {
                     field: "body".to_string(),
                     message: "Request body is empty".to_string(),
                     code: Some("empty_body".to_string()),
                 }],
-            },
+            ),
         );
     }
 
@@ -162,10 +202,10 @@ fn parse_json_error(body_text: &str) -> (StatusCode, ValidationErrorResponse) {
 
     (
         StatusCode::BAD_REQUEST,
-        ValidationErrorResponse {
-            error: "Invalid JSON".to_string(),
-            code: "INVALID_JSON".to_string(),
-            details: vec![ValidationFieldError {
+        ValidationErrorResponse::new(
+            "Invalid JSON",
+            "INVALID_JSON",
+            vec![ValidationFieldError {
                 field: "body".to_string(),
                 message: if message.is_empty() {
                     "Malformed JSON".to_string()
@@ -174,7 +214,7 @@ fn parse_json_error(body_text: &str) -> (StatusCode, ValidationErrorResponse) {
                 },
                 code: Some("invalid_json".to_string()),
             }],
-        },
+        ),
     )
 }
 
@@ -207,15 +247,15 @@ mod tests {
 
     #[test]
     fn test_validation_error_serialization() {
-        let response = ValidationErrorResponse {
-            error: "Validation failed".to_string(),
-            code: "VALIDATION_ERROR".to_string(),
-            details: vec![ValidationFieldError {
+        let response = ValidationErrorResponse::new(
+            "Validation failed",
+            "VALIDATION_ERROR",
+            vec![ValidationFieldError {
                 field: "name".to_string(),
                 message: "Name is required".to_string(),
                 code: Some("required".to_string()),
             }],
-        };
+        );
 
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("VALIDATION_ERROR"));
@@ -240,6 +280,16 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(resp.details[0].message.contains("expected a string"));
         assert_eq!(resp.details[0].code.as_deref(), Some("invalid_type"));
+    }
+
+    #[test]
+    fn test_parse_truncated_body_is_not_called_empty() {
+        let body = "Failed to parse the request body as JSON: EOF while parsing an object at line 1 column 17";
+        let (status, resp) = parse_json_error(body);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(resp.code, "INVALID_JSON");
+        assert!(!resp.details[0].message.to_lowercase().contains("empty"));
+        assert!(resp.message.contains("Malformed JSON"));
     }
 
     #[test]

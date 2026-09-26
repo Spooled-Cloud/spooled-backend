@@ -317,6 +317,9 @@ struct Claims {
     token_type: String,
     /// Email used for login (for email-based auth)
     email: Option<String>,
+    /// Login session id shared by the access/refresh pair (see `auth::Claims::sid`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sid: Option<String>,
 }
 
 /// Verify email login - validates code and returns JWT or signup token
@@ -490,6 +493,7 @@ pub async fn verify(
             let access_expiration = state.settings.jwt.expiration_hours as i64;
             let refresh_expiration = access_expiration * 24;
 
+            let sid = Uuid::new_v4().to_string();
             let access_claims = Claims {
                 sub: existing_org_id.clone(),
                 api_key_id: api_key_id.clone(),
@@ -501,6 +505,7 @@ pub async fn verify(
                 queues: vec!["*".to_string()],
                 token_type: "access".to_string(),
                 email: Some(email.clone()),
+                sid: Some(sid.clone()),
             };
 
             let refresh_claims = Claims {
@@ -514,6 +519,7 @@ pub async fn verify(
                 queues: vec!["*".to_string()],
                 token_type: "refresh".to_string(),
                 email: Some(email.clone()),
+                sid: Some(sid),
             };
 
             let access_token = encode(
@@ -649,8 +655,14 @@ fn authorize_email_signup(
                 (Some(expected), Some(provided)) if constant_time_compare(expected, provided) => {
                     Ok(())
                 }
+                // Closed registration: the deployment's own website completes signup
+                // (it holds the admin key). Say so, and that the verified signup
+                // token was not consumed, instead of implying signup is off.
                 (Some(_), _) => Err(AppError::Authorization(
-                    "Email signup is currently disabled. Contact admin for access.".to_string(),
+                    "Signup on this deployment is completed through its website, not \
+                     directly against the API. Your signup token was not used and stays \
+                     valid until it expires."
+                        .to_string(),
                 )),
                 (None, _) => Err(AppError::Authorization(
                     "Email signup is currently disabled and no admin key is configured."
@@ -829,6 +841,7 @@ pub async fn complete_signup(
     // Generate JWT tokens
     let access_expiration = state.settings.jwt.expiration_hours as i64;
 
+    let sid = Uuid::new_v4().to_string();
     let access_claims = Claims {
         sub: org_id.clone(),
         api_key_id: api_key_id.clone(),
@@ -840,6 +853,7 @@ pub async fn complete_signup(
         queues: vec!["*".to_string()],
         token_type: "access".to_string(),
         email: Some(email.clone()),
+        sid: Some(sid.clone()),
     };
 
     let refresh_claims = Claims {
@@ -853,6 +867,7 @@ pub async fn complete_signup(
         queues: vec!["*".to_string()],
         token_type: "refresh".to_string(),
         email: Some(email.clone()),
+        sid: Some(sid),
     };
 
     let access_token = encode(
@@ -1417,6 +1432,7 @@ mod tests {
             queues: vec!["*".to_string()],
             token_type: "access".to_string(),
             email: Some("test@example.com".to_string()),
+            sid: None,
         };
 
         let json = serde_json::to_string(&claims).unwrap();
@@ -1443,6 +1459,7 @@ mod tests {
             queues: vec!["emails".to_string()],
             token_type: "access".to_string(),
             email: None,
+            sid: None,
         };
 
         let json = serde_json::to_string(&claims).unwrap();

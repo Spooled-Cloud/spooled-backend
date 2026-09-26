@@ -333,6 +333,102 @@ pub async fn check_job_limits_generic(
     Ok(())
 }
 
+/// What a queue contributes to a job that is about to be enqueued into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueJobDefaults {
+    /// `queue_config.max_retries`, or the server default for unconfigured queues.
+    pub max_retries: i32,
+    /// `queue_config.default_timeout`, or the server default.
+    pub timeout_seconds: i32,
+    /// Whether the queue already exists for the org: it has a `queue_config` row,
+    /// holds jobs, or is the target of an active schedule. A job into a queue
+    /// that does not exist yet creates it, which counts against `max_queues`.
+    pub exists: bool,
+}
+
+/// Read a queue's job defaults and whether it already exists, in one query.
+///
+/// Jobs that omit `max_retries` / `timeout_seconds` take them from here, so
+/// `PUT /queues/{name}/config` actually changes new jobs (it used to be ignored
+/// in favour of the server-wide defaults).
+pub async fn queue_job_defaults(
+    pool: &PgPool,
+    settings: &crate::config::QueueSettings,
+    org_id: &str,
+    queue_name: &str,
+) -> Result<QueueJobDefaults, sqlx::Error> {
+    let (max_retries, timeout, exists): (Option<i32>, Option<i32>, bool) = sqlx::query_as(
+        r#"
+        SELECT qc.max_retries,
+               qc.default_timeout,
+               (qc.queue_name IS NOT NULL
+                OR EXISTS (SELECT 1 FROM jobs
+                           WHERE organization_id = $1 AND queue_name = $2)
+                OR EXISTS (SELECT 1 FROM schedules
+                           WHERE organization_id = $1 AND queue_name = $2 AND is_active = TRUE))
+        FROM (SELECT 1) AS one
+        LEFT JOIN queue_config qc
+               ON qc.organization_id = $1 AND qc.queue_name = $2
+        "#,
+    )
+    .bind(org_id)
+    .bind(queue_name)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(QueueJobDefaults {
+        max_retries: max_retries.unwrap_or(settings.default_max_retries),
+        timeout_seconds: timeout.unwrap_or(settings.default_timeout_secs),
+        exists,
+    })
+}
+
+/// Enforce the plan's `max_queues` for a job that would create a new queue.
+///
+/// Queues are implicit — the first job into a name creates it — so the cap has to
+/// be checked on enqueue, not only on `PUT /queues/{name}/config`. Callers check
+/// [`QueueJobDefaults::exists`] first, so jobs into existing queues never pay for
+/// this and an org already over its cap keeps working in the queues it has.
+pub async fn check_new_queue_limit_generic(
+    pool: &PgPool,
+    org_id: &str,
+    new_queues: u64,
+) -> Result<(), LimitCheckError> {
+    if new_queues == 0 {
+        return Ok(());
+    }
+    let (plan_tier, custom_limits) = get_org_plan_and_limits(pool, org_id)
+        .await
+        .map_err(|e| LimitCheckError::Database(e.to_string()))?;
+    let limits = PlanLimits::for_tier_with_overrides(&plan_tier, custom_limits.as_ref());
+    if limits.max_queues.is_none() {
+        return Ok(());
+    }
+    let counts = get_resource_counts(pool, org_id)
+        .await
+        .map_err(|e| LimitCheckError::Database(e.to_string()))?;
+    limits
+        .check_limit("queues", counts.queues, new_queues)
+        .map_err(LimitCheckError::LimitExceeded)
+}
+
+/// HTTP wrapper around [`check_new_queue_limit_generic`].
+pub async fn check_new_queue_limit(
+    pool: &PgPool,
+    org_id: &str,
+    new_queues: u64,
+) -> Result<(), Response> {
+    check_new_queue_limit_generic(pool, org_id, new_queues)
+        .await
+        .map_err(|e| match e {
+            LimitCheckError::LimitExceeded(err) => LimitExceededResponse::from(err).into_response(),
+            other => {
+                tracing::error!(error = %other, "Failed during queue limit check");
+                (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
+            }
+        })
+}
+
 /// Check payload size against plan limits - generic version (usable by HTTP, gRPC, etc.)
 pub async fn check_payload_size_generic(
     pool: &PgPool,
