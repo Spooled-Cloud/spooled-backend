@@ -11,6 +11,23 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.115] - 2026-09-26
+
+Follow-ups found while fixing clients and docs against 0.1.114.
+
+### Fixed
+
+- **`lease_duration_secs` is optional on `POST /jobs/{id}/heartbeat`.** Omitted,
+  it renews for the default claim lease (`WORKER_LEASE_DURATION_SECS`, 30 s). It
+  was required, and the Go SDK's `Heartbeat` leaves it out unless the caller sets
+  it, so those heartbeats were all 422s. Out-of-range values are still rejected.
+- **`413 PAYLOAD_TOO_LARGE` names the plan to upgrade to** (`"upgrade_to":
+  "starter"`), like every quota error; it was a bare `true`.
+- README: the production compose command listed a `pgbouncer` service that
+  `docker-compose.prod.yml` does not define, so it failed with "no such service".
+
+---
+
 ## [0.1.114] - 2026-09-26
 
 Fixes from a production QA pass (2026-09-26). Every item was re-verified against

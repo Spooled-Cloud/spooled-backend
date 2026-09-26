@@ -560,7 +560,7 @@ JSON_LOGS=true
 EOF
 
 # Deploy without the optional Cloudflare Tunnel sidecar
-docker compose -f docker-compose.prod.yml up -d db pgbouncer redis backend prometheus grafana
+docker compose -f docker-compose.prod.yml up -d db redis backend prometheus grafana
 
 # To start cloudflared too, add CLOUDFLARE_TUNNEL_TOKEN from your secret manager,
 # configure the documented routes, and run the full-stack command instead.

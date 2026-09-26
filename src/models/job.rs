@@ -370,13 +370,16 @@ pub struct HeartbeatJobRequest {
     #[validate(length(min = 1, max = 255, message = "Worker ID must be 1-255 characters"))]
     pub worker_id: String,
 
-    /// New lease duration from now (in seconds)
+    /// New lease duration from now (in seconds). Omitted = the default claim
+    /// lease (`WORKER_LEASE_DURATION_SECS`, 30). It used to be required, and the
+    /// Go SDK's `Heartbeat` leaves it out unless set, so every such heartbeat
+    /// was a 422.
     #[validate(range(
         min = 5,
         max = 3600,
         message = "Lease duration must be between 5 and 3600 seconds"
     ))]
-    pub lease_duration_secs: i64,
+    pub lease_duration_secs: Option<i64>,
 
     /// Lease fencing token from the claim response. When provided, the
     /// renewal succeeds only if it matches the job's current lease.

@@ -783,3 +783,79 @@ async fn admin_rejects_duplicate_billing_email_and_bad_sort() {
     .await;
     assert_eq!(status, StatusCode::OK);
 }
+
+// ---------------------------------------------------------------------------
+// Heartbeat without lease_duration_secs uses the default lease instead of 422;
+// a payload-too-large error names the plan to upgrade to.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn heartbeat_default_lease_and_payload_upgrade_hint() {
+    let db = TestDatabase::new().await;
+    let t = seed_tenant(db.pool(), "free").await;
+    let app = app(&db, None).await;
+
+    let (_, created) = call(
+        &app,
+        "POST",
+        "/api/v1/jobs",
+        Some(&t.key),
+        Some(json!({"queue_name": "qa-hb", "payload": {}})),
+    )
+    .await;
+    let job_id = created["id"].as_str().unwrap().to_string();
+    let (_, claimed) = call(
+        &app,
+        "POST",
+        "/api/v1/jobs/claim",
+        Some(&t.key),
+        Some(json!({"queue_name": "qa-hb", "worker_id": "w1"})),
+    )
+    .await;
+    let lease_id = claimed["jobs"][0]["lease_id"].as_str().unwrap().to_string();
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        &format!("/api/v1/jobs/{job_id}/heartbeat"),
+        Some(&t.key),
+        Some(json!({"worker_id": "w1", "lease_id": lease_id})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (expires,): (chrono::DateTime<chrono::Utc>,) =
+        sqlx::query_as("SELECT lease_expires_at FROM jobs WHERE id = $1")
+            .bind(&job_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    let secs = (expires - chrono::Utc::now()).num_seconds();
+    assert!(
+        (20..=31).contains(&secs),
+        "default lease should be ~30s, got {secs}"
+    );
+
+    // Explicit out-of-range values are still rejected.
+    let (status, _) = call(
+        &app,
+        "POST",
+        &format!("/api/v1/jobs/{job_id}/heartbeat"),
+        Some(&t.key),
+        Some(json!({"worker_id": "w1", "lease_id": lease_id, "lease_duration_secs": 1})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Free plan payload cap is 64 KiB.
+    let big = "x".repeat(70_000);
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/v1/jobs",
+        Some(&t.key),
+        Some(json!({"queue_name": "qa-hb", "payload": {"blob": big}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(body["code"], "PAYLOAD_TOO_LARGE");
+    assert_eq!(body["upgrade_to"], "starter", "{body}");
+}

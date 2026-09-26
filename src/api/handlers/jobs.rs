@@ -808,7 +808,9 @@ pub async fn heartbeat(
             &ctx.organization_id,
             request.lease_id.as_deref(),
             ctx.queue_scope_filter(),
-            request.lease_duration_secs,
+            request
+                .lease_duration_secs
+                .unwrap_or(state.settings.worker.lease_duration_secs as i64),
         )
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;

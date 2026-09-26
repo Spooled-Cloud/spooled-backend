@@ -515,7 +515,9 @@ pub async fn check_payload_size(
                     "current": current,
                     "limit": limit,
                     "plan": plan,
-                    "upgrade_to": upgrade_to.is_some()
+                    // The plan to move to, as on every quota error (was a bare
+                    // `true`); null on the top plan.
+                    "upgrade_to": upgrade_to
                 })),
             )
                 .into_response(),

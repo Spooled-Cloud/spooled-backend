@@ -4498,13 +4498,14 @@ components:
 
     HeartbeatJobRequest:
       type: object
-      required: [worker_id, lease_id, lease_duration_secs]
+      required: [worker_id, lease_id]
       properties:
         lease_duration_secs:
           type: integer
           minimum: 5
           maximum: 3600
-          description: New lease duration from now, in seconds
+          default: 30
+          description: New lease duration from now, in seconds. Omitted → `WORKER_LEASE_DURATION_SECS` (30); required before 0.1.115.
         worker_id:
           type: string
         lease_id:

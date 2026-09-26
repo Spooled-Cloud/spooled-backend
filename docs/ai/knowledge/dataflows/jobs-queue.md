@@ -49,7 +49,8 @@ Manual `POST /jobs/{id}/retry` resets `retry_count` to 0 and removes the job's
 `dead_letter_queue` row, like `POST /jobs/dlq/retry` (it used to increment, leaving
 `retry_count > max_retries`).
 
-REST claim default lease = `WORKER_LEASE_DURATION_SECS` (30). gRPC `Dequeue` default
+REST claim default lease = `WORKER_LEASE_DURATION_SECS` (30); since 0.1.115 a
+heartbeat that omits `lease_duration_secs` renews for that same default (it was a 422). gRPC `Dequeue` default
 is 300 (`grpc/services/queue_service.rs` `DEFAULT_LEASE_DURATION_SECS`).
 
 REST validation allows `max_retries` range `min = 0` (`models/job.rs` ~214).
