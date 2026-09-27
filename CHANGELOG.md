@@ -11,6 +11,22 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.116] - 2026-09-26
+
+Dependency and toolchain maintenance (Dependabot #45, #48). No API or behaviour
+change; the full suite, including `tests/qa_regression_tests.rs`, passes on the
+combined tree.
+
+### Changed
+
+- Build image: `rust:1.98-bookworm` (was 1.96).
+- `jsonwebtoken` 11 (HS256 encode/decode unchanged, so tokens issued by earlier
+  versions stay valid), `validator` 0.21, `base64` 0.23, OpenTelemetry 0.33 /
+  `tracing-opentelemetry` 0.34 (optional `otel` feature), `serial_test` 4 (dev),
+  plus 17 semver-compatible updates in `Cargo.lock`.
+
+---
+
 ## [0.1.115] - 2026-09-26
 
 Follow-ups found while fixing clients and docs against 0.1.114.

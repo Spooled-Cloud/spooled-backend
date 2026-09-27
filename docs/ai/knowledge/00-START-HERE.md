@@ -1,7 +1,7 @@
 # Spooled Backend — Agent Knowledge Base
 
 **Repo:** public OSS (`Spooled-Cloud/spooled-backend`)  
-**Version at cartography:** `0.1.115` (optional heartbeat lease, 413 `upgrade_to` plan string; QA v1 pass: API-key `permissions` rejected, global SSE forwards job events, logout revokes the session, implicit queues capped/counted, queue-config defaults applied, error bodies normalized; email-signup gating, job/queue/webhook response contracts and organization-settings handling re-surveyed for 0.1.112; auth, outgoing-webhook and worker-registration surfaces were re-surveyed for 0.1.111; the underlying 0.1.109 cartography was live re-verified 2026-07-15 ~06:07Z, tip `fa5e157` CI green, SaaS `RATE_LIMIT_FAIL_CLOSED=true`)  
+**Version at cartography:** `0.1.116` (deps: jsonwebtoken 11, validator 0.21, Rust 1.98 image; optional heartbeat lease, 413 `upgrade_to` plan string; QA v1 pass: API-key `permissions` rejected, global SSE forwards job events, logout revokes the session, implicit queues capped/counted, queue-config defaults applied, error bodies normalized; email-signup gating, job/queue/webhook response contracts and organization-settings handling re-surveyed for 0.1.112; auth, outgoing-webhook and worker-registration surfaces were re-surveyed for 0.1.111; the underlying 0.1.109 cartography was live re-verified 2026-07-15 ~06:07Z, tip `fa5e157` CI green, SaaS `RATE_LIMIT_FAIL_CLOSED=true`)  
 **Load this folder before editing queue, auth, billing, gRPC, or webhooks.**
 
 ## Read order
