@@ -5,12 +5,12 @@
 1. Read `Authorization: Bearer …` — **header only** (`authenticate_api_key`). Since **0.1.111** `?token=` / `?api_key=` on a general REST route is a `401`; the query fallback lives on a separate realtime router (see Realtime).
 2. If token starts with `eyJ` → JWT path (signature, blacklist, **re-check** active/expiry/queues from DB).
 3. Else → API key (`sp_` / legacy `sk_`) through `authenticate_api_key_token`
-   (`src/api/middleware/auth.rs:389`) → `resolve_api_key` (`:443`); see "API key
+   (`src/api/middleware/auth.rs:421`) → `resolve_api_key` (`:480`); see "API key
    resolution" below. The same function serves `/auth/login` and gRPC.
 4. Context carries `organization_id` + queue scope (`can_access_queue`).
 5. A database failure while authenticating is `503 SERVICE_UNAVAILABLE`
    "Authentication is temporarily unavailable" (pool timeout/closed, I/O, TLS) or
-   `500` "Authentication failed" (`auth_db_error` `:532`, code mapping `:40`). The
+   `500` "Authentication failed" (`auth_db_error` `:717`, code mapping `:40`). The
    sqlx text is logged, never returned (BEOPS-27; it used to be a 500 with the raw
    error, and the `is_active` recheck turned a DB error into "API key is inactive").
    Applies to the API-key path and both JWT-path queries; `/auth/login` keeps a plain
@@ -94,11 +94,89 @@ empty `X-Admin-Key` header pass closed registration and signup, and an empty
 `STRIPE_BILLING_WEBHOOK_SECRET` verified forged webhooks (BE-43). The gates also
 refuse an empty configured key explicitly.
 
+## Client IP: TCP peer, edge headers, IPv6 /64 (0.1.120, BEAUTH-10, BEBILL-24)
+
+`main.rs` serves with `into_make_service_with_connect_info::<SocketAddr>()`, so each request carries its TCP
+peer. `client_ip_from_peer(headers, peer, settings)` (`src/api/middleware/client_ip.rs:117`) is the one resolver;
+the unreduced address (Turnstile `remoteip`) is `resolve_client_addr` (`:130`). Order of trust:
+
+1. `TRUSTED_CLIENT_IP_HEADER`, believed from **any** peer (a request without it falls through to steps 3-4; the
+   built-in edge headers are not consulted when it is set);
+2. otherwise `CF-Connecting-IP`, then `X-Real-IP`, **only** when the peer is internal (`is_internal_peer` `:93`:
+   loopback, 10/8, 172.16/12, 192.168/16, 169.254/16, `::1`, `fc00::/7`, `fe80::/10`; IPv4-mapped IPv6 is judged as
+   IPv4) or unknown (`None`: a router driven without `ConnectInfo`, as the integration tests do);
+3. `X-Forwarded-For` counted from the right past `TRUSTED_PROXY_HOPS` (never with the default 0);
+4. the peer itself, then `unknown` (no peer and no header: tests only).
+
+The result goes through `rate_limit_id` (`:177`): an IPv6 address becomes its /64 (`2001:db8:1:2::/64`), an
+IPv4-mapped one plain IPv4, so rotating addresses inside a /64 mints no buckets. Callers: the public and admin
+limiters (`plan_rate_limit.rs` `extract_client_id`), the failed-auth budget (`middleware/auth.rs:244`; `/auth/login`
+`handlers/auth.rs`, which takes the `PeerAddr` extractor `client_ip.rs:80` that never rejects), `check-email`,
+`check-slug` (`organizations.rs`), email start and verify. New code that limits by address must take `PeerAddr`
+(handlers) or call `peer_addr(request.extensions())` (middleware) and use `client_ip_from_peer`; the old
+two-argument `client_ip(headers, settings)` was removed because it treated the peer as unknown and kept the old
+trust (a client reaching the backend directly could name its own bucket with `CF-Connecting-IP`).
+
+Production: cloudflared reaches the backend over the docker network (a private peer), so `CF-Connecting-IP` is
+believed with no configuration. `Settings::load` logs one `warn!` while `TRUSTED_CLIENT_IP_HEADER` is unset in
+production (`client_ip_warning` `config/mod.rs:613`). Setting it to `CF-Connecting-IP` there is safe (the backend port
+is not published). A self-hosted proxy that connects from a public address without the setting puts every caller in
+its one bucket (runbook `docs/guides/runbooks/auth-token-issues.md`, Scenario H). Tests:
+`w4_authrl_public_peer_cannot_choose_its_bucket_with_edge_headers`,
+`w4_authrl_the_server_keys_a_bare_client_on_its_tcp_address`, `w4_authrl_check_slug_budget_follows_the_peer`.
+**W4-05 (P3, open):** no peer-aware regression test for `/auth/login` or the REST failed-auth budget.
+
+## Email login throttles, Turnstile, single-use codes (0.1.120, BEAUTH-06, -11, -24, FESF-15)
+
+All Redis keys are fixed windows (`spend_budget` `email_login.rs:138`); `{ip}` is the `rate_limit_id`.
+
+| Route | Key | Limit | Over the limit |
+|-------|-----|-------|----------------|
+| start | `email_start:minute:{ip}`, `email_start:hour:{ip}` | 3 per 60 s, 10 per 3600 s | 429 `RATE_LIMIT_EXCEEDED` + `Retry-After` + `details.retry_after_seconds` (`check_start_rate_limit` `:325`); a Redis error is open, or a 429 "temporarily unavailable" with `RATE_LIMIT_FAIL_CLOSED` |
+| verify | `email_verify_attempts:{email}:{ip}` | 5 per 600 s | 429 "Too many attempts. Please try again in N minutes." |
+| verify | `email_verify_ceiling:{email}` | 20 per 600 s, spent only after the strict budget passed | 429 "Too many attempts for this address. ..." |
+
+(`spend_verify_attempt` `:876`, `too_many_requests` `:92`.) The DB cap of 5 codes per address per hour is unchanged
+(429 without `Retry-After`). Before 0.1.120 a throttled verify was a 401 and the budget was 5 guesses per address from
+everybody, so a stranger could lock a known email out (BEAUTH-06; the B-26 fix was incomplete).
+
+- While the Redis budgets are enforced a login code tolerates 40 attempts (`MAX_ATTEMPTS_PER_LOGIN_CODE` `:46` = 2 x the
+  ceiling), so guessing within the budgets never invalidates the owner's code: it slows, never blocks. Without Redis
+  (`spend_verify_attempt` returns false; verify has no fail-closed mode) the per-code cap is 5 as before and a stranger
+  can spend it. Trade-off: against a guesser spread over more than 4 client addresses the worst case rises from about 75
+  to about 200 code comparisons per address per hour, out of 10^6 codes.
+- **W4-04 (P3, open):** the 20 per 10 minutes per-address ceiling can still be burnt by one guesser who spans the /64s
+  of an IPv6 /56 (256 x 5 guesses); the owner then waits out the window and no code is invalidated.
+- Turnstile (`verify_turnstile` `:371`): checked only when `TURNSTILE_SECRET_KEY` is set (`settings.turnstile`,
+  `config/mod.rs:308,591`; `verify_url` is the Cloudflare siteverify URL, a mock only in tests). It POSTs `secret`,
+  `response`, `remoteip` as a form with a 10 s timeout; a missing, rejected or unverifiable token is 400
+  `CAPTCHA_FAILED` (**fails closed**). The per-IP throttle runs first. Keep the secret unset until the site and the
+  dashboard both send `turnstile_token` (max 2048 characters).
+- Code rows are written **after** the mail send succeeds (login `start` and billing-email verification), so a provider
+  outage no longer uses the hourly allowance. **W4-03 (P3, open):** that widens the check-then-insert race on the
+  5 per hour cap, so concurrent starts for one address can send more than 5 mails (a hard fix needs a reservation row or
+  an advisory lock). If the INSERT fails after a successful send, the user holds a code that never verifies (logged,
+  500).
+- A code is consumed with `UPDATE email_login_codes SET used_at = NOW() WHERE id = $1 AND used_at IS NULL` and
+  `rows_affected` is checked (`:727`); the loser of a race gets 401 "Invalid or expired code" (BEAUTH-24), so parallel
+  verifies of one code mint one session or one signup token.
+
+## System API key: the email-login key (0.1.120, BEAUTH-08, BEBILL-09)
+
+`api_keys.is_system` (migration `20261012110000`) marks keys Spooled creates itself: today only the "Email Login" key
+behind dashboard sessions (prefix `sp_email`). `get_or_create_email_api_key` (`email_login.rs:1585`) finds it by
+`is_system = TRUE AND is_active`, never by name (a customer key may be named "Email Login"); it is excluded from
+`max_api_keys` (`get_org_resource_counts`), listed with `is_system: true`, and revoking it ends the dashboard session
+as before. API create/update never write the flag. Residual: SELECT-then-INSERT with no lock or unique constraint, so
+two concurrent verifies of different codes for one org can each create a system key (harmless, both are outside the
+cap). During a rolling deploy an old pod can still insert an unmarked "Email Login" key; re-run the backfill in
+`docs/guides/deployment.md`, "0.1.120 checks".
+
 ## API key resolution (0.1.119)
 
-One implementation, `resolve_api_key` (`src/api/middleware/auth.rs:476`), behind
-`authenticate_api_key_token` (`:417`: active/expiry checks + `touch_last_used`). Callers:
-the REST middleware, `/auth/login` (`src/api/handlers/auth.rs:240`) and gRPC
+One implementation, `resolve_api_key` (`src/api/middleware/auth.rs:480`), behind
+`authenticate_api_key_token` (`:421`: active/expiry checks + `touch_last_used`). Callers:
+the REST middleware, `/auth/login` (`src/api/handlers/auth.rs:245`) and gRPC
 (`src/grpc/auth.rs:182` `validate_api_key`). Each passes the `FailedAuthBudget` (`:109`) its
 failures are charged to, which also picks its scan lane (`lane()` `:133`): `ClientIp` for REST
 and login (lane `Rest`), `Grpc` for gRPC (lane `Grpc`). Order:
@@ -107,31 +185,31 @@ and login (lane `Rest`), `Grpc` for gRPC (lane `Grpc`). Order:
    bcrypt; revoke/update clears it for REST, login and gRPC alike.
 2. Negative cache `auth_miss:{sha256}` (`AUTH_MISS_TTL_SECS` = 60 s, `:143`), written only
    after a legacy scan that ran found nothing.
-3. Indexed `lookup_hash` row + one bcrypt verify (`find_by_lookup_hash` `:743`).
-4. Legacy stage (`resolve_legacy` `:649`), for a token that missed 1-3:
-   - **Single flight** (`LegacyFlight` `:578`, W3R-07): concurrent requests for one token on
+3. Indexed `lookup_hash` row + one bcrypt verify (`find_by_lookup_hash` `:747`).
+4. Legacy stage (`resolve_legacy` `:653`), for a token that missed 1-3:
+   - **Single flight** (`LegacyFlight` `:582`, W3R-07): concurrent requests for one token on
      one lane share one scan. The first holds the flight's lock and leads; the others wait at
-     most `LEGACY_FLIGHT_MAX_WAIT` = 20 s (`:572`) and take its outcome (found / missed / busy)
+     most `LEGACY_FLIGHT_MAX_WAIT` = 20 s (`:576`) and take its outcome (found / missed / busy)
      without a charge or a scan of their own. A leader that leaves without an outcome
      (cancelled, over budget, database error) hands the lead to the next waiter.
-   - **Budget charged before the scan** (`charge_failed_auth` `:901`, W3R-08): the leader
+   - **Budget charged before the scan** (`charge_failed_auth` `:905`, W3R-08): the leader
      INCRs the 60 s fixed-window counter, then compares it to the limit. REST and login:
      `FAILED_AUTH_PER_IP_LIMIT` = 20 (`:87`), Redis `auth_fail:{client_ip}`, keyed by
-     `api::middleware::client_ip` (returns `unknown` without trusted headers, so behind a bare
-     proxy everyone shares one bucket). gRPC: `FAILED_AUTH_GRPC_LIMIT` = 60 (`:98`), one Redis
+     `client_ip_from_peer` (TCP peer plus trusted edge header, an IPv6 caller as its /64; see
+     "Client IP" above). gRPC: `FAILED_AUTH_GRPC_LIMIT` = 60 (`:98`), one Redis
      key `auth_fail_grpc` (`:102`) for every gRPC caller (W3R-06). Over the limit: 401, no scan,
-     not negatively cached, stays charged. The charge is refunded (`refund_failed_auth` `:926`,
+     not negatively cached, stays charged. The charge is refunded (`refund_failed_auth` `:930`,
      `DECR`, key deleted at 0) when the scan or the final `lookup_hash` retry finds the key, the
      turn stays busy, or the scan hits a database error; it stays when the scan misses or the
      request is cancelled. So concurrent unknown tokens cannot all read the counter before any
      is charged, a client that hangs up mid-scan has paid, and a burst for a dormant legacy key
      costs its address nothing.
-   - **Scan** (`scan_legacy_keys` `:778`, candidates `legacy_candidates` `:834`: active,
+   - **Scan** (`scan_legacy_keys` `:782`, candidates `legacy_candidates` `:838`: active,
      `lookup_hash IS NULL`, the token's 8-char prefix or none, `LIMIT 100`) on the lane's turn
      (`bcrypt_gate::legacy_scan_turn`). A request that had to wait re-checks the record cache,
      the negative cache and `lookup_hash` first (the scan it waited for, on the other lane or
      another replica, may have resolved the token), then reads the candidates again. A match is
-     backfilled (`backfill_lookup_hash` `:862`, awaited, as its own task so a cancelled request
+     backfilled (`backfill_lookup_hash` `:866`, awaited, as its own task so a cancelled request
      still completes it). If the turn stays busy for the bounded wait the result is `Busy`: 503
      `SERVICE_UNAVAILABLE` with `Retry-After: 5` (`AUTH_RETRY_AFTER_SECS` `:70`, added by
      `auth_error_response` `:44` to every auth 503) on REST and `/auth/login`, `UNAVAILABLE` on
@@ -154,8 +232,9 @@ bucket, 20 bogus keys a minute from anyone (60 over gRPC) disable the legacy sca
 caller of that bucket (modern keys unaffected); unknown tokens under a lane's budget can keep
 that lane's turn busy, so its legacy keys may get a 503 (retry works, nothing is cached) but
 the other lane's never do; a scan of close to 100 legacy rows plus the turn wait can exceed the
-30 s request timeout; the REST budget is only as good as `client_ip` (without
-`TRUSTED_CLIENT_IP_HEADER` it trusts `CF-Connecting-IP` / `X-Real-IP`). Production had 10
+30 s request timeout; the REST budget is only as good as the client address (without
+`TRUSTED_CLIENT_IP_HEADER`, `CF-Connecting-IP` / `X-Real-IP` count only from an internal peer;
+any other caller is keyed on its own address). Production had 10
 active legacy keys at the 2026-10-11 review; they stay supported (operator decision).
 
 bcrypt gate (`src/api/middleware/bcrypt_gate.rs`): every `bcrypt::verify` on a request path goes
@@ -181,7 +260,7 @@ Its per-key `login_attempts` limiter and its `last_used` write are unchanged.
 
 ## API key bookkeeping
 
-`api_keys.last_used` is written at most **once per key per 5 minutes**, not once per request (`touch_last_used` + Redis `SET NX` write guard `api_key_last_used:{id}`, `src/api/middleware/auth.rs:1016`, interval `:1001`). Deliberate write-amplification cap. Treat it as "was active in this 5-minute bucket", never as a live request timestamp. Since 0.1.119 gRPC uses the same debounced function (it used to spawn an UPDATE on every RPC).
+`api_keys.last_used` is written at most **once per key per 5 minutes**, not once per request (`touch_last_used` + Redis `SET NX` write guard `api_key_last_used:{id}`, `src/api/middleware/auth.rs:1020`, interval `:1005`). Deliberate write-amplification cap. Treat it as "was active in this 5-minute bucket", never as a live request timestamp. Since 0.1.119 gRPC uses the same debounced function (it used to spawn an UPDATE on every RPC).
 
 ## gRPC (`grpc/auth.rs`)
 

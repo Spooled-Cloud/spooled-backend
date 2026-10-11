@@ -11,6 +11,251 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.120] - 2026-10-11
+
+Fixes from the 2026-10-10 bug hunt (wave 4): Stripe checkout trust, plan limits,
+client-IP handling and the email-login throttles.
+
+### Upgrade notes
+
+- **Stripe: send two more events to the billing webhook.** In the Stripe
+  dashboard, the `/api/v1/billing/webhook` endpoint must also send
+  `checkout.session.async_payment_succeeded` and
+  `checkout.session.async_payment_failed` (next to the six it has). Until then a
+  checkout paid by a delayed method (SEPA, ACH) is never linked to its
+  organization (BEBILL-15).
+- **Payment Link checkouts are no longer trusted.** A completed checkout is
+  trusted only when it carries the organization in its metadata, which only the
+  new `POST /api/v1/billing/checkout` sets. A legacy Payment Link checkout (the
+  organization named by `client_reference_id`, a URL parameter anyone can edit)
+  now links only an organization that has no live subscription and whose
+  verified billing email the payer used at checkout, and it never cancels
+  anything. Any other legacy checkout is acknowledged and not linked, so the
+  customer pays and stays on the old plan until you link them by hand. Watch the
+  logs for `Not linking a Payment Link checkout` (organization id, customer id,
+  subscription id, event id). An upgrade through a Payment Link no longer
+  cancels the old subscription either: cancel it in Stripe or the billing portal
+  (BEBILL-02).
+- **The website and the dashboard must switch to `POST /api/v1/billing/checkout`**
+  (body `{"plan": "starter" | "pro"}`, redirect to the returned `url`) together
+  with, or right after, this release. Deactivate the public Payment Links in
+  Stripe once nothing uses them.
+- **`TURNSTILE_SECRET_KEY` stays unset** until both the marketing site and the
+  dashboard render the Turnstile widget and send `turnstile_token` to
+  `POST /auth/email/start`. Once it is set, a start request without a valid
+  token is `400 CAPTCHA_FAILED` (BEAUTH-11, FESF-15).
+- **Client IPs: edge headers count only from a private peer.** Without
+  `TRUSTED_CLIENT_IP_HEADER`, `CF-Connecting-IP` and `X-Real-IP` are believed
+  only when the TCP peer is a loopback, private, link-local or unique-local
+  address (a proxy on the same host or network, like production's cloudflared);
+  any other caller is rate-limited by its own address. Production needs no
+  change and logs one warning at boot while the header is unset. A self-hosted
+  proxy that reaches the backend from a public address must set
+  `TRUSTED_CLIENT_IP_HEADER`, or every caller shares that proxy's one bucket
+  (BEAUTH-10).
+- **Throttled `POST /auth/email/verify` answers 429**, with `Retry-After`, not
+  401. A client that matched on 401 for "too many attempts" must handle 429
+  (BEAUTH-06).
+- **`-1` in a `custom_limits` resource cap now means unlimited** (the eight
+  caps `max_jobs_per_day` to `max_webhooks`; it used to be ignored, which meant
+  the plan default), as `null` does and as `-1` does in the `SPOOLED_PLAN_*`
+  variables. The admin API now rejects invalid `custom_limits`
+  (see Limits). Run the checks in `docs/guides/deployment.md`, "0.1.120 checks",
+  after the rollout (BEBILL-07, BEBILL-26).
+- **Admin soft delete now also pauses the organization's schedules, disables its
+  outgoing webhooks and removes its incoming-webhook token**, and restoring
+  `plan_tier` does not turn any of them back on. Organizations soft-deleted
+  before this release keep their active schedules and enabled webhooks in the
+  database until you stop them (SQL in the same guide) (BEFLOW-06, BEAUTH-15).
+- **`max_workflows` counts pending and running workflows only**, so finished runs
+  no longer hold a slot (operator decision). Plan numbers are unchanged
+  (BEBILL-10, BEFLOW-17).
+- **`GET /billing/status` needs an unrestricted API key** (queue-scoped keys get
+  403), like the billing portal (BEBILL-23).
+- `FRONTEND_URL` is optional: it is the website base URL Stripe Checkout returns
+  to (`<FRONTEND_URL>/account/billing?checkout=success|cancel`), default
+  `https://spooled.cloud`. `docker-compose.prod.yml` forwards it, and
+  `TURNSTILE_SECRET_KEY`.
+- Three new migrations run at startup (listed below). All three are quick: a
+  column with a constant default, function definitions, and one small `UPDATE`
+  of `api_keys`. During a rolling deploy an old pod's email login can still
+  insert an `Email Login` key that is not marked as a system key; the backfill
+  in the guide fixes it and is safe to re-run.
+
+### Billing
+
+- **Server-side checkout.** `POST /api/v1/billing/checkout` creates a Stripe
+  Checkout Session bound to the authenticated organization: the session and its
+  subscription carry `metadata.spooled_org_id`, and `client_reference_id` is
+  set too. It reuses the organization's Stripe customer, otherwise Checkout is
+  prefilled with the verified billing email. Needs an unrestricted key. `400`
+  when `plan` is not `starter` or `pro`, `409` when the organization already has
+  that plan with an active or trialing subscription (use the billing portal),
+  `503` when Stripe, the plan's price id or the Stripe call is unavailable
+  (BEBILL-02, BE-08).
+- **Completed checkouts are trusted through metadata only.** Before, anyone who
+  knew an organization id could open a Payment Link with that id, pay for a
+  plan, take over that organization's billing and have its real subscription
+  cancelled. Legacy Payment Link checkouts follow the rule in the upgrade notes
+  (BEBILL-02).
+- **A replaced subscription is cancelled reliably.** When a server-created
+  checkout replaces a live subscription, the old id is recorded in
+  `organizations.stripe_superseded_subscription_ids` by the same statement that
+  relinks the organization, and removed only after Stripe confirms the cancel
+  (a 2xx, a 404, or a rejected cancel of a subscription that has already ended).
+  A failed cancel makes the webhook answer 5xx so Stripe redelivers the event,
+  instead of leaving the customer billed twice. The cancel pass also runs when
+  the relink itself was skipped as stale, and never cancels the organization's
+  current subscription. All Stripe API calls now time out after 10 s (5 s to
+  connect); the cancel used to wait 20 s and the others did not time out
+  (BEBILL-14).
+- **A second subscription of the same Stripe customer no longer takes over the
+  organization.** Checkout now reuses the customer, so
+  `customer.subscription.created` for the new subscription could arrive before
+  `checkout.session.completed` and hide the old one, which was then never
+  cancelled. `customer.subscription.created/updated` for a different
+  subscription are ignored while the organization's current one is live; the
+  completed checkout moves the organization over (BEBILL-14).
+- **Delayed payments are linked.** `checkout.session.async_payment_succeeded`
+  links the organization like `checkout.session.completed` does;
+  `checkout.session.completed` with `payment_status=unpaid` stays an
+  acknowledged no-op (the money arrives as its own event); and
+  `checkout.session.async_payment_failed` is logged at warn level and links
+  nothing (BEBILL-15).
+- **Events that arrive before the checkout link answer 409, not 500.**
+  `customer.subscription.created/updated`, `invoice.paid` and
+  `invoice.payment_failed` for a customer that is not linked yet (and younger
+  than 24 h) are logged at info level and answered `409 CONFLICT`; Stripe retries
+  any non-2xx exactly as before. This was an error-level log and a 500 on every
+  new subscription (BEBILL-25).
+- `GET /billing/status` requires an unrestricted key (BEBILL-23).
+
+### Limits
+
+- **The email-login key is a system key.** `api_keys.is_system` marks keys
+  Spooled creates itself; today that is only the `Email Login` key behind
+  dashboard sessions. System keys are excluded from `max_api_keys` (a Free
+  organization's second key slot is no longer used up by its first email
+  login), are shown as `is_system: true` in `GET /api-keys`,
+  `GET /api-keys/{id}` and the `PUT` response, and are found by the flag rather
+  than by name. No request can set the flag (BEAUTH-08, BEBILL-09).
+- **`max_workflows` counts only pending and running workflows** (BEBILL-10,
+  BEFLOW-17). Retrying a failed workflow turns it back into a running one, so
+  `POST /workflows/{id}/retry` now takes the workflows lock and pays the cap
+  first: `429 QUOTA_EXCEEDED` at the cap, `403 feature_disabled` on a plan
+  without workflows (W4-01).
+- **Re-activating through `PUT` pays the cap.** `PUT /api-keys/{id}` and
+  `PUT /schedules/{id}` with `is_active: true` check the plan cap the way create
+  and `/resume` do (`429 QUOTA_EXCEEDED`), under the per-organization lock and
+  against the row's current state, so two concurrent re-activations of one row
+  are charged once and turning a row off never fails on quota. A re-activated
+  schedule's next run is computed from now instead of firing the run it missed
+  while paused (BEAUTH-09, BEBILL-06, BEFLOW-07).
+- **`custom_limits` is validated.** `PATCH /admin/organizations/{id}` answers
+  `400 VALIDATION_ERROR`, listing every problem at once, for a value that is not
+  an object, an unknown key, a non-integer, a negative number (except `-1` on a
+  resource cap) or an out-of-range number; `null` and `{}` still reset. Retention
+  overrides are limited to 0..=36500 days. One table, `OVERRIDE_KEYS` in
+  `src/config/plans.rs`, drives both the validation and the runtime reading
+  (BEBILL-07, BEBILL-26).
+- **A bad stored retention override can no longer stop retention.** The sweep
+  cast `custom_limits` to an integer in SQL, so one organization with a string,
+  a fraction or an out-of-range number made the retention statements fail for
+  every organization, and a stored `-1` deleted all of that organization's
+  completed jobs. The sweep now reads overrides through
+  `custom_retention_days()`, which returns the plan default for anything that is
+  not a whole number of days (BEBILL-07).
+- **Admin soft delete stops everything that acts for the organization**, in one
+  transaction: keys revoked, schedules paused, outgoing webhooks disabled, the
+  incoming-webhook token removed, `plan_tier = 'deleted'`. The cron due-query
+  skips deleted organizations, and `POST /webhooks/{org_id}/custom` answers 404
+  for one, like for an unknown organization (BEFLOW-06, BEAUTH-15).
+- **Documentation:** an API key's `rate_limit` is requests per minute, checked
+  after the organization's plan limit, so it can only lower that limit
+  (BEBILL-12); a queue's `rate_limit` is stored and returned but not enforced
+  (see Deferred / known).
+
+### Auth and rate limits
+
+- **Client IP comes from the TCP peer.** The server now serves with the peer
+  address, and every limiter resolves the client the same way: the configured
+  `TRUSTED_CLIENT_IP_HEADER` from any peer; otherwise `CF-Connecting-IP` /
+  `X-Real-IP` only from a private peer; then `X-Forwarded-For` counted from the
+  right past `TRUSTED_PROXY_HOPS`; then the peer itself. This covers the public
+  and admin limiters, the failed-auth budget (REST middleware and
+  `/auth/login`), `check-email`, `check-slug`, and email-login start and verify.
+  A missing configured header falls back to the peer instead of one shared
+  `unknown` bucket. Before, a client that reached the backend directly could
+  choose its own bucket with `CF-Connecting-IP`. The old two-argument
+  `client_ip` helper is removed (BEAUTH-10).
+- **An IPv6 /64 is one client.** Rate-limit ids reduce an IPv6 address to its /64
+  (an IPv4-mapped address to plain IPv4), so rotating addresses inside a /64 no
+  longer gives fresh buckets. Existing IPv6 counters reset at deploy
+  (BEBILL-24).
+- **A stranger's wrong guesses no longer lock the owner out of email login.**
+  The strict verify budget is 5 guesses per 10 minutes per (address, client IP);
+  a per-address ceiling of 20 per 10 minutes only makes callers wait for the
+  window to end. While these Redis budgets are enforced, a login code tolerates 40
+  attempts, so guessing within the budgets never invalidates the owner's code
+  (without Redis the old per-code cap of 5 applies). Over a budget,
+  `POST /auth/email/verify` answers `429 RATE_LIMIT_EXCEEDED` with `Retry-After`
+  and a message naming the wait. The price: a guesser spread over more than four
+  client addresses can make about 200 code comparisons per address per hour (it
+  was about 75) out of 10^6 codes (BEAUTH-06).
+- **`POST /auth/email/start` is throttled per client IP** (3 per minute and 10
+  per hour; `429` with `Retry-After`; it fails open on a Redis error unless
+  `RATE_LIMIT_FAIL_CLOSED` is set) and accepts an optional `turnstile_token`,
+  checked with Cloudflare Turnstile when `TURNSTILE_SECRET_KEY` is set (`400
+  CAPTCHA_FAILED` when it is missing, rejected or cannot be verified; it fails
+  closed). A code the mail provider failed to send no longer uses up the
+  address's 5 codes per hour: the row is written after a successful send, for
+  login codes and for billing-email confirmation codes (BEAUTH-11, FESF-15).
+- **A login code works once, even when verified twice at the same moment.** The
+  code is consumed with `used_at IS NULL` and the row count checked, so parallel
+  verifies of one code create one session or one signup token (BEAUTH-24).
+
+### Migrations
+
+- `20261012100000_stripe_superseded_subscriptions.sql` (adds
+  `organizations.stripe_superseded_subscription_ids`)
+- `20261012110000_system_api_keys_and_active_workflow_count.sql` (adds
+  `api_keys.is_system` with a backfill of the `Email Login` keys, and redefines
+  `get_org_resource_counts` on top of the draining-workers definition)
+- `20261012110100_tolerant_retention_overrides.sql` (adds
+  `custom_retention_days(jsonb, text)`)
+
+### Deferred / known
+
+- **Queue `rate_limit` is stored, not enforced** (BEBILL-11, BEJOB-12; operator
+  decision). `PUT /queues/{name}/config` still accepts, validates, stores and
+  returns it, but no claim path enforces it, and enforcement is not built
+  (F02). The OpenAPI text and the doc comments now say so.
+- **W4-02 (P3, open).** Two server checkouts paid in two browser tabs: the older
+  event is skipped as stale, so its subscription stays billing and is never
+  linked. Needs an owner decision, because the obvious fix cancels a
+  subscription the customer has paid for.
+- **W4-03 (P3, open).** Writing the code row only after the mail is sent widens
+  the check-then-insert race on the 5 codes per hour cap: concurrent starts for
+  one address can send more than 5 codes.
+- **W4-04 (P3, open).** The per-address verify ceiling (20 per 10 minutes) can
+  still be burnt by one guesser who rotates through the /64s of an IPv6 /56; the
+  owner then waits out the window, and no code is invalidated.
+- **W4-05 (P3, open).** No peer-aware regression test covers `/auth/login` and
+  the REST failed-auth budget (the peer-aware tests cover the public limiter,
+  `check-slug` and email start).
+- Known billing limits: a checkout for a different plan cancels the previous
+  subscription at once and without proration (the portal is the fairer way to
+  change plans); invoice events are not scoped to the organization's current
+  subscription, so `invoice.payment_failed` for a replaced subscription of the
+  same customer can mark the organization `past_due` (paid entitlements stay);
+  deleting an organization does not cancel a superseded subscription whose
+  cancel is still pending; a subscription someone creates by hand in the Stripe
+  dashboard for an already linked customer is ignored while the organization's
+  current one is live, so switch the organization over through checkout or the
+  admin API.
+
+---
+
 ## [0.1.119] - 2026-10-11
 
 Fixes from the 2026-10-10 bug hunt (wave 3): the gRPC API, authentication cost,

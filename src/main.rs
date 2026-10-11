@@ -170,9 +170,14 @@ async fn main() -> Result<()> {
     // Serve HTTP until Ctrl+C / SIGTERM, or until one of the tasks above
     // stops on its own. Then shut everything down; after a failure the
     // process exits non-zero so the container restart policy brings it back.
-    let http = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_requested(shutdown_rx.clone()))
-        .into_future();
+    // The TCP peer rides along on every request: client-IP resolution believes
+    // CF-Connecting-IP / X-Real-IP only from an internal peer (a proxy of ours).
+    let http = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_requested(shutdown_rx.clone()))
+    .into_future();
     let mut http = std::pin::pin!(http);
     let mut http_done = false;
     let mut failure: Option<String> = None;

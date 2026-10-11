@@ -64,19 +64,41 @@ Configure via environment variables:
 
 Rate limits are tracked per client:
 - **API Key**: Hash of the API key
-- **IP Address**: See [Client IP Resolution](#client-ip-resolution) below
-- **User-Agent**: Fallback for unidentified clients
+- **IP Address**: See [Client IP Resolution](#client-ip-resolution) below. It also keys the
+  failed-auth budget, `check-email`, `check-slug` and the email-login throttles
+  (`POST /auth/email/start`: 3 per minute and 10 per hour per client; `POST /auth/email/verify`:
+  5 guesses per 10 minutes per address and client, plus 20 per address from all clients).
+  An IPv6 client counts as its whole /64.
+- There is no User-Agent fallback: an unidentified caller is keyed on its TCP peer address.
+
+Throttled email-login routes answer `429 RATE_LIMIT_EXCEEDED` with a `Retry-After` header.
 
 ### Client IP Resolution
 
 For unauthenticated traffic the limiter buckets by client IP, so where that IP comes from
-decides whether the limiter works at all. Headers are consulted in this order:
+decides whether the limiter works at all. The server sees the TCP peer of every request and
+resolves the client in this order:
 
-1. `TRUSTED_CLIENT_IP_HEADER`, if you set it (e.g. `CF-Connecting-IP`).
-2. Otherwise the built-in edge headers, `CF-Connecting-IP` then `X-Real-IP` — which is why
-   a deployment behind Cloudflare or nginx is covered without configuration.
+1. `TRUSTED_CLIENT_IP_HEADER`, if you set it (e.g. `CF-Connecting-IP`). It is believed from
+   **any** peer: you are telling Spooled that a proxy of yours always sets it. If the header
+   is missing on a request, the steps below still apply (and the built-in edge headers of step
+   2 are not consulted), ending at the peer address.
+2. Otherwise the built-in edge headers, `CF-Connecting-IP` then `X-Real-IP`, but **only when the
+   TCP peer is a loopback, private (RFC 1918), link-local or IPv6 unique-local address**, i.e.
+   a proxy on the same host or network. Production's Cloudflare Tunnel connects from the docker
+   network, so it needs no configuration. A caller that reaches the backend from any other
+   address cannot choose its bucket with these headers.
 3. `X-Forwarded-For`, read from the **right**, skipping `TRUSTED_PROXY_HOPS` entries.
 4. The socket peer address.
+
+An IPv6 address is reduced to its /64 (an IPv4-mapped address to plain IPv4) before it is used
+as a rate-limit key, because one subscriber is usually handed a whole /64.
+
+Production logs one warning at boot while `TRUSTED_CLIENT_IP_HEADER` is unset. If your proxy
+reaches the backend from a **public** address, step 2 does not apply and every caller would share
+that proxy's one bucket: set `TRUSTED_CLIENT_IP_HEADER` (`CF-Connecting-IP` behind Cloudflare,
+`X-Real-IP` behind nginx). Setting `TRUSTED_CLIENT_IP_HEADER=CF-Connecting-IP` is also safe on the
+production stack, where the backend port is not published.
 
 `X-Forwarded-For` is **not** consulted unless you set `TRUSTED_PROXY_HOPS`, and the default
 is `0`. Every proxy appends to that header, so its leftmost entry is whatever the caller
@@ -108,8 +130,12 @@ curl -X POST /api/v1/queues/emails/resume
 
 # Configure queue limits
 curl -X PUT /api/v1/queues/emails/config \
-  -d '{"max_concurrent_jobs": 100, "rate_limit_per_second": 50}'
+  -d '{"max_retries": 5, "default_timeout": 600, "rate_limit": 50}'
 ```
+
+`rate_limit` is accepted, validated, stored and returned, but it is **not enforced yet**: no claim
+path throttles a queue by it. The only enforced rate limits are the plan's request limit and an
+API key's `rate_limit` (requests per minute, checked after the plan limit, so it can only lower it).
 
 ### Backpressure Indicators
 
@@ -385,6 +411,30 @@ JWT_EXPIRATION_HOURS=24
 STRIPE_BILLING_WEBHOOK_SECRET=whsec_your-stripe-secret-min-16-chars
 ```
 
+The billing endpoint `/api/v1/billing/webhook` must be subscribed to these Stripe events:
+`checkout.session.completed`, `checkout.session.async_payment_succeeded`,
+`checkout.session.async_payment_failed`, `customer.subscription.created`,
+`customer.subscription.updated`, `customer.subscription.deleted`, `invoice.paid` and
+`invoice.payment_failed`. Without the two `async_payment_*` events a checkout paid by a delayed
+method (SEPA, ACH) is never linked to its organization.
+
+A paid plan is bought through `POST /api/v1/billing/checkout`, which creates a Checkout Session
+bound to the authenticated organization. Only such a session is trusted to say which
+organization paid. A legacy Payment Link checkout (organization named by a `client_reference_id`
+anyone can edit) links only an organization with no live subscription whose **verified** billing
+email the payer used, and never cancels a subscription; otherwise the log shows
+`Not linking a Payment Link checkout` and the customer has to be linked by hand. Variables:
+`STRIPE_SECRET_KEY`, `STRIPE_STARTER_PRICE_ID`, `STRIPE_PRO_PRICE_ID` (checkout answers 503
+without them) and the optional `FRONTEND_URL` (where Checkout returns the customer,
+default `https://spooled.cloud`).
+
+### Login Codes: Turnstile
+
+`TURNSTILE_SECRET_KEY` turns on a Cloudflare Turnstile check for `POST /api/v1/auth/email/start`:
+the request must carry a valid `turnstile_token`, else `400 CAPTCHA_FAILED` (an unreachable
+Turnstile counts as failed). Keep it unset until the website and the dashboard both render the
+widget and send the token. The per-client throttle on that route applies either way.
+
 ### Custom Webhook Security
 
 Organizations can configure a webhook token in their settings. When set, incoming
@@ -460,7 +510,7 @@ A webhook is disabled automatically after 20 consecutive failed deliveries
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TRUSTED_CLIENT_IP_HEADER` | Unset | Edge header carrying the real client IP. Unset falls back to `CF-Connecting-IP`, then `X-Real-IP` |
+| `TRUSTED_CLIENT_IP_HEADER` | Unset | Edge header carrying the real client IP, believed from any peer once set. Unset: `CF-Connecting-IP`, then `X-Real-IP`, believed only from a loopback/private/link-local peer |
 | `TRUSTED_PROXY_HOPS` | `0` | Entries **your own** proxies append to `X-Forwarded-For`, counted from the right. `0` means that header is never consulted |
 
 See [Client IP Resolution](#client-ip-resolution) for why the leftmost `X-Forwarded-For`
@@ -481,6 +531,16 @@ entry is not trusted.
 |----------|---------|-------------|
 | `EMAIL_PROVIDER` | `console` | `resend`, `sendgrid`, `postmark` or `smtp`. **Required when `RUST_ENV=production`**: the backend refuses to start with `console` (login codes would only be logged), and an unset or misspelled value resolves to `console` |
 | `EMAIL_API_KEY` | Unset | API key of the provider (SMTP uses `SMTP_*`) |
+| `TURNSTILE_SECRET_KEY` | Unset | Cloudflare Turnstile secret; when set, `POST /auth/email/start` requires a valid `turnstile_token` |
+
+### Billing
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `STRIPE_SECRET_KEY` | Unset | Stripe API key; without it checkout answers 503 |
+| `STRIPE_BILLING_WEBHOOK_SECRET` | Unset | Signing secret of the billing webhook endpoint |
+| `STRIPE_STARTER_PRICE_ID`, `STRIPE_PRO_PRICE_ID` | Unset | Price ids `POST /billing/checkout` sells and the webhook maps back to a plan |
+| `FRONTEND_URL` | `https://spooled.cloud` | Website base URL Checkout returns to (`/account/billing?checkout=success\|cancel`) |
 
 ### Tracing
 

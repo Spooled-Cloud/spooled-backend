@@ -477,10 +477,13 @@ Authorization: Bearer <token>
 
 {
   "max_retries": 5,
-  "timeout_seconds": 600,
+  "default_timeout": 600,
   "rate_limit": 100
 }
 ```
+
+`rate_limit` is accepted, validated (1-100000), stored and returned, but it is **not enforced
+yet**: no claim path throttles the queue by it.
 
 ### Pause Queue
 
@@ -787,6 +790,9 @@ Authorization: Bearer <token>
 
 Retry all failed jobs in a workflow. This resets failed/deadletter jobs back to pending,
 clears retry counts, and resumes the workflow. Only workflows with status `failed` can be retried.
+A running workflow counts toward the plan's `max_workflows` again, so the retry answers
+`429 QUOTA_EXCEEDED` when the organization is at its limit, and `403 feature_disabled` on a plan
+without workflows.
 
 ```bash
 POST /api/v1/workflows/{workflow_id}/retry
@@ -999,7 +1005,13 @@ curl -X POST https://api.spooled.cloud/api/v1/webhooks/org_abc123/custom \
 
 The `/api/v1/billing/webhook` endpoint handles Stripe subscription events for
 the platform billing system. This is configured in Stripe's webhook settings
-and secured with `STRIPE_BILLING_WEBHOOK_SECRET`.
+and secured with `STRIPE_BILLING_WEBHOOK_SECRET`. The endpoint must be subscribed to
+`checkout.session.completed`, `checkout.session.async_payment_succeeded`,
+`checkout.session.async_payment_failed`, `customer.subscription.created`,
+`customer.subscription.updated`, `customer.subscription.deleted`, `invoice.paid` and
+`invoice.payment_failed`. An event for a customer that is not linked to an organization yet
+(they usually arrive before the checkout does) is answered `409` and Stripe retries it; a
+processing failure is `500` and is retried as well.
 
 ---
 
@@ -1099,6 +1111,8 @@ If slug exists, automatically appends number:
 
 ### Get Billing Status
 
+Needs an unrestricted API key (or a JWT from one): a queue-scoped key gets `403 ACCESS_DENIED`.
+
 ```bash
 GET /api/v1/billing/status
 Authorization: Bearer <token>
@@ -1115,6 +1129,46 @@ Response:
   "cancel_at_period_end": false
 }
 ```
+
+### Start a Checkout
+
+Create a Stripe Checkout session that buys a plan for your organization. Needs an unrestricted
+API key (or a JWT from one).
+
+```bash
+POST /api/v1/billing/checkout
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{
+  "plan": "pro"
+}
+```
+
+`plan` is `starter` or `pro`. Response:
+```json
+{
+  "url": "https://checkout.stripe.com/c/pay/cs_live_xxxxx",
+  "session_id": "cs_live_xxxxx"
+}
+```
+
+Redirect the user to `url`. Checkout returns them to
+`<FRONTEND_URL>/account/billing?checkout=success` (or `=cancel`), where `FRONTEND_URL` defaults to
+`https://spooled.cloud`. The session is bound to the authenticated organization; if the
+organization already has a Stripe customer it is reused, otherwise Checkout is prefilled with the
+organization's verified billing email.
+
+| Status | When |
+|--------|------|
+| 400 `VALIDATION_ERROR` | `plan` is missing, not `starter` or `pro`, or the body is not JSON |
+| 403 `ACCESS_DENIED` | The API key is restricted to queues |
+| 409 `CONFLICT` | The organization already has that plan with an active or trialing subscription; use the billing portal |
+| 503 `SERVICE_UNAVAILABLE` | Billing or that plan's price is not configured, or Stripe is unavailable |
+
+Buying a different plan than the current one replaces the current subscription once the payment
+succeeds (the old subscription is cancelled at once, without proration); use the billing portal to
+change plans with proration.
 
 ### Create Customer Portal Session
 
@@ -1556,6 +1610,12 @@ Response:
 | Payload size | 64KB | 256KB | 1MB | 1MB |
 | Job retention | 3 days | 14 days | 30 days | 90 days |
 | History retention | 1 day | 7 days | 30 days | 90 days |
+
+`Workflows` counts workflows that are pending or running; finished runs do not hold a slot.
+`API keys` counts the keys you created: the key Spooled makes for your dashboard session when you
+sign in by email (`is_system: true` in `GET /api-keys`) is not counted. Re-activating a revoked
+key or a paused schedule with `PUT` ... `{"is_active": true}` is checked against the limit like a
+new one (`429 QUOTA_EXCEEDED`).
 
 History retention covers the delivery history behind
 `GET /api/v1/outgoing-webhooks/{id}/deliveries`. Older delivery records are removed, so on

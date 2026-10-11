@@ -234,166 +234,228 @@ lazy_static! {
     static ref ENV_PLAN_OVERRIDES: EnvPlanOverrides = EnvPlanOverrides::from_env();
 }
 
+/// Upper bound for a retention override, in days (100 years). The retention
+/// SQL (`custom_retention_days()`) applies the same bound, so the scheduler and
+/// the API never disagree about which override is in force.
+pub const MAX_RETENTION_DAYS: u64 = 36_500;
+
+/// How one override key (`organizations.custom_limits`, env JSON) is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverrideKind {
+    /// A resource cap: a whole number up to `max`, or `null` / `-1` for
+    /// unlimited (the same spellings the `SPOOLED_PLAN_*` env vars accept).
+    Cap { max: u64 },
+    /// A setting with no "unlimited": a whole number up to `max`; `null`
+    /// keeps the plan value.
+    Setting { max: u64 },
+}
+
+/// Every key an override object may carry. Job-count caps stop at `i64::MAX`
+/// because the daily quota is enforced in SQL as BIGINT.
+const OVERRIDE_KEYS: &[(&str, OverrideKind)] = &[
+    (
+        "max_jobs_per_day",
+        OverrideKind::Cap {
+            max: i64::MAX as u64,
+        },
+    ),
+    (
+        "max_active_jobs",
+        OverrideKind::Cap {
+            max: i64::MAX as u64,
+        },
+    ),
+    (
+        "max_queues",
+        OverrideKind::Cap {
+            max: u32::MAX as u64,
+        },
+    ),
+    (
+        "max_workers",
+        OverrideKind::Cap {
+            max: u32::MAX as u64,
+        },
+    ),
+    (
+        "max_api_keys",
+        OverrideKind::Cap {
+            max: u32::MAX as u64,
+        },
+    ),
+    (
+        "max_schedules",
+        OverrideKind::Cap {
+            max: u32::MAX as u64,
+        },
+    ),
+    (
+        "max_workflows",
+        OverrideKind::Cap {
+            max: u32::MAX as u64,
+        },
+    ),
+    (
+        "max_webhooks",
+        OverrideKind::Cap {
+            max: u32::MAX as u64,
+        },
+    ),
+    (
+        "max_payload_size_bytes",
+        OverrideKind::Setting {
+            max: u32::MAX as u64,
+        },
+    ),
+    (
+        "rate_limit_requests_per_second",
+        OverrideKind::Setting {
+            max: u32::MAX as u64,
+        },
+    ),
+    (
+        "rate_limit_burst",
+        OverrideKind::Setting {
+            max: u32::MAX as u64,
+        },
+    ),
+    (
+        "job_retention_days",
+        OverrideKind::Setting {
+            max: MAX_RETENTION_DAYS,
+        },
+    ),
+    (
+        "history_retention_days",
+        OverrideKind::Setting {
+            max: MAX_RETENTION_DAYS,
+        },
+    ),
+];
+
+/// One override value after parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverrideValue {
+    /// No limit (caps only).
+    Unlimited,
+    /// Keep the plan value (settings only).
+    KeepPlan,
+    /// A whole number within the key's bound.
+    Value(u64),
+}
+
+fn parse_override(kind: OverrideKind, v: &Value) -> Result<OverrideValue, String> {
+    match kind {
+        OverrideKind::Cap { max } => {
+            if v.is_null() || v.as_i64() == Some(-1) {
+                return Ok(OverrideValue::Unlimited);
+            }
+            match v.as_u64() {
+                Some(n) if n <= max => Ok(OverrideValue::Value(n)),
+                _ => Err(format!(
+                    "must be a whole number from 0 to {max}, or null / -1 for unlimited"
+                )),
+            }
+        }
+        OverrideKind::Setting { max } => {
+            if v.is_null() {
+                return Ok(OverrideValue::KeepPlan);
+            }
+            match v.as_u64() {
+                Some(n) if n <= max => Ok(OverrideValue::Value(n)),
+                _ => Err(format!(
+                    "must be a whole number from 0 to {max}, or null for the plan default"
+                )),
+            }
+        }
+    }
+}
+
+fn apply_override(limits: &mut PlanLimits, key: &str, value: OverrideValue) {
+    let n = match value {
+        OverrideValue::KeepPlan => return,
+        OverrideValue::Unlimited => None,
+        OverrideValue::Value(n) => Some(n),
+    };
+    // Every value was range-checked against its key's bound in OVERRIDE_KEYS,
+    // so the narrowing casts below cannot truncate.
+    let n32 = n.map(|n| n as u32);
+    match key {
+        "max_jobs_per_day" => limits.max_jobs_per_day = n,
+        "max_active_jobs" => limits.max_active_jobs = n,
+        "max_queues" => limits.max_queues = n32,
+        "max_workers" => limits.max_workers = n32,
+        "max_api_keys" => limits.max_api_keys = n32,
+        "max_schedules" => limits.max_schedules = n32,
+        "max_workflows" => limits.max_workflows = n32,
+        "max_webhooks" => limits.max_webhooks = n32,
+        // Settings never parse as Unlimited.
+        _ => {
+            let Some(n) = n else {
+                return;
+            };
+            match key {
+                "max_payload_size_bytes" => limits.max_payload_size_bytes = n as usize,
+                "rate_limit_requests_per_second" => {
+                    limits.rate_limit_requests_per_second = n as u32
+                }
+                "rate_limit_burst" => limits.rate_limit_burst = n as u32,
+                "job_retention_days" => limits.job_retention_days = n as u32,
+                "history_retention_days" => limits.history_retention_days = n as u32,
+                _ => {}
+            }
+        }
+    }
+}
+
 fn apply_overrides_from_object(limits: &mut PlanLimits, obj: &serde_json::Map<String, Value>) {
-    // Option<u64>
-    if let Some(v) = obj.get("max_jobs_per_day") {
-        if v.is_null() {
-            limits.max_jobs_per_day = None;
-        } else if let Some(n) = v.as_u64() {
-            limits.max_jobs_per_day = Some(n);
-        } else {
-            warn!(key = "max_jobs_per_day", value = %v, "Invalid override type; ignoring");
+    for (key, kind) in OVERRIDE_KEYS {
+        let Some(v) = obj.get(*key) else {
+            continue;
+        };
+        match parse_override(*kind, v) {
+            Ok(value) => apply_override(limits, key, value),
+            Err(_) => warn!(key = *key, value = %v, "Invalid override value; ignoring"),
         }
     }
-    if let Some(v) = obj.get("max_active_jobs") {
-        if v.is_null() {
-            limits.max_active_jobs = None;
-        } else if let Some(n) = v.as_u64() {
-            limits.max_active_jobs = Some(n);
-        } else {
-            warn!(key = "max_active_jobs", value = %v, "Invalid override type; ignoring");
-        }
-    }
+}
 
-    // Option<u32>
-    if let Some(v) = obj.get("max_queues") {
-        if v.is_null() {
-            limits.max_queues = None;
-        } else if let Some(n) = v.as_u64() {
-            if n > u32::MAX as u64 {
-                warn!(
-                    key = "max_queues",
-                    value = n,
-                    "Override too large for u32; ignoring"
-                );
-            } else {
-                limits.max_queues = Some(n as u32);
+/// Validate an org's `custom_limits` before it is stored.
+///
+/// It must be a JSON object of known override keys, each a whole number within
+/// that key's range. `null` means unlimited for a resource cap (`max_*` counts,
+/// as does `-1`) and the plan default for a setting (payload size, rate limit,
+/// retention). Anything else used to be stored as-is and then silently ignored
+/// by the limit checks, while the retention SQL read it raw.
+pub fn validate_custom_limits(value: &Value) -> Result<(), String> {
+    let Some(obj) = value.as_object() else {
+        return Err("custom_limits must be a JSON object".to_string());
+    };
+    let mut problems = Vec::new();
+    for (key, v) in obj {
+        match OVERRIDE_KEYS
+            .iter()
+            .find(|(known, _)| *known == key.as_str())
+        {
+            None => problems.push(format!(
+                "unknown key `{key}` (known keys: {})",
+                OVERRIDE_KEYS
+                    .iter()
+                    .map(|(k, _)| *k)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            Some((_, kind)) => {
+                if let Err(e) = parse_override(*kind, v) {
+                    problems.push(format!("`{key}` {e}"));
+                }
             }
-        } else {
-            warn!(key = "max_queues", value = %v, "Invalid override type; ignoring");
         }
     }
-    if let Some(v) = obj.get("max_workers") {
-        if v.is_null() {
-            limits.max_workers = None;
-        } else if let Some(n) = v.as_u64() {
-            if n > u32::MAX as u64 {
-                warn!(
-                    key = "max_workers",
-                    value = n,
-                    "Override too large for u32; ignoring"
-                );
-            } else {
-                limits.max_workers = Some(n as u32);
-            }
-        } else {
-            warn!(key = "max_workers", value = %v, "Invalid override type; ignoring");
-        }
-    }
-    if let Some(v) = obj.get("max_api_keys") {
-        if v.is_null() {
-            limits.max_api_keys = None;
-        } else if let Some(n) = v.as_u64() {
-            if n > u32::MAX as u64 {
-                warn!(
-                    key = "max_api_keys",
-                    value = n,
-                    "Override too large for u32; ignoring"
-                );
-            } else {
-                limits.max_api_keys = Some(n as u32);
-            }
-        } else {
-            warn!(key = "max_api_keys", value = %v, "Invalid override type; ignoring");
-        }
-    }
-    if let Some(v) = obj.get("max_schedules") {
-        if v.is_null() {
-            limits.max_schedules = None;
-        } else if let Some(n) = v.as_u64() {
-            if n > u32::MAX as u64 {
-                warn!(
-                    key = "max_schedules",
-                    value = n,
-                    "Override too large for u32; ignoring"
-                );
-            } else {
-                limits.max_schedules = Some(n as u32);
-            }
-        } else {
-            warn!(key = "max_schedules", value = %v, "Invalid override type; ignoring");
-        }
-    }
-    if let Some(v) = obj.get("max_workflows") {
-        if v.is_null() {
-            limits.max_workflows = None;
-        } else if let Some(n) = v.as_u64() {
-            if n > u32::MAX as u64 {
-                warn!(
-                    key = "max_workflows",
-                    value = n,
-                    "Override too large for u32; ignoring"
-                );
-            } else {
-                limits.max_workflows = Some(n as u32);
-            }
-        } else {
-            warn!(key = "max_workflows", value = %v, "Invalid override type; ignoring");
-        }
-    }
-    if let Some(v) = obj.get("max_webhooks") {
-        if v.is_null() {
-            limits.max_webhooks = None;
-        } else if let Some(n) = v.as_u64() {
-            if n > u32::MAX as u64 {
-                warn!(
-                    key = "max_webhooks",
-                    value = n,
-                    "Override too large for u32; ignoring"
-                );
-            } else {
-                limits.max_webhooks = Some(n as u32);
-            }
-        } else {
-            warn!(key = "max_webhooks", value = %v, "Invalid override type; ignoring");
-        }
-    }
-
-    // Non-option limits
-    if let Some(v) = obj.get("max_payload_size_bytes") {
-        if let Some(n) = v.as_u64() {
-            limits.max_payload_size_bytes = n as usize;
-        } else {
-            warn!(key = "max_payload_size_bytes", value = %v, "Invalid override type; ignoring");
-        }
-    }
-    if let Some(v) = obj.get("rate_limit_requests_per_second") {
-        if let Some(n) = v.as_u64() {
-            limits.rate_limit_requests_per_second = n as u32;
-        } else {
-            warn!(key = "rate_limit_requests_per_second", value = %v, "Invalid override type; ignoring");
-        }
-    }
-    if let Some(v) = obj.get("rate_limit_burst") {
-        if let Some(n) = v.as_u64() {
-            limits.rate_limit_burst = n as u32;
-        } else {
-            warn!(key = "rate_limit_burst", value = %v, "Invalid override type; ignoring");
-        }
-    }
-    if let Some(v) = obj.get("job_retention_days") {
-        if let Some(n) = v.as_u64() {
-            limits.job_retention_days = n as u32;
-        } else {
-            warn!(key = "job_retention_days", value = %v, "Invalid override type; ignoring");
-        }
-    }
-    if let Some(v) = obj.get("history_retention_days") {
-        if let Some(n) = v.as_u64() {
-            limits.history_retention_days = n as u32;
-        } else {
-            warn!(key = "history_retention_days", value = %v, "Invalid override type; ignoring");
-        }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("Invalid custom_limits: {}", problems.join("; ")))
     }
 }
 
@@ -816,5 +878,102 @@ mod tests {
 
         let pro = PlanLimits::pro();
         assert_eq!(pro.warning_threshold(), 80.0);
+    }
+
+    // BEBILL-26: -1 is "unlimited" on a resource cap, as in the env vars; it was
+    // silently ignored in custom_limits, leaving the plan cap in force.
+    #[test]
+    fn test_minus_one_means_unlimited_on_caps_only() {
+        let overrides = serde_json::json!({
+            "max_api_keys": -1,
+            "max_jobs_per_day": -1,
+            "max_schedules": 7,
+            "job_retention_days": -1,
+        });
+        let limits = PlanLimits::for_tier_with_overrides("free", Some(&overrides));
+        assert_eq!(limits.max_api_keys, None);
+        assert_eq!(limits.max_jobs_per_day, None);
+        assert_eq!(limits.max_schedules, Some(7));
+        // A setting has no "unlimited": -1 keeps the plan value.
+        assert_eq!(limits.job_retention_days, 3);
+        assert!(limits.check_limit("api_keys", 100, 1).is_ok());
+    }
+
+    // BEBILL-07: values the retention SQL also ignores are ignored here, and a
+    // setting no longer truncates an oversized number into a small one.
+    #[test]
+    fn test_bad_override_values_keep_the_plan_value() {
+        for bad in [
+            serde_json::json!("90"),
+            serde_json::json!(1.5),
+            serde_json::json!(-5),
+            serde_json::json!(MAX_RETENTION_DAYS + 1),
+        ] {
+            let overrides = serde_json::json!({ "job_retention_days": bad });
+            let limits = PlanLimits::for_tier_with_overrides("pro", Some(&overrides));
+            assert_eq!(limits.job_retention_days, 30, "{overrides}");
+        }
+        let overrides = serde_json::json!({ "rate_limit_burst": u64::from(u32::MAX) + 7 });
+        let limits = PlanLimits::for_tier_with_overrides("pro", Some(&overrides));
+        assert_eq!(limits.rate_limit_burst, 200);
+
+        let overrides =
+            serde_json::json!({ "job_retention_days": 0, "history_retention_days": null });
+        let limits = PlanLimits::for_tier_with_overrides("pro", Some(&overrides));
+        assert_eq!(limits.job_retention_days, 0);
+        assert_eq!(limits.history_retention_days, 30);
+    }
+
+    #[test]
+    fn test_validate_custom_limits() {
+        for ok in [
+            serde_json::json!({}),
+            serde_json::json!({"max_api_keys": 10, "max_jobs_per_day": null, "max_queues": -1}),
+            serde_json::json!({"job_retention_days": 0, "history_retention_days": MAX_RETENTION_DAYS}),
+            serde_json::json!({"max_payload_size_bytes": null, "rate_limit_burst": 0}),
+        ] {
+            assert!(validate_custom_limits(&ok).is_ok(), "{ok}");
+        }
+        for (bad, needle) in [
+            (serde_json::json!([1]), "JSON object"),
+            (serde_json::json!("x"), "JSON object"),
+            (
+                serde_json::json!({"max_api_key": 3}),
+                "unknown key `max_api_key`",
+            ),
+            (
+                serde_json::json!({"job_retention_days": "90"}),
+                "`job_retention_days`",
+            ),
+            (
+                serde_json::json!({"job_retention_days": 1.5}),
+                "`job_retention_days`",
+            ),
+            (
+                serde_json::json!({"job_retention_days": -1}),
+                "`job_retention_days`",
+            ),
+            (
+                serde_json::json!({"job_retention_days": MAX_RETENTION_DAYS + 1}),
+                "`job_retention_days`",
+            ),
+            (serde_json::json!({"max_api_keys": -2}), "`max_api_keys`"),
+            (
+                serde_json::json!({"max_api_keys": 4_294_967_296u64}),
+                "`max_api_keys`",
+            ),
+            (
+                serde_json::json!({"max_jobs_per_day": u64::MAX}),
+                "`max_jobs_per_day`",
+            ),
+            (serde_json::json!({"max_workers": true}), "`max_workers`"),
+        ] {
+            let err = validate_custom_limits(&bad).expect_err(&bad.to_string());
+            assert!(err.contains(needle), "{bad}: {err}");
+        }
+        // Every problem is reported at once.
+        let err =
+            validate_custom_limits(&serde_json::json!({"a": 1, "max_queues": "2"})).unwrap_err();
+        assert!(err.contains("`a`") && err.contains("`max_queues`"), "{err}");
     }
 }

@@ -107,7 +107,9 @@ pub struct ApiKey {
     pub name: String,
     /// Allowed queues (empty = all queues)
     pub queues: Vec<String>,
-    /// Rate limit override (null = use org default)
+    /// Per-key cap in requests per MINUTE (null = only the plan's limit). It is
+    /// checked after the organization's plan bucket, so it can lower the plan's
+    /// limit for this key but never raise it.
     pub rate_limit: Option<i32>,
     /// Whether the key is active
     pub is_active: bool,
@@ -117,6 +119,10 @@ pub struct ApiKey {
     pub last_used: Option<DateTime<Utc>>,
     /// Expiration timestamp (null = never expires)
     pub expires_at: Option<DateTime<Utc>>,
+    /// Created by Spooled itself (the email-login dashboard key), not by the
+    /// customer. System keys do not count toward `max_api_keys`, and no API
+    /// request can set this flag.
+    pub is_system: bool,
 }
 
 /// Validate API key name for safe characters
@@ -148,7 +154,7 @@ pub struct CreateApiKeyRequest {
     #[validate(custom(function = "validate_queues"))]
     pub queues: Option<Vec<String>>,
 
-    /// Rate limit override
+    /// Per-key cap in requests per minute; can only lower the plan's limit
     #[validate(range(
         min = 1,
         max = 10000,
@@ -196,6 +202,8 @@ pub struct ApiKeySummary {
     pub created_at: DateTime<Utc>,
     pub last_used: Option<DateTime<Utc>>,
     pub expires_at: Option<DateTime<Utc>>,
+    /// See [`ApiKey::is_system`].
+    pub is_system: bool,
 }
 
 impl From<ApiKey> for ApiKeySummary {
@@ -209,6 +217,7 @@ impl From<ApiKey> for ApiKeySummary {
             created_at: key.created_at,
             last_used: key.last_used,
             expires_at: key.expires_at,
+            is_system: key.is_system,
         }
     }
 }
@@ -299,7 +308,7 @@ pub struct UpdateApiKeyRequest {
     #[validate(custom(function = "validate_queues"))]
     pub queues: Option<Vec<String>>,
 
-    /// Rate limit override
+    /// Per-key cap in requests per minute; can only lower the plan's limit
     #[validate(range(
         min = 1,
         max = 10000,
@@ -384,6 +393,7 @@ mod tests {
             created_at: Utc::now(),
             last_used: None,
             expires_at: None,
+            is_system: false,
         };
 
         let summary = ApiKeySummary::from(key);
@@ -593,6 +603,7 @@ mod tests {
             created_at: Utc::now(),
             last_used: None,
             expires_at: None,
+            is_system: false,
         };
 
         let json = serde_json::to_string(&summary).unwrap();

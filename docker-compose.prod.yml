@@ -270,6 +270,10 @@ services:
       REGISTRATION_MODE: ${REGISTRATION_MODE:-open}
       EMAIL_SIGNUP_ENABLED: ${EMAIL_SIGNUP_ENABLED:-true}
       ADMIN_API_KEY: ${ADMIN_API_KEY:-}
+      # Cloudflare Turnstile secret: when set, POST /auth/email/start requires a valid turnstile_token.
+      TURNSTILE_SECRET_KEY: ${TURNSTILE_SECRET_KEY:-}
+      # Website base URL Stripe Checkout returns the customer to; blank = https://spooled.cloud
+      FRONTEND_URL: ${FRONTEND_URL:-}
       
       # =====================
       # Email

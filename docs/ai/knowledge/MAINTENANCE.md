@@ -8,9 +8,11 @@ Update the KB in the **same change** when you touch these areas.
 | `src/grpc/services/queue_service.rs`, `proto/` | `dataflows/grpc-rest.md`, `contracts/invariants.md`, findings if defaults change |
 | `src/api/middleware/auth.rs`, `admin_auth.rs` | `dataflows/auth.md` |
 | `src/api/handlers/email_login.rs` | `dataflows/auth.md` |
+| `src/api/middleware/client_ip.rs`, `main.rs` (ConnectInfo), any per-address limiter | `dataflows/auth.md` (Client IP), `contracts/invariants.md` #30 |
 | `src/api/handlers/billing.rs`, Stripe migrations | `dataflows/billing-stripe.md`, findings |
 | `src/outgoing_webhooks/`, `handlers/webhooks.rs` | `dataflows/webhooks.md` |
 | `src/api/middleware/limits.rs`, `config/plans.rs` | `dataflows/billing-stripe.md`, `contracts/invariants.md` |
+| Cap-counting SQL (`get_org_resource_counts`), `handlers/api_keys.rs` / `schedules.rs` / `workflows.rs` re-activation and retry, `custom_limits`, soft delete (`admin.rs`) | `contracts/invariants.md` #25-#29 |
 | `src/scheduler/` | `dataflows/jobs-queue.md`, chesterton fences |
 | Defaults / env (`QUEUE_DEFAULT_*`) | `contracts/invariants.md` + workspace `CROSS-REPO-CONTRACTS.md` |
 | Security-relevant behavior | `bugs/findings.jsonl` + `findings.md` |

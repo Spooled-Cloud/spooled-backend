@@ -350,7 +350,7 @@ impl Scheduler {
     ///
     /// Uses transaction to prevent duplicate jobs if schedule update fails
     /// Each schedule is processed in its own transaction to ensure locks are effective
-    async fn process_cron_schedules(&self) -> Result<()> {
+    pub async fn process_cron_schedules(&self) -> Result<()> {
         #[derive(sqlx::FromRow)]
         struct ScheduleRecord {
             id: String,
@@ -366,14 +366,20 @@ impl Scheduler {
             next_run_at: Option<chrono::DateTime<Utc>>,
         }
 
-        // First, get IDs of schedules that are due (without lock, just to know what to process)
+        // First, get IDs of schedules that are due (without lock, just to know what to process).
+        // A soft-deleted org (plan_tier 'deleted') has no usable keys, so nothing could
+        // ever claim what its schedules enqueue; it is skipped like every other entry
+        // point skips it, even for schedules left active from before soft delete
+        // started pausing them.
         let schedule_ids: Vec<(String,)> = sqlx::query_as(
             r#"
-            SELECT id
-            FROM schedules
-            WHERE is_active = TRUE
-              AND next_run_at IS NOT NULL
-              AND next_run_at <= NOW()
+            SELECT s.id
+            FROM schedules s
+            JOIN organizations o ON o.id = s.organization_id
+            WHERE s.is_active = TRUE
+              AND s.next_run_at IS NOT NULL
+              AND s.next_run_at <= NOW()
+              AND o.plan_tier <> 'deleted'
             LIMIT 100
             "#,
         )
@@ -1215,7 +1221,12 @@ impl Scheduler {
     ///
     /// Uses JOIN-based queries for efficiency (single query per resource type).
     /// Plan tier retention: free=3d, starter=14d, pro=30d, enterprise=90d
-    /// Custom limits can override via custom_limits.job_retention_days/history_retention_days
+    /// Custom limits can override via custom_limits.job_retention_days/history_retention_days.
+    /// Overrides are read through `custom_retention_days()`, which returns NULL (plan
+    /// default) for anything but a whole number of days in 0..=36500: a raw `::INT`
+    /// cast of one org's bad value ("90", 1.5, 1e10) used to fail every statement
+    /// here for every org, and -1 put the cutoff in the future and purged that
+    /// org's completed jobs.
     async fn cleanup_old_data_by_org(&self) -> Result<u64> {
         let mut total_cleaned: u64 = 0;
 
@@ -1231,7 +1242,7 @@ impl Scheduler {
                 WHERE j.status IN ('completed', 'cancelled')
                   AND j.completed_at < NOW() - (
                     COALESCE(
-                        (o.custom_limits->>'job_retention_days')::INT,
+                        custom_retention_days(o.custom_limits, 'job_retention_days'),
                         CASE o.plan_tier
                             WHEN 'enterprise' THEN 90
                             WHEN 'pro' THEN 30
@@ -1267,7 +1278,7 @@ impl Scheduler {
                 JOIN organizations o ON j.organization_id = o.id
                 WHERE jh.created_at < NOW() - (
                     COALESCE(
-                        (o.custom_limits->>'history_retention_days')::INT,
+                        custom_retention_days(o.custom_limits, 'history_retention_days'),
                         CASE o.plan_tier
                             WHEN 'enterprise' THEN 90
                             WHEN 'pro' THEN 30
@@ -1313,7 +1324,7 @@ impl Scheduler {
                 JOIN organizations o ON w.organization_id = o.id
                 WHERE d.created_at < NOW() - (
                     COALESCE(
-                        (o.custom_limits->>'history_retention_days')::INT,
+                        custom_retention_days(o.custom_limits, 'history_retention_days'),
                         CASE o.plan_tier
                             WHEN 'enterprise' THEN 90
                             WHEN 'pro' THEN 30
@@ -1376,7 +1387,7 @@ impl Scheduler {
                 JOIN organizations o ON wd.organization_id = o.id
                 WHERE wd.created_at < NOW() - (
                     COALESCE(
-                        (o.custom_limits->>'history_retention_days')::INT,
+                        custom_retention_days(o.custom_limits, 'history_retention_days'),
                         CASE o.plan_tier
                             WHEN 'enterprise' THEN 90
                             WHEN 'pro' THEN 30
@@ -1485,7 +1496,7 @@ impl Scheduler {
                 WHERE w.status IN ('completed', 'failed', 'cancelled')
                   AND w.completed_at < NOW() - (
                     COALESCE(
-                        (o.custom_limits->>'job_retention_days')::INT,
+                        custom_retention_days(o.custom_limits, 'job_retention_days'),
                         CASE o.plan_tier
                             WHEN 'enterprise' THEN 90
                             WHEN 'pro' THEN 30

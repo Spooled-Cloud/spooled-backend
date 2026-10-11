@@ -2122,10 +2122,11 @@ async fn app_with_redis_db(
 }
 
 /// A client address no other test uses (the throttle buckets live in a
-/// shared Redis).
+/// shared Redis). IPv4, so the address is its own rate-limit id: an IPv6
+/// client is keyed on its /64.
 fn unique_client_ip() -> String {
-    let id = uuid::Uuid::new_v4().as_u128();
-    format!("2001:db8::{:x}:{:x}", (id >> 16) as u16, id as u16)
+    let [_, a, b, c] = (uuid::Uuid::new_v4().as_u128() as u32).to_be_bytes();
+    format!("10.{a}.{b}.{c}")
 }
 
 /// Insert an active, unrestricted key for `org_id`. `legacy` leaves
@@ -4642,5 +4643,2457 @@ mod wave3_review {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
         proxy.abort();
+    }
+}
+// ---- wave 4 / billing ----
+
+const W4B_WEBHOOK_SECRET: &str = "whsec_w4_billing_fixture";
+const W4B_STRIPE_KEY: &str = "sk_test_w4_billing_fixture";
+const W4B_STARTER_PRICE: &str = "price_w4_starter";
+const W4B_PRO_PRICE: &str = "price_w4_pro";
+
+/// Settings with Stripe configured against fixture values (never live Stripe:
+/// every test sends the Stripe calls to a local mock via `w4b_stripe`).
+fn w4b_settings() -> Settings {
+    let mut settings = Settings::load_for_testing();
+    settings.stripe.secret_key = Some(W4B_STRIPE_KEY.to_string());
+    settings.stripe.webhook_secret = Some(W4B_WEBHOOK_SECRET.to_string());
+    settings.stripe.starter_price_id = Some(W4B_STARTER_PRICE.to_string());
+    settings.stripe.pro_price_id = Some(W4B_PRO_PRICE.to_string());
+    settings
+}
+
+/// Call the API with every Stripe API request sent to `stripe`.
+async fn w4b_stripe<T>(
+    stripe: &wiremock::MockServer,
+    fut: impl std::future::Future<Output = T>,
+) -> T {
+    spooled_backend::api::handlers::billing::with_stripe_api_base(stripe.uri(), fut).await
+}
+
+/// Deliver a signed Stripe event to the billing webhook.
+async fn w4b_deliver(
+    app: &Router,
+    stripe: &wiremock::MockServer,
+    event: &Value,
+) -> (StatusCode, Value) {
+    use hmac::{Hmac, KeyInit, Mac};
+
+    let ts = chrono::Utc::now().timestamp();
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(W4B_WEBHOOK_SECRET.as_bytes()).unwrap();
+    mac.update(format!("{ts}.{event}").as_bytes());
+    let signature = format!("t={ts},v1={}", hex::encode(mac.finalize().into_bytes()));
+    w4b_stripe(
+        stripe,
+        call(
+            app,
+            "POST",
+            "/api/v1/billing/webhook",
+            &[("Stripe-Signature", &signature)],
+            Some(event.clone()),
+        ),
+    )
+    .await
+}
+
+fn w4b_event(id: &str, event_type: &str, created: i64, object: Value) -> Value {
+    json!({ "id": id, "type": event_type, "created": created, "data": { "object": object } })
+}
+
+/// A completed Checkout Session. `org_ref` holds `metadata` and/or
+/// `client_reference_id`.
+fn w4b_session(
+    org_ref: Value,
+    customer: &str,
+    subscription: &str,
+    email: &str,
+    payment_status: &str,
+) -> Value {
+    let mut session = json!({
+        "id": format!("cs_test_{subscription}"),
+        "object": "checkout.session",
+        "mode": "subscription",
+        "customer": customer,
+        "subscription": subscription,
+        "customer_details": { "email": email },
+        "payment_status": payment_status,
+        "metadata": {}
+    });
+    for (key, value) in org_ref.as_object().unwrap() {
+        session[key] = value.clone();
+    }
+    session
+}
+
+fn w4b_subscription(id: &str, customer: &str, price: &str, status: &str) -> Value {
+    json!({
+        "id": id,
+        "object": "subscription",
+        "customer": customer,
+        "status": status,
+        "cancel_at_period_end": false,
+        "items": { "data": [{ "price": { "id": price }, "current_period_end": 1_900_000_000 }] }
+    })
+}
+
+async fn w4b_mock_subscription(
+    stripe: &wiremock::MockServer,
+    id: &str,
+    customer: &str,
+    price: &str,
+) {
+    use wiremock::matchers::{method, path};
+    wiremock::Mock::given(method("GET"))
+        .and(path(format!("/v1/subscriptions/{id}")))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(w4b_subscription(id, customer, price, "active")),
+        )
+        .mount(stripe)
+        .await;
+}
+
+async fn w4b_mock_cancel_ok(stripe: &wiremock::MockServer, id: &str) {
+    use wiremock::matchers::{method, path};
+    wiremock::Mock::given(method("DELETE"))
+        .and(path(format!("/v1/subscriptions/{id}")))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({ "id": id, "status": "canceled" })),
+        )
+        .mount(stripe)
+        .await;
+}
+
+/// Requests the mock Stripe received with this method (and path, if given).
+async fn w4b_received(
+    stripe: &wiremock::MockServer,
+    http_method: &str,
+    path: Option<&str>,
+) -> Vec<wiremock::Request> {
+    stripe
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.method.as_str() == http_method && path.is_none_or(|p| r.url.path() == p))
+        .collect()
+}
+
+async fn w4b_set_billing(
+    pool: &sqlx::PgPool,
+    org_id: &str,
+    plan: &str,
+    customer: Option<&str>,
+    subscription: Option<&str>,
+    status: Option<&str>,
+) {
+    sqlx::query(
+        "UPDATE organizations SET plan_tier = $2, stripe_customer_id = $3, \
+         stripe_subscription_id = $4, stripe_subscription_status = $5 WHERE id = $1",
+    )
+    .bind(org_id)
+    .bind(plan)
+    .bind(customer)
+    .bind(subscription)
+    .bind(status)
+    .execute(pool)
+    .await
+    .expect("set billing");
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct W4bBilling {
+    plan_tier: String,
+    stripe_customer_id: Option<String>,
+    stripe_subscription_id: Option<String>,
+    stripe_superseded_subscription_ids: Vec<String>,
+}
+
+async fn w4b_billing(pool: &sqlx::PgPool, org_id: &str) -> W4bBilling {
+    sqlx::query_as(
+        "SELECT plan_tier, stripe_customer_id, stripe_subscription_id, \
+         stripe_superseded_subscription_ids FROM organizations WHERE id = $1",
+    )
+    .bind(org_id)
+    .fetch_one(pool)
+    .await
+    .expect("org billing")
+}
+
+async fn w4b_billing_email(pool: &sqlx::PgPool, org_id: &str) -> String {
+    let (email,): (String,) =
+        sqlx::query_as("SELECT billing_email FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .fetch_one(pool)
+            .await
+            .expect("billing email");
+    email
+}
+
+async fn w4b_scoped_key(pool: &sqlx::PgPool, org_id: &str) -> String {
+    let key = format!("sp_test_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(
+        "INSERT INTO api_keys (id, organization_id, key_hash, key_prefix, lookup_hash, name, queues, is_active, created_at) \
+         VALUES ($1, $2, $3, $4, $5, 'w4b-scoped', ARRAY['w4b-queue']::TEXT[], TRUE, NOW())",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(org_id)
+    .bind(bcrypt::hash(&key, 4).expect("hash key"))
+    .bind(key.chars().take(8).collect::<String>())
+    .bind(spooled_backend::models::api_key_lookup_hash(&key))
+    .execute(pool)
+    .await
+    .expect("seed scoped key");
+    key
+}
+
+async fn w4b_checkout(
+    app: Router,
+    stripe: &wiremock::MockServer,
+    auth: String,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    w4b_stripe(
+        stripe,
+        call(
+            &app,
+            "POST",
+            "/api/v1/billing/checkout",
+            &[("Authorization", &auth)],
+            body,
+        ),
+    )
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// BEBILL-02 / C1: POST /billing/checkout creates an org-bound Checkout Session.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn w4_billing_checkout_validates_and_binds_the_session_to_the_org() {
+    use wiremock::matchers::{header, method, path};
+
+    let db = TestDatabase::new().await;
+    let t = seed_tenant(db.pool()).await;
+    let auth = bearer(&t.key);
+    let stripe = wiremock::MockServer::start().await;
+    wiremock::Mock::given(method("POST"))
+        .and(path("/v1/checkout/sessions"))
+        .and(header(
+            "authorization",
+            format!("Bearer {W4B_STRIPE_KEY}").as_str(),
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "id": "cs_test_w4b",
+            "object": "checkout.session",
+            "url": "https://checkout.stripe.com/c/pay/cs_test_w4b"
+        })))
+        .mount(&stripe)
+        .await;
+    let checkout =
+        |app: Router, auth: String, body: Option<Value>| w4b_checkout(app, &stripe, auth, body);
+
+    // Stripe not configured -> 503.
+    let (status, body) = checkout(app(&db), auth.clone(), Some(json!({"plan": "pro"}))).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["code"], "SERVICE_UNAVAILABLE", "{body}");
+
+    // That plan's price not configured -> 503.
+    let mut no_pro = w4b_settings();
+    no_pro.stripe.pro_price_id = None;
+    let (status, body) = checkout(
+        app_with(&db, no_pro),
+        auth.clone(),
+        Some(json!({"plan": "pro"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+
+    let app = app_with(&db, w4b_settings());
+
+    // Any other plan, or no plan at all -> 400 VALIDATION_ERROR (never 401).
+    for bad in [
+        Some(json!({"plan": "enterprise"})),
+        Some(json!({"plan": "free"})),
+        Some(json!({})),
+        None,
+    ] {
+        let (status, body) = checkout(app.clone(), auth.clone(), bad.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad:?}: {body}");
+        assert_eq!(body["code"], "VALIDATION_ERROR", "{bad:?}: {body}");
+    }
+
+    // A queue-scoped key cannot start a checkout.
+    let scoped = bearer(&w4b_scoped_key(db.pool(), &t.org_id).await);
+    let (status, body) = checkout(app.clone(), scoped, Some(json!({"plan": "pro"}))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // Already on that plan with an active subscription -> 409, use the portal.
+    w4b_set_billing(
+        db.pool(),
+        &t.org_id,
+        "starter",
+        Some("cus_w4b"),
+        Some("sub_w4b"),
+        Some("active"),
+    )
+    .await;
+    let (status, body) =
+        checkout(app.clone(), auth.clone(), Some(json!({"plan": "starter"}))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["message"].as_str().unwrap().contains("billing portal"),
+        "{body}"
+    );
+    assert!(
+        w4b_received(&stripe, "POST", None).await.is_empty(),
+        "no session may be created on an error"
+    );
+
+    // Upgrade: the session is bound to the org and reuses its customer.
+    let (status, body) = checkout(app.clone(), auth.clone(), Some(json!({"plan": "pro"}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["session_id"], "cs_test_w4b", "{body}");
+    assert_eq!(
+        body["url"], "https://checkout.stripe.com/c/pay/cs_test_w4b",
+        "{body}"
+    );
+
+    let sent = w4b_received(&stripe, "POST", Some("/v1/checkout/sessions")).await;
+    assert_eq!(sent.len(), 1);
+    let form: std::collections::HashMap<String, String> =
+        url::form_urlencoded::parse(&sent[0].body)
+            .into_owned()
+            .collect();
+    assert_eq!(form["mode"], "subscription");
+    assert_eq!(form["line_items[0][price]"], W4B_PRO_PRICE);
+    assert_eq!(form["client_reference_id"], t.org_id);
+    assert_eq!(form["metadata[spooled_org_id]"], t.org_id);
+    assert_eq!(
+        form["subscription_data[metadata][spooled_org_id]"],
+        t.org_id
+    );
+    assert!(
+        form["success_url"].ends_with("/account/billing?checkout=success"),
+        "{form:?}"
+    );
+    assert!(
+        form["cancel_url"].ends_with("/account/billing?checkout=cancel"),
+        "{form:?}"
+    );
+    assert_eq!(form["customer"], "cus_w4b");
+    assert!(!form.contains_key("customer_email"), "{form:?}");
+
+    // No customer yet: Checkout is prefilled with the verified billing email.
+    let fresh = seed_tenant(db.pool()).await;
+    let (status, body) = checkout(
+        app.clone(),
+        bearer(&fresh.key),
+        Some(json!({"plan": "starter"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let sent = w4b_received(&stripe, "POST", Some("/v1/checkout/sessions")).await;
+    let form: std::collections::HashMap<String, String> =
+        url::form_urlencoded::parse(&sent[1].body)
+            .into_owned()
+            .collect();
+    assert_eq!(form["line_items[0][price]"], W4B_STARTER_PRICE);
+    assert_eq!(form["metadata[spooled_org_id]"], fresh.org_id);
+    assert_eq!(
+        form["customer_email"],
+        w4b_billing_email(db.pool(), &fresh.org_id).await
+    );
+    assert!(!form.contains_key("customer"), "{form:?}");
+}
+
+// ---------------------------------------------------------------------------
+// BEBILL-02: a server-created checkout links its org and cancels the
+// subscription it replaces, even when the new subscription's events (same
+// customer) arrive before checkout.session.completed.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn w4_billing_server_checkout_links_the_org_and_cancels_the_replaced_subscription() {
+    let db = TestDatabase::new().await;
+    let t = seed_tenant(db.pool()).await;
+    w4b_set_billing(
+        db.pool(),
+        &t.org_id,
+        "starter",
+        Some("cus_w4u"),
+        Some("sub_w4u_old"),
+        Some("active"),
+    )
+    .await;
+    let app = app_with(&db, w4b_settings());
+    let stripe = wiremock::MockServer::start().await;
+    w4b_mock_subscription(&stripe, "sub_w4u_new", "cus_w4u", W4B_PRO_PRICE).await;
+    w4b_mock_cancel_ok(&stripe, "sub_w4u_old").await;
+    let t0 = chrono::Utc::now().timestamp() - 60;
+
+    // The new subscription's own event usually comes first. It must not take
+    // the org over from the subscription the checkout has to cancel.
+    let created = w4b_event(
+        "evt_w4u_created",
+        "customer.subscription.created",
+        t0,
+        w4b_subscription("sub_w4u_new", "cus_w4u", W4B_PRO_PRICE, "active"),
+    );
+    let (status, body) = w4b_deliver(&app, &stripe, &created).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        w4b_billing(db.pool(), &t.org_id)
+            .await
+            .stripe_subscription_id
+            .as_deref(),
+        Some("sub_w4u_old")
+    );
+
+    let session = w4b_session(
+        json!({ "metadata": { "spooled_org_id": t.org_id }, "client_reference_id": t.org_id }),
+        "cus_w4u",
+        "sub_w4u_new",
+        "someone@example.com",
+        "paid",
+    );
+    let completed = w4b_event(
+        "evt_w4u_completed",
+        "checkout.session.completed",
+        t0 + 1,
+        session,
+    );
+    let (status, body) = w4b_deliver(&app, &stripe, &completed).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let billing = w4b_billing(db.pool(), &t.org_id).await;
+    assert_eq!(billing.stripe_customer_id.as_deref(), Some("cus_w4u"));
+    assert_eq!(
+        billing.stripe_subscription_id.as_deref(),
+        Some("sub_w4u_new")
+    );
+    assert_eq!(billing.plan_tier, "pro");
+    assert!(
+        billing.stripe_superseded_subscription_ids.is_empty(),
+        "{billing:?}"
+    );
+    assert_eq!(
+        w4b_received(&stripe, "DELETE", Some("/v1/subscriptions/sub_w4u_old"))
+            .await
+            .len(),
+        1,
+        "the replaced subscription is canceled exactly once"
+    );
+
+    // Stripe then reports the old subscription deleted: the org stays on pro.
+    let deleted = w4b_event(
+        "evt_w4u_deleted",
+        "customer.subscription.deleted",
+        t0 + 2,
+        w4b_subscription("sub_w4u_old", "cus_w4u", W4B_STARTER_PRICE, "canceled"),
+    );
+    let (status, body) = w4b_deliver(&app, &stripe, &deleted).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let billing = w4b_billing(db.pool(), &t.org_id).await;
+    assert_eq!(billing.plan_tier, "pro");
+    assert_eq!(
+        billing.stripe_subscription_id.as_deref(),
+        Some("sub_w4u_new")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// BEBILL-02: a Payment Link checkout naming someone else's org (an editable
+// URL parameter) neither relinks nor cancels the victim's subscription, even
+// with the victim's billing email typed in at checkout.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn w4_billing_payment_link_checkout_cannot_take_over_a_subscribed_org() {
+    let db = TestDatabase::new().await;
+    let victim = seed_tenant(db.pool()).await;
+    w4b_set_billing(
+        db.pool(),
+        &victim.org_id,
+        "starter",
+        Some("cus_victim"),
+        Some("sub_victim"),
+        Some("active"),
+    )
+    .await;
+    let victim_email = w4b_billing_email(db.pool(), &victim.org_id).await;
+    let app = app_with(&db, w4b_settings());
+    let stripe = wiremock::MockServer::start().await;
+    w4b_mock_subscription(&stripe, "sub_attacker", "cus_attacker", W4B_PRO_PRICE).await;
+    w4b_mock_cancel_ok(&stripe, "sub_victim").await;
+
+    let session = w4b_session(
+        json!({ "client_reference_id": victim.org_id }),
+        "cus_attacker",
+        "sub_attacker",
+        &victim_email.to_uppercase(),
+        "paid",
+    );
+    let event = w4b_event(
+        "evt_w4_takeover",
+        "checkout.session.completed",
+        chrono::Utc::now().timestamp(),
+        session,
+    );
+    let (status, body) = w4b_deliver(&app, &stripe, &event).await;
+    assert_eq!(status, StatusCode::OK, "the event is acknowledged: {body}");
+
+    let billing = w4b_billing(db.pool(), &victim.org_id).await;
+    assert_eq!(billing.stripe_customer_id.as_deref(), Some("cus_victim"));
+    assert_eq!(
+        billing.stripe_subscription_id.as_deref(),
+        Some("sub_victim")
+    );
+    assert_eq!(billing.plan_tier, "starter");
+    assert!(
+        w4b_received(&stripe, "DELETE", None).await.is_empty(),
+        "nothing may be canceled"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// BEBILL-02: a Payment Link checkout links an unsubscribed org only when the
+// payer used the org's verified billing email; it never cancels anything.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn w4_billing_payment_link_checkout_needs_the_verified_billing_email() {
+    let db = TestDatabase::new().await;
+    let app = app_with(&db, w4b_settings());
+    let stripe = wiremock::MockServer::start().await;
+    let now = chrono::Utc::now().timestamp();
+
+    // Email mismatch -> not linked.
+    let other = seed_tenant(db.pool()).await;
+    w4b_set_billing(db.pool(), &other.org_id, "free", None, None, None).await;
+    let session = w4b_session(
+        json!({ "client_reference_id": other.org_id }),
+        "cus_w4_mismatch",
+        "sub_w4_mismatch",
+        "not-the-owner@example.com",
+        "paid",
+    );
+    let (status, body) = w4b_deliver(
+        &app,
+        &stripe,
+        &w4b_event(
+            "evt_w4_mismatch",
+            "checkout.session.completed",
+            now,
+            session,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let billing = w4b_billing(db.pool(), &other.org_id).await;
+    assert_eq!(billing.stripe_customer_id, None, "{billing:?}");
+    assert_eq!(billing.plan_tier, "free");
+
+    // Matching but unverified email -> not linked.
+    let unverified = seed_tenant(db.pool()).await;
+    w4b_set_billing(db.pool(), &unverified.org_id, "free", None, None, None).await;
+    sqlx::query("UPDATE organizations SET billing_email_verified_at = NULL WHERE id = $1")
+        .bind(&unverified.org_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let session = w4b_session(
+        json!({ "client_reference_id": unverified.org_id }),
+        "cus_w4_unverified",
+        "sub_w4_unverified",
+        &w4b_billing_email(db.pool(), &unverified.org_id).await,
+        "paid",
+    );
+    let (status, body) = w4b_deliver(
+        &app,
+        &stripe,
+        &w4b_event(
+            "evt_w4_unverified",
+            "checkout.session.completed",
+            now,
+            session,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        w4b_billing(db.pool(), &unverified.org_id)
+            .await
+            .stripe_customer_id,
+        None
+    );
+
+    // Verified email (any case), no live subscription -> linked.
+    let owner = seed_tenant(db.pool()).await;
+    w4b_set_billing(
+        db.pool(),
+        &owner.org_id,
+        "free",
+        Some("cus_w4_old"),
+        Some("sub_w4_ended"),
+        Some("canceled"),
+    )
+    .await;
+    w4b_mock_subscription(&stripe, "sub_w4_owner", "cus_w4_owner", W4B_STARTER_PRICE).await;
+    let session = w4b_session(
+        json!({ "client_reference_id": owner.org_id }),
+        "cus_w4_owner",
+        "sub_w4_owner",
+        &w4b_billing_email(db.pool(), &owner.org_id)
+            .await
+            .to_uppercase(),
+        "paid",
+    );
+    let (status, body) = w4b_deliver(
+        &app,
+        &stripe,
+        &w4b_event("evt_w4_owner", "checkout.session.completed", now, session),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let billing = w4b_billing(db.pool(), &owner.org_id).await;
+    assert_eq!(billing.stripe_customer_id.as_deref(), Some("cus_w4_owner"));
+    assert_eq!(
+        billing.stripe_subscription_id.as_deref(),
+        Some("sub_w4_owner")
+    );
+    assert_eq!(billing.plan_tier, "starter");
+    assert!(
+        billing.stripe_superseded_subscription_ids.is_empty(),
+        "{billing:?}"
+    );
+    assert!(
+        w4b_received(&stripe, "DELETE", None).await.is_empty(),
+        "nothing may be canceled"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// BEBILL-14: a failed cancel of the replaced subscription fails the event, and
+// Stripe's redelivery finishes the cancel.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn w4_billing_failed_superseded_cancel_is_retried_with_the_event() {
+    use wiremock::matchers::{method, path};
+
+    let db = TestDatabase::new().await;
+    let t = seed_tenant(db.pool()).await;
+    w4b_set_billing(
+        db.pool(),
+        &t.org_id,
+        "starter",
+        Some("cus_w4r"),
+        Some("sub_w4r_old"),
+        Some("active"),
+    )
+    .await;
+    let app = app_with(&db, w4b_settings());
+    let stripe = wiremock::MockServer::start().await;
+    w4b_mock_subscription(&stripe, "sub_w4r_new", "cus_w4r", W4B_PRO_PRICE).await;
+    wiremock::Mock::given(method("DELETE"))
+        .and(path("/v1/subscriptions/sub_w4r_old"))
+        .respond_with(wiremock::ResponseTemplate::new(500))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&stripe)
+        .await;
+    w4b_mock_cancel_ok(&stripe, "sub_w4r_old").await;
+
+    let session = w4b_session(
+        json!({ "metadata": { "spooled_org_id": t.org_id } }),
+        "cus_w4r",
+        "sub_w4r_new",
+        "someone@example.com",
+        "paid",
+    );
+    let event = w4b_event(
+        "evt_w4r",
+        "checkout.session.completed",
+        chrono::Utc::now().timestamp(),
+        session,
+    );
+
+    let (status, body) = w4b_deliver(&app, &stripe, &event).await;
+    assert!(
+        status.is_server_error(),
+        "a failed cancel must ask Stripe to retry: {status} {body}"
+    );
+    let billing = w4b_billing(db.pool(), &t.org_id).await;
+    assert_eq!(
+        billing.stripe_subscription_id.as_deref(),
+        Some("sub_w4r_new"),
+        "the customer keeps the plan they paid for"
+    );
+    assert_eq!(billing.plan_tier, "pro");
+    assert_eq!(
+        billing.stripe_superseded_subscription_ids,
+        vec!["sub_w4r_old".to_string()]
+    );
+    let (claims,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM processed_stripe_events WHERE event_id = 'evt_w4r'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(claims, 0, "the claim is released for the retry");
+
+    // Stripe redelivers the same event: the cancel goes through this time.
+    let (status, body) = w4b_deliver(&app, &stripe, &event).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let billing = w4b_billing(db.pool(), &t.org_id).await;
+    assert!(
+        billing.stripe_superseded_subscription_ids.is_empty(),
+        "{billing:?}"
+    );
+    assert_eq!(
+        billing.stripe_subscription_id.as_deref(),
+        Some("sub_w4r_new")
+    );
+    assert_eq!(
+        w4b_received(&stripe, "DELETE", Some("/v1/subscriptions/sub_w4r_old"))
+            .await
+            .len(),
+        2
+    );
+}
+
+// ---------------------------------------------------------------------------
+// BEBILL-14: Stripe refusing to cancel a subscription that already ended
+// counts as done, so the event does not retry forever.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn w4_billing_cancel_of_an_already_ended_subscription_counts_as_done() {
+    use wiremock::matchers::{method, path};
+
+    let db = TestDatabase::new().await;
+    let t = seed_tenant(db.pool()).await;
+    w4b_set_billing(
+        db.pool(),
+        &t.org_id,
+        "starter",
+        Some("cus_w4e"),
+        Some("sub_w4e_old"),
+        Some("past_due"),
+    )
+    .await;
+    let app = app_with(&db, w4b_settings());
+    let stripe = wiremock::MockServer::start().await;
+    w4b_mock_subscription(&stripe, "sub_w4e_new", "cus_w4e", W4B_STARTER_PRICE).await;
+    wiremock::Mock::given(method("DELETE"))
+        .and(path("/v1/subscriptions/sub_w4e_old"))
+        .respond_with(wiremock::ResponseTemplate::new(400).set_body_json(json!({
+            "error": { "type": "invalid_request_error", "message": "subscription already canceled" }
+        })))
+        .mount(&stripe)
+        .await;
+    wiremock::Mock::given(method("GET"))
+        .and(path("/v1/subscriptions/sub_w4e_old"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(w4b_subscription(
+                "sub_w4e_old",
+                "cus_w4e",
+                W4B_STARTER_PRICE,
+                "canceled",
+            )),
+        )
+        .mount(&stripe)
+        .await;
+
+    let session = w4b_session(
+        json!({ "metadata": { "spooled_org_id": t.org_id } }),
+        "cus_w4e",
+        "sub_w4e_new",
+        "someone@example.com",
+        "paid",
+    );
+    let event = w4b_event(
+        "evt_w4e",
+        "checkout.session.completed",
+        chrono::Utc::now().timestamp(),
+        session,
+    );
+    let (status, body) = w4b_deliver(&app, &stripe, &event).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let billing = w4b_billing(db.pool(), &t.org_id).await;
+    assert!(
+        billing.stripe_superseded_subscription_ids.is_empty(),
+        "{billing:?}"
+    );
+    assert_eq!(
+        billing.stripe_subscription_id.as_deref(),
+        Some("sub_w4e_new")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// BEBILL-15: a delayed payment method completes the session unpaid; the
+// later checkout.session.async_payment_succeeded links the org.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn w4_billing_async_payment_succeeded_links_the_org() {
+    let db = TestDatabase::new().await;
+    let t = seed_tenant(db.pool()).await;
+    w4b_set_billing(db.pool(), &t.org_id, "free", None, None, None).await;
+    let app = app_with(&db, w4b_settings());
+    let stripe = wiremock::MockServer::start().await;
+    w4b_mock_subscription(&stripe, "sub_w4a", "cus_w4a", W4B_STARTER_PRICE).await;
+    let now = chrono::Utc::now().timestamp();
+    let org_ref = json!({ "metadata": { "spooled_org_id": t.org_id } });
+
+    let unpaid = w4b_session(
+        org_ref.clone(),
+        "cus_w4a",
+        "sub_w4a",
+        "someone@example.com",
+        "unpaid",
+    );
+    let (status, body) = w4b_deliver(
+        &app,
+        &stripe,
+        &w4b_event(
+            "evt_w4a_completed",
+            "checkout.session.completed",
+            now,
+            unpaid.clone(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        w4b_billing(db.pool(), &t.org_id).await.stripe_customer_id,
+        None,
+        "not paid yet"
+    );
+
+    let (status, body) = w4b_deliver(
+        &app,
+        &stripe,
+        &w4b_event(
+            "evt_w4a_failed",
+            "checkout.session.async_payment_failed",
+            now,
+            unpaid,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        w4b_billing(db.pool(), &t.org_id).await.stripe_customer_id,
+        None,
+        "a failed payment links nothing"
+    );
+
+    let paid = w4b_session(org_ref, "cus_w4a", "sub_w4a", "someone@example.com", "paid");
+    let (status, body) = w4b_deliver(
+        &app,
+        &stripe,
+        &w4b_event(
+            "evt_w4a_succeeded",
+            "checkout.session.async_payment_succeeded",
+            now + 1,
+            paid,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let billing = w4b_billing(db.pool(), &t.org_id).await;
+    assert_eq!(billing.stripe_customer_id.as_deref(), Some("cus_w4a"));
+    assert_eq!(billing.stripe_subscription_id.as_deref(), Some("sub_w4a"));
+    assert_eq!(billing.plan_tier, "starter");
+}
+
+// ---------------------------------------------------------------------------
+// BEBILL-25: subscription/invoice events for a customer that is not linked
+// yet ask Stripe to retry without a 500.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn w4_billing_events_before_the_link_ask_for_a_retry_without_a_500() {
+    let db = TestDatabase::new().await;
+    let app = app_with(&db, w4b_settings());
+    let stripe = wiremock::MockServer::start().await;
+    let now = chrono::Utc::now().timestamp();
+
+    let created = w4b_event(
+        "evt_w4_early_sub",
+        "customer.subscription.created",
+        now,
+        w4b_subscription("sub_w4_early", "cus_w4_early", W4B_STARTER_PRICE, "active"),
+    );
+    let (status, body) = w4b_deliver(&app, &stripe, &created).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+    let invoice = w4b_event(
+        "evt_w4_early_invoice",
+        "invoice.paid",
+        now,
+        json!({ "id": "in_w4_early", "customer": "cus_w4_early", "subscription": "sub_w4_early" }),
+    );
+    let (status, body) = w4b_deliver(&app, &stripe, &invoice).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+}
+
+// ---------------------------------------------------------------------------
+// BEBILL-23: billing status needs an unrestricted key, like the portal.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn w4_billing_status_requires_an_unrestricted_key() {
+    let db = TestDatabase::new().await;
+    let t = seed_tenant(db.pool()).await;
+    let app = app(&db);
+
+    let scoped = bearer(&w4b_scoped_key(db.pool(), &t.org_id).await);
+    let (status, body) = call(
+        &app,
+        "GET",
+        "/api/v1/billing/status",
+        &[("Authorization", &scoped)],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    let (status, body) = call(
+        &app,
+        "GET",
+        "/api/v1/billing/status",
+        &[("Authorization", &bearer(&t.key))],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["plan_tier"], "starter", "{body}");
+}
+// ---- wave 4 / limits ----
+// BEAUTH-08 / BEBILL-09 system API keys, BEAUTH-09 / BEBILL-06 / BEFLOW-07 caps on
+// PUT re-activation, BEBILL-07 / BEBILL-26 custom_limits, BEFLOW-06 soft delete,
+// BEBILL-10 / BEFLOW-17 active-only workflow count.
+mod wave4_limits {
+    use super::*;
+
+    use spooled_backend::outgoing_webhooks::service::OutgoingWebhookService;
+    use spooled_backend::scheduler::Scheduler;
+
+    const ADMIN_KEY: &str = "w4-limits-admin-key";
+
+    fn admin_app(db: &TestDatabase) -> Router {
+        let mut settings = Settings::load_for_testing();
+        settings.registration.admin_api_key = Some(ADMIN_KEY.to_string());
+        app_with(db, settings)
+    }
+
+    fn scheduler(db: &TestDatabase) -> Scheduler {
+        Scheduler::new(
+            Arc::clone(&db.pool),
+            None,
+            Arc::new(Metrics::new()),
+            Arc::new(OutgoingWebhookService::new((*db.pool).clone(), 3, 4)),
+        )
+    }
+
+    async fn set_plan(pool: &sqlx::PgPool, org_id: &str, plan: &str, custom: Option<Value>) {
+        sqlx::query("UPDATE organizations SET plan_tier = $2, custom_limits = $3 WHERE id = $1")
+            .bind(org_id)
+            .bind(plan)
+            .bind(custom)
+            .execute(pool)
+            .await
+            .expect("set plan");
+    }
+
+    /// (api_keys, schedules, workflows) as the plan caps count them.
+    async fn counts(pool: &sqlx::PgPool, org_id: &str) -> (i64, i64, i64) {
+        sqlx::query_as("SELECT api_keys, schedules, workflows FROM get_org_resource_counts($1)")
+            .bind(org_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn email_login(app: &Router, pool: &sqlx::PgPool, email: &str) {
+        let (status, body) = call(
+            app,
+            "POST",
+            "/api/v1/auth/email/start",
+            &[],
+            Some(json!({"email": email})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (code, _) = latest_code(pool, email).await;
+        let (status, body) = call(
+            app,
+            "POST",
+            "/api/v1/auth/email/verify",
+            &[],
+            Some(json!({"email": email, "code": code})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["type"], "login", "{body}");
+    }
+
+    async fn list_keys(app: &Router, auth: &str) -> Vec<Value> {
+        let (status, body) = call(
+            app,
+            "GET",
+            "/api/v1/api-keys",
+            &[("Authorization", auth)],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body.as_array().expect("key list").clone()
+    }
+
+    async fn create_key(app: &Router, auth: &str, body: Value) -> (StatusCode, Value) {
+        call(
+            app,
+            "POST",
+            "/api/v1/api-keys",
+            &[("Authorization", auth)],
+            Some(body),
+        )
+        .await
+    }
+
+    async fn delete(app: &Router, auth: &str, path: &str) -> StatusCode {
+        call(app, "DELETE", path, &[("Authorization", auth)], None)
+            .await
+            .0
+    }
+
+    async fn put(app: &Router, auth: &str, path: &str, body: Value) -> (StatusCode, Value) {
+        call(app, "PUT", path, &[("Authorization", auth)], Some(body)).await
+    }
+
+    // BEAUTH-08 / BEBILL-09 (contract C3): the email-login key is a system key,
+    // flagged in the API and outside the max_api_keys count; no request sets the flag.
+    #[tokio::test]
+    async fn email_login_key_is_a_system_key_outside_the_key_cap() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        set_plan(db.pool(), &t.org_id, "free", None).await; // max_api_keys 2
+        let app = app(&db);
+        let auth = bearer(&t.key);
+        let email = format!("bh-{}@example.com", &t.org_id[..8]);
+
+        // Two logins share one system key.
+        email_login(&app, db.pool(), &email).await;
+        email_login(&app, db.pool(), &email).await;
+        let keys = list_keys(&app, &auth).await;
+        assert!(keys.iter().all(|k| k["is_system"].is_boolean()), "{keys:?}");
+        let system: Vec<&Value> = keys.iter().filter(|k| k["is_system"] == true).collect();
+        assert_eq!(system.len(), 1, "{keys:?}");
+        assert_eq!(system[0]["name"], "Email Login");
+        let system_id = system[0]["id"].as_str().unwrap().to_string();
+        let (status, body) = call(
+            &app,
+            "GET",
+            &format!("/api/v1/api-keys/{system_id}"),
+            &[("Authorization", &auth)],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["is_system"], true, "{body}");
+
+        // The seed key is 1 of 2: the system key takes no slot, so a second
+        // customer key fits, and a third does not.
+        let (status, body) =
+            create_key(&app, &auth, json!({"name": "second", "is_system": true})).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let second = body["id"].as_str().unwrap().to_string();
+        assert_eq!(counts(db.pool(), &t.org_id).await.0, 2);
+        let (status, body) = create_key(&app, &auth, json!({"name": "third"})).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+
+        // Neither create nor update can set the flag.
+        let (status, body) = call(
+            &app,
+            "GET",
+            &format!("/api/v1/api-keys/{second}"),
+            &[("Authorization", &auth)],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["is_system"], false, "{body}");
+        let (status, body) = put(
+            &app,
+            &auth,
+            &format!("/api/v1/api-keys/{second}"),
+            json!({"is_system": true, "name": "second-renamed"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["is_system"], false, "{body}");
+
+        // A customer key named like the system key is not mistaken for it: once
+        // the user revokes the system key, the next login mints a new system key
+        // instead of binding the dashboard session to the customer's key.
+        let path = format!("/api/v1/api-keys/{system_id}");
+        assert_eq!(delete(&app, &auth, &path).await, StatusCode::NO_CONTENT);
+        let path = format!("/api/v1/api-keys/{second}");
+        assert_eq!(delete(&app, &auth, &path).await, StatusCode::NO_CONTENT);
+        let (status, body) = create_key(&app, &auth, json!({"name": "Email Login"})).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let lookalike = body["id"].as_str().unwrap().to_string();
+
+        email_login(&app, db.pool(), &email).await;
+        let keys = list_keys(&app, &auth).await;
+        let active_system: Vec<&Value> = keys
+            .iter()
+            .filter(|k| k["is_system"] == true && k["is_active"] == true)
+            .collect();
+        assert_eq!(active_system.len(), 1, "{keys:?}");
+        assert_ne!(active_system[0]["id"], lookalike.as_str());
+        assert_ne!(active_system[0]["id"], system_id.as_str());
+        let customer = keys.iter().find(|k| k["id"] == lookalike.as_str()).unwrap();
+        assert_eq!(customer["is_system"], false, "{customer}");
+        assert_eq!(counts(db.pool(), &t.org_id).await.0, 2);
+    }
+
+    // BEAUTH-09 / BEBILL-06 / BEFLOW-07: a PUT that re-activates a revoked key or
+    // a paused schedule pays the plan cap like create / resume, and a re-activated
+    // schedule's next fire is computed from now.
+    #[tokio::test]
+    async fn put_reactivation_pays_the_cap_and_recomputes_next_run() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        set_plan(db.pool(), &t.org_id, "free", None).await; // 2 keys, 1 schedule
+        let app = app(&db);
+        let auth = bearer(&t.key);
+
+        // Keys: seed (1/2) -> A (2/2) -> revoke A -> C (2/2) -> re-enable A.
+        let (status, body) = create_key(&app, &auth, json!({"name": "a"})).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let a = format!("/api/v1/api-keys/{}", body["id"].as_str().unwrap());
+        assert_eq!(delete(&app, &auth, &a).await, StatusCode::NO_CONTENT);
+        let (status, body) = create_key(&app, &auth, json!({"name": "c"})).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let c = format!("/api/v1/api-keys/{}", body["id"].as_str().unwrap());
+
+        let (status, body) = put(&app, &auth, &a, json!({"is_active": true})).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+        assert_eq!(body["code"], "QUOTA_EXCEEDED", "{body}");
+        assert_eq!(counts(db.pool(), &t.org_id).await.0, 2);
+        // Edits that do not re-activate never touch the quota.
+        let (status, body) = put(&app, &auth, &a, json!({"name": "a2"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["is_active"], false, "{body}");
+        let (status, body) = put(&app, &auth, &c, json!({"is_active": false})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = put(&app, &auth, &a, json!({"is_active": true})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["is_active"], true, "{body}");
+
+        // Schedules: S1 (1/1) -> pause S1 -> S2 (1/1) -> PUT S1 is_active.
+        let schedule = |name: &str| {
+            json!({
+                "name": name,
+                "cron_expression": "0 0 * * *",
+                "queue_name": "w4-limits",
+                "payload_template": {},
+            })
+        };
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/api/v1/schedules",
+            &[("Authorization", &auth)],
+            Some(schedule("s1")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let s1_id = body["id"].as_str().unwrap().to_string();
+        let s1 = format!("/api/v1/schedules/{s1_id}");
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{s1}/pause"),
+            &[("Authorization", &auth)],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/api/v1/schedules",
+            &[("Authorization", &auth)],
+            Some(schedule("s2")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let s2 = format!("/api/v1/schedules/{}", body["id"].as_str().unwrap());
+
+        let (status, body) = put(&app, &auth, &s1, json!({"is_active": true})).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+        assert_eq!(body["code"], "QUOTA_EXCEEDED", "{body}");
+        assert_eq!(counts(db.pool(), &t.org_id).await.1, 1);
+
+        // With the slot free, re-activation works and does not fire the stale,
+        // long-past next_run_at on the next tick.
+        assert_eq!(delete(&app, &auth, &s2).await, StatusCode::NO_CONTENT);
+        sqlx::query("UPDATE schedules SET next_run_at = NOW() - INTERVAL '3 days' WHERE id = $1")
+            .bind(&s1_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let (status, body) = put(&app, &auth, &s1, json!({"is_active": true})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["is_active"], true, "{body}");
+        let (future,): (bool,) =
+            sqlx::query_as("SELECT next_run_at > NOW() FROM schedules WHERE id = $1")
+                .bind(&s1_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(
+            future,
+            "re-activation must recompute next_run_at from now: {body}"
+        );
+    }
+
+    // BEAUTH-09 / BEFLOW-07: at the cap, parallel re-activations never overshoot.
+    #[tokio::test]
+    async fn concurrent_put_reactivations_never_overshoot_the_cap() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        set_plan(
+            db.pool(),
+            &t.org_id,
+            "starter",
+            Some(json!({"max_api_keys": 3, "max_schedules": 2})),
+        )
+        .await;
+        let app = app(&db);
+        let auth = bearer(&t.key);
+
+        let mut keys = Vec::new();
+        let mut schedules = Vec::new();
+        for i in 0..6 {
+            let key = uuid::Uuid::new_v4().to_string();
+            sqlx::query(
+                "INSERT INTO api_keys (id, organization_id, key_hash, key_prefix, name, queues, is_active, created_at) \
+                 VALUES ($1, $2, 'unused-' || $1, 'sp_test_', $3, ARRAY[]::TEXT[], FALSE, NOW())",
+            )
+            .bind(&key)
+            .bind(&t.org_id)
+            .bind(format!("revoked-{i}"))
+            .execute(db.pool())
+            .await
+            .unwrap();
+            keys.push(key);
+            let schedule = uuid::Uuid::new_v4().to_string();
+            sqlx::query(
+                "INSERT INTO schedules (id, organization_id, name, cron_expression, queue_name, is_active) \
+                 VALUES ($1, $2, $3, '0 0 * * *', 'w4-limits', FALSE)",
+            )
+            .bind(&schedule)
+            .bind(&t.org_id)
+            .bind(format!("paused-{i}"))
+            .execute(db.pool())
+            .await
+            .unwrap();
+            schedules.push(schedule);
+        }
+
+        // The seed key holds 1 of 3 key slots; no schedule is active yet.
+        for (resource, ids) in [("api-keys", &keys), ("schedules", &schedules)] {
+            let mut tasks = Vec::new();
+            for id in ids {
+                let app = app.clone();
+                let auth = auth.clone();
+                let path = format!("/api/v1/{resource}/{id}");
+                tasks.push(tokio::spawn(async move {
+                    put(&app, &auth, &path, json!({"is_active": true})).await
+                }));
+            }
+            let mut granted = 0;
+            for task in tasks {
+                let (status, body) = task.await.unwrap();
+                match status {
+                    StatusCode::OK => granted += 1,
+                    StatusCode::TOO_MANY_REQUESTS => {}
+                    other => panic!("{resource}: unexpected {other}: {body}"),
+                }
+            }
+            assert_eq!(granted, 2, "{resource}: exactly the free slots are granted");
+        }
+        let (api_keys, schedules, _) = counts(db.pool(), &t.org_id).await;
+        assert_eq!(api_keys, 3, "seed key + 2 re-activated");
+        assert_eq!(schedules, 2);
+    }
+
+    // BEBILL-07 / BEBILL-26: the admin API rejects custom_limits the limit
+    // checks or the retention sweep cannot use; -1 is "unlimited" on caps only.
+    #[tokio::test]
+    async fn admin_patch_validates_custom_limits() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let app = admin_app(&db);
+        let path = format!("/api/v1/admin/organizations/{}", t.org_id);
+        let admin = [("X-Admin-Key", ADMIN_KEY)];
+
+        for bad in [
+            json!({"job_retention_days": "90"}),
+            json!({"job_retention_days": 1.5}),
+            json!({"job_retention_days": -1}),
+            json!({"history_retention_days": 99_999_999_999u64}),
+            json!({"max_api_key": 3}),
+            json!({"max_api_keys": -2}),
+            json!([1]),
+        ] {
+            let (status, body) = call(
+                &app,
+                "PATCH",
+                &path,
+                &admin,
+                Some(json!({"custom_limits": bad})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+            assert_eq!(body["code"], "VALIDATION_ERROR", "{bad}: {body}");
+        }
+        let (stored,): (Option<Value>,) =
+            sqlx::query_as("SELECT custom_limits FROM organizations WHERE id = $1")
+                .bind(&t.org_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(stored, None, "nothing invalid was stored");
+
+        let good = json!({"max_api_keys": -1, "max_jobs_per_day": null, "job_retention_days": 45});
+        let (status, body) = call(
+            &app,
+            "PATCH",
+            &path,
+            &admin,
+            Some(json!({"custom_limits": good})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["custom_limits"], good, "{body}");
+        // Reset still works.
+        let (status, body) = call(
+            &app,
+            "PATCH",
+            &path,
+            &admin,
+            Some(json!({"custom_limits": null})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["custom_limits"].is_null(), "{body}");
+    }
+
+    async fn completed_job(pool: &sqlx::PgPool, org_id: &str, days_ago: i32) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO jobs (id, organization_id, queue_name, payload, status, completed_at, created_at, updated_at) \
+             VALUES ($1, $2, 'w4-ret', '{}'::JSONB, 'completed', NOW() - make_interval(days => $3), \
+                     NOW() - make_interval(days => $3), NOW())",
+        )
+        .bind(&id)
+        .bind(org_id)
+        .bind(days_ago)
+        .execute(pool)
+        .await
+        .expect("seed completed job");
+        id
+    }
+
+    async fn job_exists(pool: &sqlx::PgPool, id: &str) -> bool {
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM jobs WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        n == 1
+    }
+
+    // BEBILL-07: a bad stored retention override falls back to the plan default
+    // instead of failing the sweep for every org, and -1 no longer purges.
+    #[tokio::test]
+    async fn retention_sweep_tolerates_bad_custom_limits() {
+        let db = TestDatabase::new().await;
+        let pool = db.pool();
+        let good = seed_tenant(pool).await;
+        let negative = seed_tenant(pool).await;
+        let bad = seed_tenant(pool).await;
+        set_plan(pool, &good.org_id, "free", None).await;
+        set_plan(
+            pool,
+            &negative.org_id,
+            "free",
+            Some(json!({"job_retention_days": -1})),
+        )
+        .await;
+        let scheduler = scheduler(&db);
+
+        // -1 used to put the cutoff in the future: a 1-day-old job was purged.
+        let old_good = completed_job(pool, &good.org_id, 30).await;
+        let recent_negative = completed_job(pool, &negative.org_id, 1).await;
+        scheduler.cleanup_stale_workers().await.expect("sweep");
+        assert!(
+            !job_exists(pool, &old_good).await,
+            "free retention is 3 days"
+        );
+        assert!(
+            job_exists(pool, &recent_negative).await,
+            "-1 falls back to the plan's 3 days"
+        );
+
+        // One org's unusable values used to fail the sweep for everyone.
+        for value in [json!("ninety"), json!(1.5), json!(99_999_999_999u64)] {
+            set_plan(
+                pool,
+                &bad.org_id,
+                "free",
+                Some(json!({"job_retention_days": value, "history_retention_days": value})),
+            )
+            .await;
+            let old_good = completed_job(pool, &good.org_id, 30).await;
+            let recent_bad = completed_job(pool, &bad.org_id, 1).await;
+            scheduler
+                .cleanup_stale_workers()
+                .await
+                .unwrap_or_else(|e| panic!("sweep with {value}: {e:?}"));
+            assert!(!job_exists(pool, &old_good).await, "{value}");
+            assert!(job_exists(pool, &recent_bad).await, "{value}");
+        }
+        assert!(job_exists(pool, &recent_negative).await);
+    }
+
+    // BEFLOW-06 / BEAUTH-15: soft delete stops the org's schedules, outgoing
+    // webhooks and incoming-webhook token; cron and ingest skip a deleted org
+    // even when its rows predate that.
+    #[tokio::test]
+    async fn soft_deleted_org_stops_cron_webhooks_and_ingest() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let app = admin_app(&db);
+        let auth = bearer(&t.key);
+
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/api/v1/schedules",
+            &[("Authorization", &auth)],
+            Some(json!({
+                "name": "cron",
+                "cron_expression": "0 0 * * *",
+                "queue_name": "w4-del",
+                "payload_template": {},
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let schedule = body["id"].as_str().unwrap().to_string();
+        sqlx::query(
+            "INSERT INTO outgoing_webhooks (organization_id, name, url, events) \
+             VALUES ($1, 'hook', 'https://example.com/hook', ARRAY['job.completed'])",
+        )
+        .bind(&t.org_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let set_token = || {
+            sqlx::query(
+                "UPDATE organizations \
+                 SET settings = settings || jsonb_build_object('webhook_token', 'whk_w4_limits') \
+                 WHERE id = $1",
+            )
+            .bind(&t.org_id)
+            .execute(db.pool())
+        };
+        set_token().await.unwrap();
+        let ingest_path = format!("/api/v1/webhooks/{}/custom", t.org_id);
+        let ingest = || {
+            call(
+                &app,
+                "POST",
+                &ingest_path,
+                &[("X-Webhook-Token", "whk_w4_limits")],
+                Some(json!({"queue_name": "w4-del", "payload": {"n": 1}})),
+            )
+        };
+        let (status, body) = ingest().await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (status, body) = call(
+            &app,
+            "DELETE",
+            &format!("/api/v1/admin/organizations/{}", t.org_id),
+            &[("X-Admin-Key", ADMIN_KEY)],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+        let (schedule_active, hooks_enabled, has_token): (bool, i64, bool) = sqlx::query_as(
+            "SELECT \
+               (SELECT is_active FROM schedules WHERE id = $2), \
+               (SELECT COUNT(*) FROM outgoing_webhooks WHERE organization_id = $1 AND enabled), \
+               (SELECT settings ? 'webhook_token' FROM organizations WHERE id = $1)",
+        )
+        .bind(&t.org_id)
+        .bind(&schedule)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(!schedule_active, "soft delete pauses schedules");
+        assert_eq!(hooks_enabled, 0, "soft delete disables outgoing webhooks");
+        assert!(!has_token, "soft delete clears the incoming-webhook token");
+
+        // An org soft-deleted before this release still has active schedules
+        // and its token: neither cron nor ingest may act for it.
+        sqlx::query(
+            "UPDATE schedules SET is_active = TRUE, next_run_at = NOW() - INTERVAL '1 minute' \
+             WHERE id = $1",
+        )
+        .bind(&schedule)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        set_token().await.unwrap();
+        let (jobs_before,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM jobs WHERE organization_id = $1")
+                .bind(&t.org_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+
+        scheduler(&db)
+            .process_cron_schedules()
+            .await
+            .expect("cron tick");
+        let (jobs_after, still_due): (i64, bool) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM jobs WHERE organization_id = $1), \
+                    (SELECT next_run_at < NOW() FROM schedules WHERE id = $2)",
+        )
+        .bind(&t.org_id)
+        .bind(&schedule)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            jobs_after, jobs_before,
+            "cron must not enqueue for a deleted org"
+        );
+        assert!(still_due, "the deleted org's schedule was not processed");
+
+        let (status, body) = ingest().await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+
+    async fn seed_workflows(pool: &sqlx::PgPool, org_id: &str, status: &str, n: i32) {
+        sqlx::query(
+            "INSERT INTO workflows (organization_id, name, status, completed_at) \
+             SELECT $1, 'wf-' || g, $2, \
+                    CASE WHEN $2 IN ('completed', 'failed', 'cancelled') THEN NOW() END \
+             FROM generate_series(1, $3) AS g",
+        )
+        .bind(org_id)
+        .bind(status)
+        .bind(n)
+        .execute(pool)
+        .await
+        .expect("seed workflows");
+    }
+
+    // BEBILL-10 / BEFLOW-17 (contract C5): max_workflows counts pending/running
+    // workflows only; finished runs no longer hold a slot until retention.
+    #[tokio::test]
+    async fn max_workflows_counts_only_unfinished_workflows() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await; // starter: max_workflows 5
+        let app = app(&db);
+        let auth = bearer(&t.key);
+        for (status, n) in [
+            ("completed", 5),
+            ("failed", 1),
+            ("cancelled", 1),
+            ("running", 1),
+            ("pending", 1),
+        ] {
+            seed_workflows(db.pool(), &t.org_id, status, n).await;
+        }
+        assert_eq!(counts(db.pool(), &t.org_id).await.2, 2);
+
+        let headers = [("Authorization", auth.as_str())];
+        let create = || {
+            call(
+                &app,
+                "POST",
+                "/api/v1/workflows",
+                &headers,
+                Some(json!({
+                    "name": "w4",
+                    "jobs": [{"key": "a", "queue_name": "w4-wf", "payload": {}}],
+                })),
+            )
+        };
+        let (status, body) = create().await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(counts(db.pool(), &t.org_id).await.2, 3);
+
+        // The cap still holds for unfinished workflows.
+        seed_workflows(db.pool(), &t.org_id, "running", 2).await;
+        let (status, body) = create().await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    }
+}
+// ---- wave 4 / authrl ----
+// BEAUTH-10 / BEBILL-24 (client IP from the TCP peer, IPv6 per /64),
+// BEAUTH-06 (verify budgets per client), BEAUTH-11 / FESF-15 (start throttle,
+// Turnstile, undelivered codes), BEAUTH-24 (single-use codes).
+mod wave4_authrl {
+    use super::*;
+
+    use std::net::SocketAddr;
+
+    use axum::extract::ConnectInfo;
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use spooled_backend::cache::RedisCache;
+    use spooled_backend::config::{EmailProvider, RedisSettings};
+
+    /// Router on Redis with `settings`. Keep the `TestRedis` alive.
+    async fn redis_app(
+        db: &TestDatabase,
+        settings: Settings,
+    ) -> (Router, RedisCache, super::common::TestRedis) {
+        let redis = super::common::TestRedis::new().await;
+        let cache = RedisCache::connect(&RedisSettings {
+            url: redis.url.clone(),
+            pool_size: 4,
+        })
+        .await
+        .expect("connect redis");
+        let app = router(AppState::new(
+            Database::from_pool(Arc::clone(&db.pool)),
+            Some(cache.clone()),
+            Metrics::new(),
+            settings,
+        ));
+        (app, cache, redis)
+    }
+
+    /// A public IPv6 /64 no other test uses; `host` picks an address in it.
+    fn unique_prefix() -> String {
+        let id = uuid::Uuid::new_v4().as_u128();
+        format!("2001:db8:{:x}:{:x}", (id >> 16) as u16, id as u16)
+    }
+
+    fn in_prefix(prefix: &str, host: u16) -> String {
+        format!("{prefix}::{host:x}")
+    }
+
+    /// [`call`] over a connection from `peer`, as `axum::serve` with
+    /// `ConnectInfo` delivers it (main.rs). Returns the response headers too.
+    async fn call_from(
+        app: &Router,
+        peer: &str,
+        method: &str,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: Option<Value>,
+    ) -> (StatusCode, axum::http::HeaderMap, Value) {
+        let mut req = Request::builder().method(method).uri(uri);
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        let mut req = match body {
+            Some(b) => req
+                .header("Content-Type", "application/json")
+                .body(Body::from(b.to_string()))
+                .unwrap(),
+            None => req.body(Body::empty()).unwrap(),
+        };
+        let ip: std::net::IpAddr = peer.parse().expect("peer address");
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::new(ip, 41000)));
+        let res = app.clone().oneshot(req).await.expect("request");
+        let status = res.status();
+        let response_headers = res.headers().clone();
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let json = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into()))
+        };
+        (status, response_headers, json)
+    }
+
+    fn unique_address(tag: &str) -> String {
+        format!("{tag}-{}@example.com", uuid::Uuid::new_v4().simple())
+    }
+
+    fn retry_after(headers: &axum::http::HeaderMap) -> u64 {
+        headers
+            .get("Retry-After")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .expect("Retry-After header")
+    }
+
+    async fn code_rows(pool: &sqlx::PgPool, email: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM email_login_codes WHERE email = $1")
+            .bind(email)
+            .fetch_one(pool)
+            .await
+            .expect("count codes")
+    }
+
+    // -----------------------------------------------------------------------
+    // BEAUTH-10: without TRUSTED_CLIENT_IP_HEADER, CF-Connecting-IP picked the
+    // bucket for any caller, so a client reaching the backend directly got a
+    // fresh public-limiter bucket per request. Production's cloudflared talks
+    // to the backend from the docker network and keeps per-client buckets.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn w4_authrl_public_peer_cannot_choose_its_bucket_with_edge_headers() {
+        let db = TestDatabase::new().await;
+        let mut settings = Settings::load_for_testing();
+        settings.rate_limit.requests_per_second = 1;
+        settings.rate_limit.burst_size = 2;
+        let (app, _cache, _redis) = redis_app(&db, settings).await;
+        let uri = "/api/v1/auth/check-email?email=nobody-w4@example.com";
+
+        // A public peer (203.0.113.9 in spirit; unique per run in a shared
+        // Redis) naming a different client every time: one bucket, its own.
+        let public_peer = in_prefix(&unique_prefix(), 9);
+        let mut statuses = Vec::new();
+        for _ in 0..4 {
+            let spoofed = unique_client_ip();
+            let (status, _, _) = call_from(
+                &app,
+                &public_peer,
+                "GET",
+                uri,
+                &[("CF-Connecting-IP", &spoofed), ("X-Real-IP", &spoofed)],
+                None,
+            )
+            .await;
+            statuses.push(status);
+        }
+        assert!(
+            statuses.contains(&StatusCode::TOO_MANY_REQUESTS),
+            "a public peer must be limited on its own address: {statuses:?}"
+        );
+
+        // The tunnel container's address (docker bridge): the header is the
+        // client, so distinct clients behind one proxy keep separate buckets.
+        for _ in 0..4 {
+            let client = unique_client_ip();
+            let (status, _, body) = call_from(
+                &app,
+                "172.18.0.5",
+                "GET",
+                uri,
+                &[("CF-Connecting-IP", &client)],
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+    }
+
+    // BEAUTH-10: check-slug keys its limits on the TCP peer
+    // (as do /auth/login and the failed-auth budget). A public peer naming another client in CF-Connecting-IP is still
+    // counted on its own address; a docker-network peer is counted on the header.
+    #[tokio::test]
+    async fn w4_authrl_check_slug_budget_follows_the_peer() {
+        use spooled_backend::api::middleware::client_ip::rate_limit_id;
+
+        let db = TestDatabase::new().await;
+        let (app, cache, _redis) = redis_app(&db, Settings::load_for_testing()).await;
+
+        let public_peer = in_prefix(&unique_prefix(), 9);
+        let spoofed = unique_client_ip();
+        let (status, _, body) = call_from(
+            &app,
+            &public_peer,
+            "GET",
+            "/api/v1/organizations/check-slug?slug=w4-peer-slug",
+            &[("CF-Connecting-IP", &spoofed)],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let own = format!("check_slug:minute:{}", rate_limit_id(&public_peer));
+        let named = format!("check_slug:minute:{}", rate_limit_id(&spoofed));
+        assert!(
+            cache.get(&own).await.unwrap().is_some(),
+            "the public peer is counted on its own address"
+        );
+        assert!(
+            cache.get(&named).await.unwrap().is_none(),
+            "a public peer cannot move its count to the address it names"
+        );
+
+        let client = unique_client_ip();
+        let (status, _, body) = call_from(
+            &app,
+            "172.18.0.5",
+            "GET",
+            "/api/v1/organizations/check-slug?slug=w4-peer-slug",
+            &[("CF-Connecting-IP", &client)],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let behind_proxy = format!("check_slug:minute:{}", rate_limit_id(&client));
+        assert!(
+            cache.get(&behind_proxy).await.unwrap().is_some(),
+            "behind the tunnel the header names the client"
+        );
+    }
+
+    // The real binary serves with ConnectInfo: a caller that sends no edge
+    // header is keyed on its TCP address, not on the shared "unknown" bucket.
+    #[tokio::test]
+    async fn w4_authrl_the_server_keys_a_bare_client_on_its_tcp_address() {
+        use std::time::{Duration, Instant};
+
+        use super::wave3_runtime::{child_database_url, free_port, Backend};
+
+        let db = TestDatabase::new().await;
+        let url = child_database_url(&db).await;
+        let redis = super::common::TestRedis::new().await;
+        let cache = RedisCache::connect(&RedisSettings {
+            url: redis.url.clone(),
+            pool_size: 2,
+        })
+        .await
+        .expect("connect redis");
+        let bucket = "check_email:minute:127.0.0.1";
+        cache.delete(bucket).await.unwrap();
+
+        let backend = Backend::spawn_with_env(
+            &url,
+            free_port(),
+            free_port(),
+            free_port(),
+            &[("REDIS_URL", redis.url.as_str())],
+        );
+        let deadline = Instant::now() + Duration::from_secs(45);
+        while !matches!(backend.get("/health/live", None).await, Some((200, _))) {
+            assert!(
+                Instant::now() < deadline,
+                "the backend never came up; output:\n{}",
+                backend.output()
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        let (status, body) = backend
+            .get("/api/v1/auth/check-email?email=w4-peer@example.com", None)
+            .await
+            .expect("an answer");
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            cache.exists(bucket).await.unwrap(),
+            "keyed on the TCP peer; output:\n{}",
+            backend.output()
+        );
+        cache.delete(bucket).await.unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // BEAUTH-11 / FESF-15 / contract C2: POST /auth/email/start is limited per
+    // client IP (429 RATE_LIMIT_EXCEEDED + Retry-After). BEBILL-24: an IPv6
+    // client is one client per /64.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn w4_authrl_email_start_is_limited_per_client_ip() {
+        let db = TestDatabase::new().await;
+        let (app, cache, _redis) = redis_app(&db, Settings::load_for_testing()).await;
+
+        // Behind the tunnel, one client rotating addresses inside its /64
+        // while asking for codes to different addresses.
+        let prefix = unique_prefix();
+        let mut statuses = Vec::new();
+        let mut throttled = None;
+        for host in 1..=4u16 {
+            let client = in_prefix(&prefix, host);
+            let (status, headers, body) = call_from(
+                &app,
+                "172.18.0.5",
+                "POST",
+                "/api/v1/auth/email/start",
+                &[("CF-Connecting-IP", &client)],
+                Some(json!({"email": unique_address("w4-start")})),
+            )
+            .await;
+            statuses.push(status);
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                throttled = Some((headers, body));
+            }
+        }
+        assert_eq!(
+            statuses,
+            vec![
+                StatusCode::OK,
+                StatusCode::OK,
+                StatusCode::OK,
+                StatusCode::TOO_MANY_REQUESTS
+            ],
+            "burst of 3 per minute per /64"
+        );
+        let (headers, body) = throttled.unwrap();
+        assert_eq!(body["code"], "RATE_LIMIT_EXCEEDED", "{body}");
+        let wait = retry_after(&headers);
+        assert!((1..=60).contains(&wait), "Retry-After {wait}");
+
+        // Another client is unaffected.
+        let (status, _, body) = call_from(
+            &app,
+            "172.18.0.5",
+            "POST",
+            "/api/v1/auth/email/start",
+            &[("CF-Connecting-IP", &unique_client_ip())],
+            Some(json!({"email": unique_address("w4-start")})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // The hourly budget: a client that already asked 10 times this hour.
+        let hourly = in_prefix(&unique_prefix(), 1);
+        cache
+            .set(
+                &format!("email_start:hour:{}", rate_limit_id(&hourly)),
+                "10",
+                3600,
+            )
+            .await
+            .unwrap();
+        let (status, headers, body) = call_from(
+            &app,
+            &hourly,
+            "POST",
+            "/api/v1/auth/email/start",
+            &[],
+            Some(json!({"email": unique_address("w4-start")})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+        assert!(retry_after(&headers) > 60, "{headers:?}");
+        assert!(
+            body["message"].as_str().unwrap().contains("minutes"),
+            "{body}"
+        );
+    }
+
+    fn rate_limit_id(addr: &str) -> String {
+        spooled_backend::api::middleware::client_ip::rate_limit_id(addr)
+    }
+
+    // -----------------------------------------------------------------------
+    // Contract C2: with TURNSTILE_SECRET_KEY set, start needs a token that
+    // Cloudflare accepts (400 CAPTCHA_FAILED otherwise); unset, nothing changes.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn w4_authrl_turnstile_is_checked_only_when_configured() {
+        let db = TestDatabase::new().await;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/turnstile/v0/siteverify"))
+            .and(body_string_contains("secret=turnstile-test-secret"))
+            .and(body_string_contains("response=good-token"))
+            .and(body_string_contains("remoteip=198.51.100.23"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"success": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/turnstile/v0/siteverify"))
+            .and(body_string_contains("response=bad-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"success": false, "error-codes": ["invalid-input-response"]}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/turnstile/v0/siteverify"))
+            .and(body_string_contains("response=outage-token"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Off (production today): no token needed, Cloudflare never called.
+        let off = app(&db);
+        let (status, body) = call(
+            &off,
+            "POST",
+            "/api/v1/auth/email/start",
+            &[],
+            Some(json!({"email": unique_address("w4-ts-off")})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let mut settings = Settings::load_for_testing();
+        settings.turnstile.secret_key = Some("turnstile-test-secret".to_string());
+        settings.turnstile.verify_url = format!("{}/turnstile/v0/siteverify", server.uri());
+        let on = app_with(&db, settings);
+        let start = |token: Option<&str>, email: &str| {
+            let mut body = json!({"email": email});
+            if let Some(token) = token {
+                body["turnstile_token"] = json!(token);
+            }
+            let on = on.clone();
+            async move {
+                call(
+                    &on,
+                    "POST",
+                    "/api/v1/auth/email/start",
+                    &[("CF-Connecting-IP", "198.51.100.23")],
+                    Some(body),
+                )
+                .await
+            }
+        };
+
+        for token in [None, Some(""), Some("bad-token"), Some("outage-token")] {
+            let email = unique_address("w4-ts-on");
+            let (status, body) = start(token, &email).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{token:?}: {body}");
+            assert_eq!(body["code"], "CAPTCHA_FAILED", "{token:?}: {body}");
+            assert_eq!(
+                code_rows(db.pool(), &email).await,
+                0,
+                "no code for {token:?}"
+            );
+        }
+
+        let email = unique_address("w4-ts-on");
+        let (status, body) = start(Some("good-token"), &email).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(code_rows(db.pool(), &email).await, 1);
+        // Mock expectations (one call each) are checked when `server` drops.
+    }
+
+    // -----------------------------------------------------------------------
+    // BEAUTH-11: the code row was stored before the mail went out, so a mail
+    // provider outage spent the address's 5 codes per hour on codes nobody got.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn w4_authrl_undelivered_codes_do_not_use_the_hourly_allowance() {
+        let db = TestDatabase::new().await;
+        let tenant = seed_tenant(db.pool()).await;
+        // Resend without EMAIL_API_KEY: every send fails before any network call.
+        let mut settings = Settings::load_for_testing();
+        settings.email.provider = EmailProvider::Resend;
+        settings.email.api_key = None;
+        let broken = app_with(&db, settings);
+
+        let email = unique_address("w4-outage");
+        for _ in 0..6 {
+            let (status, body) = call(
+                &broken,
+                "POST",
+                "/api/v1/auth/email/start",
+                &[],
+                Some(json!({"email": email})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        }
+        assert_eq!(code_rows(db.pool(), &email).await, 0);
+
+        // The provider is back: the address still gets its code.
+        let (status, body) = call(
+            &app(&db),
+            "POST",
+            "/api/v1/auth/email/start",
+            &[],
+            Some(json!({"email": email})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(code_rows(db.pool(), &email).await, 1);
+
+        // Same for the billing-email confirmation code.
+        let address = unique_address("w4-billing");
+        let (status, body) = call(
+            &app(&db),
+            "PUT",
+            &format!("/api/v1/organizations/{}", tenant.org_id),
+            &[("Authorization", &bearer(&tenant.key))],
+            Some(json!({"billing_email": address})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = call(
+            &broken,
+            "POST",
+            "/api/v1/organizations/billing-email/verification",
+            &[("Authorization", &bearer(&tenant.key))],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(code_rows(db.pool(), &address).await, 0);
+    }
+
+    /// Org email of a seeded tenant, and a fresh login code for it.
+    async fn tenant_with_code(db: &TestDatabase, app: &Router) -> (String, String) {
+        let tenant = seed_tenant(db.pool()).await;
+        let (email,): (String,) =
+            sqlx::query_as("SELECT billing_email FROM organizations WHERE id = $1")
+                .bind(&tenant.org_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let (status, body) = call(
+            app,
+            "POST",
+            "/api/v1/auth/email/start",
+            &[("CF-Connecting-IP", &unique_client_ip())],
+            Some(json!({"email": email})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (code, org) = latest_code(db.pool(), &email).await;
+        assert_eq!(org.as_deref(), Some(tenant.org_id.as_str()));
+        (email, code)
+    }
+
+    fn wrong_code(code: &str) -> &'static str {
+        if code == "000000" {
+            "111111"
+        } else {
+            "000000"
+        }
+    }
+
+    async fn verify_from(app: &Router, ip: &str, email: &str, code: &str) -> (StatusCode, Value) {
+        call(
+            app,
+            "POST",
+            "/api/v1/auth/email/verify",
+            &[("CF-Connecting-IP", ip)],
+            Some(json!({"email": email, "code": code})),
+        )
+        .await
+    }
+
+    // -----------------------------------------------------------------------
+    // BEAUTH-06: five wrong guesses by anyone exhausted the address's budget
+    // and the owner's correct code was refused for the rest of the window.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn w4_authrl_a_strangers_wrong_guesses_do_not_lock_the_owner_out() {
+        let db = TestDatabase::new().await;
+        let (app, _cache, _redis) = redis_app(&db, Settings::load_for_testing()).await;
+        let (email, code) = tenant_with_code(&db, &app).await;
+        let wrong = wrong_code(&code);
+
+        let stranger = unique_client_ip();
+        for _ in 0..5 {
+            let (status, body) = verify_from(&app, &stranger, &email, wrong).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+            assert_eq!(body["message"], "Invalid code", "{body}");
+        }
+        // The stranger is out of guesses, and is told for how long.
+        let (status, body) = verify_from(&app, &stranger, &email, wrong).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+        let message = body["message"].as_str().unwrap();
+        assert!(message.contains("try again in"), "{message}");
+        assert!(message.contains("minute"), "{message}");
+
+        // The owner, from their own network, signs in with the code they got.
+        let (status, body) = verify_from(&app, &unique_client_ip(), &email, &code).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["type"], "login", "{body}");
+    }
+
+    // The per-address ceiling makes a guesser spread over many clients (and
+    // everyone else) wait out the window; it never invalidates the codes.
+    #[tokio::test]
+    async fn w4_authrl_the_per_address_ceiling_slows_without_burning_codes() {
+        let db = TestDatabase::new().await;
+        let (app, _cache, _redis) = redis_app(&db, Settings::load_for_testing()).await;
+        let (email, code) = tenant_with_code(&db, &app).await;
+        let wrong = wrong_code(&code);
+
+        for _ in 0..4 {
+            let client = unique_client_ip();
+            for _ in 0..5 {
+                let (status, body) = verify_from(&app, &client, &email, wrong).await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+            }
+        }
+        let (status, body) = verify_from(&app, &unique_client_ip(), &email, &code).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+        let message = body["message"].as_str().unwrap();
+        assert!(message.contains("for this address"), "{message}");
+        assert!(message.contains("minute"), "{message}");
+
+        let (used, attempts): (Option<chrono::DateTime<chrono::Utc>>, i32) = sqlx::query_as(
+            "SELECT used_at, attempts FROM email_login_codes WHERE email = $1 AND code = $2",
+        )
+        .bind(&email)
+        .bind(&code)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(used.is_none(), "the code must survive the ceiling");
+        assert_eq!(attempts, 20);
+    }
+
+    // -----------------------------------------------------------------------
+    // BEAUTH-24: marking a code used was not conditional, so parallel verifies
+    // of one code each minted a session.
+    // -----------------------------------------------------------------------
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn w4_authrl_parallel_verifies_of_one_code_mint_one_session() {
+        let db = TestDatabase::new().await;
+        let app = app(&db);
+        for round in 0..3 {
+            let (email, code) = tenant_with_code(&db, &app).await;
+            let barrier = Arc::new(tokio::sync::Barrier::new(5));
+            let mut tasks = Vec::new();
+            for _ in 0..5 {
+                let (app, email, code, barrier) = (
+                    app.clone(),
+                    email.clone(),
+                    code.clone(),
+                    Arc::clone(&barrier),
+                );
+                tasks.push(tokio::spawn(async move {
+                    barrier.wait().await;
+                    verify_from(&app, &unique_client_ip(), &email, &code).await
+                }));
+            }
+            let mut sessions = 0;
+            for task in tasks {
+                let (status, body) = task.await.unwrap();
+                if status == StatusCode::OK {
+                    assert_eq!(body["type"], "login", "{body}");
+                    sessions += 1;
+                } else {
+                    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+                }
+            }
+            assert_eq!(sessions, 1, "round {round}: one code, one session");
+        }
+    }
+}
+// ---- wave 4 / review fixes ----
+// W4-01: workflow retry pays the max_workflows cap, now that only pending/running
+// workflows count against it.
+mod wave4_review {
+    use super::*;
+
+    /// Create a one-job workflow through the API; returns its id.
+    async fn create_workflow(app: &Router, auth: &str, name: &str) -> String {
+        let (status, body) = call(
+            app,
+            "POST",
+            "/api/v1/workflows",
+            &[("Authorization", auth)],
+            Some(json!({
+                "name": name,
+                "jobs": [{"key": "a", "queue_name": "w4r-wf", "payload": {}}],
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["workflow_id"]
+            .as_str()
+            .expect("workflow_id")
+            .to_string()
+    }
+
+    /// Fail the workflow's job and the workflow, as a failed run leaves them.
+    async fn fail_workflow(pool: &sqlx::PgPool, workflow_id: &str) {
+        sqlx::query(
+            "UPDATE jobs SET status = 'failed', last_error = 'boom', completed_at = NOW(), \
+             updated_at = NOW() WHERE workflow_id = $1",
+        )
+        .bind(workflow_id)
+        .execute(pool)
+        .await
+        .expect("fail jobs");
+        sqlx::query(
+            "UPDATE workflows SET status = 'failed', completed_at = COALESCE(completed_at, NOW()) \
+             WHERE id = $1",
+        )
+        .bind(workflow_id)
+        .execute(pool)
+        .await
+        .expect("fail workflow");
+    }
+
+    /// (workflow status, its job statuses).
+    async fn workflow_state(pool: &sqlx::PgPool, workflow_id: &str) -> (String, Vec<String>) {
+        let status: String = sqlx::query_scalar("SELECT status FROM workflows WHERE id = $1")
+            .bind(workflow_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let jobs: Vec<String> =
+            sqlx::query_scalar("SELECT status FROM jobs WHERE workflow_id = $1 ORDER BY id")
+                .bind(workflow_id)
+                .fetch_all(pool)
+                .await
+                .unwrap();
+        (status, jobs)
+    }
+
+    fn state(workflow: &str, job: &str) -> (String, Vec<String>) {
+        (workflow.to_string(), vec![job.to_string()])
+    }
+
+    async fn active_workflows(pool: &sqlx::PgPool, org_id: &str) -> i64 {
+        sqlx::query_scalar("SELECT workflows FROM get_org_resource_counts($1)")
+            .bind(org_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn retry(app: &Router, auth: &str, workflow_id: &str) -> (StatusCode, Value) {
+        call(
+            app,
+            "POST",
+            &format!("/api/v1/workflows/{workflow_id}/retry"),
+            &[("Authorization", auth)],
+            None,
+        )
+        .await
+    }
+
+    // W4-01: retry flipped a failed workflow back to running with no cap check, so
+    // fail 5 -> create 5 -> retry 5 left 10 active workflows on a cap of 5.
+    #[tokio::test]
+    async fn w4_review_workflow_retry_pays_the_workflows_cap() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await; // starter: max_workflows 5
+        let app = app(&db);
+        let auth = bearer(&t.key);
+
+        let mut failed = Vec::new();
+        for i in 0..5 {
+            let id = create_workflow(&app, &auth, &format!("first-{i}")).await;
+            fail_workflow(db.pool(), &id).await;
+            failed.push(id);
+        }
+        assert_eq!(active_workflows(db.pool(), &t.org_id).await, 0);
+        let mut running = Vec::new();
+        for i in 0..5 {
+            running.push(create_workflow(&app, &auth, &format!("second-{i}")).await);
+        }
+        assert_eq!(active_workflows(db.pool(), &t.org_id).await, 5);
+
+        // At the cap: every retry is refused and nothing is reset.
+        for id in &failed {
+            let (status, body) = retry(&app, &auth, id).await;
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+            assert_eq!(
+                workflow_state(db.pool(), id).await,
+                state("failed", "failed"),
+                "a refused retry must not reset the workflow or its jobs"
+            );
+        }
+        assert_eq!(active_workflows(db.pool(), &t.org_id).await, 5);
+
+        // One run finishes, freeing a slot: exactly one retry fits.
+        sqlx::query(
+            "UPDATE workflows SET status = 'completed', completed_at = NOW() WHERE id = $1",
+        )
+        .bind(&running[0])
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let (status, body) = retry(&app, &auth, &failed[0]).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            workflow_state(db.pool(), &failed[0]).await,
+            state("running", "pending")
+        );
+        let (status, body) = retry(&app, &auth, &failed[1]).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+        assert_eq!(active_workflows(db.pool(), &t.org_id).await, 5);
+
+        // A plan without workflows cannot restart one left over from a paid plan.
+        sqlx::query(
+            "UPDATE workflows SET status = 'cancelled', completed_at = NOW() \
+             WHERE organization_id = $1 AND status IN ('pending', 'running')",
+        )
+        .bind(&t.org_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("UPDATE organizations SET plan_tier = 'free' WHERE id = $1")
+            .bind(&t.org_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let (status, body) = retry(&app, &auth, &failed[1]).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["error"], "feature_disabled", "{body}");
+        assert_eq!(
+            workflow_state(db.pool(), &failed[1]).await,
+            state("failed", "failed")
+        );
+        assert_eq!(active_workflows(db.pool(), &t.org_id).await, 0);
+    }
+
+    // W4-01: parallel retries of different failed workflows never overshoot the cap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn w4_review_parallel_workflow_retries_never_overshoot_the_cap() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        sqlx::query("UPDATE organizations SET custom_limits = $2 WHERE id = $1")
+            .bind(&t.org_id)
+            .bind(json!({"max_workflows": 2}))
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let app = app(&db);
+        let auth = bearer(&t.key);
+
+        let mut failed = Vec::new();
+        for i in 0..5 {
+            let id = create_workflow(&app, &auth, &format!("wf-{i}")).await;
+            fail_workflow(db.pool(), &id).await;
+            failed.push(id);
+        }
+        assert_eq!(active_workflows(db.pool(), &t.org_id).await, 0);
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(failed.len()));
+        let mut tasks = Vec::new();
+        for id in &failed {
+            let (app, auth, id, barrier) =
+                (app.clone(), auth.clone(), id.clone(), Arc::clone(&barrier));
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                retry(&app, &auth, &id).await
+            }));
+        }
+        let mut granted = 0;
+        for task in tasks {
+            let (status, body) = task.await.unwrap();
+            match status {
+                StatusCode::OK => granted += 1,
+                StatusCode::TOO_MANY_REQUESTS => {}
+                other => panic!("unexpected {other}: {body}"),
+            }
+        }
+        assert_eq!(granted, 2, "two free slots, two retries");
+        assert_eq!(active_workflows(db.pool(), &t.org_id).await, 2);
     }
 }

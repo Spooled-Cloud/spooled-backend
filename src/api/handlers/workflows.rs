@@ -640,6 +640,12 @@ pub async fn retry(
     let mut tx = state.db.pool().begin().await?;
     require_workflow_access(&mut *tx, &ctx, &workflow_id).await?;
 
+    // The max_workflows cap counts pending/running workflows only, so flipping a
+    // failed workflow back to running takes a slot just like create does and pays
+    // for it under the same advisory lock. Taken before the row lock below so the
+    // lock order matches create (advisory lock, then rows).
+    lock_resource(&mut tx, &ctx.organization_id, "workflows").await?;
+
     // Verify + lock the workflow row inside the transaction. `FOR UPDATE` serializes
     // concurrent retries of the same workflow: the second caller blocks here until the
     // first commits, then observes status='running' and is rejected — instead of both
@@ -659,6 +665,14 @@ pub async fn retry(
             "Cannot retry workflow with status '{}'. Only failed workflows can be retried.",
             workflow.status
         )));
+    }
+
+    // A failed workflow is outside the cap's count; running it again adds one. A plan
+    // without workflows (Free after a downgrade) gets feature_disabled here.
+    if let Err(response) =
+        check_resource_limit_conn(&mut tx, &ctx.organization_id, "workflows", 1).await
+    {
+        return Err(AppError::LimitExceeded(Box::new(response)));
     }
 
     // Reset every non-completed job back to pending — including jobs the failure

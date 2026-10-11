@@ -2,13 +2,17 @@
 //!
 //! This module provides endpoints for:
 //! - Getting billing status
-//! - Creating billing portal sessions
+//! - Creating Checkout and billing portal sessions
 //! - Handling Stripe billing webhooks
+
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use axum::{
     body::Bytes,
     extract::{Extension, State},
     http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     Json,
 };
 use chrono::{DateTime, Utc};
@@ -20,8 +24,8 @@ use tracing::{error, info, warn};
 use crate::api::handlers::require_unrestricted_key;
 use crate::api::middleware::plan_rate_limit::invalidate_org_rate_limits;
 use crate::api::AppState;
-use crate::config::Environment;
-use crate::error::{AppError, AppResult};
+use crate::config::{Environment, StripeSettings};
+use crate::error::{AppError, AppResult, ErrorResponse};
 use crate::models::ApiKeyContext;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -50,6 +54,60 @@ const STRIPE_TIMESTAMP_TOLERANCE_SECS: i64 = 300;
 /// idempotent, so erring high costs only latency-to-recovery.
 const STRIPE_CLAIM_STALE_AFTER_SECS: i64 = 300;
 
+/// Upper bound for one Stripe API call.
+///
+/// A webhook makes up to a few calls in a row (reconcile, then cancel a
+/// superseded subscription) and the router's 30 s request timeout drops the
+/// whole handler, so a hung call has to give up well before that.
+const STRIPE_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+
+const STRIPE_API_BASE: &str = "https://api.stripe.com";
+
+tokio::task_local! {
+    /// Stripe API base URL for the current task, set only by tests.
+    static STRIPE_API_BASE_OVERRIDE: String;
+}
+
+/// Run `fut` with every Stripe API call it makes sent to `base` instead of
+/// api.stripe.com. Integration tests use it to point the handlers at a mock
+/// Stripe server; nothing in the service calls it.
+#[doc(hidden)]
+pub async fn with_stripe_api_base<F: std::future::Future>(base: String, fut: F) -> F::Output {
+    STRIPE_API_BASE_OVERRIDE.scope(base, fut).await
+}
+
+fn stripe_api_url(path: &str) -> String {
+    let base = STRIPE_API_BASE_OVERRIDE
+        .try_with(|base| base.trim_end_matches('/').to_string())
+        .unwrap_or_else(|_| STRIPE_API_BASE.to_string());
+    format!("{base}{path}")
+}
+
+/// Shared Stripe HTTP client with a request timeout.
+fn stripe_http_client() -> AppResult<reqwest::Client> {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client.clone());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(STRIPE_HTTP_TIMEOUT)
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| AppError::Internal(format!("Failed to build HTTP client: {}", e)))?;
+    Ok(CLIENT.get_or_init(|| client).clone())
+}
+
+/// Checkout Session metadata key naming the organization that started it.
+///
+/// Only `POST /billing/checkout` sets it, with the Stripe secret key, for the
+/// authenticated organization. A Payment Link URL can set
+/// `client_reference_id` but not metadata, so this key is what makes a
+/// completed checkout trustworthy.
+const CHECKOUT_ORG_METADATA_KEY: &str = "spooled_org_id";
+
+/// Where Checkout sends the customer back to when `FRONTEND_URL` is not set.
+const DEFAULT_FRONTEND_URL: &str = "https://spooled.cloud";
+
 /// Billing status response
 #[derive(Debug, Serialize)]
 pub struct BillingStatusResponse {
@@ -74,6 +132,10 @@ pub async fn status(
     State(state): State<AppState>,
     Extension(context): Extension<ApiKeyContext>,
 ) -> AppResult<Json<BillingStatusResponse>> {
+    // Subscription id and period end are account data, not queue data: a
+    // queue-scoped worker key has no business reading them (same as the portal).
+    require_unrestricted_key(&context, "read billing status")?;
+
     // Fetch organization billing data
     let org: Option<OrgBillingData> = sqlx::query_as(
         r#"
@@ -167,7 +229,7 @@ pub async fn create_portal(
     };
 
     // Create billing portal session via Stripe API
-    let client = reqwest::Client::new();
+    let client = stripe_http_client()?;
 
     let mut form_params = vec![
         ("customer", customer_id.as_str()),
@@ -186,7 +248,7 @@ pub async fn create_portal(
     }
 
     let response = client
-        .post("https://api.stripe.com/v1/billing_portal/sessions")
+        .post(stripe_api_url("/v1/billing_portal/sessions"))
         .header("Authorization", format!("Bearer {}", stripe_secret))
         .form(&form_params)
         .send()
@@ -217,6 +279,253 @@ pub async fn create_portal(
 #[derive(Debug, Deserialize)]
 struct StripePortalSession {
     url: String,
+}
+
+/// Create checkout session request
+#[derive(Debug, Deserialize)]
+pub struct CreateCheckoutRequest {
+    /// Plan to buy: "starter" or "pro"
+    pub plan: Option<String>,
+}
+
+/// Create checkout session response
+#[derive(Debug, Serialize)]
+pub struct CreateCheckoutResponse {
+    /// Stripe-hosted Checkout page to redirect the user to
+    pub url: String,
+    /// Checkout Session id (cs_...)
+    pub session_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct StripeCheckoutSession {
+    id: String,
+    url: Option<String>,
+}
+
+/// Errors of `POST /billing/checkout`: the usual API errors, plus 503 for
+/// "billing is not available", which `AppError` has no variant for.
+#[derive(Debug)]
+pub enum CheckoutError {
+    App(AppError),
+    Unavailable(String),
+}
+
+impl From<AppError> for CheckoutError {
+    fn from(e: AppError) -> Self {
+        Self::App(e)
+    }
+}
+
+impl From<sqlx::Error> for CheckoutError {
+    fn from(e: sqlx::Error) -> Self {
+        Self::App(e.into())
+    }
+}
+
+impl IntoResponse for CheckoutError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::App(e) => e.into_response(),
+            Self::Unavailable(message) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    code: "SERVICE_UNAVAILABLE".to_string(),
+                    message,
+                    details: None,
+                }),
+            )
+                .into_response(),
+        }
+    }
+}
+
+/// Organization fields the checkout endpoint needs.
+#[derive(sqlx::FromRow)]
+struct CheckoutOrg {
+    plan_tier: String,
+    stripe_customer_id: Option<String>,
+    stripe_subscription_id: Option<String>,
+    stripe_subscription_status: Option<String>,
+    billing_email: Option<String>,
+    billing_email_verified_at: Option<DateTime<Utc>>,
+}
+
+/// The plan named in a checkout request body: "starter" or "pro".
+fn parse_checkout_plan(body: &[u8]) -> AppResult<&'static str> {
+    let invalid = || AppError::Validation("plan must be \"starter\" or \"pro\"".to_string());
+    let request: CreateCheckoutRequest = serde_json::from_slice(body).map_err(|_| invalid())?;
+    match request.plan.as_deref().map(str::trim) {
+        Some("starter") => Ok("starter"),
+        Some("pro") => Ok("pro"),
+        _ => Err(invalid()),
+    }
+}
+
+fn checkout_price_id<'a>(stripe: &'a StripeSettings, plan: &str) -> Option<&'a str> {
+    let price = match plan {
+        "starter" => stripe.starter_price_id.as_deref(),
+        "pro" => stripe.pro_price_id.as_deref(),
+        _ => None,
+    };
+    price.map(str::trim).filter(|p| !p.is_empty())
+}
+
+/// Base URL of the website Checkout returns the customer to.
+fn checkout_return_base() -> String {
+    std::env::var("FRONTEND_URL")
+        .ok()
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_FRONTEND_URL.to_string())
+}
+
+/// Form body of the Stripe `POST /v1/checkout/sessions` call.
+///
+/// The organization goes into `client_reference_id` (for the Stripe dashboard)
+/// and into session and subscription metadata, which the webhook trusts. An
+/// existing Stripe customer is reused so the new subscription stays reachable
+/// from the same billing portal; otherwise Checkout is prefilled with the
+/// verified billing email.
+fn checkout_session_form(
+    org_id: &str,
+    price_id: &str,
+    customer_id: Option<&str>,
+    verified_email: Option<&str>,
+    return_base: &str,
+) -> Vec<(String, String)> {
+    let mut form = vec![
+        ("mode".to_string(), "subscription".to_string()),
+        ("line_items[0][price]".to_string(), price_id.to_string()),
+        ("line_items[0][quantity]".to_string(), "1".to_string()),
+        ("client_reference_id".to_string(), org_id.to_string()),
+        (
+            format!("metadata[{CHECKOUT_ORG_METADATA_KEY}]"),
+            org_id.to_string(),
+        ),
+        (
+            format!("subscription_data[metadata][{CHECKOUT_ORG_METADATA_KEY}]"),
+            org_id.to_string(),
+        ),
+        (
+            "success_url".to_string(),
+            format!("{return_base}/account/billing?checkout=success"),
+        ),
+        (
+            "cancel_url".to_string(),
+            format!("{return_base}/account/billing?checkout=cancel"),
+        ),
+    ];
+    if let Some(customer_id) = customer_id {
+        form.push(("customer".to_string(), customer_id.to_string()));
+    } else if let Some(email) = verified_email {
+        form.push(("customer_email".to_string(), email.to_string()));
+    }
+    form
+}
+
+/// Create a Stripe Checkout Session for the caller's organization
+///
+/// POST /api/v1/billing/checkout
+///
+/// Replaces the public Payment Links, whose `client_reference_id` is a URL
+/// parameter anyone can edit: the session created here is bound to the
+/// authenticated organization through metadata only this server can set.
+pub async fn create_checkout(
+    State(state): State<AppState>,
+    Extension(context): Extension<ApiKeyContext>,
+    body: Bytes,
+) -> Result<Json<CreateCheckoutResponse>, CheckoutError> {
+    require_unrestricted_key(&context, "start a checkout")?;
+
+    let plan = parse_checkout_plan(&body)?;
+
+    let Some(stripe_secret) = state.stripe.secret_key.as_deref() else {
+        return Err(CheckoutError::Unavailable(
+            "Billing is not configured".to_string(),
+        ));
+    };
+    let Some(price_id) = checkout_price_id(&state.stripe, plan) else {
+        return Err(CheckoutError::Unavailable(format!(
+            "The {plan} plan is not available for purchase right now"
+        )));
+    };
+
+    let org_id = context.organization_id.as_str();
+    let org: Option<CheckoutOrg> = sqlx::query_as(
+        r#"
+        SELECT plan_tier, stripe_customer_id, stripe_subscription_id,
+               stripe_subscription_status, billing_email, billing_email_verified_at
+        FROM organizations
+        WHERE id = $1 AND plan_tier <> 'deleted'
+        "#,
+    )
+    .bind(org_id)
+    .fetch_optional(state.db.pool())
+    .await?;
+    let Some(org) = org else {
+        return Err(AppError::NotFound("Organization not found".to_string()).into());
+    };
+
+    let live = matches!(
+        org.stripe_subscription_status.as_deref(),
+        Some("active" | "trialing")
+    );
+    if org.plan_tier == plan && org.stripe_subscription_id.is_some() && live {
+        return Err(AppError::Conflict(format!(
+            "This organization already has an active {plan} subscription. \
+             Use the billing portal to manage it."
+        ))
+        .into());
+    }
+
+    let verified_email = org
+        .billing_email
+        .as_deref()
+        .filter(|_| org.billing_email_verified_at.is_some());
+    let form = checkout_session_form(
+        org_id,
+        price_id,
+        org.stripe_customer_id.as_deref(),
+        verified_email,
+        &checkout_return_base(),
+    );
+
+    let unavailable =
+        || CheckoutError::Unavailable("Checkout is temporarily unavailable; try again".to_string());
+    let response = stripe_http_client()?
+        .post(stripe_api_url("/v1/checkout/sessions"))
+        .header("Authorization", format!("Bearer {}", stripe_secret))
+        .form(&form)
+        .send()
+        .await
+        .map_err(|e| {
+            error!(org_id = %org_id, error = %e, "Stripe checkout session request failed");
+            unavailable()
+        })?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response.text().await.unwrap_or_default();
+        error!(org_id = %org_id, status = %status, error = %error_text, "Stripe checkout session creation failed");
+        return Err(unavailable());
+    }
+
+    let session: StripeCheckoutSession = response.json().await.map_err(|e| {
+        error!(org_id = %org_id, error = %e, "Failed to parse Stripe checkout session");
+        unavailable()
+    })?;
+    let Some(url) = session.url else {
+        error!(org_id = %org_id, session_id = %session.id, "Stripe checkout session has no url");
+        return Err(unavailable());
+    };
+
+    info!(org_id = %org_id, session_id = %session.id, plan = %plan, "Created Stripe checkout session");
+
+    Ok(Json(CreateCheckoutResponse {
+        url,
+        session_id: session.id,
+    }))
 }
 
 /// Handle Stripe billing webhook
@@ -260,6 +569,8 @@ pub async fn webhook(
     let handled = matches!(
         event.event_type.as_str(),
         "checkout.session.completed"
+            | "checkout.session.async_payment_succeeded"
+            | "checkout.session.async_payment_failed"
             | "customer.subscription.created"
             | "customer.subscription.updated"
             | "customer.subscription.deleted"
@@ -348,7 +659,22 @@ pub async fn webhook(
 
     // Handle different event types.
     let outcome: AppResult<()> = match event.event_type.as_str() {
-        "checkout.session.completed" => handle_checkout_completed(&state, &event).await,
+        // A delayed payment method (SEPA, ACH) completes the session unpaid and
+        // reports the money later as async_payment_succeeded: same linker.
+        "checkout.session.completed" | "checkout.session.async_payment_succeeded" => {
+            handle_checkout_completed(&state, &event).await
+        }
+        "checkout.session.async_payment_failed" => {
+            let session = &event.data.object;
+            warn!(
+                event_id = %event.id,
+                session_id = ?session["id"].as_str(),
+                customer_id = ?session["customer"].as_str(),
+                subscription_id = ?session["subscription"].as_str(),
+                "Checkout payment failed; organization not linked"
+            );
+            Ok(())
+        }
         "customer.subscription.created" | "customer.subscription.updated" => {
             handle_subscription_updated(&state, &event).await
         }
@@ -458,47 +784,104 @@ struct StripeEventData {
     object: serde_json::Value,
 }
 
-/// Handle checkout.session.completed event
+/// Which organization a completed checkout is for, and how far the session can
+/// be trusted to say so.
+#[derive(Debug, PartialEq, Eq)]
+enum CheckoutOrgRef<'a> {
+    /// Session created by `POST /billing/checkout`: only this server can have
+    /// set `metadata.spooled_org_id`, and it set it to the authenticated org.
+    Trusted(&'a str),
+    /// Legacy Payment Link: `client_reference_id` is a URL parameter anyone can
+    /// set to any organization id.
+    Unverified(&'a str),
+}
+
+fn non_empty_str(value: &serde_json::Value) -> Option<&str> {
+    value.as_str().map(str::trim).filter(|s| !s.is_empty())
+}
+
+fn checkout_org_ref(session: &serde_json::Value) -> Option<CheckoutOrgRef<'_>> {
+    if let Some(org_id) = non_empty_str(&session["metadata"][CHECKOUT_ORG_METADATA_KEY]) {
+        return Some(CheckoutOrgRef::Trusted(org_id));
+    }
+    non_empty_str(&session["client_reference_id"]).map(CheckoutOrgRef::Unverified)
+}
+
+/// The email the payer gave at checkout.
+fn checkout_customer_email(session: &serde_json::Value) -> Option<&str> {
+    non_empty_str(&session["customer_details"]["email"])
+        .or_else(|| non_empty_str(&session["customer_email"]))
+}
+
+/// Handle checkout.session.completed and checkout.session.async_payment_succeeded
+///
+/// Links the paying Stripe customer and subscription to the organization the
+/// checkout was for. How far that is trusted depends on who created the
+/// session (see [`CheckoutOrgRef`]):
+/// - created by `POST /billing/checkout`: link the organization and cancel the
+///   subscription it replaces (an upgrade);
+/// - legacy Payment Link: link only an organization without a live
+///   subscription whose verified billing email is the email the payer gave,
+///   and never cancel anything. Otherwise anyone who learned an organization id
+///   could pay for a plan, take over its billing and have the backend cancel
+///   its real subscription.
 async fn handle_checkout_completed(state: &AppState, event: &StripeEvent) -> AppResult<()> {
     let session = &event.data.object;
 
-    // Reject unpaid / incomplete checkouts before trusting client_reference_id linkage.
-    // Empty payment_status kept for older fixtures / partial payloads (warn-free allow).
+    // Reject unpaid / incomplete checkouts before linking anything. A delayed
+    // payment method (SEPA, ACH) completes the session `unpaid`; the money is
+    // reported by checkout.session.async_payment_succeeded, which links then.
+    // Empty payment_status kept for older fixtures / partial payloads.
     let payment_status = session["payment_status"].as_str().unwrap_or("");
     if !matches!(payment_status, "paid" | "no_payment_required" | "") {
-        warn!(
+        info!(
             payment_status = %payment_status,
             event_id = %event.id,
-            "Ignoring checkout.session.completed with non-paid payment_status"
+            event_type = %event.event_type,
+            "Checkout not paid yet; linking waits for checkout.session.async_payment_succeeded"
         );
         return Ok(());
     }
 
-    let customer_id = session["customer"].as_str();
+    let Some(org_ref) = checkout_org_ref(session) else {
+        info!(event_id = %event.id, "Ignoring checkout session without an organization reference");
+        return Ok(());
+    };
+    let Some(customer_id) = session["customer"].as_str() else {
+        warn!(event_id = %event.id, "Ignoring checkout session without a customer");
+        return Ok(());
+    };
     let subscription_id = session["subscription"].as_str();
-    let client_reference_id = session["client_reference_id"].as_str(); // org_id
 
-    if let (Some(customer_id), Some(org_id)) = (customer_id, client_reference_id) {
-        // Capture the current linkage before overwriting it: a Payment Link checkout for an
-        // already-subscribed org creates a brand-new customer + second subscription, and the
-        // old subscription would keep billing while becoming unreachable from the portal.
-        let previous: Option<(Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT stripe_customer_id, stripe_subscription_id FROM organizations WHERE id = $1",
-        )
-        .bind(org_id)
-        .fetch_optional(state.db.pool())
-        .await?;
+    // The stripe_last_event_at guard rejects stale re-deliveries: an old
+    // checkout event from a previous session must never relink the org after a
+    // newer billing event has been applied.
+    let event_time = event_created_at(event);
+    let (org_id, trusted) = match org_ref {
+        CheckoutOrgRef::Trusted(org_id) => (org_id, true),
+        CheckoutOrgRef::Unverified(org_id) => (org_id, false),
+    };
 
-        // Update organization with Stripe customer ID. The stripe_last_event_at
-        // guard rejects stale re-deliveries: an old checkout event from a previous
-        // session must never relink the org (and trigger the cancel backstop below)
-        // after a newer billing event has been applied.
-        let event_time = event_created_at(event);
-        let relinked = sqlx::query(
+    let relinked = if trusted {
+        // The subscription this checkout replaces is recorded in the same
+        // statement that forgets it, and dropped from the list only once Stripe
+        // confirms the cancel: a failed or interrupted cancel is retried with
+        // the event instead of leaving the customer billed twice.
+        sqlx::query(
             r#"
             UPDATE organizations
             SET stripe_customer_id = $1,
-                stripe_subscription_id = $2,
+                stripe_subscription_id = COALESCE($2, stripe_subscription_id),
+                stripe_superseded_subscription_ids = CASE
+                    WHEN $2::TEXT IS NOT NULL
+                     AND stripe_subscription_id IS NOT NULL
+                     AND stripe_subscription_id <> $2
+                     AND COALESCE(stripe_subscription_status, '')
+                         NOT IN ('canceled', 'cancelled', 'incomplete_expired')
+                     AND NOT (stripe_subscription_id = ANY(stripe_superseded_subscription_ids))
+                    THEN array_append(stripe_superseded_subscription_ids, stripe_subscription_id)
+                    ELSE stripe_superseded_subscription_ids
+                END,
                 stripe_last_event_at = $3,
                 updated_at = NOW()
             WHERE id = $4
@@ -511,43 +894,42 @@ async fn handle_checkout_completed(state: &AppState, event: &StripeEvent) -> App
         .bind(event_time)
         .bind(org_id)
         .execute(state.db.pool())
-        .await?;
+        .await?
+    } else {
+        sqlx::query(
+            r#"
+            UPDATE organizations
+            SET stripe_customer_id = $1,
+                stripe_subscription_id = COALESCE($2, stripe_subscription_id),
+                stripe_last_event_at = $3,
+                updated_at = NOW()
+            WHERE id = $4
+              AND plan_tier <> 'deleted'
+              AND (stripe_last_event_at IS NULL OR stripe_last_event_at <= $3)
+              -- The payer gave the organization's verified billing email ...
+              AND billing_email_verified_at IS NOT NULL
+              AND lower(btrim(billing_email)) = lower(btrim($5))
+              -- ... and the organization pays for no live subscription (a
+              -- retry of this same checkout is not a takeover).
+              AND (stripe_subscription_id IS NULL
+                   OR stripe_subscription_id = $2
+                   OR COALESCE(stripe_subscription_status, '')
+                      IN ('canceled', 'cancelled', 'incomplete_expired', 'unpaid'))
+            "#,
+        )
+        .bind(customer_id)
+        .bind(subscription_id)
+        .bind(event_time)
+        .bind(org_id)
+        .bind(checkout_customer_email(session))
+        .execute(state.db.pool())
+        .await?
+    }
+    .rows_affected()
+        > 0;
 
-        if relinked.rows_affected() == 0 {
-            warn!(
-                org_id = %org_id,
-                customer_id = %customer_id,
-                event_id = %event.id,
-                "Skipping checkout.session.completed: org missing or a newer billing event was already applied"
-            );
-            return Ok(());
-        }
-
-        // Backstop against double billing: cancel the superseded subscription, if any.
-        if let Some((prev_customer_id, Some(prev_subscription_id))) = previous {
-            let is_superseded =
-                subscription_id.is_some() && subscription_id != Some(prev_subscription_id.as_str());
-            if is_superseded {
-                error!(
-                    org_id = %org_id,
-                    prev_customer_id = ?prev_customer_id,
-                    prev_subscription_id = %prev_subscription_id,
-                    new_customer_id = %customer_id,
-                    new_subscription_id = ?subscription_id,
-                    "Checkout completed for an org that already had a subscription; canceling the superseded subscription"
-                );
-                if let Err(e) = cancel_stripe_subscription(state, &prev_subscription_id).await {
-                    error!(
-                        org_id = %org_id,
-                        prev_subscription_id = %prev_subscription_id,
-                        error = %e,
-                        "Failed to cancel superseded subscription — manual cleanup required to stop double billing"
-                    );
-                }
-            }
-        }
-
-        info!(org_id = %org_id, customer_id = %customer_id, "Linked Stripe customer to organization");
+    if relinked {
+        info!(org_id = %org_id, customer_id = %customer_id, trusted, "Linked Stripe customer to organization");
 
         // Important: webhook event order is not guaranteed. In practice we often see
         // customer.subscription.created arrive before checkout.session.completed, which means
@@ -559,8 +941,7 @@ async fn handle_checkout_completed(state: &AppState, event: &StripeEvent) -> App
                 // Propagate as 5xx so Stripe retries the event: the customer has paid,
                 // and swallowing this error could leave them on the free tier. The event
                 // is only marked processed after success, so the retry is applied
-                // (re-linking is idempotent and the cancel backstop only fires when the
-                // subscription id actually changes).
+                // (re-linking is idempotent).
                 warn!(
                     org_id = %org_id,
                     subscription_id = %subscription_id,
@@ -570,8 +951,88 @@ async fn handle_checkout_completed(state: &AppState, event: &StripeEvent) -> App
                 return Err(e);
             }
         }
+    } else if trusted {
+        warn!(
+            org_id = %org_id,
+            customer_id = %customer_id,
+            event_id = %event.id,
+            "Skipping checkout.session.completed: org missing or a newer billing event was already applied"
+        );
+    } else {
+        warn!(
+            org_id = %org_id,
+            customer_id = %customer_id,
+            subscription_id = ?subscription_id,
+            event_id = %event.id,
+            "Not linking a Payment Link checkout: the org has a live subscription, the payer's email \
+             is not its verified billing email, the org is missing, or a newer billing event was applied"
+        );
     }
 
+    // Only a checkout this server created may retire a subscription. Runs even
+    // when the relink above was skipped, so a retry finishes a cancel that an
+    // earlier attempt recorded but could not complete.
+    if trusted {
+        cancel_superseded_subscriptions(state, org_id).await?;
+    }
+
+    Ok(())
+}
+
+/// Cancel the subscriptions that server-created checkouts replaced for this
+/// organization, forgetting each one once Stripe confirms.
+///
+/// Returns the first failure, so the webhook answers 5xx and Stripe redelivers
+/// the event; the redelivery tries the remaining cancels again.
+async fn cancel_superseded_subscriptions(state: &AppState, org_id: &str) -> AppResult<()> {
+    let row: Option<(Vec<String>, Option<String>)> = sqlx::query_as(
+        "SELECT stripe_superseded_subscription_ids, stripe_subscription_id \
+         FROM organizations WHERE id = $1",
+    )
+    .bind(org_id)
+    .fetch_optional(state.db.pool())
+    .await?;
+    let Some((superseded, current)) = row else {
+        return Ok(());
+    };
+
+    let mut failure = None;
+    for subscription_id in superseded {
+        if current.as_deref() == Some(subscription_id.as_str()) {
+            // It became the organization's subscription again: never cancel
+            // the subscription the organization is on.
+            warn!(org_id = %org_id, subscription_id = %subscription_id,
+                "Superseded subscription is the organization's current one again; not canceling it");
+        } else {
+            info!(org_id = %org_id, subscription_id = %subscription_id,
+                "Canceling the subscription a checkout replaced");
+            if let Err(e) = cancel_stripe_subscription(state, &subscription_id).await {
+                error!(org_id = %org_id, subscription_id = %subscription_id, error = %e,
+                    "Failed to cancel a superseded subscription; Stripe will redeliver the event to retry");
+                failure.get_or_insert(e);
+                continue;
+            }
+        }
+        forget_superseded_subscription(state, &subscription_id).await?;
+    }
+
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Drop a subscription from every organization's list of subscriptions to
+/// cancel: it was canceled, or Stripe reported it deleted.
+async fn forget_superseded_subscription(state: &AppState, subscription_id: &str) -> AppResult<()> {
+    sqlx::query(
+        "UPDATE organizations \
+         SET stripe_superseded_subscription_ids = array_remove(stripe_superseded_subscription_ids, $1) \
+         WHERE $1 = ANY(stripe_superseded_subscription_ids)",
+    )
+    .bind(subscription_id)
+    .execute(state.db.pool())
+    .await?;
     Ok(())
 }
 
@@ -614,6 +1075,16 @@ async fn handle_subscription_updated(state: &AppState, event: &StripeEvent) -> A
               -- Never resurrect a soft-deleted org (plan_tier is its tombstone).
               AND plan_tier <> 'deleted'
               AND (stripe_last_event_at IS NULL OR stripe_last_event_at <= $7)
+              -- A checkout reuses the org's customer, so one customer can hold
+              -- the live subscription and the one replacing it. An event for
+              -- the other one must not take over the org: before
+              -- checkout.session.completed it would hide the subscription that
+              -- checkout has to cancel, and afterwards an update of the
+              -- canceled one would switch the org back to it.
+              AND (stripe_subscription_id IS NULL
+                   OR stripe_subscription_id = $1
+                   OR COALESCE(stripe_subscription_status, '')
+                      IN ('canceled', 'cancelled', 'incomplete_expired', 'unpaid'))
             RETURNING id
             "#,
         )
@@ -637,26 +1108,18 @@ async fn handle_subscription_updated(state: &AppState, event: &StripeEvent) -> A
 
         if result.is_empty() {
             // No org linked to this customer yet (event arrived before
-            // checkout.session.completed): return 5xx so Stripe retries until the
+            // checkout.session.completed): ask Stripe to retry until the
             // linkage exists. Without the retry this event is dropped forever and a
             // paying customer can be stuck on the free tier. Orphaned customers
             // (superseded > 24h ago) are ACKed to stop pointless retries.
             if !org_linked_to_customer(state, customer_id).await?
                 && should_request_retry_for_unlinked(event_time)
             {
-                warn!(
-                    customer_id = %customer_id,
-                    subscription_id = ?subscription_id,
-                    event_id = %event.id,
-                    "Subscription event received before org linkage; requesting Stripe retry"
-                );
-                return Err(AppError::Internal(format!(
-                    "subscription event received before org was linked to customer {}; requesting Stripe retry",
-                    customer_id
-                )));
+                return Err(retry_until_linked(event, customer_id));
             }
 
-            // Org exists but the ordering guard rejected the event (stale re-delivery),
+            // Org exists but the ordering guard rejected the event (stale
+            // re-delivery), the event is for a subscription the org is not on,
             // or the customer is orphaned: ACK.
             info!(
                 customer_id = %customer_id,
@@ -664,7 +1127,7 @@ async fn handle_subscription_updated(state: &AppState, event: &StripeEvent) -> A
                 status = %status,
                 plan_tier = ?plan_tier,
                 event_id = %event.id,
-                "Ignoring stale subscription event"
+                "Ignoring stale subscription event or one for a subscription the org is not on"
             );
         } else {
             info!(
@@ -694,11 +1157,8 @@ pub(crate) async fn reconcile_org_from_subscription_id(
         .as_ref()
         .ok_or_else(|| AppError::Internal("Stripe is not configured".to_string()))?;
 
-    let client = reqwest::Client::new();
-    let url = format!(
-        "https://api.stripe.com/v1/subscriptions/{}",
-        subscription_id
-    );
+    let client = stripe_http_client()?;
+    let url = stripe_api_url(&format!("/v1/subscriptions/{}", subscription_id));
 
     let response = client
         .get(url)
@@ -782,16 +1242,10 @@ async fn cancel_stripe_subscription(state: &AppState, subscription_id: &str) -> 
         .as_ref()
         .ok_or_else(|| AppError::Internal("Stripe is not configured".to_string()))?;
 
-    let client = reqwest::Client::builder()
-        // A hung Stripe call must not hang the request that triggered the cancel
-        // (an organization delete waits on it).
-        .timeout(std::time::Duration::from_secs(20))
-        .build()
-        .map_err(|e| AppError::Internal(format!("Failed to build HTTP client: {}", e)))?;
-    let url = format!(
-        "https://api.stripe.com/v1/subscriptions/{}",
-        subscription_id
-    );
+    // The shared client times out: a hung Stripe call must not hang the
+    // request that triggered the cancel (an organization delete waits on it).
+    let client = stripe_http_client()?;
+    let url = stripe_api_url(&format!("/v1/subscriptions/{}", subscription_id));
 
     let response = client
         .delete(url)
@@ -806,15 +1260,54 @@ async fn cancel_stripe_subscription(state: &AppState, subscription_id: &str) -> 
         return Ok(());
     }
     if !response.status().is_success() {
+        let status = response.status();
         let error_text = response.text().await.unwrap_or_default();
+        // Stripe refuses to cancel a subscription that already ended. That is
+        // the outcome we wanted; reporting it as a failure would retry the
+        // cancel for as long as Stripe redelivers the event.
+        if status.is_client_error()
+            && stripe_subscription_has_ended(stripe_secret, subscription_id).await
+        {
+            warn!(subscription_id = %subscription_id, "Stripe subscription had already ended while canceling");
+            return Ok(());
+        }
         return Err(AppError::Internal(format!(
-            "Stripe subscription cancel failed: {}",
-            error_text
+            "Stripe subscription cancel failed ({}): {}",
+            status, error_text
         )));
     }
 
     info!(subscription_id = %subscription_id, "Canceled Stripe subscription");
     Ok(())
+}
+
+/// Whether Stripe reports the subscription as ended (canceled or expired).
+/// Any failure to find out counts as "not ended".
+async fn stripe_subscription_has_ended(stripe_secret: &str, subscription_id: &str) -> bool {
+    let Ok(client) = stripe_http_client() else {
+        return false;
+    };
+    let response = client
+        .get(stripe_api_url(&format!(
+            "/v1/subscriptions/{}",
+            subscription_id
+        )))
+        .header("Authorization", format!("Bearer {}", stripe_secret))
+        .send()
+        .await;
+    let Ok(response) = response else {
+        return false;
+    };
+    if !response.status().is_success() {
+        return false;
+    }
+    let Ok(subscription) = response.json::<serde_json::Value>().await else {
+        return false;
+    };
+    matches!(
+        subscription["status"].as_str(),
+        Some("canceled" | "incomplete_expired")
+    )
 }
 
 /// Cancel the organization's Stripe subscription before the organization is
@@ -912,6 +1405,12 @@ async fn handle_subscription_deleted(state: &AppState, event: &StripeEvent) -> A
             invalidate_org_rate_limits(state.cache.as_ref(), &org_id).await;
         }
 
+        // Stripe confirms the subscription is gone: if a checkout had replaced
+        // it, there is nothing left to cancel.
+        if let Some(subscription_id) = subscription_id {
+            forget_superseded_subscription(state, subscription_id).await?;
+        }
+
         info!(customer_id = %customer_id, subscription_id = ?subscription_id, "Subscription canceled, downgraded to free tier");
     }
 
@@ -940,8 +1439,29 @@ async fn org_linked_to_customer(state: &AppState, customer_id: &str) -> AppResul
     Ok(row.is_some())
 }
 
-/// Whether an event for a not-yet-linked customer should be answered with 5xx so
-/// Stripe retries it. Linkage races (subscription/invoice events arriving before
+/// Answer for an event whose customer is not linked to an organization yet.
+///
+/// Subscription and invoice events usually arrive before
+/// checkout.session.completed links the customer. That is the normal path of
+/// every new subscription, not a server fault, so it is answered 409 (Stripe
+/// retries any non-2xx response) and logged at info, not as a 500 with an
+/// error log.
+fn retry_until_linked(event: &StripeEvent, customer_id: &str) -> AppError {
+    info!(
+        customer_id = %customer_id,
+        event_id = %event.id,
+        event_type = %event.event_type,
+        "Stripe event arrived before its customer was linked to an organization; asking Stripe to retry"
+    );
+    AppError::Conflict(format!(
+        "Stripe customer {} is not linked to an organization yet; retry later",
+        customer_id
+    ))
+}
+
+/// Whether an event for a not-yet-linked customer should be answered with a
+/// retry request (see [`retry_until_linked`]). Linkage races
+/// (subscription/invoice events arriving before
 /// checkout.session.completed) resolve within minutes; after 24h the customer is
 /// almost certainly orphaned (e.g. superseded by a newer checkout), and retrying
 /// forever would only pollute webhook health.
@@ -979,17 +1499,14 @@ async fn handle_invoice_paid(state: &AppState, event: &StripeEvent) -> AppResult
         .await?;
 
         if result.rows_affected() == 0 {
-            // No org linked yet (event raced ahead of checkout linkage): return 5xx so
-            // Stripe retries — a paying customer must not get stuck on the free tier
+            // No org linked yet (event raced ahead of checkout linkage): ask
+            // Stripe to retry — a paying customer must not get stuck on the free tier
             // because a one-shot event was dropped. Already-canceled / orphaned
             // customers are ACKed instead.
             if !org_linked_to_customer(state, customer_id).await?
                 && should_request_retry_for_unlinked(event_time)
             {
-                return Err(AppError::Internal(format!(
-                    "invoice.paid received before org was linked to customer {}; requesting Stripe retry",
-                    customer_id
-                )));
+                return Err(retry_until_linked(event, customer_id));
             }
             info!(customer_id = %customer_id, event_id = %event.id, "Ignoring invoice.paid for unlinked or canceled org");
             return Ok(());
@@ -1040,10 +1557,7 @@ async fn handle_payment_failed(state: &AppState, event: &StripeEvent) -> AppResu
             if !org_linked_to_customer(state, customer_id).await?
                 && should_request_retry_for_unlinked(event_time)
             {
-                return Err(AppError::Internal(format!(
-                    "invoice.payment_failed received before org was linked to customer {}; requesting Stripe retry",
-                    customer_id
-                )));
+                return Err(retry_until_linked(event, customer_id));
             }
             info!(customer_id = %customer_id, event_id = %event.id, "Ignoring invoice.payment_failed for unlinked or canceled org");
             return Ok(());
@@ -1543,6 +2057,146 @@ mod tests {
             None
         };
         assert_eq!(tier.as_deref(), Some("free"));
+    }
+
+    #[test]
+    fn test_checkout_org_ref_trusts_only_server_metadata() {
+        // Server-created session: metadata wins over client_reference_id.
+        let session = serde_json::json!({
+            "client_reference_id": "org-from-url",
+            "metadata": { "spooled_org_id": "org-from-server" }
+        });
+        assert_eq!(
+            checkout_org_ref(&session),
+            Some(CheckoutOrgRef::Trusted("org-from-server"))
+        );
+
+        // Payment Link: only the URL parameter, which anyone can edit.
+        let link = serde_json::json!({ "client_reference_id": "org-from-url", "metadata": {} });
+        assert_eq!(
+            checkout_org_ref(&link),
+            Some(CheckoutOrgRef::Unverified("org-from-url"))
+        );
+
+        // Blank values reference nothing.
+        let blank = serde_json::json!({
+            "client_reference_id": " ",
+            "metadata": { "spooled_org_id": "" }
+        });
+        assert_eq!(checkout_org_ref(&blank), None);
+        assert_eq!(checkout_org_ref(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn test_checkout_customer_email_prefers_customer_details() {
+        let session = serde_json::json!({
+            "customer_details": { "email": "payer@example.com" },
+            "customer_email": "prefilled@example.com"
+        });
+        assert_eq!(checkout_customer_email(&session), Some("payer@example.com"));
+
+        let prefilled = serde_json::json!({
+            "customer_details": { "email": null },
+            "customer_email": "prefilled@example.com"
+        });
+        assert_eq!(
+            checkout_customer_email(&prefilled),
+            Some("prefilled@example.com")
+        );
+        assert_eq!(checkout_customer_email(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn test_parse_checkout_plan_accepts_only_starter_and_pro() {
+        assert_eq!(
+            parse_checkout_plan(br#"{"plan":"starter"}"#).unwrap(),
+            "starter"
+        );
+        assert_eq!(parse_checkout_plan(br#"{"plan":"pro"}"#).unwrap(), "pro");
+        for body in [
+            &br#"{"plan":"enterprise"}"#[..],
+            br#"{"plan":"free"}"#,
+            br#"{"plan":"PRO"}"#,
+            br#"{"plan":7}"#,
+            br#"{}"#,
+            b"",
+            b"not json",
+        ] {
+            assert!(
+                matches!(parse_checkout_plan(body), Err(AppError::Validation(_))),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn test_checkout_session_form_binds_the_org() {
+        let form = checkout_session_form(
+            "org-1",
+            "price_pro",
+            None,
+            Some("owner@example.com"),
+            "https://spooled.cloud",
+        );
+        let get = |key: &str| form.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
+        assert_eq!(get("mode"), Some("subscription"));
+        assert_eq!(get("line_items[0][price]"), Some("price_pro"));
+        assert_eq!(get("client_reference_id"), Some("org-1"));
+        assert_eq!(get("metadata[spooled_org_id]"), Some("org-1"));
+        assert_eq!(
+            get("subscription_data[metadata][spooled_org_id]"),
+            Some("org-1")
+        );
+        assert_eq!(
+            get("success_url"),
+            Some("https://spooled.cloud/account/billing?checkout=success")
+        );
+        assert_eq!(
+            get("cancel_url"),
+            Some("https://spooled.cloud/account/billing?checkout=cancel")
+        );
+        assert_eq!(get("customer_email"), Some("owner@example.com"));
+        assert_eq!(get("customer"), None);
+
+        // An existing customer is reused instead of prefilling an email.
+        let form = checkout_session_form(
+            "org-1",
+            "price_pro",
+            Some("cus_1"),
+            Some("owner@example.com"),
+            "https://spooled.cloud",
+        );
+        assert!(form.iter().any(|(k, v)| k == "customer" && v == "cus_1"));
+        assert!(!form.iter().any(|(k, _)| k == "customer_email"));
+    }
+
+    #[test]
+    fn test_checkout_price_id_ignores_blank_and_unknown_plans() {
+        let stripe = StripeSettings {
+            secret_key: None,
+            webhook_secret: None,
+            starter_price_id: Some("price_starter".to_string()),
+            pro_price_id: Some("  ".to_string()),
+            billing_portal_config_id: None,
+        };
+        assert_eq!(checkout_price_id(&stripe, "starter"), Some("price_starter"));
+        assert_eq!(checkout_price_id(&stripe, "pro"), None);
+        assert_eq!(checkout_price_id(&stripe, "enterprise"), None);
+    }
+
+    #[tokio::test]
+    async fn test_stripe_api_url_override_is_scoped_to_the_task() {
+        assert_eq!(
+            stripe_api_url("/v1/subscriptions/sub_1"),
+            "https://api.stripe.com/v1/subscriptions/sub_1"
+        );
+        let inside = with_stripe_api_base("http://127.0.0.1:9/".to_string(), async {
+            stripe_api_url("/v1/subscriptions/sub_1")
+        })
+        .await;
+        assert_eq!(inside, "http://127.0.0.1:9/v1/subscriptions/sub_1");
+        assert!(stripe_api_url("/x").starts_with("https://api.stripe.com"));
     }
 
     #[test]

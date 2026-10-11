@@ -45,7 +45,7 @@ pub struct QueueConfig {
     pub max_retries: i32,
     /// Default timeout in seconds
     pub default_timeout: i32,
-    /// Rate limit (jobs per second, null = unlimited)
+    /// Rate limit (jobs per second, null = unlimited). Stored and returned; not enforced yet.
     pub rate_limit: Option<i32>,
     /// Whether the queue is enabled
     pub enabled: bool,
@@ -75,7 +75,7 @@ pub struct UpsertQueueConfigRequest {
     #[validate(range(min = 1, max = 86400, message = "Timeout must be between 1 and 86400"))]
     pub default_timeout: Option<i32>,
 
-    /// Rate limit (jobs per second)
+    /// Rate limit (jobs per second). Stored and returned; not enforced yet.
     #[validate(range(
         min = 1,
         max = 100000,

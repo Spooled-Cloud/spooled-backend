@@ -59,7 +59,7 @@ the 30 s REST default: the Go SDK `StreamJobs` cannot send a lease (W3R-03).
 
 REST validation allows `max_retries` range `min = 0` (`models/job.rs` ~214).
 
-`PUT /queues/{name}/config` is an upsert. Omitted `max_retries`/`default_timeout`/`enabled`/`rate_limit`/`settings` keep the existing row. Incoming `settings` objects are merged into the current JSON (pause metadata lives there).
+`PUT /queues/{name}/config` is an upsert. Omitted `max_retries`/`default_timeout`/`enabled`/`rate_limit`/`settings` keep the existing row. Incoming `settings` objects are merged into the current JSON (pause metadata lives there). `rate_limit` (1-100000) is accepted, stored and returned but **not enforced by any claim path** (BEBILL-11 / BEJOB-12, operator decision; enforcement is F02): say "stored, not enforced yet" in docs, never that workers are throttled by it.
 
 `DELETE /queues/{name}` without `delete_jobs` removes the `queue_config` row only and 409s while pending/processing jobs exist; with no config row but finished jobs it is a 409 that points at `?delete_jobs=true` (was a bare 404). `POST /queues/{name}/pause` on a queue that does not exist is 404 (it used to create a config row outside the queue cap); create-and-pause is `PUT .../config {"enabled": false}`. `?delete_jobs=true` deletes every job in that org+queue, matching `dead_letter_queue` rows, and the config (OpenAPI + dashboard checkbox).
 

@@ -266,10 +266,12 @@ curl -X PUT https://api.spooled.cloud/api/v1/queues/emails/config \
   -H "Content-Type: application/json" \
   -d '{
     "max_retries": 5,
-    "timeout_seconds": 600,
+    "default_timeout": 600,
     "rate_limit": 100
   }'
 ```
+
+`rate_limit` is stored and returned, but it is **not enforced yet**: workers are not throttled by it.
 
 ### Queue Operations
 

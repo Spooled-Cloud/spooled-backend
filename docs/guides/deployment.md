@@ -146,6 +146,69 @@ The backend also applies pending migrations itself at startup, so `sqlx migrate 
 3. Add foreign keys `NOT VALID`, then run `ALTER TABLE ... VALIDATE CONSTRAINT ...` as a separate statement (ideally a later migration): validation then holds only a `SHARE UPDATE EXCLUSIVE` lock instead of blocking reads and writes of the table during the full scan. Same idea for big indexes: avoid holding `ACCESS EXCLUSIVE` while scanning.
 4. `build.rs` tracks the `migrations/` directory, so a new `.sql` file alone triggers a rebuild that embeds it.
 
+#### 0.1.120 checks
+
+Run these after the rollout (all are read-only except the `UPDATE`s in 4 and 5, which are idempotent).
+
+1. **Stripe webhook events.** In the Stripe dashboard the `/api/v1/billing/webhook` endpoint must also
+   send `checkout.session.async_payment_succeeded` and `checkout.session.async_payment_failed`.
+   Payment Link checkouts are no longer trusted; watch the logs for `Not linking a Payment Link
+   checkout` (organization id, customer id, subscription id, event id) and link those customers by
+   hand through the admin API. Cancel a replaced subscription in Stripe or the portal when the
+   upgrade went through a Payment Link.
+
+2. **Stored `custom_limits` the new validator would reject.** These organizations keep working (a
+   bad value is ignored, so the plan default applies), but the admin editor answers 400 on their
+   next save until the bad key is fixed or reset:
+   ```sql
+   SELECT id, custom_limits FROM organizations
+   WHERE custom_limits IS NOT NULL
+     AND CASE jsonb_typeof(custom_limits)
+           WHEN 'object' THEN EXISTS (
+             SELECT 1 FROM jsonb_each(custom_limits) e
+             WHERE e.key NOT IN ('max_jobs_per_day','max_active_jobs','max_queues','max_workers',
+                                 'max_api_keys','max_schedules','max_workflows','max_webhooks',
+                                 'max_payload_size_bytes','rate_limit_requests_per_second',
+                                 'rate_limit_burst','job_retention_days','history_retention_days')
+                OR (e.value <> 'null'::jsonb
+                    AND (jsonb_typeof(e.value) <> 'number' OR e.value::text !~ '^-?[0-9]+$')))
+           WHEN 'null' THEN FALSE
+           ELSE TRUE
+         END;
+   ```
+
+3. **A stored `-1` on a resource cap.** It used to be ignored (plan default) and now means
+   unlimited, so this lists the organizations whose limit just went up (a `-1` on one of the
+   five settings keys is not valid and is ignored, as before):
+   ```sql
+   SELECT id, custom_limits FROM organizations WHERE custom_limits::text ~ ':\s*-1\b';
+   ```
+
+4. **Re-run the system-key backfill once.** During a rolling deploy an old pod's email login can
+   insert an `Email Login` key that is not marked `is_system`; it counts toward the key cap until
+   this runs:
+   ```sql
+   UPDATE api_keys SET is_system = TRUE
+   WHERE name = 'Email Login' AND key_prefix IN ('sp_email','sk_email') AND is_system = FALSE;
+   ```
+
+5. **Organizations soft-deleted before 0.1.120** still have active schedules and enabled outgoing
+   webhooks in the database. Cron and incoming-webhook ingest now skip them, but outgoing webhooks
+   are not filtered by `plan_tier`; stop them with:
+   ```sql
+   UPDATE schedules SET is_active = FALSE
+   WHERE is_active AND organization_id IN (SELECT id FROM organizations WHERE plan_tier = 'deleted');
+   UPDATE outgoing_webhooks SET enabled = FALSE
+   WHERE enabled AND organization_id IN (SELECT id FROM organizations WHERE plan_tier = 'deleted');
+   ```
+
+6. **Client IPs.** Production logs one `TRUSTED_CLIENT_IP_HEADER is not set` warning at boot; that is
+   expected behind the bundled cloudflared. Set `TRUSTED_CLIENT_IP_HEADER` (to silence it, or because
+   your proxy reaches the backend from a public address) as described in the operations guide.
+
+7. **Turnstile.** Leave `TURNSTILE_SECRET_KEY` unset until the website and the dashboard both send
+   `turnstile_token` to `POST /auth/email/start`.
+
 ### 4. Start the Server
 
 ```bash

@@ -29,6 +29,7 @@ pub struct Settings {
     pub registration: RegistrationSettings,
     pub stripe: StripeSettings,
     pub email: EmailSettings,
+    pub turnstile: TurnstileSettings,
 }
 
 /// Registration/onboarding settings
@@ -232,7 +233,13 @@ impl Default for OutgoingWebhookSettings {
 pub struct TrustedProxySettings {
     /// Header set by the edge proxy that carries the real client IP, e.g.
     /// `CF-Connecting-IP` (Cloudflare) or `X-Real-IP` (nginx).
-    /// Set via `TRUSTED_CLIENT_IP_HEADER`. Checked first when present.
+    /// Set via `TRUSTED_CLIENT_IP_HEADER`. Checked first when present, and
+    /// believed from any TCP peer.
+    ///
+    /// Unset, `CF-Connecting-IP` then `X-Real-IP` are believed only when the
+    /// TCP peer is a loopback/private/link-local/unique-local address (a proxy
+    /// on the same host or network); any other peer is keyed on its own
+    /// address.
     pub client_ip_header: Option<String>,
     /// Number of trusted proxy hops appended to `X-Forwarded-For`.
     ///
@@ -291,6 +298,27 @@ pub struct EmailSettings {
     pub smtp_username: Option<String>,
     /// SMTP password (only for SMTP provider)
     pub smtp_password: Option<String>,
+}
+
+/// Cloudflare Turnstile siteverify endpoint.
+pub const TURNSTILE_VERIFY_URL: &str = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+
+/// Cloudflare Turnstile check on `POST /auth/email/start`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TurnstileSettings {
+    /// `TURNSTILE_SECRET_KEY`. While unset no token is required or checked.
+    pub secret_key: Option<String>,
+    /// Siteverify endpoint ([`TURNSTILE_VERIFY_URL`]; tests point it at a mock).
+    pub verify_url: String,
+}
+
+impl Default for TurnstileSettings {
+    fn default() -> Self {
+        Self {
+            secret_key: None,
+            verify_url: TURNSTILE_VERIFY_URL.to_string(),
+        }
+    }
 }
 
 /// Email provider type
@@ -559,12 +587,38 @@ impl Settings {
                 smtp_username: non_empty_env("SMTP_USERNAME"),
                 smtp_password: non_empty_env("SMTP_PASSWORD"),
             },
+            turnstile: TurnstileSettings {
+                secret_key: non_empty_env("TURNSTILE_SECRET_KEY"),
+                ..TurnstileSettings::default()
+            },
         };
 
         // Validate settings
         settings.validate()?;
 
+        if let Some(warning) = settings.client_ip_warning() {
+            tracing::warn!("{warning}");
+        }
+
         Ok(settings)
+    }
+
+    /// Boot-time warning for production without `TRUSTED_CLIENT_IP_HEADER`.
+    ///
+    /// Not an error: behind a proxy on the same network (production's
+    /// cloudflared) the default edge headers are still believed, and a direct
+    /// client is keyed on its own address. But which header carries the client
+    /// address is deployment knowledge, and a proxy that reaches the backend
+    /// from a public address leaves every caller in that proxy's one bucket.
+    fn client_ip_warning(&self) -> Option<&'static str> {
+        (self.server.environment == Environment::Production
+            && self.trusted_proxy.client_ip_header.is_none())
+        .then_some(
+            "TRUSTED_CLIENT_IP_HEADER is not set: CF-Connecting-IP / X-Real-IP are believed \
+             only from loopback or private-network peers, every other caller is rate-limited \
+             by its TCP address. Set TRUSTED_CLIENT_IP_HEADER=CF-Connecting-IP behind \
+             Cloudflare or X-Real-IP behind nginx.",
+        )
     }
 
     /// Validate settings
@@ -791,6 +845,7 @@ impl Settings {
                 smtp_username: None,
                 smtp_password: None,
             },
+            turnstile: TurnstileSettings::default(),
         }
     }
 }
@@ -900,6 +955,7 @@ mod tests {
         "METRICS_TOKEN",
         "OTEL_EXPORTER_OTLP_ENDPOINT",
         "GRPC_DEFAULT_LEASE_DURATION_SECS",
+        "TURNSTILE_SECRET_KEY",
     ];
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -941,6 +997,8 @@ mod tests {
         assert_eq!(settings.outgoing_webhooks.max_concurrent_deliveries, 64);
         assert_eq!(settings.tracing.otlp_endpoint, None);
         assert_eq!(settings.worker.grpc_default_lease_duration_secs, 300);
+        assert_eq!(settings.turnstile.secret_key, None);
+        assert_eq!(settings.turnstile.verify_url, TURNSTILE_VERIFY_URL);
     }
 
     fn production_settings(provider: EmailProvider) -> Settings {
@@ -967,6 +1025,23 @@ mod tests {
         ] {
             production_settings(provider).validate().unwrap();
         }
+    }
+
+    // ---- wave 4 / authrl ----
+
+    // BEAUTH-10: production without TRUSTED_CLIENT_IP_HEADER is told at boot
+    // how client addresses are resolved and which header to set.
+    #[test]
+    fn production_without_a_client_ip_header_warns_once_at_boot() {
+        let mut settings = production_settings(EmailProvider::Resend);
+        let warning = settings.client_ip_warning().expect("warning in production");
+        assert!(warning.contains("TRUSTED_CLIENT_IP_HEADER"), "{warning}");
+
+        settings.trusted_proxy.client_ip_header = Some("CF-Connecting-IP".to_string());
+        assert_eq!(settings.client_ip_warning(), None);
+
+        let development = Settings::load_for_testing();
+        assert_eq!(development.client_ip_warning(), None);
     }
 
     #[test]
@@ -1089,6 +1164,7 @@ mod tests {
             "DATABASE_DIRECT_URL",
             "GRPC_PORT",
             "GRPC_DEFAULT_LEASE_DURATION_SECS",
+            "TURNSTILE_SECRET_KEY",
         ] {
             assert!(
                 compose.contains(&format!("      {name}: ${{{name}:-")),

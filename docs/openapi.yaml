@@ -59,7 +59,8 @@ info:
     - Active jobs: Free (10), Starter (500), Pro (5,000), Enterprise (unlimited)
     - Queues: Free (2), Starter (10), Pro (50), Enterprise (unlimited)
     - Workers: Free (1), Starter (5), Pro (25), Enterprise (unlimited)
-    - Workflows: Free (disabled), Starter (5), Pro (50), Enterprise (unlimited)
+    - Workflows: Free (disabled), Starter (5), Pro (50), Enterprise (unlimited). Only
+      workflows that are pending or running count toward the limit.
 
   version: 1.0.0
   license:
@@ -403,6 +404,13 @@ paths:
         Start the email-based login flow. Sends a verification code to the provided email.
         If the email is not associated with an existing organization, verification will
         return a short-lived signup token to complete registration.
+
+        Each client IP may request 3 codes per minute and 10 per hour (an IPv6 client counts
+        as its whole /64), and each address receives at most 5 codes per hour. When the server
+        has `TURNSTILE_SECRET_KEY` set, the request must also carry a valid `turnstile_token`
+        (Cloudflare Turnstile); without that variable the field is ignored. A code is stored
+        only after the mail was sent, so a mail provider failure (500) does not use up the
+        address's hourly allowance.
       operationId: startEmailLogin
       security: []
       requestBody:
@@ -418,8 +426,40 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/StartEmailLoginResponse'
+        '400':
+          description: >-
+            Validation failed, or `CAPTCHA_FAILED`: the server requires a Turnstile token and
+            it is missing, rejected or could not be verified
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: CAPTCHA_FAILED
+                message: Complete the verification challenge and try again.
         '429':
-          description: Too many requests - rate limited
+          description: >-
+            Too many requests. Per client IP (3 per minute, 10 per hour) the answer is
+            `RATE_LIMIT_EXCEEDED` with a `Retry-After` header and
+            `details.retry_after_seconds` (also while Redis is down and the server runs with
+            `RATE_LIMIT_FAIL_CLOSED`). More than 5 codes for one address in an hour is a 429
+            without `Retry-After`.
+          headers:
+            Retry-After:
+              description: Seconds until the limit clears
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: RATE_LIMIT_EXCEEDED
+                message: Too many login codes requested from this network. Please try again in 1 minute.
+                details:
+                  retry_after_seconds: 60
+        '500':
+          description: The mail provider failed; no code was stored
 
   /api/v1/auth/email/verify:
     post:
@@ -443,8 +483,33 @@ paths:
                 $ref: '#/components/schemas/VerifyEmailResponse'
         '400':
           description: Invalid or expired code
+        '401':
+          description: >-
+            `AUTHENTICATION_FAILED`: the code is wrong, expired or already used, or has
+            reached its own attempt limit
         '404':
           description: No pending verification found
+        '429':
+          description: >-
+            Too many attempts: `RATE_LIMIT_EXCEEDED` with a `Retry-After` header and
+            `details.retry_after_seconds`. Budgets are per address and client IP (5 guesses per
+            10 minutes) and per address from all clients (20 per 10 minutes). Throttling
+            never invalidates the owner's code; it only makes callers wait for the window to
+            end. Before 0.1.120 this was a 401.
+          headers:
+            Retry-After:
+              description: Seconds until the limit clears
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: RATE_LIMIT_EXCEEDED
+                message: Too many attempts. Please try again in 7 minutes.
+                details:
+                  retry_after_seconds: 420
 
   /api/v1/auth/signup/complete:
     post:
@@ -487,7 +552,9 @@ paths:
     get:
       tags: [Billing]
       summary: Get billing status
-      description: Get the current billing status for the organization
+      description: |
+        Get the current billing status for the organization. Needs an unrestricted API key
+        (or a JWT issued from one); queue-scoped keys are refused.
       operationId: getBillingStatus
       responses:
         '200':
@@ -496,6 +563,81 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/BillingStatus'
+        '403':
+          description: The API key is restricted to queues (`ACCESS_DENIED`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/billing/checkout:
+    post:
+      tags: [Billing]
+      summary: Start a Stripe checkout
+      description: |
+        Create a Stripe Checkout Session that buys a plan for the authenticated organization,
+        and return its URL for the caller to redirect to. Needs an unrestricted API key (or a
+        JWT issued from one).
+
+        The session is bound to the organization through metadata only this server sets,
+        which is what makes a completed checkout trustworthy; the organization's existing
+        Stripe customer is reused, otherwise Checkout is prefilled with its verified billing
+        email. After paying or cancelling, Stripe returns the customer to
+        `<FRONTEND_URL>/account/billing?checkout=success` or `?checkout=cancel`
+        (`FRONTEND_URL` defaults to `https://spooled.cloud`).
+
+        Replaces the public Stripe Payment Links, whose `client_reference_id` URL parameter
+        anyone can edit. A legacy Payment Link checkout is still accepted by the webhook, but
+        it links only an organization with no live subscription whose verified billing email
+        the payer used, and it never cancels a subscription.
+      operationId: createBillingCheckout
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCheckoutRequest'
+      responses:
+        '200':
+          description: Checkout session created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateCheckoutResponse'
+        '400':
+          description: '`VALIDATION_ERROR`: `plan` is missing or not `starter` / `pro`, or the body is not JSON'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: The API key is restricted to queues (`ACCESS_DENIED`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Organization not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: >-
+            `CONFLICT`: the organization already has that plan with an active or trialing
+            subscription; manage it through the billing portal
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: >-
+            `SERVICE_UNAVAILABLE`: Stripe or that plan's price id is not configured, or the
+            Stripe call failed or timed out (10 s). Safe to retry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /api/v1/billing/portal:
     post:
@@ -523,7 +665,20 @@ paths:
       summary: Stripe webhook
       description: |
         Webhook endpoint for Stripe events. Secured with STRIPE_BILLING_WEBHOOK_SECRET.
-        Handles subscription lifecycle events.
+        Handles subscription lifecycle events; the Stripe endpoint must be subscribed to:
+
+        - `checkout.session.completed`
+        - `checkout.session.async_payment_succeeded` (links the organization once a delayed
+          payment such as SEPA or ACH succeeds)
+        - `checkout.session.async_payment_failed` (logged, links nothing)
+        - `customer.subscription.created`, `customer.subscription.updated`,
+          `customer.subscription.deleted`
+        - `invoice.paid`, `invoice.payment_failed`
+
+        A completed checkout is trusted only when it carries the organization in its metadata
+        (created by `POST /billing/checkout`). Any other checkout (a legacy Payment Link) links
+        only an organization with no live subscription whose verified billing email the payer
+        used, and never cancels a subscription.
       operationId: stripeWebhook
       security: []
       requestBody:
@@ -537,6 +692,14 @@ paths:
           description: Webhook processed
         '400':
           description: Invalid webhook signature
+        '409':
+          description: >-
+            Retry later: the event arrived before its Stripe customer is linked to an
+            organization (younger than 24 h), or another attempt holds the event. Stripe retries.
+        '500':
+          description: >-
+            Processing failed (for example the cancel of a replaced subscription); the claim is
+            released and Stripe retries the event
 
   /api/v1/organizations/check-slug:
     get:
@@ -913,7 +1076,10 @@ paths:
     patch:
       tags: [Admin]
       summary: Update organization
-      description: Update organization settings including plan tier
+      description: |
+        Update organization settings including plan tier. `custom_limits` is validated: unknown
+        keys, non-integer values and negative or out-of-range values are refused with
+        `400 VALIDATION_ERROR` (every problem is listed in the message).
       operationId: adminUpdateOrganization
       security:
         - AdminKeyAuth: []
@@ -930,13 +1096,22 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Organization'
+        '400':
+          description: Validation failed, including an invalid `custom_limits`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
     delete:
       tags: [Admin]
       summary: Delete organization
       description: |
         Delete an organization and all its data.
         
-        - **Soft delete** (default): Marks organization as deleted.
+        - **Soft delete** (default): Marks organization as deleted (`plan_tier` becomes
+          `deleted`) and, in one transaction, revokes its API keys, pauses all its schedules,
+          disables its outgoing webhooks and removes its incoming-webhook token. Restoring
+          `plan_tier` does not turn any of these back on.
         - **Hard delete** (`hard_delete=true`): Permanently removes organization and all related data (jobs, workflows, workers, etc.).
       operationId: adminDeleteOrganization
       security:
@@ -1844,6 +2019,15 @@ paths:
                 $ref: '#/components/schemas/ApiKeySummary'
         '404':
           description: API key not found
+        '429':
+          description: >-
+            `QUOTA_EXCEEDED` (resource `api_keys`): `is_active: true` re-activates a revoked
+            key while the organization is at its API-key limit. Turning a key off, or
+            re-activating a system key, never fails on quota.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
     delete:
       tags: [API Keys]
       summary: Revoke API key
@@ -1962,7 +2146,7 @@ paths:
                 code: authentication_error
                 message: Invalid or missing X-Webhook-Token
         '404':
-          description: Organization not found
+          description: Organization not found, or soft-deleted
 
   # Workflow Endpoints
   /api/v1/workflows:
@@ -2075,6 +2259,11 @@ paths:
         resumes the workflow.
 
         Only workflows with status 'failed' can be retried.
+
+        A running workflow counts toward the plan's `max_workflows` (only pending and running
+        workflows count), so retrying takes a slot: the call is refused with `429 QUOTA_EXCEEDED`
+        when the organization is at its limit, and with `403` (`feature_disabled`) on a plan
+        without workflows.
       operationId: retryWorkflow
       parameters:
         - name: id
@@ -2092,8 +2281,18 @@ paths:
                 $ref: '#/components/schemas/WorkflowResponse'
         '400':
           description: Workflow cannot be retried (not in failed status)
+        '403':
+          description: Workflows are not available on the organization's plan (`feature_disabled`)
         '404':
           description: Workflow not found
+        '429':
+          description: >-
+            `QUOTA_EXCEEDED` (resource `workflows`): retrying would exceed the plan's limit of
+            pending and running workflows
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /api/v1/jobs/{id}/dependencies:
     get:
@@ -2353,7 +2552,13 @@ paths:
     put:
       tags: [Schedules]
       summary: Update schedule
-      description: Update an existing schedule
+      description: |
+        Update an existing schedule.
+
+        `is_active: true` on a paused schedule re-activates it like `POST /schedules/{id}/resume`:
+        it is checked against the plan's schedule limit (429 `QUOTA_EXCEEDED`) and the next run is
+        computed from the current time, so the run missed while paused does not fire. Turning a
+        schedule off never fails on quota.
       operationId: updateSchedule
       parameters:
         - name: id
@@ -2376,6 +2581,14 @@ paths:
                 $ref: '#/components/schemas/Schedule'
         '404':
           description: Schedule not found
+        '429':
+          description: >-
+            `QUOTA_EXCEEDED` (resource `schedules`): `is_active: true` re-activates a paused
+            schedule while the organization is at its schedule limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
     delete:
       tags: [Schedules]
       summary: Delete schedule
@@ -3327,6 +3540,7 @@ components:
           type: integer
         rate_limit:
           type: integer
+          description: Stored and returned; not enforced yet (planned).
         enabled:
           type: boolean
         settings:
@@ -3350,6 +3564,7 @@ components:
           type: integer
         rate_limit:
           type: integer
+          description: Stored and returned; not enforced yet (planned).
         enabled:
           type: boolean
 
@@ -3371,6 +3586,9 @@ components:
           type: integer
           minimum: 1
           maximum: 100000
+          description: >-
+            Stored and returned; not enforced yet (planned). Workers are not throttled to this
+            many jobs per second.
         enabled:
           type: boolean
         settings:
@@ -3543,7 +3761,7 @@ components:
 
     ApiKeySummary:
       type: object
-      required: [id, name, queues, is_active, created_at]
+      required: [id, name, queues, is_active, is_system, created_at]
       properties:
         id:
           type: string
@@ -3555,8 +3773,17 @@ components:
             type: string
         rate_limit:
           type: integer
+          description: >-
+            Per-key cap in requests per minute (1-10000). Checked after the organization's plan
+            rate limit, so it can only lower that limit for this key, never raise it.
         is_active:
           type: boolean
+        is_system:
+          type: boolean
+          readOnly: true
+          description: >-
+            True only for the key Spooled creates for email-login dashboard sessions. System keys
+            do not count toward the plan's API-key limit. No request can set this field.
         created_at:
           type: string
           format: date-time
@@ -3587,6 +3814,9 @@ components:
           type: integer
           minimum: 1
           maximum: 10000
+          description: >-
+            Per-key cap in requests per minute. Checked after the organization's plan rate
+            limit, so it can only lower that limit for this key, never raise it.
         expires_at:
           type: string
           format: date-time
@@ -3628,8 +3858,14 @@ components:
           type: integer
           minimum: 1
           maximum: 10000
+          description: >-
+            Per-key cap in requests per minute. Checked after the organization's plan rate
+            limit, so it can only lower that limit for this key, never raise it.
         is_active:
           type: boolean
+          description: >-
+            `false` revokes the key. `true` re-activates a revoked key and is checked against
+            the plan's API-key limit (429 `QUOTA_EXCEEDED`). `is_system` cannot be set.
 
     CustomWebhookRequest:
       type: object
@@ -4559,7 +4795,34 @@ components:
         custom_limits:
           type: object
           nullable: true
-          description: Custom limit overrides (null or empty object resets to plan defaults)
+          description: |
+            Per-organization limit overrides (null or an empty object resets to plan defaults).
+            Optional keys, each a whole number:
+
+            - Resource caps `max_jobs_per_day`, `max_active_jobs`, `max_queues`, `max_workers`,
+              `max_api_keys`, `max_schedules`, `max_workflows`, `max_webhooks`: `null` or `-1`
+              means unlimited.
+            - Settings `max_payload_size_bytes`, `rate_limit_requests_per_second`,
+              `rate_limit_burst`, `job_retention_days`, `history_retention_days`: `null` keeps the
+              plan default; the two retention keys must be 0-36500 days.
+
+            Unknown keys, non-integers and any other negative or out-of-range value are a
+            `400 VALIDATION_ERROR`.
+          properties:
+            max_jobs_per_day: {type: integer, nullable: true, minimum: -1}
+            max_active_jobs: {type: integer, nullable: true, minimum: -1}
+            max_queues: {type: integer, nullable: true, minimum: -1}
+            max_workers: {type: integer, nullable: true, minimum: -1}
+            max_api_keys: {type: integer, nullable: true, minimum: -1}
+            max_schedules: {type: integer, nullable: true, minimum: -1}
+            max_workflows: {type: integer, nullable: true, minimum: -1}
+            max_webhooks: {type: integer, nullable: true, minimum: -1}
+            max_payload_size_bytes: {type: integer, nullable: true, minimum: 0}
+            rate_limit_requests_per_second: {type: integer, nullable: true, minimum: 0}
+            rate_limit_burst: {type: integer, nullable: true, minimum: 0}
+            job_retention_days: {type: integer, nullable: true, minimum: 0, maximum: 36500}
+            history_retention_days: {type: integer, nullable: true, minimum: 0, maximum: 36500}
+          additionalProperties: false
         stripe_customer_id:
           type: string
           nullable: true
@@ -4739,6 +5002,13 @@ components:
         email:
           type: string
           format: email
+        turnstile_token:
+          type: string
+          maxLength: 2048
+          description: >-
+            Cloudflare Turnstile token. Required (and verified) only when the server has
+            `TURNSTILE_SECRET_KEY` set; otherwise ignored. A missing, rejected or unverifiable
+            token is `400 CAPTCHA_FAILED`.
 
     StartEmailLoginResponse:
       type: object
@@ -4890,6 +5160,27 @@ components:
           format: date-time
         cancel_at_period_end:
           type: boolean
+
+    CreateCheckoutRequest:
+      type: object
+      required: [plan]
+      properties:
+        plan:
+          type: string
+          enum: [starter, pro]
+          description: The plan to buy
+
+    CreateCheckoutResponse:
+      type: object
+      required: [url, session_id]
+      properties:
+        url:
+          type: string
+          format: uri
+          description: Stripe-hosted Checkout page (`https://checkout.stripe.com/...`) to redirect the user to
+        session_id:
+          type: string
+          description: Checkout Session id (`cs_...`)
 
     CreatePortalRequest:
       type: object

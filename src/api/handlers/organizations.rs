@@ -91,13 +91,14 @@ pub struct CheckSlugResponse {
 /// Rate limited to prevent slug enumeration attacks.
 pub async fn check_slug(
     State(state): State<AppState>,
+    crate::api::middleware::client_ip::PeerAddr(peer): crate::api::middleware::client_ip::PeerAddr,
     headers: axum::http::HeaderMap,
     axum::extract::Query(query): axum::extract::Query<CheckSlugQuery>,
 ) -> AppResult<Json<CheckSlugResponse>> {
     let slug = query.slug.to_lowercase().trim().to_string();
 
     // Extract IP for rate limiting
-    let client_ip = extract_client_ip(&state, &headers);
+    let client_ip = extract_client_ip(&state, &headers, peer);
 
     // Rate limiting lives in Redis, like every other limiter in this codebase.
     //
@@ -326,8 +327,16 @@ async fn check_slug_rate_limit(
 /// carry its own copy that trusted the LEFTMOST `X-Forwarded-For` entry — the
 /// one the caller supplies — so `check-slug`'s per-IP limits could be bypassed
 /// by varying a header, and each bypassed request still wrote a permanent row.
-fn extract_client_ip(state: &AppState, headers: &axum::http::HeaderMap) -> String {
-    crate::api::middleware::client_ip::client_ip(headers, &state.settings.trusted_proxy)
+fn extract_client_ip(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    peer: Option<std::net::IpAddr>,
+) -> String {
+    crate::api::middleware::client_ip::client_ip_from_peer(
+        headers,
+        peer,
+        &state.settings.trusted_proxy,
+    )
 }
 
 /// List organizations (returns only the authenticated user's organization)

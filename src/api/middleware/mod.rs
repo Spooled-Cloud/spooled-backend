@@ -14,8 +14,6 @@ pub mod versioning;
 // Re-export commonly used items
 // Some exports are for external use by SDK consumers
 #[allow(unused_imports)]
-pub use client_ip::client_ip;
-#[allow(unused_imports)]
 pub use limits::{
     check_job_limits, check_payload_size, check_resource_limit, get_usage_info,
     increment_daily_jobs, LimitExceededResponse, UsageInfo,

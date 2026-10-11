@@ -218,7 +218,7 @@ async fn test_stripe_handler_error_releases_event_claim() {
     let db = TestDatabase::new().await;
     let state = billing_state(&db);
 
-    // No org linked to this customer; recent created → 5xx retry request + claim release.
+    // No org linked to this customer; recent created → 409 retry request + claim release.
     let body = subscription_event(
         "evt_release_1",
         Utc::now().timestamp(),
@@ -232,7 +232,7 @@ async fn test_stripe_handler_error_releases_event_claim() {
         Bytes::from(body.clone()),
     )
     .await
-    .expect_err("unlinked recent subscription should 5xx");
+    .expect_err("unlinked recent subscription should be rejected with 409 so Stripe retries");
     let _ = err;
 
     let claimed: (i64,) =

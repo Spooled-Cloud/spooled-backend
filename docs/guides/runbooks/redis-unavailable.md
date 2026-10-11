@@ -25,6 +25,7 @@ Redis is **not critical** - the system degrades gracefully:
 | WebSocket updates | Disabled | Dashboard not real-time |
 | Rate limiting | 10 req/min fallback | More restrictive |
 | Worker coordination | Direct DB queries | Higher DB load |
+| Email-login throttles (`email_start:*`, `email_verify_*`) | Start throttle fails open (429 with `RATE_LIMIT_FAIL_CLOSED`); the verify budgets are skipped and each code allows only 5 attempts | A stranger can burn an address's code again until Redis is back |
 
 **Bottom line**: Jobs continue processing, but with higher latency and DB load.
 

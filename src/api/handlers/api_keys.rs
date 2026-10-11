@@ -217,6 +217,32 @@ pub async fn update(
     let queues = request.queues.unwrap_or(existing.queues);
     let is_active = request.is_active.unwrap_or(existing.is_active);
 
+    // The api_keys cap counts ACTIVE customer keys, so re-activating a revoked key
+    // takes a slot just like create does and pays for it here, under the same
+    // advisory lock (revoke A -> create C -> re-activate A used to overshoot).
+    // The active flag is re-read under the lock: two concurrent re-activations of
+    // one key must charge once. System keys do not count, and turning a key OFF
+    // never fails on quota.
+    let mut tx = state.db.pool().begin().await?;
+    if request.is_active == Some(true) && !existing.is_system {
+        lock_resource(&mut tx, &ctx.organization_id, "api_keys").await?;
+        let active_now: bool = sqlx::query_scalar(
+            "SELECT is_active FROM api_keys WHERE id = $1 AND organization_id = $2 FOR UPDATE",
+        )
+        .bind(&id)
+        .bind(&ctx.organization_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("API key {} not found", id)))?;
+        if !active_now {
+            if let Err(response) =
+                check_resource_limit_conn(&mut tx, &ctx.organization_id, "api_keys", 1).await
+            {
+                return Err(AppError::LimitExceeded(Box::new(response)));
+            }
+        }
+    }
+
     let key = sqlx::query_as::<_, ApiKey>(
         r#"
         UPDATE api_keys
@@ -231,8 +257,10 @@ pub async fn update(
     .bind(is_active)
     .bind(&id)
     .bind(&ctx.organization_id)
-    .fetch_one(state.db.pool())
+    .fetch_one(&mut *tx)
     .await?;
+
+    tx.commit().await?;
 
     // Invalidate cache when API key is updated
     // This prevents stale cached keys from being used

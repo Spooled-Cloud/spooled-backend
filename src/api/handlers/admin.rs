@@ -393,6 +393,16 @@ pub async fn update_organization(
         }
     }
 
+    // custom_limits used to be stored as any JSON: the limit checks ignored a bad
+    // value, but the retention sweep read it raw, so one string or negative number
+    // stopped retention for every org or purged that org's completed jobs.
+    // Null / {} (reset) is handled below and needs no check.
+    if let Some(Some(ref limits)) = request.custom_limits {
+        if !limits.is_null() {
+            crate::config::plans::validate_custom_limits(limits).map_err(AppError::Validation)?;
+        }
+    }
+
     if let Some(ref email) = request.billing_email {
         if crate::api::handlers::organizations::billing_email_taken(
             state.db.pool(),
@@ -633,6 +643,12 @@ pub async fn delete_organization(
         // Soft delete - mark the plan "deleted" AND revoke the org's API keys, so a
         // soft-deleted org can no longer authenticate. Marking plan_tier alone left
         // every existing key fully usable (auth only checks api_keys.is_active).
+        //
+        // Everything that acts for the org without a key stops too: its cron
+        // schedules (they kept enqueueing jobs nothing could claim), its outgoing
+        // webhooks (they kept delivering to the customer's endpoint), and its
+        // incoming-webhook token (an upstream holding it kept creating jobs).
+        // All of it, or none of it, in one transaction.
         let soft_key_hashes: Vec<(String,)> =
             sqlx::query_as("SELECT key_hash FROM api_keys WHERE organization_id = $1")
                 .bind(&id)
@@ -640,17 +656,39 @@ pub async fn delete_organization(
                 .await
                 .unwrap_or_default();
 
+        let mut tx = state.db.pool().begin().await?;
+
         sqlx::query("UPDATE api_keys SET is_active = false WHERE organization_id = $1")
             .bind(&id)
-            .execute(state.db.pool())
+            .execute(&mut *tx)
             .await?;
 
         sqlx::query(
-            "UPDATE organizations SET plan_tier = 'deleted', updated_at = NOW() WHERE id = $1",
+            "UPDATE schedules SET is_active = FALSE, updated_at = NOW() \
+             WHERE organization_id = $1 AND is_active = TRUE",
         )
         .bind(&id)
-        .execute(state.db.pool())
+        .execute(&mut *tx)
         .await?;
+
+        sqlx::query(
+            "UPDATE outgoing_webhooks SET enabled = FALSE, updated_at = NOW() \
+             WHERE organization_id = $1 AND enabled = TRUE",
+        )
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "UPDATE organizations \
+             SET plan_tier = 'deleted', settings = settings - 'webhook_token', updated_at = NOW() \
+             WHERE id = $1",
+        )
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
 
         // Evict the now-revoked keys from the auth cache so they stop working
         // immediately instead of surviving up to the cache TTL.
@@ -670,7 +708,10 @@ pub async fn delete_organization(
             }
         }
 
-        tracing::info!(org_id = %id, "Organization soft deleted by admin (API keys revoked)");
+        tracing::info!(
+            org_id = %id,
+            "Organization soft deleted by admin (API keys revoked, schedules and webhooks stopped)"
+        );
     }
 
     // Both branches: drop the cached plan limits so a deleted org cannot keep

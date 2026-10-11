@@ -405,6 +405,10 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
         // Billing endpoints
         .route("/billing/status", get(handlers::billing::status))
         .route("/billing/portal", post(handlers::billing::create_portal))
+        .route(
+            "/billing/checkout",
+            post(handlers::billing::create_checkout),
+        )
         // Apply authentication middleware to all protected routes
         // route_layer runs the middleware for matched routes only
         // IMPORTANT: auth must run BEFORE plan-based rate limiting so the limiter can use ApiKeyContext.

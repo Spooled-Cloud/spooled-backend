@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use crate::api::handlers::auth::Claims;
 use crate::api::middleware::bcrypt_gate::{self, ScanLane};
-use crate::api::middleware::client_ip::client_ip;
+use crate::api::middleware::client_ip::{client_ip_from_peer, peer_addr};
 use crate::api::AppState;
 use crate::cache::RedisCache;
 use crate::error::ErrorResponse;
@@ -241,7 +241,11 @@ async fn authenticate_inner(
             .await
             .map_err(|(s, m)| auth_error_response(s, m))?
     } else {
-        let client_ip = client_ip(request.headers(), &state.settings.trusted_proxy);
+        let client_ip = client_ip_from_peer(
+            request.headers(),
+            peer_addr(request.extensions()),
+            &state.settings.trusted_proxy,
+        );
         authenticate_api_key_token(
             state.db.pool(),
             state.cache.as_ref(),

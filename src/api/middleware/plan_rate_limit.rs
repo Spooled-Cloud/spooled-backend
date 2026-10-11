@@ -16,7 +16,7 @@ use axum::{
 use serde::Serialize;
 use tracing::{debug, warn};
 
-use crate::api::middleware::client_ip::client_ip;
+use crate::api::middleware::client_ip::{client_ip_from_peer, peer_addr};
 use crate::api::AppState;
 use crate::config::{PlanLimits, TrustedProxySettings};
 use crate::models::ApiKeyContext;
@@ -72,8 +72,16 @@ fn rate_limit_unavailable_response(retry_after_secs: u64) -> Response {
 ///
 /// The User-Agent fallback was also removed: it is client-controlled too, so it
 /// provided the same bypass one step down.
+///
+/// The TCP peer decides whether the default edge headers are believed at all
+/// (a client reaching the backend directly could otherwise name its own bucket
+/// with `CF-Connecting-IP`), and an IPv6 caller is keyed on its /64.
 fn extract_client_id(request: &Request<Body>, settings: &TrustedProxySettings) -> String {
-    format!("ip:{}", client_ip(request.headers(), settings))
+    let peer = peer_addr(request.extensions());
+    format!(
+        "ip:{}",
+        client_ip_from_peer(request.headers(), peer, settings)
+    )
 }
 
 /// Redis key holding an org's cached plan rate limits.

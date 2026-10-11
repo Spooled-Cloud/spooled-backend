@@ -167,12 +167,13 @@ const LOGIN_RATE_LIMIT_WINDOW: i64 = 60;
 /// it must not look like a bad key (401) or a server bug (500).
 pub async fn login(
     State(state): State<AppState>,
+    crate::api::middleware::client_ip::PeerAddr(peer): crate::api::middleware::client_ip::PeerAddr,
     headers: axum::http::HeaderMap,
     ValidatedJson(req): ValidatedJson<LoginRequest>,
 ) -> Result<Json<LoginResponse>, axum::response::Response> {
     use axum::response::IntoResponse;
 
-    login_inner(state, headers, req)
+    login_inner(state, peer, headers, req)
         .await
         .map_err(|(status, body)| {
             let mut response = (status, body).into_response();
@@ -190,6 +191,7 @@ pub async fn login(
 
 async fn login_inner(
     state: AppState,
+    peer: Option<std::net::IpAddr>,
     headers: axum::http::HeaderMap,
     req: LoginRequest,
 ) -> Result<Json<LoginResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -235,8 +237,11 @@ async fn login_inner(
     // per-address failed-auth budget. /auth/login used to carry its own copy, with
     // bcrypt inline on the async worker; it is UNAUTHENTICATED, so a bogus key here
     // is as cheap to send as anywhere.
-    let client_ip =
-        crate::api::middleware::client_ip::client_ip(&headers, &state.settings.trusted_proxy);
+    let client_ip = crate::api::middleware::client_ip::client_ip_from_peer(
+        &headers,
+        peer,
+        &state.settings.trusted_proxy,
+    );
     let api_key = match crate::api::middleware::auth::resolve_api_key(
         state.db.pool(),
         state.cache.as_ref(),

@@ -292,29 +292,33 @@ pub async fn update(
     Extension(ctx): Extension<ApiKeyContext>,
     Path(id): Path<String>,
     ValidatedJson(req): ValidatedJson<UpdateScheduleRequest>,
-) -> Result<Json<Schedule>, (StatusCode, String)> {
+) -> Result<Json<Schedule>, Response> {
     let org_id = &ctx.organization_id;
-    require_schedule_access(&state, &ctx, &id).await?;
+    let internal = |msg: &str| (StatusCode::INTERNAL_SERVER_ERROR, msg.to_string()).into_response();
+    require_schedule_access(&state, &ctx, &id)
+        .await
+        .map_err(IntoResponse::into_response)?;
+
+    let current: Option<Schedule> =
+        sqlx::query_as("SELECT * FROM schedules WHERE id = $1 AND organization_id = $2")
+            .bind(&id)
+            .bind(org_id)
+            .fetch_optional(state.db.pool())
+            .await
+            .map_err(|e| {
+                error!(error = %e, "Failed to load schedule for update");
+                internal("Failed to update schedule")
+            })?;
+    let current = current
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Schedule not found".to_string()).into_response())?;
 
     // Recompute next_run_at when the cron expression OR the timezone changes —
     // both alter the next fire time. The effective values are the incoming ones
-    // falling back to what is currently stored.
+    // falling back to what is currently stored. Re-activating a paused schedule
+    // recomputes it from now as /resume does; the stored value is the fire it
+    // missed while paused, so keeping it fired the schedule on the next tick.
+    let reactivating = req.is_active == Some(true) && !current.is_active;
     let next_run = if req.cron_expression.is_some() || req.timezone.is_some() {
-        let current: Option<Schedule> =
-            sqlx::query_as("SELECT * FROM schedules WHERE id = $1 AND organization_id = $2")
-                .bind(&id)
-                .bind(org_id)
-                .fetch_optional(state.db.pool())
-                .await
-                .map_err(|e| {
-                    error!(error = %e, "Failed to load schedule for update");
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Failed to update schedule".to_string(),
-                    )
-                })?;
-        let current = current.ok_or((StatusCode::NOT_FOUND, "Schedule not found".to_string()))?;
-
         let cron_expr = req
             .cron_expression
             .as_deref()
@@ -326,11 +330,47 @@ pub async fn update(
                 StatusCode::BAD_REQUEST,
                 format!("Invalid cron expression: {}", e),
             )
+                .into_response()
         })?;
-        Some(cron.next_run_after_in_timezone(Utc::now(), timezone))
+        cron.next_run_after_in_timezone(Utc::now(), timezone)
+    } else if reactivating {
+        CronSchedule::parse(&current.cron_expression)
+            .ok()
+            .and_then(|c| c.next_run_after_in_timezone(Utc::now(), &current.timezone))
     } else {
         None
     };
+
+    // `is_active: true` on a paused schedule takes a schedules slot, so it pays
+    // the same advisory-locked cap as create and /resume; without this,
+    // pause -> create -> PUT is_active overshot the plan. The flag is re-read
+    // under the lock so concurrent re-activations of one schedule charge once.
+    let mut tx = state.db.pool().begin().await.map_err(|e| {
+        error!(error = %e, "Failed to begin transaction for schedule update");
+        internal("Failed to update schedule")
+    })?;
+    if req.is_active == Some(true) {
+        lock_resource(&mut tx, org_id, "schedules")
+            .await
+            .map_err(|e| {
+                error!(error = %e, "Failed to acquire schedule limit lock on update");
+                internal("Failed to update schedule")
+            })?;
+        let active_now: Option<bool> = sqlx::query_scalar(
+            "SELECT is_active FROM schedules WHERE id = $1 AND organization_id = $2 FOR UPDATE",
+        )
+        .bind(&id)
+        .bind(org_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Failed to lock schedule for update");
+            internal("Failed to update schedule")
+        })?;
+        if active_now == Some(false) {
+            check_resource_limit_conn(&mut tx, org_id, "schedules", 1).await?;
+        }
+    }
 
     let schedule: Option<Schedule> = sqlx::query_as(
         r#"
@@ -364,23 +404,25 @@ pub async fn update(
     .bind(req.max_retries)
     .bind(req.timeout_seconds)
     .bind(req.is_active)
-    .bind(next_run.flatten())
+    .bind(next_run)
     .bind(&req.tags)
     .bind(&req.metadata)
-    .fetch_optional(state.db.pool())
+    .fetch_optional(&mut *tx)
     .await
     // Don't leak database error details
     .map_err(|e| {
         error!(error = %e, "Failed to update schedule");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to update schedule".to_string(),
-        )
+        internal("Failed to update schedule")
+    })?;
+
+    tx.commit().await.map_err(|e| {
+        error!(error = %e, "Failed to commit schedule update");
+        internal("Failed to update schedule")
     })?;
 
     schedule
         .map(Json)
-        .ok_or((StatusCode::NOT_FOUND, "Schedule not found".to_string()))
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Schedule not found".to_string()).into_response())
 }
 
 /// Delete a schedule

@@ -96,8 +96,12 @@ pub async fn custom(
     // Validate webhook authorization token
     let webhook_token = headers.get("X-Webhook-Token").and_then(|v| v.to_str().ok());
 
+    // A soft-deleted org answers like an unknown one: every other entry point
+    // already refuses plan_tier 'deleted', and this one kept creating jobs for any
+    // upstream still holding the org's token.
     let org_data: Option<(String, Option<String>)> = sqlx::query_as(
-        "SELECT id, settings->>'webhook_token' as webhook_token FROM organizations WHERE id = $1",
+        "SELECT id, settings->>'webhook_token' as webhook_token FROM organizations \
+         WHERE id = $1 AND plan_tier <> 'deleted'",
     )
     .bind(&org_id)
     .fetch_optional(state.db.pool())

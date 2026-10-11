@@ -4,7 +4,12 @@
 //! - Starting email login flow (sends 6-digit code)
 //! - Verifying email login code (returns JWT tokens)
 
-use axum::{extract::State, Json};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
+};
 use chrono::{Duration, Utc};
 use jsonwebtoken::{encode, EncodingKey, Header};
 use rand::RngExt;
@@ -13,13 +18,32 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 use validator::Validate;
 
+use crate::api::middleware::client_ip::{resolve_client_addr, PeerAddr};
 use crate::api::middleware::validation::ValidatedJson;
 use crate::api::AppState;
 use crate::config::{EmailProvider, RegistrationMode};
-use crate::error::{AppError, AppResult};
+use crate::error::{AppError, AppResult, ErrorResponse};
 
-/// Maximum login code attempts before invalidation
+/// Login-code guesses per (address, client IP) per code-validity window, and
+/// the per-code attempt cap of billing-email codes (and of login codes while
+/// Redis is unavailable).
 const MAX_CODE_ATTEMPTS: i32 = 5;
+/// Login-code guesses per address from all clients per code-validity window.
+///
+/// Only a caller spread over more than four client addresses (IPv6: /64s) can
+/// exhaust it, and it costs the owner a wait of at most one window, never
+/// their codes.
+/// With at most [`MAX_CODES_PER_HOUR`] codes per address, a code alive for one
+/// window, and each guess compared with every live code, it bounds a
+/// distributed brute force to roughly 200 code comparisons per address per
+/// hour out of 10^6 possible codes.
+const MAX_VERIFY_ATTEMPTS_PER_EMAIL: i32 = 20;
+/// Per-code attempt cap of a login code while the Redis budgets are enforced.
+///
+/// Above the per-address ceiling (a code's life can straddle two windows), so
+/// guessing within the budgets never invalidates a code: a stranger can make
+/// the owner wait, but cannot make them start over.
+const MAX_ATTEMPTS_PER_LOGIN_CODE: i32 = 2 * MAX_VERIFY_ATTEMPTS_PER_EMAIL;
 /// Login code validity in minutes
 const CODE_VALIDITY_MINUTES: i64 = 10;
 /// Rate limit: max codes per email per hour
@@ -28,6 +52,104 @@ const MAX_CODES_PER_HOUR: i64 = 5;
 const MAX_EMAIL_CHECKS_PER_MINUTE: i64 = 10;
 /// Rate limit: max email checks per IP per hour
 const MAX_EMAIL_CHECKS_PER_HOUR: i64 = 60;
+/// Rate limit: login-code requests per client IP per minute (burst)
+const MAX_STARTS_PER_IP_PER_MINUTE: u32 = 3;
+/// Rate limit: login-code requests per client IP per hour
+const MAX_STARTS_PER_IP_PER_HOUR: u32 = 10;
+/// Upper bound for one Turnstile siteverify call.
+const TURNSTILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Error of the public email-code routes: an [`AppError`], or a finished
+/// response for the answers `AppError` has no shape for — a 429 that names
+/// the wait (with `Retry-After`) and a 400 `CAPTCHA_FAILED`.
+pub enum EmailCodeError {
+    App(AppError),
+    Response(Box<Response>),
+}
+
+impl From<AppError> for EmailCodeError {
+    fn from(err: AppError) -> Self {
+        Self::App(err)
+    }
+}
+
+impl From<sqlx::Error> for EmailCodeError {
+    fn from(err: sqlx::Error) -> Self {
+        Self::App(AppError::Database(err))
+    }
+}
+
+impl IntoResponse for EmailCodeError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::App(err) => err.into_response(),
+            Self::Response(res) => *res,
+        }
+    }
+}
+
+/// 429 `RATE_LIMIT_EXCEEDED` with `Retry-After` and a message naming the wait.
+fn too_many_requests(message: String, retry_after_secs: u64) -> EmailCodeError {
+    let body = ErrorResponse {
+        code: "RATE_LIMIT_EXCEEDED".to_string(),
+        message,
+        details: Some(serde_json::json!({ "retry_after_seconds": retry_after_secs })),
+    };
+    let mut res = (StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response();
+    res.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from(retry_after_secs),
+    );
+    EmailCodeError::Response(Box::new(res))
+}
+
+/// 400 `CAPTCHA_FAILED` (contract C2).
+fn captcha_failed(message: &str) -> EmailCodeError {
+    let body = ErrorResponse {
+        code: "CAPTCHA_FAILED".to_string(),
+        message: message.to_string(),
+        details: None,
+    };
+    EmailCodeError::Response(Box::new(
+        (StatusCode::BAD_REQUEST, Json(body)).into_response(),
+    ))
+}
+
+/// "45 seconds", "1 minute", "7 minutes" — a wait as a person reads it.
+fn wait_text(secs: u64) -> String {
+    let secs = secs.max(1);
+    if secs < 60 {
+        format!("{secs} second{}", if secs == 1 { "" } else { "s" })
+    } else {
+        let minutes = secs.div_ceil(60);
+        format!("{minutes} minute{}", if minutes == 1 { "" } else { "s" })
+    }
+}
+
+/// Outcome of spending one unit of a fixed-window budget kept in Redis.
+enum Budget {
+    Spent,
+    /// Exhausted; the window resets in this many seconds.
+    Exhausted(u64),
+    /// No Redis configured, or it failed: the caller picks its fallback.
+    Unavailable,
+}
+
+async fn spend_budget(state: &AppState, key: &str, limit: u32, window_secs: u64) -> Budget {
+    let Some(ref cache) = state.cache else {
+        return Budget::Unavailable;
+    };
+    match cache.check_rate_limit(key, limit.max(1), window_secs).await {
+        Ok(result) if !result.allowed => {
+            Budget::Exhausted((result.reset_at - Utc::now()).num_seconds().max(1) as u64)
+        }
+        Ok(_) => Budget::Spent,
+        Err(e) => {
+            warn!(error = %e, "Redis error while spending an email-login budget");
+            Budget::Unavailable
+        }
+    }
+}
 
 /// Resolve the live organization whose VERIFIED billing email is `$1`
 /// (already lower-cased). An unverified address never resolves a login: anyone
@@ -74,6 +196,7 @@ pub struct CheckEmailResponse {
 pub async fn check_email(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
+    PeerAddr(peer): PeerAddr,
     axum::extract::Query(query): axum::extract::Query<CheckEmailRequest>,
 ) -> AppResult<Json<CheckEmailResponse>> {
     // The derive was present but `.validate()` was never called, so arbitrary
@@ -85,7 +208,7 @@ pub async fn check_email(
     let email = query.email.trim().to_lowercase();
 
     // Extract IP for rate limiting
-    let client_ip = extract_client_ip(&state, &headers);
+    let client_ip = extract_client_ip(&state, &headers, peer);
 
     // Rate limiting lives in Redis, like every other limiter in this codebase.
     //
@@ -180,9 +303,126 @@ async fn check_email_rate_limit(
 /// had its own extractor that (correctly) preferred `CF-Connecting-IP` while the
 /// middleware's (incorrectly) took the client-supplied leftmost
 /// `X-Forwarded-For` — two implementations, and the security-critical one was
-/// the weaker.
-fn extract_client_ip(state: &AppState, headers: &axum::http::HeaderMap) -> String {
-    crate::api::middleware::client_ip::client_ip(headers, &state.settings.trusted_proxy)
+/// the weaker. The TCP peer decides whether edge headers are believed at all.
+fn extract_client_ip(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    peer: Option<std::net::IpAddr>,
+) -> String {
+    crate::api::middleware::client_ip::client_ip_from_peer(
+        headers,
+        peer,
+        &state.settings.trusted_proxy,
+    )
+}
+
+/// Per-client throttle on `POST /auth/email/start`.
+///
+/// The per-address cap does nothing against one client mailing many different
+/// addresses (mail bombing third parties, burning the sender's reputation and
+/// provider quota). Fails open without Redis like the other throttles here,
+/// and denies when `RATE_LIMIT_FAIL_CLOSED` is set.
+async fn check_start_rate_limit(state: &AppState, client_ip: &str) -> Result<(), EmailCodeError> {
+    for (window, limit, window_secs) in [
+        ("minute", MAX_STARTS_PER_IP_PER_MINUTE, 60),
+        ("hour", MAX_STARTS_PER_IP_PER_HOUR, 3600),
+    ] {
+        let key = format!("email_start:{window}:{client_ip}");
+        match spend_budget(state, &key, limit, window_secs).await {
+            Budget::Spent => {}
+            Budget::Exhausted(retry_after) => {
+                warn!(ip = %client_ip, window, "Email login start rate limit exceeded");
+                return Err(too_many_requests(
+                    format!(
+                        "Too many login codes requested from this network. Please try again in {}.",
+                        wait_text(retry_after)
+                    ),
+                    retry_after,
+                ));
+            }
+            Budget::Unavailable if state.settings.rate_limit.fail_closed_on_redis_error => {
+                warn!("Email login start throttle unavailable; denying (RATE_LIMIT_FAIL_CLOSED)");
+                return Err(too_many_requests(
+                    "Login codes are temporarily unavailable. Please try again shortly."
+                        .to_string(),
+                    5,
+                ));
+            }
+            Budget::Unavailable => return Ok(()),
+        }
+    }
+    Ok(())
+}
+
+/// Cloudflare Turnstile siteverify answer.
+#[derive(Debug, Deserialize)]
+struct TurnstileVerdict {
+    success: bool,
+    #[serde(default, rename = "error-codes")]
+    error_codes: Vec<String>,
+}
+
+/// Check a Turnstile token with Cloudflare (only called when
+/// `TURNSTILE_SECRET_KEY` is set).
+///
+/// Fails closed: a token that could not be verified is not a verified token.
+/// The widget hands out a fresh token on retry, so a passing siteverify hiccup
+/// costs the user one more click.
+async fn verify_turnstile(
+    verify_url: &str,
+    secret: &str,
+    token: Option<&str>,
+    remote_ip: Option<&str>,
+) -> Result<(), EmailCodeError> {
+    let Some(token) = token.map(str::trim).filter(|t| !t.is_empty()) else {
+        return Err(captcha_failed(
+            "Complete the verification challenge and try again.",
+        ));
+    };
+    let mut form = vec![("secret", secret), ("response", token)];
+    if let Some(ip) = remote_ip {
+        form.push(("remoteip", ip));
+    }
+
+    let verdict = match reqwest::Client::builder()
+        .timeout(TURNSTILE_TIMEOUT)
+        .build()
+    {
+        Ok(client) => match client.post(verify_url).form(&form).send().await {
+            Ok(res) if res.status().is_success() => match res.json::<TurnstileVerdict>().await {
+                Ok(verdict) => Some(verdict),
+                Err(e) => {
+                    error!(error = %e, "Turnstile siteverify returned an unreadable answer");
+                    None
+                }
+            },
+            Ok(res) => {
+                error!(status = %res.status(), "Turnstile siteverify failed");
+                None
+            }
+            Err(e) => {
+                error!(error = %e, "Turnstile siteverify unreachable");
+                None
+            }
+        },
+        Err(e) => {
+            error!(error = %e, "Failed to build the Turnstile client");
+            None
+        }
+    };
+
+    match verdict {
+        Some(verdict) if verdict.success => Ok(()),
+        Some(verdict) => {
+            warn!(errors = ?verdict.error_codes, "Turnstile token rejected");
+            Err(captcha_failed(
+                "Verification failed. Please complete the challenge again.",
+            ))
+        }
+        None => Err(captcha_failed(
+            "Verification could not be completed. Please try again.",
+        )),
+    }
 }
 
 /// Start email login request
@@ -190,6 +430,10 @@ fn extract_client_ip(state: &AppState, headers: &axum::http::HeaderMap) -> Strin
 pub struct StartEmailLoginRequest {
     #[validate(email(message = "Invalid email format"))]
     pub email: String,
+    /// Cloudflare Turnstile token; checked only when `TURNSTILE_SECRET_KEY` is set.
+    #[serde(default)]
+    #[validate(length(max = 2048, message = "Invalid verification token"))]
+    pub turnstile_token: Option<String>,
 }
 
 /// Start email login response
@@ -205,8 +449,26 @@ pub struct StartEmailLoginResponse {
 /// POST /api/v1/auth/email/start
 pub async fn start(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    PeerAddr(peer): PeerAddr,
     ValidatedJson(request): ValidatedJson<StartEmailLoginRequest>,
-) -> AppResult<Json<StartEmailLoginResponse>> {
+) -> Result<Json<StartEmailLoginResponse>, EmailCodeError> {
+    // Per client first: it is cheap, and it also bounds how often one client
+    // can make us call Turnstile.
+    let client_ip = extract_client_ip(&state, &headers, peer);
+    check_start_rate_limit(&state, &client_ip).await?;
+
+    if let Some(secret) = state.settings.turnstile.secret_key.as_deref() {
+        let remote_ip = resolve_client_addr(&headers, peer, &state.settings.trusted_proxy);
+        verify_turnstile(
+            &state.settings.turnstile.verify_url,
+            secret,
+            request.turnstile_token.as_deref(),
+            remote_ip.as_deref(),
+        )
+        .await?;
+    }
+
     let email = request.email.to_lowercase().trim().to_string();
 
     // Rate limit: check how many codes sent in the last hour
@@ -225,7 +487,8 @@ pub async fn start(
         warn!(email = %email, "Email login rate limit exceeded");
         return Err(AppError::RateLimit(
             "Too many login attempts. Please try again later.".to_string(),
-        ));
+        )
+        .into());
     }
 
     // Check if email is associated with an organization
@@ -242,9 +505,12 @@ pub async fn start(
         format!("{:06}", rng.random_range(0..1000000))
     };
 
-    let expires_at = Utc::now() + Duration::minutes(CODE_VALIDITY_MINUTES);
+    // Send first, store second: the row is what counts against the address's
+    // hourly allowance, so a code the provider failed to deliver must not use
+    // one up (an outage used to lock users out for the hour).
+    send_login_code_email(&state, &email, &code).await?;
 
-    // Store the code
+    let expires_at = Utc::now() + Duration::minutes(CODE_VALIDITY_MINUTES);
     sqlx::query(
         r#"
         INSERT INTO email_login_codes (email, code, organization_id, expires_at)
@@ -257,9 +523,6 @@ pub async fn start(
     .bind(expires_at)
     .execute(state.db.pool())
     .await?;
-
-    // Send the email
-    send_login_code_email(&state, &email, &code).await?;
 
     // Mask email for response
     let masked_email = mask_email(&email);
@@ -346,8 +609,10 @@ struct Claims {
 /// - If email is new: signup token to complete registration
 pub async fn verify(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    PeerAddr(peer): PeerAddr,
     ValidatedJson(request): ValidatedJson<VerifyEmailLoginRequest>,
-) -> AppResult<Json<VerifyEmailResponse>> {
+) -> Result<Json<VerifyEmailResponse>, EmailCodeError> {
     let email = request.email.to_lowercase().trim().to_string();
     let code = request.code.trim().to_string();
 
@@ -361,9 +626,8 @@ pub async fn verify(
     // MAX_CODES_PER_HOUR issuances the victim also could not obtain a fresh one,
     // producing an hour-long login lockout repeatable indefinitely.
     //
-    // The per-code attempt cap is unchanged (each row still allows at most
-    // MAX_CODE_ATTEMPTS), so this grants the attacker no extra guesses: the
-    // ceiling is still MAX_CODES_PER_HOUR × MAX_CODE_ATTEMPTS per address.
+    // Guesses are bounded per address by the budgets below and per code by the
+    // attempt cap, so this grants the attacker no extra guesses.
     let candidates: Vec<(Uuid, String, Option<String>, i32)> = sqlx::query_as(
         r#"
         SELECT id, code, organization_id, attempts
@@ -390,41 +654,24 @@ pub async fn verify(
         warn!(email = %mask_email(&email), "No valid login code found");
         return Err(AppError::Authentication(
             "Invalid or expired code. Please request a new one.".to_string(),
-        ));
+        )
+        .into());
     }
 
-    // Per-ADDRESS attempt budget.
-    //
-    // Comparing a guess against every live code (which is what stops a third
-    // party from invalidating the victim's code) would otherwise multiply the
-    // attacker's reach: with five codes outstanding, one request tests five
-    // values while burning one per-code attempt. This budget makes the total
-    // number of guesses against an address independent of how many codes exist.
-    //
-    // Deliberately NOT implemented by charging every candidate row: that would
-    // let an attacker burn all live codes with five wrong guesses and re-create
-    // the lockout this change exists to remove.
-    if let Some(ref cache) = state.cache {
-        let key = format!("email_verify_attempts:{}", email);
-        let window_secs = (CODE_VALIDITY_MINUTES.max(1) as u64) * 60;
-        match cache
-            .check_rate_limit(&key, MAX_CODE_ATTEMPTS.max(1) as u32, window_secs)
-            .await
-        {
-            Ok(result) if !result.allowed => {
-                warn!(email = %mask_email(&email), "Login verify attempt budget exhausted");
-                return Err(AppError::Authentication(
-                    "Too many attempts. Please request a new code.".to_string(),
-                ));
-            }
-            Ok(_) => {}
-            Err(e) => {
-                // Redis unavailable: the per-code cap below is still enforced in
-                // Postgres, so brute force stays bounded — just less tightly.
-                warn!(error = %e, "Login verify attempt budget unavailable; relying on per-code cap");
-            }
-        }
-    }
+    // Attempt budgets. Comparing a guess against every live code (which is
+    // what stops a third party from invalidating the victim's code) would
+    // otherwise multiply the attacker's reach: with five codes outstanding, one
+    // request tests five values while burning one per-code attempt.
+    let client_ip = extract_client_ip(&state, &headers, peer);
+    let budgets_enforced = spend_verify_attempt(&state, &email, &client_ip).await?;
+    // Without Redis the per-code cap is the only bound left, so it falls back
+    // to the strict budget (a stranger can then spend the owner's code, as
+    // before the budgets were keyed per client).
+    let per_code_cap = if budgets_enforced {
+        MAX_ATTEMPTS_PER_LOGIN_CODE
+    } else {
+        MAX_CODE_ATTEMPTS
+    };
 
     // Constant-time compare against each candidate. On a match we charge the
     // attempt to THAT row; with no match we charge the newest, so a wrong guess
@@ -449,7 +696,7 @@ pub async fn verify(
          WHERE id = $1 AND attempts < $2 RETURNING attempts",
     )
     .bind(code_id)
-    .bind(MAX_CODE_ATTEMPTS)
+    .bind(per_code_cap)
     .fetch_optional(state.db.pool())
     .await?;
 
@@ -462,21 +709,33 @@ pub async fn verify(
 
         return Err(AppError::Authentication(
             "Too many attempts. Please request a new code.".to_string(),
-        ));
+        )
+        .into());
     };
 
     // SECURITY: Use constant-time comparison to prevent timing attacks
     // An attacker could otherwise determine the correct code digit-by-digit
     if !constant_time_compare(&code, &stored_code) {
         warn!(email = %mask_email(&email), attempts = attempts_now, "Invalid login code");
-        return Err(AppError::Authentication("Invalid code".to_string()));
+        return Err(AppError::Authentication("Invalid code".to_string()).into());
     }
 
-    // Mark code as used
-    sqlx::query("UPDATE email_login_codes SET used_at = NOW() WHERE id = $1")
-        .bind(code_id)
-        .execute(state.db.pool())
-        .await?;
+    // Spend the code. `used_at IS NULL` makes this the one place a code is
+    // consumed: of two verifies racing on the same code, only the one whose
+    // UPDATE lands goes on to mint a session (or a signup token).
+    let consumed = sqlx::query(
+        "UPDATE email_login_codes SET used_at = NOW() WHERE id = $1 AND used_at IS NULL",
+    )
+    .bind(code_id)
+    .execute(state.db.pool())
+    .await?;
+    if consumed.rows_affected() == 0 {
+        warn!(email = %mask_email(&email), "Login code was already used");
+        return Err(AppError::Authentication(
+            "Invalid or expired code. Please request a new one.".to_string(),
+        )
+        .into());
+    }
 
     // Check if organization exists
     match org_id {
@@ -499,7 +758,8 @@ pub async fn verify(
                     );
                     return Err(AppError::Authentication(
                         "Invalid or expired code. Please request a new one.".to_string(),
-                    ));
+                    )
+                    .into());
                 }
                 Some(_) => {}
             }
@@ -598,6 +858,56 @@ pub async fn verify(
             )))
         }
     }
+}
+
+/// Spend one login-code guess against `email` from `client_ip`.
+///
+/// Two budgets per code-validity window:
+/// - [`MAX_CODE_ATTEMPTS`] per (address, client): the strict one. Keyed on the
+///   address alone it let anyone who knew an address lock its owner out with
+///   five wrong guesses, and requesting a new code did not help.
+/// - [`MAX_VERIFY_ATTEMPTS_PER_EMAIL`] per address: the ceiling for a guesser
+///   spread over many clients. It only makes everyone wait for the window to
+///   end; codes stay valid.
+///
+/// A client over its own budget is not charged to the ceiling, so one client
+/// cannot spend it for everyone. Returns whether the budgets were enforced
+/// (false without a working Redis).
+async fn spend_verify_attempt(
+    state: &AppState,
+    email: &str,
+    client_ip: &str,
+) -> Result<bool, EmailCodeError> {
+    let window_secs = (CODE_VALIDITY_MINUTES.max(1) as u64) * 60;
+    let budgets = [
+        (
+            format!("email_verify_attempts:{email}:{client_ip}"),
+            MAX_CODE_ATTEMPTS,
+            "Too many attempts.",
+        ),
+        (
+            format!("email_verify_ceiling:{email}"),
+            MAX_VERIFY_ATTEMPTS_PER_EMAIL,
+            "Too many attempts for this address.",
+        ),
+    ];
+    for (key, limit, reason) in budgets {
+        match spend_budget(state, &key, limit.max(1) as u32, window_secs).await {
+            Budget::Spent => {}
+            Budget::Exhausted(retry_after) => {
+                warn!(email = %mask_email(email), ip = %client_ip, reason, "Login verify attempt budget exhausted");
+                return Err(too_many_requests(
+                    format!("{reason} Please try again in {}.", wait_text(retry_after)),
+                    retry_after,
+                ));
+            }
+            Budget::Unavailable => {
+                warn!("Login verify attempt budget unavailable; relying on per-code cap");
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// Signup token validity in minutes
@@ -1268,6 +1578,10 @@ async fn send_via_smtp(
 }
 
 /// Get or create API key for email login
+///
+/// The key is a system key (`is_system`): the customer never created it, so it
+/// does not count toward `max_api_keys`, and it is looked up by that flag rather
+/// than by its name, which a customer key may share.
 async fn get_or_create_email_api_key(
     state: &AppState,
     org_id: &str,
@@ -1276,9 +1590,9 @@ async fn get_or_create_email_api_key(
     // Check for existing email-based API key
     let existing: Option<(String,)> = sqlx::query_as(
         r#"
-        SELECT id FROM api_keys 
-        WHERE organization_id = $1 
-          AND name = 'Email Login'
+        SELECT id FROM api_keys
+        WHERE organization_id = $1
+          AND is_system = TRUE
           AND is_active = TRUE
         LIMIT 1
         "#,
@@ -1305,8 +1619,8 @@ async fn get_or_create_email_api_key(
 
     sqlx::query(
         r#"
-        INSERT INTO api_keys (id, organization_id, name, key_hash, key_prefix, queues, is_active, created_at, lookup_hash)
-        VALUES ($1, $2, 'Email Login', $3, $4, ARRAY['*'], TRUE, $5, $6)
+        INSERT INTO api_keys (id, organization_id, name, key_hash, key_prefix, queues, is_active, created_at, lookup_hash, is_system)
+        VALUES ($1, $2, 'Email Login', $3, $4, ARRAY['*'], TRUE, $5, $6, TRUE)
         "#,
     )
     .bind(&key_id)
@@ -1452,6 +1766,9 @@ pub async fn start_billing_email_verification(
         let mut rng = rand::rng();
         format!("{:06}", rng.random_range(0..1000000))
     };
+    // Sent before it is stored, as in `start`: an undelivered code must not
+    // count against the address's hourly allowance.
+    send_code_email(&state, &email, &code, CodePurpose::BillingEmailVerification).await?;
     sqlx::query(
         "INSERT INTO email_login_codes (email, code, organization_id, expires_at) \
          VALUES ($1, $2, $3, $4)",
@@ -1462,8 +1779,6 @@ pub async fn start_billing_email_verification(
     .bind(Utc::now() + Duration::minutes(CODE_VALIDITY_MINUTES))
     .execute(state.db.pool())
     .await?;
-
-    send_code_email(&state, &email, &code, CodePurpose::BillingEmailVerification).await?;
 
     let masked = mask_email(&email);
     info!(org_id = %ctx.organization_id, email = %masked, "Billing email confirmation code sent");
@@ -1659,18 +1974,21 @@ mod tests {
         // Valid email
         let valid = StartEmailLoginRequest {
             email: "test@example.com".to_string(),
+            turnstile_token: None,
         };
         assert!(valid.validate().is_ok());
 
         // Invalid email
         let invalid = StartEmailLoginRequest {
             email: "not-an-email".to_string(),
+            turnstile_token: None,
         };
         assert!(invalid.validate().is_err());
 
         // Empty email
         let empty = StartEmailLoginRequest {
             email: "".to_string(),
+            turnstile_token: None,
         };
         assert!(empty.validate().is_err());
     }
@@ -1970,8 +2288,12 @@ mod tests {
     // Note the deleted test `test_extract_client_ip_forwarded_for` asserted that
     // the LEFTMOST `X-Forwarded-For` entry wins. That was the bug: the leftmost
     // entry is supplied by the caller, so it must never be trusted.
-    use crate::api::middleware::client_ip::client_ip;
+    use crate::api::middleware::client_ip::client_ip_from_peer;
     use crate::config::TrustedProxySettings;
+
+    fn client_ip(headers: &axum::http::HeaderMap, settings: &TrustedProxySettings) -> String {
+        client_ip_from_peer(headers, None, settings)
+    }
 
     fn edge_settings() -> TrustedProxySettings {
         TrustedProxySettings {
@@ -2026,6 +2348,16 @@ mod tests {
         let mut empty_xff = axum::http::HeaderMap::new();
         empty_xff.insert("X-Forwarded-For", "".parse().unwrap());
         assert_eq!(client_ip(&empty_xff, &edge_settings()), "unknown");
+    }
+
+    // BEAUTH-06: a throttled verify says how long to wait.
+    #[test]
+    fn wait_text_names_the_remaining_window() {
+        assert_eq!(wait_text(0), "1 second");
+        assert_eq!(wait_text(45), "45 seconds");
+        assert_eq!(wait_text(60), "1 minute");
+        assert_eq!(wait_text(61), "2 minutes");
+        assert_eq!(wait_text(600), "10 minutes");
     }
 
     fn admin_headers(key: &str) -> axum::http::HeaderMap {

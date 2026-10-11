@@ -72,7 +72,8 @@ The database uses `max_concurrent_jobs`, `current_job_count`, and `created_at`; 
   `current_jobs` on Heartbeat is clamped to 0-1000 (BEGRPC-09).
 - Slot rule: `worker_counts_toward_cap(status, last_heartbeat)` (migration
   `20261011150300`) is true for healthy/degraded, and for draining only with a heartbeat in
-  the last 2 minutes. `get_org_resource_counts`, REST register and gRPC register all use
+  the last 2 minutes. `get_org_resource_counts` (newest definition: migration
+  `20261012110000`, which keeps this rule), REST register and gRPC register all use
   it. The stale sweep also takes silent draining workers offline now
   (`src/scheduler/mod.rs:1049`).
 - `Heartbeat` (`:535`): no metadata keeps the stored metadata (BEGRPC-06); an empty status
