@@ -459,3 +459,171 @@ async fn deleting_an_unfinished_parent_cancels_its_blocked_children() {
         assert!(completed, "cancelled jobs need completed_at for retention");
     }
 }
+
+// ---------------------------------------------------------------------------
+// BEJOB-01: the stale-worker sweep leaves jobs whose lease is still live.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn stale_worker_sweep_keeps_jobs_with_a_live_lease() {
+    use spooled_backend::outgoing_webhooks::service::OutgoingWebhookService;
+    use spooled_backend::scheduler::Scheduler;
+
+    let db = TestDatabase::new().await;
+    let tenant = seed_tenant(db.pool()).await;
+    let worker = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO workers (id, organization_id, queue_name, hostname, status, last_heartbeat) \
+         VALUES ($1, $2, 'q', 'host', 'healthy', NOW() - INTERVAL '10 minutes')",
+    )
+    .bind(&worker)
+    .bind(&tenant.org_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let job = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO jobs (id, organization_id, queue_name, payload, status, assigned_worker_id, \
+         lease_id, lease_expires_at, retry_count, max_retries, created_at, updated_at) \
+         VALUES ($1, $2, 'q', '{}'::JSONB, 'processing', $3, 'lease-1', NOW() + INTERVAL '10 minutes', 0, 3, NOW(), NOW())",
+    )
+    .bind(&job)
+    .bind(&tenant.org_id)
+    .bind(&worker)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let scheduler = Scheduler::new(
+        Arc::clone(&db.pool),
+        None,
+        Arc::new(Metrics::new()),
+        Arc::new(OutgoingWebhookService::new((*db.pool).clone(), 3, 4)),
+    );
+    scheduler.cleanup_stale_workers().await.unwrap();
+
+    let (status,): (String,) = sqlx::query_as("SELECT status FROM jobs WHERE id = $1")
+        .bind(&job)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(status, "processing", "a renewed lease must not be released");
+
+    // Once the lease has expired the job is recovered as before.
+    sqlx::query("UPDATE jobs SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+        .bind(&job)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    scheduler.cleanup_stale_workers().await.unwrap();
+    let (status, last_error): (String, Option<String>) =
+        sqlx::query_as("SELECT status, last_error FROM jobs WHERE id = $1")
+            .bind(&job)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(status, "pending");
+    assert_eq!(last_error.as_deref(), Some("Worker went offline"));
+}
+
+// ---------------------------------------------------------------------------
+// BEJOB-11: any failure text is recorded; job heartbeats refresh the worker.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn fail_accepts_empty_and_long_error_text_and_heartbeat_refreshes_worker() {
+    let db = TestDatabase::new().await;
+    let tenant = seed_tenant(db.pool()).await;
+    let app = app(&db);
+    let auth = bearer(&tenant.key);
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/v1/workers/register",
+        &[("Authorization", &auth)],
+        Some(json!({"queue_name": "fq", "hostname": "bh-host"})),
+    )
+    .await;
+    assert!(status.is_success(), "{body}");
+    let worker = body["id"]
+        .as_str()
+        .or_else(|| body["worker_id"].as_str())
+        .unwrap()
+        .to_string();
+
+    for (case, error) in [("empty", String::new()), ("long", "x".repeat(10_000))] {
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/api/v1/jobs",
+            &[("Authorization", &auth)],
+            Some(json!({"queue_name": "fq", "payload": {"case": case}, "max_retries": 0})),
+        )
+        .await;
+        assert!(status.is_success(), "{body}");
+
+        // Age the worker's heartbeat; the job heartbeat below must refresh it.
+        sqlx::query(
+            "UPDATE workers SET last_heartbeat = NOW() - INTERVAL '10 minutes' WHERE id = $1",
+        )
+        .bind(&worker)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/api/v1/jobs/claim",
+            &[("Authorization", &auth)],
+            Some(json!({"queue_name": "fq", "worker_id": worker, "limit": 1})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let claimed = &body["jobs"][0];
+        let job_id = claimed["id"].as_str().unwrap().to_string();
+        let lease_id = claimed["lease_id"].as_str().unwrap().to_string();
+
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("/api/v1/jobs/{job_id}/heartbeat"),
+            &[("Authorization", &auth)],
+            Some(json!({"worker_id": worker, "lease_id": lease_id})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (fresh,): (bool,) = sqlx::query_as(
+            "SELECT last_heartbeat > NOW() - INTERVAL '1 minute' FROM workers WHERE id = $1",
+        )
+        .bind(&worker)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(fresh, "a job heartbeat must refresh the worker heartbeat");
+
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("/api/v1/jobs/{job_id}/fail"),
+            &[("Authorization", &auth)],
+            Some(json!({"worker_id": worker, "lease_id": lease_id, "error": error})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{case}: {body}");
+
+        let (job_status, last_error): (String, String) =
+            sqlx::query_as("SELECT status, last_error FROM jobs WHERE id = $1")
+                .bind(&job_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(job_status, "deadletter", "{case}");
+        match case {
+            "empty" => assert_eq!(last_error, "Job failed"),
+            _ => {
+                assert!(last_error.len() <= spooled_backend::models::MAX_FAILURE_MESSAGE_BYTES);
+                assert!(last_error.ends_with(spooled_backend::models::FAILURE_TRUNCATION_SUFFIX));
+            }
+        }
+    }
+}

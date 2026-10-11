@@ -4568,9 +4568,9 @@ components:
       properties:
         error:
           type: string
-          minLength: 1
-          maxLength: 2048
-          description: Error message for the failed attempt
+          description: >-
+            Error message for the failed attempt. Any text is accepted: empty
+            is stored as "Job failed" and text over 4096 bytes is truncated.
         worker_id:
           type: string
         lease_id:

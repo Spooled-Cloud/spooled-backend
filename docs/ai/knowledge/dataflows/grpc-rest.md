@@ -27,3 +27,7 @@ The database uses `max_concurrent_jobs`, `current_job_count`, and `created_at`; 
 ## Proto JSON
 
 camelCase: `jobId`, `leaseId`, etc.
+
+`FailRequest.retry` is proto3 `optional` (0.1.118): omitted = retry per
+`max_retries` (REST parity), explicit `false` = dead-letter now (BEGRPC-02).
+

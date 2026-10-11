@@ -346,6 +346,35 @@ pub struct CompleteJobRequest {
     pub lease_id: Option<String>,
 }
 
+/// Longest failure message stored for a job, in bytes (REST and gRPC).
+pub const MAX_FAILURE_MESSAGE_BYTES: usize = 4096;
+/// Appended to a failure message cut at [`MAX_FAILURE_MESSAGE_BYTES`].
+pub const FAILURE_TRUNCATION_SUFFIX: &str = "... [truncated]";
+
+/// Make any worker-supplied failure text storable.
+///
+/// The failure must always be recorded: REST used to reject an empty or
+/// over-long `error` with 400, and SDK workers that forwarded an exception's
+/// text unmodified then left the job `processing` until its lease expired.
+/// Empty text becomes "Job failed"; long text is cut at a character boundary.
+pub fn normalize_failure_message(raw: &str) -> String {
+    let message = raw.trim();
+    if message.is_empty() {
+        return "Job failed".to_string();
+    }
+    if message.len() <= MAX_FAILURE_MESSAGE_BYTES {
+        return message.to_string();
+    }
+    let max_prefix_len = MAX_FAILURE_MESSAGE_BYTES - FAILURE_TRUNCATION_SUFFIX.len();
+    let boundary = message
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= max_prefix_len)
+        .last()
+        .unwrap_or(0);
+    format!("{}{}", &message[..boundary], FAILURE_TRUNCATION_SUFFIX)
+}
+
 /// Request to fail a job (triggers retry or DLQ based on retry_count/max_retries)
 #[derive(Debug, Deserialize, Validate)]
 pub struct FailJobRequest {
@@ -353,8 +382,9 @@ pub struct FailJobRequest {
     #[validate(length(min = 1, max = 255, message = "Worker ID must be 1-255 characters"))]
     pub worker_id: String,
 
-    /// Error message (required)
-    #[validate(length(min = 1, max = 2048, message = "Error must be 1-2048 characters"))]
+    /// Error message. Any text is accepted and normalised with
+    /// [`normalize_failure_message`] (empty becomes "Job failed", long text is
+    /// truncated), so a failure is never rejected for its wording.
     pub error: String,
 
     /// Lease fencing token from the claim response. When provided, the

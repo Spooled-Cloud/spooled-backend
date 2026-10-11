@@ -11,6 +11,32 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.118] - 2026-10-10
+
+Worker-semantics fixes from the 2026-10-10 bug hunt (wave 2).
+
+### Fixed
+
+- **The stale-worker sweep no longer re-runs jobs that are still running.** It
+  released (or dead-lettered) every `processing` job of a worker that missed
+  worker heartbeats for two minutes, even when the job's lease was live and
+  being renewed. A worker busy in one long job (the PHP SDK sent no worker
+  heartbeat while a handler ran) therefore had the job handed to someone else
+  mid-run. Jobs with an unexpired lease are left alone; expired leases are
+  recovered as before. A successful job heartbeat now also refreshes the
+  worker's `last_heartbeat`.
+- **`POST /jobs/{id}/fail` records any failure text.** An empty or over-long
+  `error` was a 400, and SDK workers that forwarded an exception message
+  unmodified left the job `processing` until its lease expired. Empty text is
+  stored as "Job failed"; text over 4096 bytes is truncated (same rule as gRPC).
+- **gRPC `Fail` without `retry` honours `max_retries`.** `FailRequest.retry` is
+  now `optional`: omitted means retry like REST, only an explicit `false`
+  dead-letters at once. Before, every client that did not set the field
+  dead-lettered jobs on their first failure. Wire-compatible: existing clients
+  that never set `retry` get the REST behaviour without upgrading.
+
+---
+
 ## [0.1.117] - 2026-10-10
 
 Fixes from the 2026-10-10 code-level bug hunt (wave 1).

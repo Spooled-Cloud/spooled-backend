@@ -143,7 +143,10 @@ message FailRequest {
     string job_id = 1;
     string worker_id = 2;
     string error = 3;
-    bool retry = 4; // Whether to retry or move to DLQ
+    // Omitted: retry according to the job's max_retries (same as REST).
+    // false: move to the dead-letter queue now. `optional` gives presence, so
+    // clients that never set the field no longer dead-letter on first failure.
+    optional bool retry = 4;
     // Lease fencing token from the dequeued Job. When set, the failure
     // succeeds only if it matches the job's current lease.
     string lease_id = 5;

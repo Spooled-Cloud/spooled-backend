@@ -48,8 +48,10 @@ const MAX_PAYLOAD_SIZE: usize = 1024 * 1024;
 const MAX_RESULT_SIZE: usize = 1024 * 1024;
 
 /// Maximum error message length
-const MAX_ERROR_MESSAGE_LENGTH: usize = 4096;
-const TRUNCATION_SUFFIX: &str = "... [truncated]";
+#[cfg(test)]
+const MAX_ERROR_MESSAGE_LENGTH: usize = crate::models::MAX_FAILURE_MESSAGE_BYTES;
+#[cfg(test)]
+const TRUNCATION_SUFFIX: &str = crate::models::FAILURE_TRUNCATION_SUFFIX;
 
 /// Minimum lease duration in seconds
 const MIN_LEASE_DURATION_SECS: i32 = 5;
@@ -862,7 +864,9 @@ impl QueueService for QueueServiceImpl {
             FROM updated u
             "#,
         )
-        .bind(req.retry)
+        // Omitted `retry` (proto3 optional) means "retry per max_retries", like
+        // REST; only an explicit false dead-letters immediately.
+        .bind(req.retry.unwrap_or(true))
         .bind(&error_message)
         .bind(&req.job_id)
         .bind(&req.worker_id)
@@ -1535,18 +1539,8 @@ fn process_error(code: &str, message: &str) -> ProcessResponse {
 }
 
 fn truncate_error_message(message: &str) -> String {
-    if message.len() <= MAX_ERROR_MESSAGE_LENGTH {
-        return message.to_string();
-    }
-
-    let max_prefix_len = MAX_ERROR_MESSAGE_LENGTH - TRUNCATION_SUFFIX.len();
-    let boundary = message
-        .char_indices()
-        .map(|(index, _)| index)
-        .take_while(|index| *index <= max_prefix_len)
-        .last()
-        .unwrap_or(0);
-    format!("{}{}", &message[..boundary], TRUNCATION_SUFFIX)
+    // Same rules as REST: empty becomes "Job failed", long text is cut.
+    crate::models::normalize_failure_message(message)
 }
 
 /// Handle dequeue request in ProcessJobs stream
@@ -2043,7 +2037,7 @@ async fn handle_process_fail(
             END as retry_delay_secs
         "#,
     )
-    .bind(req.retry)
+    .bind(req.retry.unwrap_or(true))
     .bind(&error_message)
     .bind(&req.job_id)
     .bind(&req.worker_id)
@@ -2313,7 +2307,7 @@ mod tests {
             job_id: "job".to_string(),
             worker_id: "worker".to_string(),
             error: "boom".to_string(),
-            retry: true,
+            retry: Some(true),
             lease_id: "fail-lease".to_string(),
         });
         assert_eq!(fail.lease_id, "fail-lease");
@@ -2343,7 +2337,7 @@ mod tests {
                 job_id: "fail".to_string(),
                 worker_id: "worker".to_string(),
                 error: "boom".to_string(),
-                retry: false,
+                retry: Some(false),
                 lease_id: "lease-f".to_string(),
             }),
             Operation::RenewLease(RenewLeaseRequest {

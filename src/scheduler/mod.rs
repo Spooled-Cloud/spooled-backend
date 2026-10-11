@@ -1020,7 +1020,7 @@ impl Scheduler {
     }
 
     /// Cleanup workers that haven't sent heartbeat
-    async fn cleanup_stale_workers(&self) -> Result<()> {
+    pub async fn cleanup_stale_workers(&self) -> Result<()> {
         // Mark workers as offline if no heartbeat for 2 minutes
         let result = sqlx::query(
             r#"
@@ -1055,6 +1055,12 @@ impl Scheduler {
             WHERE 
                 status = 'processing'
                 AND retry_count < max_retries
+                -- A live lease means someone is still renewing it: worker and
+                -- job heartbeats are separate calls, and a worker busy in a
+                -- long job may miss worker heartbeats (the PHP SDK did) while
+                -- its job heartbeats keep the lease alive. Releasing such a job
+                -- ran it twice. Expired leases are recovered elsewhere.
+                AND (lease_expires_at IS NULL OR lease_expires_at <= NOW())
                 AND EXISTS (
                     SELECT 1 FROM workers w
                     WHERE w.id = jobs.assigned_worker_id
@@ -1124,6 +1130,9 @@ impl Scheduler {
                 WHERE
                     status = 'processing'
                     AND retry_count >= max_retries
+                    -- Same live-lease guard as the release above: a job whose
+                    -- lease is still being renewed is running, not abandoned.
+                    AND (lease_expires_at IS NULL OR lease_expires_at <= NOW())
                     AND EXISTS (
                         SELECT 1 FROM workers w
                         WHERE w.id = jobs.assigned_worker_id

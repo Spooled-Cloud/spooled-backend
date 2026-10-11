@@ -98,3 +98,18 @@ hourly / `*/N` schedules for ~20 h every fall-back (BE-45). The date-mismatch
 jump goes to the real next local midnight, so 23-hour days no longer skip
 00:00–00:59 matches.
 
+## Stale workers vs live leases (0.1.118)
+
+`Scheduler::cleanup_stale_workers` marks workers offline after 2 min without a
+worker heartbeat, but only releases or dead-letters their jobs once the job
+lease has expired (`lease_expires_at IS NULL OR <= NOW()`). A live lease means a
+worker is still renewing it (BEJOB-01: the PHP SDK sent no worker heartbeat
+during a long handler and its jobs were re-run). `QueueManager::renew_lease`
+also refreshes `workers.last_heartbeat` on success.
+
+## Failure text (0.1.118)
+
+`models::normalize_failure_message` (REST `/fail` and gRPC `Fail`): empty →
+"Job failed", over `MAX_FAILURE_MESSAGE_BYTES` (4096) → truncated with
+`FAILURE_TRUNCATION_SUFFIX`. Never a 400 (BEJOB-11).
+

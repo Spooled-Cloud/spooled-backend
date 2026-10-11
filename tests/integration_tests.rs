@@ -2342,7 +2342,7 @@ async fn test_grpc_unary_transport_rejects_out_of_scope_settlement() {
                 job_id: job_id.clone(),
                 worker_id: worker_id.clone(),
                 error: "hidden".to_string(),
-                retry: false,
+                retry: Some(false),
                 lease_id: "transport-lease".to_string(),
             },
         ))

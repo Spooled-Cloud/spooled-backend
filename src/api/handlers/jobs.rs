@@ -672,7 +672,7 @@ pub async fn fail(
             &ctx.organization_id,
             request.lease_id.as_deref(),
             ctx.queue_scope_filter(),
-            &request.error,
+            &crate::models::normalize_failure_message(&request.error),
         )
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;

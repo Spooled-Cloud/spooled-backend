@@ -1196,6 +1196,21 @@ impl QueueManager {
         .await?;
 
         if result.rows_affected() > 0 {
+            // A job heartbeat proves the worker is alive too. Without this a
+            // worker busy in one long job (and not sending worker heartbeats)
+            // was marked offline by the stale-worker sweep. Best effort: the
+            // lease renewal above is what matters.
+            if let Err(e) = sqlx::query(
+                "UPDATE workers SET last_heartbeat = NOW() \
+                 WHERE id = $1 AND organization_id = $2 AND status IN ('healthy', 'degraded')",
+            )
+            .bind(worker_id)
+            .bind(organization_id)
+            .execute(&*self.db)
+            .await
+            {
+                tracing::debug!(error = %e, worker_id, "Could not refresh worker heartbeat");
+            }
             Ok(WorkerOpOutcome::Ok)
         } else {
             self.classify_worker_miss(job_id, worker_id, organization_id, lease_id, allowed_queues)
