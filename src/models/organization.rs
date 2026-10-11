@@ -18,6 +18,12 @@ pub struct Organization {
     pub plan_tier: String,
     /// Email for billing notifications
     pub billing_email: Option<String>,
+    /// When `billing_email` was proven to belong to the organization (email
+    /// signup, the verification code flow, or an operator). Null means email
+    /// login does not resolve the organization by this address.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub billing_email_verified_at: Option<DateTime<Utc>>,
     /// Additional settings as JSON
     pub settings: serde_json::Value,
     /// Custom limit overrides (null = use plan defaults)

@@ -663,7 +663,9 @@ pub struct RetryDlqRequest {
     /// Specific job IDs to retry (optional)
     pub job_ids: Option<Vec<String>>,
 
-    /// Queue name filter (optional)
+    /// Queue name filter (optional). `queue` is accepted too: unknown fields are
+    /// ignored, so a request saying `queue` used to retry jobs of every queue.
+    #[serde(alias = "queue")]
     #[validate(length(max = 100, message = "Queue name must be at most 100 characters"))]
     pub queue_name: Option<String>,
 
@@ -696,7 +698,10 @@ pub const MAX_PURGE_DLQ_LIMIT: i64 = 10000;
 ///
 #[derive(Debug, Serialize, Deserialize, Validate)]
 pub struct PurgeDlqRequest {
-    /// Queue name filter (optional)
+    /// Queue name filter (optional). `queue` is accepted too: unknown fields are
+    /// ignored, so a purge saying `queue` used to delete dead-lettered jobs of
+    /// every queue.
+    #[serde(alias = "queue")]
     #[validate(length(max = 100, message = "Queue name must be at most 100 characters"))]
     pub queue_name: Option<String>,
 
@@ -755,6 +760,17 @@ pub struct PaginatedResponse<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dlq_requests_accept_queue_as_alias_for_queue_name() {
+        let purge: PurgeDlqRequest =
+            serde_json::from_str(r#"{"queue": "payments", "confirm": true}"#).unwrap();
+        assert_eq!(purge.queue_name.as_deref(), Some("payments"));
+
+        let retry: RetryDlqRequest =
+            serde_json::from_str(r#"{"queue": "payments", "limit": 5}"#).unwrap();
+        assert_eq!(retry.queue_name.as_deref(), Some("payments"));
+    }
 
     #[test]
     fn test_job_status_display() {

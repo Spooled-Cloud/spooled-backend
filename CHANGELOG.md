@@ -11,6 +11,90 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.117] - 2026-10-10
+
+Fixes from the 2026-10-10 code-level bug hunt (wave 1).
+
+### Fixed
+
+- **Schedules no longer go silent for most of a day at the DST fall-back.** In
+  the repeated hour, the cron stepper mistook its "already fired" guard for a
+  date mismatch and jumped to the next midnight, so every hourly or `*/N`-minute
+  schedule in a DST timezone stopped for about 20 hours (Europe on 2026-10-25,
+  the US on 2026-11-01). In the repeated hour, a schedule whose minute is `*` or
+  `*/N`, or whose hour is `*`, keeps its real-time cadence; every other schedule
+  (`30 1 * * *`, `0 */2 * * *`) still fires once. A spring-forward day no longer
+  makes 00:00–00:59 schedules skip the next day.
+- **Redis reconnects by itself.** The cache held one `MultiplexedConnection`
+  that stayed broken after any Redis restart, leaving rate limiting, logout and
+  session revocation, the auth cache and email-attempt budgets dead until the
+  API restarted. It now uses a `ConnectionManager` with short reconnect
+  attempts (callers fall back to their fail-open / fail-closed path within a
+  couple of seconds), and a failed health-check PING replaces the connection so
+  a half-open socket cannot stick. `/health` reports `degraded` while a
+  configured Redis does not answer, and the startup log no longer prints the
+  password embedded in `REDIS_URL`.
+- **Deleting a parent job no longer deletes its children.** `jobs.parent_job_id`
+  was `ON DELETE CASCADE`, so retention, expiry and DLQ purges of a parent
+  silently deleted child jobs in any status. It is `ON DELETE SET NULL` now, and
+  indexed, so retention no longer scans the whole table per deleted row. A job
+  still blocked on a dependency (parent or workflow edge) that is deleted
+  before it completed is cancelled by a database trigger, whatever deleted it
+  (expiry, queue delete, DLQ purge); before, it was either deleted with the
+  parent or released to run an hour later. The expiry sweep cancels those
+  children first so it can send `job.cancelled` (reason `parent_expired`).
+- **Email login only trusts a verified billing email.** Any key holder could set
+  `billing_email` to someone else's address; when that person later signed up
+  by email, they were logged into the squatter's organization. Organizations
+  now carry `billing_email_verified_at`; changing the address clears it, and
+  email login, signup and the uniqueness check only consider verified
+  addresses. Addresses are stored lower-cased. New routes confirm an address:
+  `POST /api/v1/organizations/billing-email/verification` sends a code and
+  `POST /api/v1/organizations/billing-email/verify` checks it (a wrong or
+  expired code is a 400). When an email-login code is verified for an address
+  that an unconfirmed org holds, the signup response carries
+  `unverified_org_exists: true` so clients can point the owner at the
+  confirmation step instead of a second signup. Existing addresses that email
+  login could already resolve (stored lower-cased; the oldest of duplicates)
+  are grandfathered as verified; any admin write of `billing_email` counts as
+  verified.
+- **Empty secrets no longer count as configured.** `ADMIN_API_KEY`,
+  `STRIPE_BILLING_WEBHOOK_SECRET`, `STRIPE_SECRET_KEY`, `METRICS_TOKEN`,
+  `EMAIL_API_KEY`, the SMTP settings and `EXTERNAL_URL` arriving as empty
+  strings (the compose `${NAME:-}` default) used to be treated as set: an empty
+  admin key opened closed registration to an empty `X-Admin-Key` header, and an
+  empty webhook secret let forged billing webhooks verify.
+- **Deleting an organization cancels its Stripe subscription** (self-serve and
+  admin, soft and hard delete). If the cancel fails, nothing is deleted. The
+  Stripe call has a 20 s timeout, and the subscription is recorded as canceled
+  so a later hard delete does not cancel it twice. Stripe events no longer
+  overwrite a soft-deleted organization's `plan_tier` tombstone.
+- **DLQ retry and purge accept `queue` as well as `queue_name`.** Unknown fields
+  are ignored, so a purge that said `queue` (as the PHP docs did) deleted
+  dead-lettered jobs of every queue.
+- **SSRF filter:** `::ffff:0.0.0.0` and the rest of `0.0.0.0/8`, multicast and
+  reserved ranges, and private addresses embedded in NAT64 (`64:ff9b::/96`) or
+  6to4 (`2002::/16`) addresses are rejected as webhook targets.
+- Admin `PATCH /admin/organizations/{id}` stores `plan_tier` lower-cased;
+  "Pro" used to get free-tier retention.
+- Jobs cancelled because their parent or a workflow dependency failed now get
+  `completed_at`, so retention eventually removes them.
+
+### Changed
+
+- `:latest` images are published only after CI passes on a push to `main` of
+  this repository (the release workflow runs on `workflow_run` of CI instead of
+  on every push; fork pull requests can never publish), one at a time, labelled
+  with the commit that was tested.
+- Clippy 1.99's new `double_must_use` lint is allowed on tonic's generated code.
+
+### Migrations
+
+- `20261010120000_parent_job_fk_set_null.sql`
+- `20261010120100_billing_email_verification.sql`
+
+---
+
 ## [0.1.116] - 2026-09-26
 
 Dependency and toolchain maintenance (Dependabot #45, #48). No API or behaviour

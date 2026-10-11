@@ -29,6 +29,21 @@ const MAX_EMAIL_CHECKS_PER_MINUTE: i64 = 10;
 /// Rate limit: max email checks per IP per hour
 const MAX_EMAIL_CHECKS_PER_HOUR: i64 = 60;
 
+/// Resolve the live organization whose VERIFIED billing email is `$1`
+/// (already lower-cased). An unverified address never resolves a login: anyone
+/// with an API key can type any address into their org settings.
+const VERIFIED_ORG_BY_EMAIL: &str = "SELECT id FROM organizations \
+     WHERE lower(billing_email) = $1 \
+       AND billing_email_verified_at IS NOT NULL \
+       AND plan_tier <> 'deleted' \
+     ORDER BY billing_email_verified_at ASC \
+     LIMIT 1";
+
+/// Prefix for billing-email verification codes stored in `email_login_codes`.
+/// They must never be accepted by the login flow: the code proves the address,
+/// it does not authorize a login into the organization that requested it.
+const VERIFY_CODE_PREFIX: &str = "verify:";
+
 /// Check email availability request
 #[derive(Debug, Deserialize, Validate)]
 pub struct CheckEmailRequest {
@@ -102,12 +117,10 @@ pub async fn check_email(
     .await?;
 
     // Check if email is associated with any organization
-    let exists: Option<(String,)> = sqlx::query_as(
-        "SELECT id FROM organizations WHERE billing_email = $1 AND plan_tier <> 'deleted'",
-    )
-    .bind(&email)
-    .fetch_optional(state.db.pool())
-    .await?;
+    let exists: Option<(String,)> = sqlx::query_as(VERIFIED_ORG_BY_EMAIL)
+        .bind(&email)
+        .fetch_optional(state.db.pool())
+        .await?;
 
     Ok(Json(CheckEmailResponse {
         available: exists.is_none(),
@@ -216,12 +229,10 @@ pub async fn start(
     }
 
     // Check if email is associated with an organization
-    let org: Option<(String,)> = sqlx::query_as(
-        "SELECT id FROM organizations WHERE billing_email = $1 AND plan_tier <> 'deleted'",
-    )
-    .bind(&email)
-    .fetch_optional(state.db.pool())
-    .await?;
+    let org: Option<(String,)> = sqlx::query_as(VERIFIED_ORG_BY_EMAIL)
+        .bind(&email)
+        .fetch_optional(state.db.pool())
+        .await?;
 
     let org_id = org.map(|(id,)| id);
 
@@ -289,6 +300,10 @@ pub struct VerifyEmailSignupResponse {
     pub email: String,
     /// Token expiration in seconds
     pub expires_in: i64,
+    /// An organization already uses this address as an UNCONFIRMED billing
+    /// email. Its owner should sign in with an API key and confirm the address
+    /// instead of creating a second organization; anyone else can sign up.
+    pub unverified_org_exists: bool,
 }
 
 /// Combined response for email verification
@@ -359,6 +374,9 @@ pub async fn verify(
           -- Signup tokens ("signup:<token>") live in this same table; excluding them
           -- stops a pending signup row from shadowing the real 6-digit login code.
           AND code NOT LIKE 'signup:%'
+          -- Billing-email verification codes prove an address for one org;
+          -- accepting them here would log their recipient into that org.
+          AND code NOT LIKE 'verify:%'
         ORDER BY created_at DESC
         LIMIT $2
         "#,
@@ -556,6 +574,18 @@ pub async fn verify(
             // New user - return signup token
             let signup_token = generate_signup_token(&state, &email).await?;
 
+            // Only a hint: the code proves the mailbox, but it must never link
+            // the caller to an org whose address was never confirmed.
+            let (unverified_org_exists,): (bool,) = sqlx::query_as(
+                "SELECT EXISTS (SELECT 1 FROM organizations \
+                 WHERE lower(billing_email) = $1 \
+                   AND billing_email_verified_at IS NULL \
+                   AND plan_tier <> 'deleted')",
+            )
+            .bind(&email)
+            .fetch_one(state.db.pool())
+            .await?;
+
             info!(email = %mask_email(&email), "Email verified, signup token issued");
 
             Ok(Json(VerifyEmailResponse::Signup(
@@ -563,6 +593,7 @@ pub async fn verify(
                     signup_token,
                     email: email.clone(),
                     expires_in: 900, // 15 minutes
+                    unverified_org_exists,
                 },
             )))
         }
@@ -651,7 +682,8 @@ fn authorize_email_signup(
         RegistrationMode::Open => Ok(()),
         RegistrationMode::Closed => {
             let provided = headers.get("X-Admin-Key").and_then(|v| v.to_str().ok());
-            match (configured_admin_key, provided) {
+            // An empty configured key must never match an empty header.
+            match (configured_admin_key.filter(|key| !key.is_empty()), provided) {
                 (Some(expected), Some(provided)) if constant_time_compare(expected, provided) => {
                     Ok(())
                 }
@@ -734,12 +766,10 @@ pub async fn complete_signup(
     }
 
     // Check for duplicate email (race condition guard)
-    let existing_email: Option<(String,)> = sqlx::query_as(
-        "SELECT id FROM organizations WHERE billing_email = $1 AND plan_tier <> 'deleted'",
-    )
-    .bind(&email)
-    .fetch_optional(state.db.pool())
-    .await?;
+    let existing_email: Option<(String,)> = sqlx::query_as(VERIFIED_ORG_BY_EMAIL)
+        .bind(&email)
+        .fetch_optional(state.db.pool())
+        .await?;
 
     if existing_email.is_some() {
         return Err(AppError::Conflict(
@@ -786,8 +816,8 @@ pub async fn complete_signup(
 
     sqlx::query(
         r#"
-        INSERT INTO organizations (id, name, slug, plan_tier, billing_email, settings, created_at, updated_at)
-        VALUES ($1, $2, $3, 'free', $4, $5, $6, $6)
+        INSERT INTO organizations (id, name, slug, plan_tier, billing_email, billing_email_verified_at, settings, created_at, updated_at)
+        VALUES ($1, $2, $3, 'free', $4, $6, $5, $6, $6)
         "#,
     )
     .bind(&org_id)
@@ -933,11 +963,45 @@ fn generate_webhook_token() -> String {
 
 /// Send login code email
 async fn send_login_code_email(state: &AppState, email: &str, code: &str) -> AppResult<()> {
-    let subject = "Your Spooled Cloud Login Code";
+    send_code_email(state, email, code, CodePurpose::Login).await
+}
+
+/// What a one-time code e-mail is for; only the wording differs.
+#[derive(Debug, Clone, Copy)]
+enum CodePurpose {
+    Login,
+    BillingEmailVerification,
+}
+
+async fn send_code_email(
+    state: &AppState,
+    email: &str,
+    code: &str,
+    purpose: CodePurpose,
+) -> AppResult<()> {
+    let (subject, explanation, label) = match purpose {
+        CodePurpose::Login => ("Your Spooled Cloud Login Code", None, "Your login code is"),
+        CodePurpose::BillingEmailVerification => (
+            "Confirm your Spooled Cloud billing email",
+            Some(
+                "Someone set this address as the billing email of a Spooled Cloud \
+                 organization. If that was you, enter this code in the dashboard to confirm \
+                 it. Confirming also lets you log in to that organization with this address.",
+            ),
+            "Your confirmation code is",
+        ),
+    };
+    let intro = match explanation {
+        Some(text) => format!("{text}\n\n{label}"),
+        None => label.to_string(),
+    };
+    let html_explanation = explanation
+        .map(|text| format!("<p>{text}</p>"))
+        .unwrap_or_default();
     let body = format!(
         r#"Hi,
 
-Your login code for Spooled Cloud is: {}
+{}: {}
 
 This code will expire in {} minutes.
 
@@ -945,7 +1009,7 @@ If you didn't request this code, you can safely ignore this email.
 
 Best,
 The Spooled Cloud Team"#,
-        code, CODE_VALIDITY_MINUTES
+        intro, code, CODE_VALIDITY_MINUTES
     );
 
     let html_body = format!(
@@ -957,7 +1021,8 @@ The Spooled Cloud Team"#,
         <h1 style="color: #10b981; margin: 0;">Spooled Cloud</h1>
     </div>
     <p>Hi,</p>
-    <p>Your login code is:</p>
+    {}
+    <p>{}:</p>
     <div style="text-align: center; margin: 30px 0;">
         <span style="font-size: 32px; font-weight: bold; letter-spacing: 8px; background: #f3f4f6; padding: 16px 32px; border-radius: 8px; font-family: monospace;">{}</span>
     </div>
@@ -969,7 +1034,7 @@ The Spooled Cloud Team"#,
     </p>
 </body>
 </html>"#,
-        code, CODE_VALIDITY_MINUTES
+        html_explanation, label, code, CODE_VALIDITY_MINUTES
     );
 
     match state.settings.email.provider {
@@ -1290,6 +1355,257 @@ fn constant_time_compare(a: &str, b: &str) -> bool {
     len_eq && bytes_eq
 }
 
+/// Billing-email verification state returned by both verification routes.
+#[derive(Debug, Serialize)]
+pub struct BillingEmailVerificationResponse {
+    /// `code_sent` after a code went out, `verified` once the address is proven.
+    pub status: String,
+    /// Masked address the code was sent to (only with `code_sent`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email_sent_to: Option<String>,
+}
+
+/// Request body for `POST /organizations/billing-email/verify`.
+#[derive(Debug, Deserialize, Validate)]
+pub struct VerifyBillingEmailRequest {
+    #[validate(length(equal = 6, message = "Code must be 6 digits"))]
+    pub code: String,
+}
+
+/// The caller's billing email and whether it is verified, for live orgs only.
+async fn current_billing_email(
+    state: &AppState,
+    org_id: &str,
+) -> AppResult<(Option<String>, bool)> {
+    let row: Option<(Option<String>, Option<chrono::DateTime<Utc>>)> = sqlx::query_as(
+        "SELECT billing_email, billing_email_verified_at FROM organizations \
+         WHERE id = $1 AND plan_tier <> 'deleted'",
+    )
+    .bind(org_id)
+    .fetch_optional(state.db.pool())
+    .await?;
+    let Some((email, verified_at)) = row else {
+        return Err(AppError::NotFound("Organization not found".to_string()));
+    };
+    Ok((
+        email.map(|e| crate::api::handlers::organizations::normalize_billing_email(&e)),
+        verified_at.is_some(),
+    ))
+}
+
+fn verified_response() -> Json<BillingEmailVerificationResponse> {
+    Json(BillingEmailVerificationResponse {
+        status: "verified".to_string(),
+        email_sent_to: None,
+    })
+}
+
+/// Send a confirmation code to the organization's unverified billing email.
+///
+/// POST /api/v1/organizations/billing-email/verification
+///
+/// Until the address is confirmed, email login does not resolve the
+/// organization by it (see `VERIFIED_ORG_BY_EMAIL`).
+pub async fn start_billing_email_verification(
+    State(state): State<AppState>,
+    axum::extract::Extension(ctx): axum::extract::Extension<crate::models::ApiKeyContext>,
+) -> AppResult<Json<BillingEmailVerificationResponse>> {
+    crate::api::handlers::require_unrestricted_key(&ctx, "verify the billing email")?;
+
+    let (email, verified) = current_billing_email(&state, &ctx.organization_id).await?;
+    let Some(email) = email else {
+        return Err(AppError::BadRequest(
+            "Set a billing email on the organization before verifying it".to_string(),
+        ));
+    };
+    if verified {
+        return Ok(verified_response());
+    }
+    if crate::api::handlers::organizations::billing_email_taken(
+        state.db.pool(),
+        &email,
+        Some(&ctx.organization_id),
+    )
+    .await?
+    {
+        return Err(AppError::Conflict(
+            "Another account already uses this billing email".to_string(),
+        ));
+    }
+
+    // Shares the per-address hourly budget with login codes, so this route
+    // cannot be used to mail an address more often than the login flow can.
+    let (recent,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM email_login_codes \
+         WHERE email = $1 AND created_at > NOW() - INTERVAL '1 hour'",
+    )
+    .bind(&email)
+    .fetch_one(state.db.pool())
+    .await?;
+    if recent >= MAX_CODES_PER_HOUR {
+        return Err(AppError::RateLimit(
+            "Too many codes sent to this address. Please try again later.".to_string(),
+        ));
+    }
+
+    let code: String = {
+        let mut rng = rand::rng();
+        format!("{:06}", rng.random_range(0..1000000))
+    };
+    sqlx::query(
+        "INSERT INTO email_login_codes (email, code, organization_id, expires_at) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(&email)
+    .bind(format!("{VERIFY_CODE_PREFIX}{code}"))
+    .bind(&ctx.organization_id)
+    .bind(Utc::now() + Duration::minutes(CODE_VALIDITY_MINUTES))
+    .execute(state.db.pool())
+    .await?;
+
+    send_code_email(&state, &email, &code, CodePurpose::BillingEmailVerification).await?;
+
+    let masked = mask_email(&email);
+    info!(org_id = %ctx.organization_id, email = %masked, "Billing email confirmation code sent");
+    Ok(Json(BillingEmailVerificationResponse {
+        status: "code_sent".to_string(),
+        email_sent_to: Some(masked),
+    }))
+}
+
+/// Confirm the organization's billing email with the code sent to it.
+///
+/// POST /api/v1/organizations/billing-email/verify
+pub async fn verify_billing_email(
+    State(state): State<AppState>,
+    axum::extract::Extension(ctx): axum::extract::Extension<crate::models::ApiKeyContext>,
+    ValidatedJson(request): ValidatedJson<VerifyBillingEmailRequest>,
+) -> AppResult<Json<BillingEmailVerificationResponse>> {
+    crate::api::handlers::require_unrestricted_key(&ctx, "verify the billing email")?;
+
+    let (email, verified) = current_billing_email(&state, &ctx.organization_id).await?;
+    let Some(email) = email else {
+        return Err(AppError::BadRequest(
+            "The organization has no billing email to verify".to_string(),
+        ));
+    };
+    if verified {
+        return Ok(verified_response());
+    }
+
+    // Codes are bound to the address they were sent to: changing the billing
+    // email again makes earlier codes useless.
+    let candidates: Vec<(Uuid, String)> = sqlx::query_as(
+        r#"
+        SELECT id, code
+        FROM email_login_codes
+        WHERE email = $1
+          AND organization_id = $2
+          AND code LIKE 'verify:%'
+          AND expires_at > NOW()
+          AND used_at IS NULL
+        ORDER BY created_at DESC
+        LIMIT $3
+        "#,
+    )
+    .bind(&email)
+    .bind(&ctx.organization_id)
+    .bind(MAX_CODES_PER_HOUR)
+    .fetch_all(state.db.pool())
+    .await?;
+
+    // 400, not 401: this route is authenticated, and clients treat a 401 as an
+    // expired session (the dashboard refreshes and replays the request, which
+    // spent a second attempt on the same wrong code, or logged the user out).
+    let invalid = || AppError::BadRequest("Invalid or expired code".to_string());
+    if candidates.is_empty() {
+        return Err(invalid());
+    }
+
+    // Per-address budget, as in the login flow: a guess is compared against
+    // every live code, so without it the reach grows with the codes issued.
+    if let Some(ref cache) = state.cache {
+        let key = format!("billing_verify_attempts:{}:{}", ctx.organization_id, email);
+        let window_secs = (CODE_VALIDITY_MINUTES.max(1) as u64) * 60;
+        match cache
+            .check_rate_limit(&key, MAX_CODE_ATTEMPTS.max(1) as u32, window_secs)
+            .await
+        {
+            Ok(result) if !result.allowed => {
+                return Err(AppError::BadRequest(
+                    "Too many attempts. Please request a new code.".to_string(),
+                ));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(error = %e, "Billing email verify budget unavailable; relying on per-code cap");
+            }
+        }
+    }
+
+    let submitted = format!("{VERIFY_CODE_PREFIX}{}", request.code.trim());
+    let matched = candidates
+        .iter()
+        .find(|(_, stored)| constant_time_compare(&submitted, stored));
+    // A wrong guess is charged to the newest code, as in the login flow.
+    let (code_id, _) = matched.unwrap_or(&candidates[0]).clone();
+
+    let charged: Option<(i32,)> = sqlx::query_as(
+        "UPDATE email_login_codes SET attempts = attempts + 1 \
+         WHERE id = $1 AND attempts < $2 RETURNING attempts",
+    )
+    .bind(code_id)
+    .bind(MAX_CODE_ATTEMPTS)
+    .fetch_optional(state.db.pool())
+    .await?;
+    if charged.is_none() {
+        sqlx::query("UPDATE email_login_codes SET used_at = NOW() WHERE id = $1")
+            .bind(code_id)
+            .execute(state.db.pool())
+            .await?;
+        return Err(AppError::BadRequest(
+            "Too many attempts. Please request a new code.".to_string(),
+        ));
+    }
+    if matched.is_none() {
+        return Err(invalid());
+    }
+
+    sqlx::query("UPDATE email_login_codes SET used_at = NOW() WHERE id = $1")
+        .bind(code_id)
+        .execute(state.db.pool())
+        .await?;
+
+    if crate::api::handlers::organizations::billing_email_taken(
+        state.db.pool(),
+        &email,
+        Some(&ctx.organization_id),
+    )
+    .await?
+    {
+        return Err(AppError::Conflict(
+            "Another account verified this billing email first".to_string(),
+        ));
+    }
+
+    // Only verify the address the code was sent to: if the email changed in the
+    // meantime, nothing is updated and the caller has to start over.
+    let updated = sqlx::query(
+        "UPDATE organizations SET billing_email_verified_at = NOW(), updated_at = NOW() \
+         WHERE id = $1 AND lower(billing_email) = $2 AND billing_email_verified_at IS NULL",
+    )
+    .bind(&ctx.organization_id)
+    .bind(&email)
+    .execute(state.db.pool())
+    .await?;
+    if updated.rows_affected() == 0 {
+        return Err(invalid());
+    }
+
+    info!(org_id = %ctx.organization_id, email = %mask_email(&email), "Billing email verified");
+    Ok(verified_response())
+}
+
 /// Mask email for privacy in logs and responses
 fn mask_email(email: &str) -> String {
     let parts: Vec<&str> = email.split('@').collect();
@@ -1522,6 +1838,7 @@ mod tests {
             signup_token: "abc123-token".to_string(),
             email: "test@example.com".to_string(),
             expires_in: 900,
+            unverified_org_exists: false,
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -1552,6 +1869,7 @@ mod tests {
             signup_token: "signup-token-123".to_string(),
             email: "new@user.com".to_string(),
             expires_in: 900,
+            unverified_org_exists: false,
         });
 
         let json = serde_json::to_string(&signup_response).unwrap();

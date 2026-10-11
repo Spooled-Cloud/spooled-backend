@@ -795,6 +795,7 @@ impl Scheduler {
             SET
                 status = 'cancelled',
                 last_error = 'Parent job failed or was deadlettered',
+                completed_at = NOW(),
                 updated_at = NOW()
             WHERE
                 child.parent_job_id IS NOT NULL
@@ -855,6 +856,7 @@ impl Scheduler {
                 SET
                     status = 'cancelled',
                     last_error = 'Dependency job failed or was deadlettered',
+                    completed_at = NOW(),
                     updated_at = NOW()
                 WHERE
                     child.status IN ('pending', 'scheduled')
@@ -1366,23 +1368,68 @@ impl Scheduler {
 
         // Cleanup jobs that have passed their expires_at timestamp
         // These are jobs created with explicit expiration (e.g., demo/temporary jobs)
-        // They remain pending/scheduled but are never claimed, so delete them
-        let result = sqlx::query(
+        // They remain pending/scheduled but are never claimed, so delete them.
+        //
+        // Children still waiting on an expiring parent are cancelled first: the
+        // parent never ran, so they must not run either. Deleting the parent
+        // only clears their `parent_job_id` (ON DELETE SET NULL), and an
+        // orphaned, still-blocked job is otherwise released by the orphan sweep.
+        let mut tx = self.db.begin().await?;
+        let expired_ids: Vec<String> = sqlx::query_scalar(
             r#"
-            DELETE FROM jobs
-            WHERE id IN (
-                SELECT id FROM jobs
-                WHERE expires_at IS NOT NULL
-                  AND expires_at < NOW()
-                  AND status IN ('pending', 'scheduled', 'failed', 'deadletter')
-                LIMIT 10000
-            )
+            SELECT id FROM jobs
+            WHERE expires_at IS NOT NULL
+              AND expires_at < NOW()
+              AND status IN ('pending', 'scheduled', 'failed', 'deadletter')
+            LIMIT 10000
+            FOR UPDATE SKIP LOCKED
             "#,
         )
-        .execute(&*self.db)
+        .fetch_all(&mut *tx)
         .await?;
 
-        let expired_cleaned = result.rows_affected();
+        let mut expired_children: Vec<(String, String, String)> = Vec::new();
+        let mut expired_cleaned = 0;
+        if !expired_ids.is_empty() {
+            expired_children = sqlx::query_as(
+                r#"
+                UPDATE jobs child
+                SET status = 'cancelled',
+                    last_error = 'Parent job expired before it completed',
+                    completed_at = NOW(),
+                    updated_at = NOW()
+                WHERE child.parent_job_id = ANY($1)
+                  AND child.status IN ('pending', 'scheduled')
+                  AND child.dependencies_met IS NOT TRUE
+                RETURNING child.id, child.organization_id, child.queue_name
+                "#,
+            )
+            .bind(&expired_ids)
+            .fetch_all(&mut *tx)
+            .await?;
+
+            expired_cleaned = sqlx::query("DELETE FROM jobs WHERE id = ANY($1)")
+                .bind(&expired_ids)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+        }
+        tx.commit().await?;
+
+        for (job_id, org_id, queue_name) in &expired_children {
+            self.outgoing_webhooks.spawn_dispatch(
+                org_id.clone(),
+                "job.cancelled".to_string(),
+                job_id.clone(),
+                serde_json::json!({
+                    "job_id": job_id,
+                    "queue_name": queue_name,
+                    "status": "cancelled",
+                    "reason": "parent_expired",
+                }),
+            );
+        }
+
         if expired_cleaned > 0 {
             debug!(
                 count = expired_cleaned,

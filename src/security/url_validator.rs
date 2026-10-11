@@ -319,6 +319,20 @@ fn validate_ip_address(
 fn validate_ipv4(ip: &Ipv4Addr) -> Result<(), UrlValidationError> {
     let octets = ip.octets();
 
+    // "This network" (0.0.0.0/8). Connecting to 0.0.0.0 reaches the local host on
+    // Linux, and this function also vets IPv4 embedded in IPv6 forms such as
+    // `::ffff:0.0.0.0`, which the top-level unspecified check never sees.
+    if octets[0] == 0 {
+        warn!(ip = %ip, "Blocked webhook IP (this-network 0.x.x.x)");
+        return Err(UrlValidationError::PrivateIpAddress);
+    }
+
+    // Multicast (224.0.0.0/4) and reserved (240.0.0.0/4, includes broadcast)
+    if octets[0] >= 224 {
+        warn!(ip = %ip, "Blocked webhook IP (multicast/reserved)");
+        return Err(UrlValidationError::PrivateIpAddress);
+    }
+
     // Private ranges (RFC 1918)
     // 10.0.0.0/8
     if octets[0] == 10 {
@@ -438,6 +452,35 @@ fn validate_ipv6(ip: &Ipv6Addr) -> Result<(), UrlValidationError> {
             segments[7] as u8,
         );
         return validate_ipv4(&ipv4);
+    }
+
+    // NAT64 well-known prefix (64:ff9b::/96): a NAT64 gateway forwards to the
+    // embedded IPv4 address, so vet that address.
+    if segments[0..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        let ipv4 = Ipv4Addr::new(
+            (segments[6] >> 8) as u8,
+            segments[6] as u8,
+            (segments[7] >> 8) as u8,
+            segments[7] as u8,
+        );
+        return validate_ipv4(&ipv4);
+    }
+
+    // 6to4 (2002::/16) embeds an IPv4 address in the next 32 bits.
+    if segments[0] == 0x2002 {
+        let ipv4 = Ipv4Addr::new(
+            (segments[1] >> 8) as u8,
+            segments[1] as u8,
+            (segments[2] >> 8) as u8,
+            segments[2] as u8,
+        );
+        return validate_ipv4(&ipv4);
+    }
+
+    // Multicast (ff00::/8)
+    if segments[0] & 0xff00 == 0xff00 {
+        warn!(ip = %ip, "Blocked webhook IP (multicast)");
+        return Err(UrlValidationError::PrivateIpAddress);
     }
 
     Ok(())
@@ -623,6 +666,35 @@ mod tests {
         // Unique local (fc00::/7, fd00::/8)
         assert!(validate_webhook_url("https://[fd00::1]/webhook", &opts).is_err());
         assert!(validate_webhook_url("https://[fc00::1]/webhook", &opts).is_err());
+    }
+
+    #[test]
+    fn test_embedded_ipv4_forms_of_local_addresses_are_blocked() {
+        let opts = test_options();
+
+        // IPv4-mapped "this network" reaches the local host on Linux.
+        for url in [
+            "https://[::ffff:0.0.0.0]/webhook",
+            "https://[::ffff:0.1.2.3]/webhook",
+            "https://[::ffff:127.0.0.1]/webhook",
+            "https://[64:ff9b::7f00:1]/webhook", // NAT64 -> 127.0.0.1
+            "https://[64:ff9b::a9fe:a9fe]/webhook", // NAT64 -> 169.254.169.254
+            "https://[2002:7f00:1::]/webhook",   // 6to4 -> 127.0.0.1
+            "https://[ff02::1]/webhook",         // multicast
+            "https://0.1.2.3/webhook",
+            "https://224.0.0.1/webhook",
+            "https://240.0.0.1/webhook",
+        ] {
+            assert!(
+                validate_webhook_url(url, &opts).is_err(),
+                "{url} must be rejected"
+            );
+        }
+
+        // Public addresses in the same forms still pass.
+        assert!(validate_webhook_url("https://[::ffff:8.8.8.8]/webhook", &opts).is_ok());
+        assert!(validate_webhook_url("https://[64:ff9b::808:808]/webhook", &opts).is_ok());
+        assert!(validate_webhook_url("https://[2606:4700::1111]/webhook", &opts).is_ok());
     }
 
     #[test]

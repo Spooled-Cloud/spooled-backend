@@ -299,6 +299,22 @@ pub enum EmailProvider {
     Smtp,
 }
 
+/// Read an optional setting, treating an empty or whitespace-only value as
+/// unset.
+///
+/// Compose files pass optional variables through as `${NAME:-}`, so an unset
+/// variable arrives as an empty string. Read with `env::var(..).ok()`, that
+/// empty string counted as configured: an empty `ADMIN_API_KEY` let anyone pass
+/// closed registration with an empty `X-Admin-Key` header, and an empty
+/// `STRIPE_BILLING_WEBHOOK_SECRET` made forged billing webhooks verify against
+/// an empty HMAC key.
+pub fn non_empty_env(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 impl Settings {
     /// Load settings from environment variables
     pub fn load() -> Result<Self> {
@@ -317,8 +333,8 @@ impl Settings {
                     .unwrap_or_else(|_| "50051".to_string())
                     .parse()
                     .context("Invalid GRPC_PORT")?,
-                external_url: env::var("EXTERNAL_URL").ok(),
-                metrics_token: env::var("METRICS_TOKEN").ok(),
+                external_url: non_empty_env("EXTERNAL_URL"),
+                metrics_token: non_empty_env("METRICS_TOKEN"),
                 cors_allowed_origins: env::var("CORS_ALLOWED_ORIGINS")
                     .unwrap_or_else(|_| {
                         // Default matches the live production topology: the marketing
@@ -481,13 +497,13 @@ impl Settings {
                 email_signup_enabled: env::var("EMAIL_SIGNUP_ENABLED")
                     .map(|v| v == "true" || v == "1" || v == "yes")
                     .unwrap_or(true),
-                admin_api_key: env::var("ADMIN_API_KEY").ok(),
+                admin_api_key: non_empty_env("ADMIN_API_KEY"),
             },
             stripe: StripeSettings {
-                secret_key: env::var("STRIPE_SECRET_KEY").ok(),
-                webhook_secret: env::var("STRIPE_BILLING_WEBHOOK_SECRET").ok(),
-                starter_price_id: env::var("STRIPE_STARTER_PRICE_ID").ok(),
-                pro_price_id: env::var("STRIPE_PRO_PRICE_ID").ok(),
+                secret_key: non_empty_env("STRIPE_SECRET_KEY"),
+                webhook_secret: non_empty_env("STRIPE_BILLING_WEBHOOK_SECRET"),
+                starter_price_id: non_empty_env("STRIPE_STARTER_PRICE_ID"),
+                pro_price_id: non_empty_env("STRIPE_PRO_PRICE_ID"),
                 billing_portal_config_id: env::var("STRIPE_BILLING_PORTAL_CONFIG_ID")
                     .ok()
                     .and_then(|v| {
@@ -507,15 +523,15 @@ impl Settings {
                     "smtp" => EmailProvider::Smtp,
                     _ => EmailProvider::Console,
                 },
-                api_key: env::var("EMAIL_API_KEY").ok(),
+                api_key: non_empty_env("EMAIL_API_KEY"),
                 from_address: env::var("EMAIL_FROM_ADDRESS")
                     .unwrap_or_else(|_| "noreply@spooled.cloud".to_string()),
                 from_name: env::var("EMAIL_FROM_NAME")
                     .unwrap_or_else(|_| "Spooled Cloud".to_string()),
-                smtp_host: env::var("SMTP_HOST").ok(),
+                smtp_host: non_empty_env("SMTP_HOST"),
                 smtp_port: env::var("SMTP_PORT").ok().and_then(|s| s.parse().ok()),
-                smtp_username: env::var("SMTP_USERNAME").ok(),
-                smtp_password: env::var("SMTP_PASSWORD").ok(),
+                smtp_username: non_empty_env("SMTP_USERNAME"),
+                smtp_password: non_empty_env("SMTP_PASSWORD"),
             },
         };
 
@@ -725,6 +741,20 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_empty_env_treats_blank_values_as_unset() {
+        std::env::set_var("SPOOLED_TEST_NON_EMPTY_ENV_BLANK", "");
+        std::env::set_var("SPOOLED_TEST_NON_EMPTY_ENV_SPACES", "   ");
+        std::env::set_var("SPOOLED_TEST_NON_EMPTY_ENV_SET", " value ");
+        assert_eq!(non_empty_env("SPOOLED_TEST_NON_EMPTY_ENV_BLANK"), None);
+        assert_eq!(non_empty_env("SPOOLED_TEST_NON_EMPTY_ENV_SPACES"), None);
+        assert_eq!(
+            non_empty_env("SPOOLED_TEST_NON_EMPTY_ENV_SET").as_deref(),
+            Some("value")
+        );
+        assert_eq!(non_empty_env("SPOOLED_TEST_NON_EMPTY_ENV_MISSING"), None);
+    }
 
     #[test]
     fn test_default_environment() {

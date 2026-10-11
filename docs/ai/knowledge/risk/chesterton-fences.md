@@ -10,3 +10,7 @@ Do not remove without understanding why it exists.
 6. **RLS present but unused** — honesty path chosen over fake security theater; enabling RLS needs GUC-per-query and role changes — large migration.
 7. **Rate-limit fail-open by default** — self-host without Redis keeps working; set `RATE_LIMIT_FAIL_CLOSED=true` on hosted SaaS.
 8. **Admin constant-time compare after hash** — do not “simplify” to string `==`.
+9. **Unverified billing email is ignored by email login** (0.1.117) — do not "simplify" the login lookup back to `billing_email = $1`; that reopens identity squatting (BE-42).
+10. **Fall-back repeat guard skipped only for interval schedules** (0.1.117) — minute `*`/`*/N` or hour `*`; a step hour with a fixed minute keeps the guard (else `0 */2` double-fires). The guard must jump past the reference wall clock rather than to the next day (BE-45).
+11. **`parent_job_id` is SET NULL, plus the `"A_cancel_blocked_dependents_on_delete"` trigger** (0.1.117) — switching back to CASCADE silently deletes live children; dropping or renaming the trigger (it must sort before `RI_ConstraintTrigger_*`) lets dependents of never-completed jobs run after the orphan sweep.
+

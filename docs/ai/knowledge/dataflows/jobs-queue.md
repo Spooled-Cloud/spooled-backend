@@ -74,3 +74,27 @@ Cron catch-up (`scheduler/mod.rs` ~395–418): if `next_run_at` is far in the pa
 ## Chesterton fence
 
 gRPC maps proto3 zero to “use default 3” intentionally — explicit zero retries are **not** expressible on gRPC without a proto change or sentinel. Do not “fix” by treating 0 as zero retries without updating all SDKs and docs.
+
+## Parent/child jobs and deletion (0.1.117)
+
+`jobs.parent_job_id` is `ON DELETE SET NULL` (migration `20261010120000`, with a
+partial index). Retention, expiry and DLQ purge used to cascade-delete children
+in any status (BE-46). The AFTER DELETE trigger `"A_cancel_blocked_dependents_on_delete"`
+cancels jobs still blocked on a deleted job that had not completed (scalar
+`parent_job_id` or `job_dependencies` edge), for every delete path; its name
+sorts before the `RI_ConstraintTrigger_*` FK actions so it still sees the links.
+Without it the orphan sweep would release those jobs after 1 h. The expiry sweep
+(`scheduler/mod.rs` cleanup) cancels children of an expiring parent first so it
+can dispatch `job.cancelled` (reason `parent_expired`).
+
+## Cron and DST (0.1.117)
+
+`CronSchedule::next_run_after_tz` (`models/schedule.rs`): spring-forward wall
+times never match. In a repeated fall-back hour, a schedule whose minute is
+`*` / `*/N`, or whose hour is `*`, keeps real-time cadence; every other schedule
+(including `0 */2 * * *`) fires on the first occurrence only. The repeat guard jumps straight past the reference wall clock.
+It used to be read as a date mismatch and jump to the next midnight, silencing
+hourly / `*/N` schedules for ~20 h every fall-back (BE-45). The date-mismatch
+jump goes to the real next local midnight, so 23-hour days no longer skip
+00:00–00:59 matches.
+

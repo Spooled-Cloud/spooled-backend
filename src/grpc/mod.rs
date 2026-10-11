@@ -13,8 +13,10 @@ pub mod convert;
 pub mod server;
 pub mod services;
 
-// Generated protobuf types
-#[allow(clippy::large_enum_variant)]
+// Generated protobuf types. `double_must_use` (new in clippy 1.99) fires on
+// tonic's generated async-trait methods; `unknown_lints` keeps older toolchains
+// that do not know that lint from failing under `-D warnings`.
+#[allow(unknown_lints, clippy::large_enum_variant, clippy::double_must_use)]
 pub mod proto {
     tonic::include_proto!("spooled.v1");
 

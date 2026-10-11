@@ -236,12 +236,18 @@ pub async fn webhook(
         .ok_or_else(|| AppError::Authentication("Missing Stripe-Signature header".to_string()))?;
 
     // Verify signature
-    let webhook_secret = state.stripe.webhook_secret.as_ref().ok_or_else(|| {
-        error!(
+    // An empty secret would make any payload signed with an empty HMAC key verify.
+    let webhook_secret = state
+        .stripe
+        .webhook_secret
+        .as_ref()
+        .filter(|secret| !secret.is_empty())
+        .ok_or_else(|| {
+            error!(
             "Stripe billing webhook received but STRIPE_BILLING_WEBHOOK_SECRET is not configured"
         );
-        AppError::Internal("Webhook signature verification not configured".to_string())
-    })?;
+            AppError::Internal("Webhook signature verification not configured".to_string())
+        })?;
 
     verify_stripe_signature(webhook_secret, &body, signature)?;
 
@@ -496,6 +502,7 @@ async fn handle_checkout_completed(state: &AppState, event: &StripeEvent) -> App
                 stripe_last_event_at = $3,
                 updated_at = NOW()
             WHERE id = $4
+              AND plan_tier <> 'deleted'
               AND (stripe_last_event_at IS NULL OR stripe_last_event_at <= $3)
             "#,
         )
@@ -604,6 +611,8 @@ async fn handle_subscription_updated(state: &AppState, event: &StripeEvent) -> A
                 stripe_last_event_at = $7,
                 updated_at = NOW()
             WHERE stripe_customer_id = $6
+              -- Never resurrect a soft-deleted org (plan_tier is its tombstone).
+              AND plan_tier <> 'deleted'
               AND (stripe_last_event_at IS NULL OR stripe_last_event_at <= $7)
             RETURNING id
             "#,
@@ -731,6 +740,7 @@ pub(crate) async fn reconcile_org_from_subscription_id(
             plan_tier = COALESCE($6, plan_tier),
             updated_at = NOW()
         WHERE id = $7
+          AND plan_tier <> 'deleted'
         "#,
     )
     .bind(customer_id)
@@ -772,7 +782,12 @@ async fn cancel_stripe_subscription(state: &AppState, subscription_id: &str) -> 
         .as_ref()
         .ok_or_else(|| AppError::Internal("Stripe is not configured".to_string()))?;
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        // A hung Stripe call must not hang the request that triggered the cancel
+        // (an organization delete waits on it).
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| AppError::Internal(format!("Failed to build HTTP client: {}", e)))?;
     let url = format!(
         "https://api.stripe.com/v1/subscriptions/{}",
         subscription_id
@@ -785,6 +800,11 @@ async fn cancel_stripe_subscription(state: &AppState, subscription_id: &str) -> 
         .await
         .map_err(|e| AppError::Internal(format!("Failed to cancel subscription: {}", e)))?;
 
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        // Already canceled and purged on Stripe's side: nothing left to stop.
+        warn!(subscription_id = %subscription_id, "Stripe subscription not found while canceling");
+        return Ok(());
+    }
     if !response.status().is_success() {
         let error_text = response.text().await.unwrap_or_default();
         return Err(AppError::Internal(format!(
@@ -793,7 +813,57 @@ async fn cancel_stripe_subscription(state: &AppState, subscription_id: &str) -> 
         )));
     }
 
-    info!(subscription_id = %subscription_id, "Canceled superseded Stripe subscription");
+    info!(subscription_id = %subscription_id, "Canceled Stripe subscription");
+    Ok(())
+}
+
+/// Cancel the organization's Stripe subscription before the organization is
+/// deleted.
+///
+/// Deleting an org used to leave its subscription running, so the customer
+/// kept being charged for an organization that no longer existed. Callers must
+/// abort the delete when this returns an error.
+pub(crate) async fn cancel_subscription_before_org_delete(
+    state: &AppState,
+    org: &crate::models::Organization,
+) -> AppResult<()> {
+    let Some(subscription_id) = org.stripe_subscription_id.as_deref() else {
+        return Ok(());
+    };
+    let status = org.stripe_subscription_status.as_deref().unwrap_or("");
+    if matches!(status, "canceled" | "cancelled" | "incomplete_expired") {
+        return Ok(());
+    }
+    if state.stripe.secret_key.is_none() {
+        warn!(
+            org_id = %org.id,
+            subscription_id = %subscription_id,
+            "Organization has a Stripe subscription but Stripe is not configured; not canceling it"
+        );
+        return Ok(());
+    }
+    cancel_stripe_subscription(state, subscription_id)
+        .await
+        .map_err(|e| {
+            error!(org_id = %org.id, subscription_id = %subscription_id, error = %e,
+                "Could not cancel Stripe subscription before deleting organization");
+            AppError::Conflict(
+                "The organization's subscription could not be canceled, so nothing was \
+                 deleted. Try again, or cancel the subscription in the billing portal first."
+                    .to_string(),
+            )
+        })?;
+
+    // Record the cancel locally: a soft-deleted org no longer receives billing
+    // webhooks (its tombstone is protected), so without this a later hard
+    // delete would try to cancel the same subscription again.
+    sqlx::query(
+        "UPDATE organizations SET stripe_subscription_status = 'canceled', \
+         stripe_cancel_at_period_end = FALSE, updated_at = NOW() WHERE id = $1",
+    )
+    .bind(&org.id)
+    .execute(state.db.pool())
+    .await?;
     Ok(())
 }
 
@@ -822,6 +892,7 @@ async fn handle_subscription_deleted(state: &AppState, event: &StripeEvent) -> A
                 stripe_last_event_at = $3,
                 updated_at = NOW()
             WHERE stripe_customer_id = $1
+              AND plan_tier <> 'deleted'
               AND (stripe_subscription_id IS NULL OR stripe_subscription_id = $2)
               AND (stripe_last_event_at IS NULL OR stripe_last_event_at <= $3)
             RETURNING id

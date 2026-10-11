@@ -375,13 +375,21 @@ fn validate_slug(slug: &str) -> Result<(), AppError> {
 /// Maximum settings JSON size
 const MAX_SETTINGS_SIZE: usize = 64 * 1024; // 64KB
 
-/// Whether another live organization already uses this billing email.
+/// Normalize a billing email the way every lookup compares it.
+pub fn normalize_billing_email(email: &str) -> String {
+    email.trim().to_lowercase()
+}
+
+/// Whether another live organization already holds this billing email as a
+/// VERIFIED address.
 ///
-/// Email login resolves an account by billing email (lower-cased), so two live
-/// orgs sharing one would make the login land in an arbitrary one of them. Every
-/// path that sets a billing email — public create, admin create, and both update
-/// routes — must refuse a duplicate. Soft-deleted orgs do not count, matching the
-/// email-login lookups.
+/// Email login resolves an account by its verified billing email (lower-cased),
+/// so two live orgs sharing one would make the login land in an arbitrary one of
+/// them. Every path that sets a billing email — public create, admin create, and
+/// both update routes — must refuse a duplicate. Unverified addresses do not
+/// count: they never resolve a login, and letting them block an address would
+/// let anyone stop its real owner from signing up. Soft-deleted orgs do not
+/// count either, matching the email-login lookups.
 pub async fn billing_email_taken(
     pool: &sqlx::PgPool,
     email: &str,
@@ -392,6 +400,7 @@ pub async fn billing_email_taken(
         SELECT EXISTS (
             SELECT 1 FROM organizations
             WHERE lower(billing_email) = lower($1)
+              AND billing_email_verified_at IS NOT NULL
               AND plan_tier <> 'deleted'
               AND ($2::TEXT IS NULL OR id <> $2)
         )
@@ -428,7 +437,14 @@ pub async fn create(
             // Require admin API key
             let admin_key = headers.get("X-Admin-Key").and_then(|v| v.to_str().ok());
 
-            match (&state.settings.registration.admin_api_key, admin_key) {
+            // An empty configured key must never match an empty header.
+            let configured = state
+                .settings
+                .registration
+                .admin_api_key
+                .as_ref()
+                .filter(|key| !key.is_empty());
+            match (configured, admin_key) {
                 (Some(expected), Some(provided)) if constant_time_compare(expected, provided) => {
                     // Valid admin key (constant-time comparison prevents timing attacks)
                 }
@@ -465,6 +481,13 @@ pub async fn create(
         }
     }
 
+    // Stored unverified: whoever calls this route has not proven they own the
+    // address, so email login ignores it until the verification code flow runs.
+    let billing_email = request
+        .billing_email
+        .as_deref()
+        .map(normalize_billing_email);
+
     let org_id = Uuid::new_v4().to_string();
     let now = Utc::now();
     // SECURITY: Generate a webhook token for the org so incoming webhook ingestion is never public by default.
@@ -483,7 +506,7 @@ pub async fn create(
     .bind(&org_id)
     .bind(&request.name)
     .bind(&request.slug)
-    .bind(&request.billing_email)
+    .bind(&billing_email)
     .bind(&org_settings)
     .bind(now)
     .fetch_one(state.db.pool())
@@ -687,7 +710,11 @@ pub async fn update(
     }
 
     let name = request.name.unwrap_or(existing.name);
-    let billing_email = request.billing_email.or(existing.billing_email);
+    let billing_email = request
+        .billing_email
+        .as_deref()
+        .map(normalize_billing_email)
+        .or(existing.billing_email);
 
     // Validate settings size to prevent large payloads
     let settings = if let Some(ref new_settings) = request.settings {
@@ -707,8 +734,18 @@ pub async fn update(
 
     let org = sqlx::query_as::<_, Organization>(
         r#"
-        UPDATE organizations 
-        SET name = $1, billing_email = $2, settings = $3, updated_at = NOW()
+        UPDATE organizations
+        SET name = $1,
+            billing_email = $2,
+            -- A new address has not been proven yet: email login must not
+            -- resolve this org by it until the verification code flow runs.
+            billing_email_verified_at = CASE
+                WHEN lower(billing_email) IS NOT DISTINCT FROM lower($2)
+                THEN billing_email_verified_at
+                ELSE NULL
+            END,
+            settings = $3,
+            updated_at = NOW()
         WHERE id = $4
         RETURNING *
         "#,
@@ -784,6 +821,14 @@ pub async fn delete(
             active_schedules
         )));
     }
+
+    // Stop billing first: if the subscription cannot be canceled, keep the org.
+    let org = sqlx::query_as::<_, Organization>("SELECT * FROM organizations WHERE id = $1")
+        .bind(&id)
+        .fetch_optional(state.db.pool())
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Organization {} not found", id)))?;
+    crate::api::handlers::billing::cancel_subscription_before_org_delete(&state, &org).await?;
 
     // CRITICAL: Get API key hashes BEFORE deleting, for cache invalidation
     let api_key_hashes: Vec<(String,)> =
@@ -1075,6 +1120,7 @@ mod tests {
             slug: "test-org".to_string(),
             plan_tier: "free".to_string(),
             billing_email: None,
+            billing_email_verified_at: None,
             settings: serde_json::json!({}),
             custom_limits: None,
             stripe_customer_id: None,

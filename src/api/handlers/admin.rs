@@ -410,8 +410,22 @@ pub async fn update_organization(
     }
 
     let old_plan = existing.plan_tier.clone();
-    let plan_tier = request.plan_tier.unwrap_or(existing.plan_tier);
-    let billing_email = request.billing_email.or(existing.billing_email);
+    // Stored lower-case: retention and limits compare plan_tier case-sensitively,
+    // so "Pro" from this route silently got free-tier retention.
+    let plan_tier = request
+        .plan_tier
+        .map(|tier| tier.to_lowercase())
+        .unwrap_or(existing.plan_tier);
+    // An operator setting the address vouches for it, so any admin write of
+    // `billing_email` (even re-sending the current one) stores it as verified.
+    // Support uses this to enable email login for an org whose address was
+    // never confirmed.
+    let billing_email_vouched = request.billing_email.is_some();
+    let billing_email = request
+        .billing_email
+        .as_deref()
+        .map(crate::api::handlers::organizations::normalize_billing_email)
+        .or(existing.billing_email);
     let settings = match request.settings {
         Some(incoming) => crate::api::handlers::organizations::preserve_webhook_token(
             &existing.settings,
@@ -441,6 +455,10 @@ pub async fn update_organization(
         SET
             plan_tier = $1,
             billing_email = $2,
+            billing_email_verified_at = CASE
+                WHEN $8 THEN NOW()
+                ELSE billing_email_verified_at
+            END,
             settings = $3,
             custom_limits = $4,
             stripe_customer_id = $5,
@@ -457,6 +475,7 @@ pub async fn update_organization(
     .bind(&stripe_customer_id)
     .bind(&stripe_subscription_id)
     .bind(&id)
+    .bind(billing_email_vouched)
     .fetch_one(state.db.pool())
     .await?;
 
@@ -516,9 +535,13 @@ pub async fn delete_organization(
             .fetch_optional(state.db.pool())
             .await?;
 
-    if existing.is_none() {
+    let Some(existing) = existing else {
         return Err(AppError::NotFound(format!("Organization {} not found", id)));
-    }
+    };
+
+    // Both soft and hard delete end the customer relationship: stop billing
+    // first, and keep the org if the subscription cannot be canceled.
+    crate::api::handlers::billing::cancel_subscription_before_org_delete(&state, &existing).await?;
 
     if query.hard_delete.unwrap_or(false) {
         // Hard delete - manually delete related data first (some tables lack ON DELETE CASCADE).
@@ -928,8 +951,9 @@ pub async fn create_organization(
     // Create organization with specified plan tier
     let org = sqlx::query_as::<_, Organization>(
         r#"
-        INSERT INTO organizations (id, name, slug, plan_tier, billing_email, settings, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+        INSERT INTO organizations (id, name, slug, plan_tier, billing_email, billing_email_verified_at, settings, created_at, updated_at)
+        -- An operator creating the org vouches for the address (see update_organization).
+        VALUES ($1, $2, $3, $4, $5, CASE WHEN $5::TEXT IS NULL THEN NULL ELSE $7 END, $6, $7, $7)
         RETURNING *
         "#,
     )
@@ -937,7 +961,12 @@ pub async fn create_organization(
     .bind(&request.name)
     .bind(&request.slug)
     .bind(&plan_tier)
-    .bind(&request.billing_email)
+    .bind(
+        request
+            .billing_email
+            .as_deref()
+            .map(crate::api::handlers::organizations::normalize_billing_email),
+    )
     .bind(&initial_settings)
     .bind(now)
     .fetch_one(&mut *tx)

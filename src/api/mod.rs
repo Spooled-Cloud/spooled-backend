@@ -237,6 +237,15 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
             "/organizations/{id}",
             delete(handlers::organizations::delete),
         )
+        // Billing email confirmation (email login only trusts verified addresses)
+        .route(
+            "/organizations/billing-email/verification",
+            post(handlers::email_login::start_billing_email_verification),
+        )
+        .route(
+            "/organizations/billing-email/verify",
+            post(handlers::email_login::verify_billing_email),
+        )
         // Organization webhook token management
         .route(
             "/organizations/webhook-token",

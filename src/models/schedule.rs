@@ -432,9 +432,11 @@ impl CronSchedule {
     /// the supplied timezone's wall clock.
     ///
     /// DST is handled by stepping through instants: wall times skipped by a
-    /// spring-forward transition never match (that occurrence is skipped), and
-    /// wall times repeated by a fall-back transition match their first
-    /// occurrence.
+    /// spring-forward transition never match (that occurrence is skipped).
+    /// Wall times repeated by a fall-back transition: a schedule whose minute
+    /// is `*` or `*/N`, or whose hour is `*`, keeps firing on real time through
+    /// the repeated hour; any other schedule (e.g. `30 1 * * *`, `0 */2 * * *`)
+    /// fires on the first occurrence only, so it never runs twice.
     ///
     /// Optimized to prevent CPU exhaustion attacks
     /// Previously iterated up to 31M times (1 year in seconds), now uses smarter stepping
@@ -452,6 +454,16 @@ impl CronSchedule {
         // the schedule. Requiring the match's wall clock to be strictly after this
         // skips the repeat while leaving every normal (monotonic) case untouched.
         let after_naive = after_local.naive_local();
+        // Only fixed-time schedules need the repeat guard. An interval-like
+        // schedule (`*/5 * * * *`, `0 * * * *`) is defined by real time, so it
+        // must keep firing through the repeated hour; skipping the repeat made
+        // it look as if the next match were tomorrow.
+        //
+        // A step hour with a fixed minute (`0 */2 * * *`) counts as fixed-time:
+        // following real time there would fire it twice an hour apart when the
+        // repeated hour is one of its hours.
+        let interval_like = matches!(self.minute, CronField::Any | CronField::Step { .. })
+            || matches!(self.hour, CronField::Any);
         let mut current = after_local + Duration::seconds(1);
         // Set to start of second
         current = current.clone().with_nanosecond(0).unwrap_or(current);
@@ -463,6 +475,21 @@ impl CronSchedule {
         let mut iterations = 0;
 
         while iterations < max_iterations {
+            if !interval_like {
+                let current_naive = current.naive_local();
+                if current_naive <= after_naive {
+                    // Inside the repeat of a fall-back hour: every wall time up
+                    // to the reference wall clock already had its occurrence.
+                    // Wall clock advances 1:1 with real time here, so jump
+                    // straight past it instead of mistaking the guard for a
+                    // date mismatch (which used to skip to the next midnight
+                    // and silence the schedule for most of a day).
+                    current += (after_naive - current_naive) + Duration::seconds(1);
+                    iterations += 1;
+                    continue;
+                }
+            }
+
             let second = current.second() as u8;
             let minute = current.minute() as u8;
             let hour = current.hour() as u8;
@@ -494,9 +521,6 @@ impl CronSchedule {
                 && Self::field_matches(&self.hour, hour)
                 && Self::field_matches(&self.month, month)
                 && day_matches
-                // DST fall-back guard: never return a wall clock that is not strictly
-                // after the reference wall clock (skips the repeated hour's re-occurrence).
-                && current.naive_local() > after_naive
             {
                 return Some(current.with_timezone(&Utc));
             }
@@ -523,9 +547,7 @@ impl CronSchedule {
                 // (day-of-month/month/day-of-week) does not: jump to the start of the
                 // next day, so sparse schedules (e.g. once a year) resolve in ~365
                 // iterations instead of exhausting the iteration cap and stalling.
-                Duration::seconds(
-                    86400 - (hour as i64 * 3600) - (minute as i64 * 60) - second as i64,
-                )
+                Self::until_next_local_midnight(&current, tz)
             };
 
             current += step.max(Duration::seconds(1));
@@ -539,6 +561,34 @@ impl CronSchedule {
         );
 
         None
+    }
+
+    /// Real time from `current` to the next local midnight.
+    ///
+    /// Counting `86400 - seconds_since_midnight` assumes a 24-hour day: on a
+    /// 23-hour spring-forward day it overshoots to 01:00 and skips every match
+    /// between 00:00 and 00:59 (a `0 0 * * 1-5` schedule missed Monday).
+    fn until_next_local_midnight<Z: chrono::TimeZone>(
+        current: &DateTime<Z>,
+        tz: &Z,
+    ) -> chrono::Duration {
+        use chrono::Timelike;
+
+        let wall_seconds = current.num_seconds_from_midnight() as i64;
+        let assume_24h = chrono::Duration::seconds(86400 - wall_seconds);
+        let Some(midnight) = current
+            .date_naive()
+            .succ_opt()
+            .and_then(|day| day.and_hms_opt(0, 0, 0))
+        else {
+            return assume_24h;
+        };
+        match tz.from_local_datetime(&midnight).earliest() {
+            Some(target) => target.signed_duration_since(current.clone()),
+            // Midnight itself is skipped (a zone that springs forward at 00:00):
+            // nothing can match before the first valid instant of that day.
+            None => assume_24h,
+        }
     }
 }
 
@@ -852,6 +902,90 @@ mod tests {
             second,
             Utc.with_ymd_and_hms(2026, 10, 26, 1, 30, 0).unwrap()
         );
+    }
+
+    #[test]
+    fn test_interval_schedule_keeps_firing_through_kyiv_fall_back() {
+        // Kyiv DST ends 2026-10-25 04:00 EEST -> 03:00 EET. An every-5-minutes
+        // schedule must keep its real-time cadence through the repeated hour.
+        // It used to jump from 03:55 EEST to Monday 00:00, ~21 h of silence.
+        let schedule = CronSchedule::parse("0 */5 * * * *").unwrap();
+        let fired = Utc.with_ymd_and_hms(2026, 10, 25, 0, 55, 0).unwrap(); // 03:55 EEST
+        let next = schedule
+            .next_run_after_in_timezone(fired, "Europe/Kyiv")
+            .unwrap();
+        assert_eq!(next, Utc.with_ymd_and_hms(2026, 10, 25, 1, 0, 0).unwrap()); // 03:00 EET
+        let after = schedule
+            .next_run_after_in_timezone(next, "Europe/Kyiv")
+            .unwrap();
+        assert_eq!(after, Utc.with_ymd_and_hms(2026, 10, 25, 1, 5, 0).unwrap());
+    }
+
+    #[test]
+    fn test_hourly_schedule_keeps_firing_through_new_york_fall_back() {
+        // US DST ends 2026-11-01 02:00 EDT -> 01:00 EST.
+        let schedule = CronSchedule::parse("0 0 * * * *").unwrap();
+        let mut fired = Utc.with_ymd_and_hms(2026, 11, 1, 4, 0, 0).unwrap(); // 00:00 EDT
+        for expected_hour in [5, 6, 7, 8] {
+            fired = schedule
+                .next_run_after_in_timezone(fired, "America/New_York")
+                .unwrap();
+            assert_eq!(
+                fired,
+                Utc.with_ymd_and_hms(2026, 11, 1, expected_hour, 0, 0)
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn test_fixed_time_schedule_still_fires_once_in_repeated_hour() {
+        // Minute and hour both restricted: the repeated 01:15 EST is skipped.
+        let fixed = CronSchedule::parse("0 15 1 * * *").unwrap();
+        let first = Utc.with_ymd_and_hms(2026, 11, 1, 5, 15, 0).unwrap(); // 01:15 EDT
+        assert_eq!(
+            fixed
+                .next_run_after_in_timezone(first, "America/New_York")
+                .unwrap(),
+            Utc.with_ymd_and_hms(2026, 11, 2, 6, 15, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_every_two_hours_fires_once_in_berlin_repeated_hour() {
+        // Berlin falls back 2026-10-25 03:00 CEST -> 02:00 CET, so 02:00 local
+        // happens twice (00:00Z and 01:00Z). `0 */2 * * *` must not fire at both.
+        let schedule = CronSchedule::parse("0 0 */2 * * *").unwrap();
+        let fired = Utc.with_ymd_and_hms(2026, 10, 25, 0, 0, 0).unwrap(); // 02:00 CEST
+        let next = schedule
+            .next_run_after_in_timezone(fired, "Europe/Berlin")
+            .unwrap();
+        assert_eq!(next, Utc.with_ymd_and_hms(2026, 10, 25, 3, 0, 0).unwrap()); // 04:00 CET
+    }
+
+    #[test]
+    fn test_midnight_weekday_schedule_survives_spring_forward_day() {
+        // Berlin DST starts Sunday 2026-03-29 (23-hour day). A weekday 00:00
+        // schedule must fire on Monday 00:00 CEST (Sunday 22:00 UTC); counting
+        // a 24-hour day used to land on Monday 01:00 and skip to Tuesday.
+        let schedule = CronSchedule::parse("0 0 0 * * 1-5").unwrap();
+        let friday = Utc.with_ymd_and_hms(2026, 3, 26, 23, 0, 0).unwrap(); // Fri 00:00 CET
+        let next = schedule
+            .next_run_after_in_timezone(friday, "Europe/Berlin")
+            .unwrap();
+        assert_eq!(next, Utc.with_ymd_and_hms(2026, 3, 29, 22, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn test_early_morning_monday_schedule_survives_kyiv_spring_forward() {
+        // Kyiv DST starts Sunday 2026-03-29 03:00 -> 04:00. Monday 00:30 local
+        // is 2026-03-29 21:30 UTC.
+        let schedule = CronSchedule::parse("0 30 0 * * 1").unwrap();
+        let previous = Utc.with_ymd_and_hms(2026, 3, 22, 22, 30, 0).unwrap(); // Mon 23rd 00:30 EET
+        let next = schedule
+            .next_run_after_in_timezone(previous, "Europe/Kyiv")
+            .unwrap();
+        assert_eq!(next, Utc.with_ymd_and_hms(2026, 3, 29, 21, 30, 0).unwrap());
     }
 
     #[test]

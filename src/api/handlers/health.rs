@@ -47,7 +47,14 @@ pub async fn health_check(State(state): State<AppState>) -> Json<HealthResponse>
     // Don't expose version to unauthenticated users
     // Version is only shown in dashboard_data which requires authentication
     Json(HealthResponse {
-        status: if db_healthy { "healthy" } else { "degraded" }.to_string(),
+        // A configured Redis that does not answer degrades rate limiting,
+        // session revocation and realtime, so report it instead of "healthy".
+        status: if db_healthy && cache_healthy {
+            "healthy"
+        } else {
+            "degraded"
+        }
+        .to_string(),
         version: None, // Hidden from unauthenticated endpoint
         database: db_healthy,
         cache: cache_healthy,

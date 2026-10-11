@@ -633,6 +633,70 @@ paths:
               schema:
                 $ref: '#/components/schemas/UsageInfo'
 
+  /api/v1/organizations/billing-email/verification:
+    post:
+      tags: [Organizations]
+      summary: Send a billing email confirmation code
+      description: |
+        Email login only resolves an organization by a **confirmed** billing
+        email. Setting or changing `billing_email` through the API leaves it
+        unconfirmed; this sends a 6-digit code to the address. Shares the
+        per-address hourly code budget with email login. Requires an
+        unrestricted API key or session.
+      operationId: startBillingEmailVerification
+      responses:
+        '200':
+          description: Code sent, or the address was already confirmed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillingEmailVerificationResponse'
+              example:
+                status: code_sent
+                email_sent_to: 'o***r@example.com'
+        '400':
+          description: The organization has no billing email
+        '409':
+          description: Another organization already confirmed this address
+        '429':
+          description: Too many codes sent to this address in the last hour
+
+  /api/v1/organizations/billing-email/verify:
+    post:
+      tags: [Organizations]
+      summary: Confirm the billing email
+      description: |
+        Confirms the billing email with the code sent by
+        `POST /api/v1/organizations/billing-email/verification`. A code is bound
+        to the address it was sent to; changing the billing email again
+        invalidates it. Five wrong attempts burn a code.
+      operationId: verifyBillingEmail
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code:
+                  type: string
+                  minLength: 6
+                  maxLength: 6
+      responses:
+        '200':
+          description: The address is confirmed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillingEmailVerificationResponse'
+              example:
+                status: verified
+        '400':
+          description: Invalid or expired code, or too many attempts
+        '409':
+          description: Another organization confirmed this address first
+
   /api/v1/organizations/webhook-token:
     get:
       tags: [Organizations]
@@ -2862,6 +2926,15 @@ components:
         billing_email:
           type: string
           format: email
+          description: Stored lower-cased.
+        billing_email_verified_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            When the billing email was confirmed (email signup, the confirmation
+            code flow, or an operator). Null means email login does not resolve
+            this organization by the address. Changing `billing_email` clears it.
         settings:
           type: object
         created_at:
@@ -2870,6 +2943,17 @@ components:
         updated_at:
           type: string
           format: date-time
+
+    BillingEmailVerificationResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [code_sent, verified]
+        email_sent_to:
+          type: string
+          description: Masked address the code went to (only with `code_sent`)
 
     OrganizationSummary:
       type: object
@@ -4622,6 +4706,13 @@ components:
         expires_in:
           type: integer
           description: Token expiration in seconds
+        unverified_org_exists:
+          type: boolean
+          description: |
+            An organization already uses this address as an unconfirmed billing
+            email. Its owner should sign in with an API key and confirm the
+            address (POST /api/v1/organizations/billing-email/verification)
+            rather than create a second organization. A hint only.
 
     SignupOrganization:
       type: object

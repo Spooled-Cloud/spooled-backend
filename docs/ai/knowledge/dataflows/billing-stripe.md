@@ -36,3 +36,12 @@ Enqueue/resource gates use **plan_tier quotas** (`middleware/limits.rs` + `confi
 - `checkout.session.completed` checks paid/no-payment status before linking. Residual risk: it still trusts `client_reference_id` as org id, so org linkage policy remains sensitive.
 - `charge.dispute.*` not handled.
 - Outbound Stripe HTTP calls: no pinned `Stripe-Version` header observed.
+
+## Organization delete (0.1.117)
+
+Self-serve `DELETE /organizations/{id}` and admin soft/hard delete call
+`billing::cancel_subscription_before_org_delete` first; a failed cancel aborts
+the delete with 409 (BE-48). A 404 from Stripe counts as already canceled.
+Subscription/checkout handlers skip orgs whose `plan_tier = 'deleted'`, so a late
+Stripe event cannot resurrect a soft-deleted org.
+

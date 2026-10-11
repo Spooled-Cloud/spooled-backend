@@ -47,12 +47,41 @@ There are no per-permission scopes; `queues` is the only way to narrow a key.
 `permissions` on create/update is a 400 `VALIDATION_ERROR` (0.1.114) — it used to be
 dropped silently, so a "read-only" key had full access.
 
-## Billing email uniqueness
+## Billing email: login identity, verification, uniqueness (0.1.117)
 
-Email login resolves an org by lower-cased `billing_email`, so every path that sets
-one (public create, admin create, both PATCH/PUT routes) rejects a duplicate among
-live orgs with 409 (`organizations::billing_email_taken`). Before 0.1.114 admin
-create/update accepted duplicates and the login landed in an arbitrary org.
+Email login resolves an org by its **verified**, lower-cased `billing_email`
+(`email_login.rs` `VERIFIED_ORG_BY_EMAIL`, used by `check-email`, `start` and
+`signup/complete`). `organizations.billing_email_verified_at` records the proof:
+email signup sets it, `POST /organizations/billing-email/verification` +
+`POST /organizations/billing-email/verify` set it, and an admin create/PATCH that
+write of `billing_email` counts as verified. `PUT /organizations/{id}` with a
+different address clears it; `POST /organizations` stores the address
+unverified. A wrong/expired confirmation code is 400 (not 401, which clients
+read as an expired session). When a login code is verified for an address an
+unconfirmed org holds, the signup response sets `unverified_org_exists: true`
+(a hint only; it never links the caller to that org).
+Before 0.1.117 any key holder could set someone else's address and capture that
+person's later email "signup" into their org (BE-42). Existing addresses were
+grandfathered as verified by migration `20261010120100` where email login could
+already resolve them (stored lower-cased; the oldest org of a duplicate group).
+
+Verification codes live in `email_login_codes` with a `verify:` prefix and the
+org id; the login `verify()` query excludes them so a confirmation code can never
+log its recipient into the requesting org. They share the per-address hourly
+budget with login codes.
+
+Uniqueness (`organizations::billing_email_taken`) only counts verified addresses
+among live orgs: an unverified copy never resolves a login, so it must not block
+the real owner from signing up. Before 0.1.114 admin create/update accepted
+duplicates and the login landed in an arbitrary org.
+
+## Empty secrets
+
+Optional secrets are read with `config::non_empty_env`: an empty or blank value
+(compose `${NAME:-}`) is unset. Before 0.1.117 an empty `ADMIN_API_KEY` let an
+empty `X-Admin-Key` header pass closed registration and signup, and an empty
+`STRIPE_BILLING_WEBHOOK_SECRET` verified forged webhooks (BE-43). The gates also
+refuse an empty configured key explicitly.
 
 ## API key bookkeeping
 

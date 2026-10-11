@@ -4,37 +4,70 @@
 //! It gracefully degrades when Redis is unavailable.
 
 use anyhow::{Context, Result};
-use redis::aio::MultiplexedConnection;
+use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::{AsyncCommands, Client};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::config::RedisSettings;
 
 /// Redis cache wrapper
+///
+/// Commands go through a [`ConnectionManager`], which re-establishes the
+/// connection after an I/O error. A bare `MultiplexedConnection` stays broken
+/// forever once its socket drops (for example when Redis restarts), which left
+/// rate limiting, session revocation and the auth cache dead until the API
+/// process itself was restarted.
 #[derive(Clone)]
 pub struct RedisCache {
     client: Client,
-    connection: Arc<tokio::sync::RwLock<Option<MultiplexedConnection>>>,
+    config: ConnectionManagerConfig,
+    connection: Arc<RwLock<ConnectionManager>>,
+}
+
+/// Upper bound for the health-check PING, so `/health` answers promptly while
+/// Redis is unreachable instead of waiting out reconnect attempts.
+const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Strip any `user:password@` part from a Redis URL before it is logged.
+fn redact_redis_url(raw: &str) -> String {
+    match url::Url::parse(raw) {
+        Ok(mut parsed) => {
+            if !parsed.username().is_empty() || parsed.password().is_some() {
+                let _ = parsed.set_username("");
+                let _ = parsed.set_password(None);
+            }
+            parsed.to_string()
+        }
+        Err(_) => "<unparseable redis url>".to_string(),
+    }
 }
 
 impl RedisCache {
     /// Connect to Redis with the given settings
     pub async fn connect(settings: &RedisSettings) -> Result<Self> {
-        info!(url = %settings.url, "Connecting to Redis");
+        info!(url = %redact_redis_url(&settings.url), "Connecting to Redis");
 
         let client =
             Client::open(settings.url.as_str()).context("Failed to create Redis client")?;
 
-        let connection = client
-            .get_multiplexed_async_connection()
+        // While Redis is down, a command waits for the manager's reconnect
+        // attempt before failing, so keep that attempt short: two retries, 1 s
+        // per connect, at most 1 s between tries. Callers then fall back to
+        // their fail-open / fail-closed handling within a couple of seconds,
+        // and normal service resumes as soon as Redis answers again.
+        let config = ConnectionManagerConfig::new()
+            .set_number_of_retries(2)
+            .set_max_delay(Duration::from_secs(1))
+            .set_connection_timeout(Some(Duration::from_secs(1)));
+        let mut connection = ConnectionManager::new_with_config(client.clone(), config.clone())
             .await
             .context("Failed to connect to Redis")?;
 
         // Test connection
-        let mut conn = connection.clone();
         let _: String = redis::cmd("PING")
-            .query_async(&mut conn)
+            .query_async(&mut connection)
             .await
             .context("Failed to ping Redis")?;
 
@@ -42,34 +75,40 @@ impl RedisCache {
 
         Ok(Self {
             client,
-            connection: Arc::new(tokio::sync::RwLock::new(Some(connection))),
+            config,
+            connection: Arc::new(RwLock::new(connection)),
         })
     }
 
-    /// Get a connection, reconnecting if necessary
+    /// Get a connection handle.
     ///
-    pub async fn get_connection(&self) -> Result<MultiplexedConnection> {
-        {
-            let guard = self.connection.read().await;
-            if let Some(conn) = guard.as_ref() {
-                return Ok(conn.clone());
+    /// The handle is cheap to clone and reconnects on its own after the
+    /// underlying connection drops.
+    pub async fn get_connection(&self) -> Result<ConnectionManager> {
+        Ok(self
+            .connection
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone())
+    }
+
+    /// Replace the connection manager with a fresh, lazily connecting one.
+    ///
+    /// The manager reconnects on I/O errors but not on response timeouts, so a
+    /// half-open socket (Redis host gone without a TCP reset) would keep timing
+    /// out forever. The health check calls this when PING fails, which the
+    /// container healthcheck does every 30 s.
+    fn reset_connection(&self) {
+        match ConnectionManager::new_lazy_with_config(self.client.clone(), self.config.clone()) {
+            Ok(fresh) => {
+                *self
+                    .connection
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = fresh;
+                info!("Replaced Redis connection after a failed health check");
             }
+            Err(e) => warn!(error = %e, "Could not create a new Redis connection"),
         }
-
-        // Reconnect with timeout
-        let mut guard = self.connection.write().await;
-        if guard.is_none() {
-            info!("Reconnecting to Redis");
-            // Add timeout to prevent indefinite hang
-            let conn_future = self.client.get_multiplexed_async_connection();
-            let conn = tokio::time::timeout(std::time::Duration::from_secs(10), conn_future)
-                .await
-                .context("Redis connection timeout")?
-                .context("Failed to reconnect to Redis")?;
-            *guard = Some(conn);
-        }
-
-        Ok(guard.as_ref().unwrap().clone())
     }
 
     /// Get a value from cache
@@ -359,16 +398,19 @@ impl RedisCache {
 
     /// Health check
     pub async fn health_check(&self) -> Result<bool> {
-        match self.get_connection().await {
-            Ok(mut conn) => match redis::cmd("PING").query_async::<String>(&mut conn).await {
-                Ok(_) => Ok(true),
-                Err(e) => {
-                    warn!(error = %e, "Redis health check failed");
-                    Ok(false)
-                }
-            },
-            Err(e) => {
-                warn!(error = %e, "Redis connection failed");
+        let mut conn = self.get_connection().await?;
+        let ping_cmd = redis::cmd("PING");
+        let ping = ping_cmd.query_async::<String>(&mut conn);
+        match tokio::time::timeout(HEALTH_CHECK_TIMEOUT, ping).await {
+            Ok(Ok(_)) => Ok(true),
+            Ok(Err(e)) => {
+                warn!(error = %e, "Redis health check failed");
+                self.reset_connection();
+                Ok(false)
+            }
+            Err(_) => {
+                warn!("Redis health check timed out");
+                self.reset_connection();
                 Ok(false)
             }
         }
@@ -536,6 +578,20 @@ pub struct TokenBucketResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redis_url_is_redacted_before_logging() {
+        assert_eq!(
+            redact_redis_url("redis://:s3cret@redis:6379/0"),
+            "redis://redis:6379/0"
+        );
+        assert_eq!(
+            redact_redis_url("redis://user:s3cret@redis:6379"),
+            "redis://redis:6379"
+        );
+        assert_eq!(redact_redis_url("redis://redis:6379"), "redis://redis:6379");
+        assert!(!redact_redis_url("not a url :s3cret@").contains("s3cret"));
+    }
 
     #[test]
     fn test_rate_limit_result() {
