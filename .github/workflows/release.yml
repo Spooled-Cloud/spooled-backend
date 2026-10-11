@@ -109,6 +109,13 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # Never let metadata-action add `latest` on its own: with the default
+          # `latest=auto` a semver tag push also tags each single-arch build as
+          # `:latest`, overwriting the multi-arch manifest the main build made
+          # (an arm64 host then pulled an amd64 image, 2026-10-11). `:latest` is
+          # only ever the manifest from the create-manifest job on main.
+          flavor: |
+            latest=false
           # For workflow_run, github.sha is main's current head, which may be
           # newer than the commit CI tested and this job built.
           labels: |
