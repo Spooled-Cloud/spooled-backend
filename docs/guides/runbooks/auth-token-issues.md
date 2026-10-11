@@ -12,6 +12,7 @@
 - Dashboard showing "Session expired" frequently
 - Workers unable to authenticate
 - Sudden spike in authentication failures
+- `503 SERVICE_UNAVAILABLE` "Authentication is temporarily unavailable" with `Retry-After: 5` (gRPC `UNAVAILABLE`, `/auth/login` `service_unavailable`): the credential could not be checked. Either the database could not be reached (see the [Postgres saturation runbook](./postgres-saturation.md)), or a legacy key (created before 0.1.90, no `lookup_hash`) waited for the legacy-key scan longer than about one scan, at most 10 s, while other unknown keys on the same transport held it (see [Scenario F](#scenario-f-503--unavailable-for-a-legacy-key)). It is not a bad key; a retry authenticates it. Any other database failure during authentication is `500` "Authentication failed"; the database error text is only in the server log.
 
 ---
 
@@ -210,27 +211,62 @@ LIMIT 50;
    timedatectl set-ntp true
    ```
 
+### Scenario F: 503 / UNAVAILABLE for a legacy key
+
+**Cause**: the key has no `lookup_hash` yet (created before 0.1.90 and not used since), so
+it is found by a bcrypt scan of all such keys, about 250 ms per key. REST (with
+`/auth/login`) and gRPC each run one scan at a time; concurrent requests for the same key
+share one scan. A request waits for its transport's turn about as long as one scan takes
+(plus 1 s, at most 10 s) and is then answered 503 / `UNAVAILABLE`. That happens when unknown
+keys on the same transport keep the turn busy; unknown gRPC keys never delay REST and the
+other way round.
+
+#### Actions:
+
+1. **Retry.** SDKs retry 503 and `UNAVAILABLE`. The first successful authentication stores
+   the key's `lookup_hash`; from then on it never scans again.
+
+2. **Count the legacy keys** (each one adds about 250 ms to every scan; around 40 the 10 s
+   wait cap is reached, around 100 a scan approaches the 30 s request timeout):
+   ```sql
+   SELECT id, organization_id, name, key_prefix, last_used
+   FROM api_keys
+   WHERE is_active = TRUE AND lookup_hash IS NULL
+   ORDER BY last_used DESC NULLS LAST;
+   ```
+   Do not deactivate or rotate them to fix this: legacy keys stay supported (operator
+   decision).
+
+3. **Look for a flood of unknown keys** on the affected transport: the `auth_fail:*`
+   counters and `auth_fail_grpc` in Redis, 401 rates in the access logs. Block the source at
+   the load balancer if it is an attack.
+
 ---
 
 ## API Key Cache Issues
 
-The backend caches API key lookups. If keys appear invalid immediately after creation:
+The backend caches API key lookups in Redis, shared by REST, `/auth/login` and gRPC:
+
+| Redis key | Meaning | TTL |
+|-----------|---------|-----|
+| `api_key:{sha256(token)}` | Verified key record (bcrypt skipped on a hit) | 60 s |
+| `auth_miss:{sha256(token)}` | The token matched no key (refused without touching the database) | 60 s |
+| `auth_fail:{client_ip}` | Failed-auth count (20 per minute budget), charged before the legacy bcrypt scan of keys without a `lookup_hash` and taken back when the scan finds the key or never runs; over it, only that scan is skipped (401) | 60 s |
+| `auth_fail_grpc` | Failed-auth count shared by every gRPC caller (60 per minute), charged the same way; over it, gRPC skips the same legacy scan | 60 s |
+
+If a key appears invalid right after creation or reactivation (a token that was refused is remembered for up to 60 s):
 
 ### Clear API Key Cache
 
 ```bash
 # If using Redis cache
 redis-cli KEYS "api_key:*" | xargs redis-cli DEL
+redis-cli KEYS "auth_miss:*" | xargs redis-cli DEL
 
-# Or wait for cache expiration (typically 5 minutes)
+# Or wait up to 60 seconds for the entries to expire
 ```
 
-### Verify Cache Settings
-
-```bash
-# Check cache TTL
-echo $API_KEY_CACHE_TTL_SECONDS  # Default: 300 (5 min)
-```
+The TTLs are fixed in the code (no environment variable). Without Redis every request is a cache miss and pays one bcrypt verification (about 250 ms of CPU, run on a bounded blocking pool of half the cores, 1 to 4), so throughput per process is limited to roughly that many verifications per 0.25 s.
 
 ---
 

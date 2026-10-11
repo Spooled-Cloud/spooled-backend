@@ -11,6 +11,265 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.119] - 2026-10-11
+
+Fixes from the 2026-10-10 bug hunt (wave 3): the gRPC API, authentication cost,
+process supervision and the production configuration.
+
+### Upgrade notes
+
+- **Omitted gRPC leases stay 300 s, now configurable.** `Dequeue`,
+  `StreamJobs`, `ProcessJobs` and `RenewLease` without a lease (proto3 `0`) get
+  `GRPC_DEFAULT_LEASE_DURATION_SECS`, default 300 as before this release (`0` or
+  blank also means 300, a value above 3600 is lowered to 3600, and one at or
+  below `WORKER_HEARTBEAT_INTERVAL_SECS` or below 5 stops the server at startup:
+  such a lease would expire between heartbeats). It is separate from `WORKER_LEASE_DURATION_SECS` (the
+  REST default, 30 s on the hosted service) because the Go SDK's `StreamJobs`
+  cannot send a lease and the Go and PHP `Dequeue` / `RenewLease` send none
+  unless set: on 30 s their longer jobs would be handed to a second worker. An
+  explicit lease is honoured as before. `Register` reports this lease as
+  `lease_duration_secs`; `heartbeat_interval_secs` is
+  `WORKER_HEARTBEAT_INTERVAL_SECS`.
+- **`StreamJobs` holds one job per stream.** The next job is claimed only once
+  the delivered one is settled (completed or failed), released, or its lease
+  has run out. Run one stream per concurrent job slot (up to 100 per
+  organization per server), or use `Dequeue` / `ProcessJobs`, if a worker ran
+  several jobs from one stream at once.
+- **Production refuses `EMAIL_PROVIDER=console`.** `docker-compose.prod.yml`
+  still defaults to it, so set `EMAIL_PROVIDER` (and its API key) before
+  deploying, or the container exits at startup. An unset or unknown `RUST_ENV`
+  counts as production, so a local run needs `RUST_ENV=development`.
+- **`GET /health` is 503 while the database is down**, so `curl -f`
+  healthchecks and the container `HEALTHCHECK` now fail in that case.
+- The new migration `20261011150300_count_draining_workers.sql` runs at startup
+  and changes the worker count (see "Draining workers" below).
+
+### gRPC
+
+- **The default gRPC lease is configurable.** An omitted (or `<= 0`) lease on
+  `Dequeue`, `StreamJobs`, `ProcessJobs` and `RenewLease` is
+  `GRPC_DEFAULT_LEASE_DURATION_SECS` (default 300, the previous fixed value;
+  `0` means unset, at most 3600 s, and a value at or below
+  `WORKER_HEARTBEAT_INTERVAL_SECS` or below 5 fails startup, so a worker that
+  sends no lease never gets one shorter than its heartbeat). It does not follow the REST `WORKER_LEASE_DURATION_SECS`,
+  so clients that cannot send a lease keep the lease they have always had.
+  `Register` returns that lease and `WORKER_HEARTBEAT_INTERVAL_SECS` instead of a
+  fixed 300/10 (BEGRPC-10, W3R-03).
+- **Workers can re-register under a stable id.** `RegisterWorkerRequest` has an
+  optional `worker_id` (field 7). Send the same id after a restart and the
+  server updates that worker instead of adding one, so a restarting worker at the
+  plan's `max_workers` is no longer locked out. Ids follow the REST rules, are
+  scoped to the organization, and an id another organization uses is
+  `ALREADY_EXISTS`. Wire-compatible; SDKs need regenerated stubs to send it
+  (BEGRPC-08).
+- **`Register` enforces `max_workers` atomically**, under the same advisory lock
+  and transaction as REST, so concurrent registrations can no longer overshoot
+  the cap (BEGRPC-07).
+- **Draining workers count toward `max_workers`** on REST and gRPC, and in
+  `GET /organizations/usage`, for as long as they keep heartbeating. A worker
+  that heartbeated `draining` used to drop out of the count and let an
+  organization run any number of workers. One silent for 2 minutes now goes
+  offline like any other stale worker and frees its slot (BEGRPC-15).
+- **`Enqueue` validates like REST.** Queue name up to 100 characters, priority
+  -100..100, idempotency key up to 255 characters, tags up to 64 KB of JSON, and a
+  `scheduled_at` outside years 1-9999 are `INVALID_ARGUMENT`; database CHECK and
+  row-size errors are `INVALID_ARGUMENT` instead of `INTERNAL`. An all-zero
+  `scheduled_at` means unset (it used to store 1970). `Register` and `Heartbeat`
+  apply the REST limits too (metadata 64 KB, `worker_type` and `version` 50
+  characters, worker id rules); `max_concurrency` above 100 is lowered to 100
+  (BEGRPC-09, BEGRPC-21).
+- **Whole numbers in payloads and results stay integers.** `42` round-trips as
+  `42`, not `42.0`, for values below 2^53 (BEGRPC-05).
+- **Settling a finished job is `FAILED_PRECONDITION`.** `Complete`, `Fail` or
+  `RenewLease` on a job that already finished returns the message
+  `Job is already <status>` (`CONFLICT` inside `ProcessJobs`), like REST's 409,
+  not `NOT_FOUND` (BEGRPC-17).
+- **`StreamJobs` claims on demand and is capped.** A stream keeps one job with
+  the worker: it claims the next job only once the previous one is settled
+  (completed or failed), released, or its lease has run out, so one stream runs
+  one job at a time and a worker opens one stream per concurrent job slot. Before, it claimed whenever the client's
+  HTTP/2 window had room, so a worker holding one job was leased as many further
+  jobs as that window held (about 64 KB of them for grpc-go), which expired
+  unread and used up their retries. A job
+  claimed but not yet handed over when the client disconnects goes back to
+  pending without using a retry. At most 100 streams per organization per server
+  (`RESOURCE_EXHAUSTED` beyond that). The rate limit is charged when a stream
+  opens and per delivered job, not per idle poll, and a stream over its limit
+  waits instead of ending. A change to a key's rate limit applies to open
+  `StreamJobs` and `ProcessJobs` streams. A claim reads the organization's plan
+  limits from the key row it already holds, so it never waits for a second
+  database connection; with the cached limits gone (TTL expiry or a Redis outage)
+  and as many busy streams as pool connections, that wait used to stall the
+  whole process (BEGRPC-03, BEGRPC-12, BEGRPC-22, W3R-01, W3R-02).
+- **Responses stay under the 4 MiB message limit.** A `Dequeue` batch stops at
+  about 3 MiB (always at least one job) and the rest stay pending; a job too large
+  for any message is dead-lettered with the reason instead of blocking the queue.
+  A claim error part-way through a `Dequeue` batch returns the jobs already
+  claimed instead of failing the call and leaving them leased (BEGRPC-04,
+  BEGRPC-24).
+- Dead-lettering over gRPC no longer counts an extra retry (`retry_count` and the
+  DLQ `total_retries` match REST). The `job.created` webhook for gRPC jobs
+  carries the real initial status (`scheduled` for a future `scheduled_at`) and
+  the priority. `ProcessJobs` ends with the request stream's error (for example
+  an oversized message) instead of a clean OK (BEGRPC-16, BEGRPC-18, BEGRPC-23).
+- Worker RPCs: `Heartbeat` without metadata keeps the stored metadata, and with an
+  empty status keeps the current status without a warning (an offline worker
+  still comes back as healthy); repeated `Deregister` no longer drives the
+  `workers_active` gauge negative. Worker RPCs follow `RATE_LIMIT_FAIL_CLOSED`
+  like the queue RPCs (a Redis error no longer fails them with `INTERNAL` in the
+  default fail-open mode). gRPC health follows database reachability (checked
+  every 10 s) instead of always reporting SERVING (BEGRPC-06, BEGRPC-11,
+  BEGRPC-25).
+
+### Authentication
+
+- **bcrypt no longer runs on the async runtime.** Every API-key verification
+  (REST, `/auth/login`, gRPC) runs on the blocking pool behind one process-wide
+  limit (half the cores, 1-4), and legacy-key scans run one at a time, so a burst
+  of bad keys cannot stall requests, the scheduler or the health probes
+  (BEOPS-04).
+- **Legacy keys are not refused while a scan is busy.** REST (with `/auth/login`)
+  and gRPC scan legacy keys on separate turns, so unknown keys on one transport
+  never delay legacy keys on the other. Concurrent requests for the same key share
+  one scan. A request waits for its turn about as long as a scan takes (measured
+  on the host, plus 1 s, at most 10 s), then re-checks whether the scan it waited
+  for already found its key. If the turn is still busy the answer is
+  `503 SERVICE_UNAVAILABLE` with `Retry-After: 5` (gRPC `UNAVAILABLE`), never 401,
+  and the key is not remembered as unknown. Before, a request waited a flat 2 s,
+  less than one scan of ten keys at bcrypt cost 12, so concurrent requests for a
+  dormant legacy key got 401s that SDKs do not retry (W3R-06, W3R-07, W3R-08).
+- **REST, login and gRPC share one key path and one cache.** The Redis record
+  cache, then a negative cache (an unknown key is refused for 60 s without
+  touching the database), then the indexed `lookup_hash`, then the bounded
+  legacy scan. A repeat gRPC call skips bcrypt, a REST revoke ends the gRPC key
+  too, and `last_used` is written at most once per 5 minutes instead of on every
+  RPC (BEGRPC-01, BEGRPC-25).
+- **A per-IP failed-auth budget (20 per minute)** skips only the legacy
+  `lookup_hash IS NULL` scan for an address that keeps sending unknown keys. Keys
+  that match by `lookup_hash` always authenticate. Legacy keys stay supported and
+  nothing is rotated or deactivated (operator decision). gRPC cannot be budgeted
+  per address (the peer address it sees is the ingress), so all gRPC callers
+  share one budget of 60 failures per minute (Redis key `auth_fail_grpc`) with
+  the same effect: over it, gRPC skips the legacy scan (401, not negatively
+  cached) until the minute is up. A budget is charged before the scan, so
+  concurrent requests and requests the client cancels count too, and the charge
+  is taken back when the scan finds the key or never runs. A Redis error leaves
+  both budgets open (BEAUTH-05, BEGRPC-13, W3R-06, W3R-08).
+- **`/auth/login` resolves keys exactly like the middleware**, so it refuses keys
+  of soft-deleted organizations (401) instead of issuing tokens that every later
+  JWT check rejected. A key it could not check is a 503 with `Retry-After`, not a
+  500.
+- **A database failure during authentication no longer leaks database text.** The
+  status is `503 SERVICE_UNAVAILABLE` "Authentication is temporarily unavailable"
+  (with `Retry-After: 5`) when the database cannot be reached, otherwise `500`
+  "Authentication failed";
+  gRPC returns `UNAVAILABLE`. It used to be a 500 with the raw sqlx message, or
+  "API key is inactive". `GET /schedules/{id}/history` no longer returns database
+  error text either (BEOPS-27).
+
+### Runtime and operations
+
+- **The process exits when a part of it dies.** It exits non-zero, so the
+  container restart policy brings it back, when the gRPC port is busy or the TLS
+  certificate or key is bad, or when the gRPC server, the scheduler or the metrics
+  server stops. Before, the process kept running and reported healthy
+  (BEGRPC-14, BEOPS-09).
+- **Graceful shutdown covers gRPC.** Health turns `NOT_SERVING` first, then
+  in-flight calls finish (up to 10 s) while HTTP drains. The whole shutdown, open
+  SSE streams included, is bounded by the 30 s shutdown timeout, so the process
+  still releases its jobs and closes the database pool (BEOPS-24).
+- **`GET /health`** returns 503 with the same body when the database is down (a
+  Redis outage stays 200 with `cache: false`, `status: degraded`). The body adds
+  `grpc` and `scheduler` booleans; either being false makes `status` degraded
+  (BEOPS-21, BEOPS-09).
+- **Redis half-open connections are detected.** Every Redis call and the health
+  check are capped at 500 ms, including any wait for a reconnect; three timeouts in
+  a row (or a failed health ping) replace the connection, at most once per second,
+  and Redis sockets use TCP keepalive. A stalled Redis used to hold requests for
+  seconds (W1-02).
+- **A Redis that is down at startup is picked up when it comes back.** With
+  `REDIS_URL` set or `RATE_LIMIT_FAIL_CLOSED` on, the process keeps a
+  reconnecting client and runs degraded (`/health`: `cache: false`,
+  `status: degraded`) until Redis answers. Before, it ran without Redis until
+  restarted: under `RATE_LIMIT_FAIL_CLOSED` every request was refused while
+  `/health` reported healthy. Without `REDIS_URL` and fail-closed, a missing Redis
+  is still optional (W3R-04).
+- **Prometheus metrics are wired up.** `spooled_api_requests_total` and
+  `spooled_api_request_duration_seconds` (method, route template, status class),
+  `spooled_database_connections_active` and the new
+  `spooled_database_connections_max` are recorded; REST failures count
+  `spooled_jobs_failed_total` and `spooled_jobs_deadlettered_total`; REST and gRPC
+  completions observe `spooled_job_duration_seconds`. `spooled_redis_operations_total`
+  and its two alerts are gone (nothing fed them); the latency and database-pool
+  alerts and the Grafana panels are corrected. The metrics server returns an error
+  instead of panicking when it cannot bind (BEOPS-07).
+- `POST /workflows` no longer takes a second database connection while its
+  transaction holds the organization lock, so concurrent creates cannot exhaust
+  the pool (BEOPS-10).
+- **Rolling back to an older image no longer crash-loops** on migrations a newer
+  release already applied: unknown applied migrations are ignored, and the
+  checksums of the known ones are still checked (BEOPS-08).
+- Dashboard `uptime_seconds` and `started_at` count from process start, not from
+  the first dashboard request (BEOPS-22).
+- `POST /jobs/bulk` accepts bodies up to 100 jobs at the largest plan payload cap,
+  capped at 32 MiB (was axum's 2 MiB default, so 100 jobs of 25 KB were refused);
+  other routes keep 2 MiB (BEOPS-16).
+- Postgres (`sslmode=require` / `verify-*`) and Redis (`rediss://`) connections can
+  use TLS, through rustls with the ring provider. Plain URLs behave as before. The
+  bundled web PKI roots cover public CAs; a private CA may need a different root
+  setup (BEOPS-14).
+
+### Configuration and deployment
+
+- **`docker-compose.prod.yml` forwards the settings the app reads:**
+  `RATE_LIMIT_FAIL_CLOSED`, `CORS_ALLOWED_ORIGINS`, `EXTERNAL_URL`, `ENABLE_HSTS`,
+  `TRUSTED_CLIENT_IP_HEADER`, `TRUSTED_PROXY_HOPS`, `OUTGOING_WEBHOOK_MAX_ATTEMPTS`,
+  `OUTGOING_WEBHOOK_MAX_CONCURRENT_DELIVERIES`, `DATABASE_TEST_BEFORE_ACQUIRE`,
+  `DATABASE_DIRECT_URL`, `GRPC_PORT` and the new
+  `GRPC_DEFAULT_LEASE_DURATION_SECS` (default 300). A blank value counts as unset for every
+  numeric and flag setting (and keeps the default CORS origins), so
+  `${NAME:-}` forwarding changes nothing until you set it. Before, setting
+  `RATE_LIMIT_FAIL_CLOSED` or `CORS_ALLOWED_ORIGINS` in the stack had no effect
+  (BEOPS-13).
+- The backend container gets `stop_grace_period: 40s` (the Docker default of 10 s
+  would SIGKILL the shutdown drain), and the Kubernetes base deployment
+  `terminationGracePeriodSeconds: 40` (was 30): the 30 s shutdown bound plus
+  releasing jobs and closing the pool.
+- **The bundled Prometheus works with `METRICS_TOKEN`.** It sends the token as a
+  bearer credential and loads `docker/prometheus/spooled-rules.yml`. Before, a
+  non-empty token made every scrape a 401 and no alert rules were loaded (a single
+  downloaded compose file has no rules directory, which means no rules, not an
+  error) (BEOPS-06).
+- **Production refuses `EMAIL_PROVIDER=console`** (the default when the variable
+  is unset or misspelled): login codes would only be written to the log, the API
+  would still answer 200, and anyone with log access could sign in as any user.
+  Development and staging are unaffected (BEOPS-17).
+- Migrations run over `DATABASE_DIRECT_URL` when it is set, bypassing PgBouncer
+  (the migrator's session-level lock is not reliable in transaction mode). The build
+  re-runs when `migrations/` changes, so a new `.sql` file alone is embedded
+  (BEOPS-19, BEOPS-32).
+- The Kubernetes ingress no longer pins clients to one pod with
+  `upstream-hash-by: $request_uri` (BEOPS-18).
+- Migration convention for new migrations: start with `SET LOCAL lock_timeout =
+  '5s'` and add foreign keys `NOT VALID`, then `VALIDATE CONSTRAINT` separately
+  (W1-10). Documented in `docs/guides/deployment.md`.
+
+### Migrations
+
+- `20261011150300_count_draining_workers.sql` (adds
+  `worker_counts_toward_cap(status, last_heartbeat)` and redefines
+  `get_org_resource_counts` to use it)
+
+### Deferred
+
+- Requiring the claiming `worker_id` to be a live registered worker of the
+  organization on claim and dequeue (BEGRPC-15, owner decision: breaking for REST
+  and gRPC consumers that never call Register).
+- Pending billing email, so a typo does not drop email login until the new
+  address is confirmed (W1-14, moved to a later wave).
+
+---
+
 ## [0.1.118] - 2026-10-10
 
 Worker-semantics fixes from the 2026-10-10 bug hunt (wave 2).

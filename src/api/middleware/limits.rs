@@ -429,6 +429,43 @@ pub async fn check_new_queue_limit(
         })
 }
 
+/// Same as [`check_new_queue_limit`] but runs its reads on a caller-provided
+/// connection. Required wherever the caller already holds a transaction (and
+/// possibly an advisory lock): taking a second pool connection there deadlocks
+/// the pool once pool-size callers are waiting on the lock.
+pub async fn check_new_queue_limit_conn(
+    conn: &mut sqlx::PgConnection,
+    org_id: &str,
+    new_queues: u64,
+) -> Result<(), Response> {
+    if new_queues == 0 {
+        return Ok(());
+    }
+    let internal = |e: sqlx::Error| {
+        tracing::error!(error = %e, "Failed during queue limit check");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
+    };
+    let (plan_tier, custom_limits): (String, Option<serde_json::Value>) =
+        sqlx::query_as("SELECT plan_tier, custom_limits FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(internal)?;
+    let limits = PlanLimits::for_tier_with_overrides(&plan_tier, custom_limits.as_ref());
+    if limits.max_queues.is_none() {
+        return Ok(());
+    }
+    let row: (i64, i64, i64, i64, i64, i64, i64, i64) =
+        sqlx::query_as("SELECT * FROM get_org_resource_counts($1)")
+            .bind(org_id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(internal)?;
+    limits
+        .check_limit("queues", row.1 as u64, new_queues)
+        .map_err(|e| LimitExceededResponse::from(e).into_response())
+}
+
 /// Check payload size against plan limits - generic version (usable by HTTP, gRPC, etc.)
 pub async fn check_payload_size_generic(
     pool: &PgPool,

@@ -296,7 +296,9 @@ Response:
 
 Supplying `worker_id` makes registration an **upsert**: a worker that restarts reuses its
 existing row instead of creating another one. Re-registering an id you already own is not
-charged against your plan's worker limit.
+charged against your plan's worker limit. Healthy and degraded workers count toward the limit,
+and so do draining workers that still heartbeat (a draining worker silent for 2 minutes frees its
+slot). gRPC `Register` accepts the same optional `worker_id`.
 
 Omit it and the server mints a fresh UUID, which is the older behaviour — but then every
 restart leaves the previous row behind, counting against your worker cap until the
@@ -536,10 +538,14 @@ request = StreamJobsRequest(
 
 metadata = [('x-api-key', 'sp_live_YOUR_API_KEY')]
 
+# One job at a time per stream: the next one arrives after this one is settled.
 for job in stub.StreamJobs(request, metadata=metadata):
     print(f"Received job: {job.id}")
     process_job(job)
-    stub.Complete(CompleteRequest(job_id=job.id, worker_id="worker-1"), metadata=metadata)
+    stub.Complete(
+        CompleteRequest(job_id=job.id, worker_id="worker-1", lease_id=job.lease_id),
+        metadata=metadata,
+    )
 ```
 
 ### Bidirectional Streaming

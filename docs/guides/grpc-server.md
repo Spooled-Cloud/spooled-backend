@@ -27,6 +27,7 @@ Spooled Backend provides a high-performance gRPC API alongside the REST API for 
 | `GRPC_TLS_ENABLED` | `false` | Enable TLS for gRPC connections |
 | `GRPC_TLS_CERT_PATH` | - | Path to TLS certificate (PEM format) |
 | `GRPC_TLS_KEY_PATH` | - | Path to TLS private key (PEM format) |
+| `GRPC_DEFAULT_LEASE_DURATION_SECS` | `300` | Lease for `Dequeue` / `StreamJobs` / `ProcessJobs` / `RenewLease` that send none (`0` = 300, at most 3600 s; at or below `WORKER_HEARTBEAT_INTERVAL_SECS` the server does not start); reported by `Register` |
 
 ### Example Startup
 
@@ -107,15 +108,61 @@ Job queue operations for enqueueing, processing, and managing jobs.
 > **`Enqueue` timeouts**: if `timeout_seconds` is omitted (or `0`), the job
 > timeout defaults to `300` seconds (matching the REST API).
 
+> **Leases**: if `lease_duration_secs` (`Dequeue`, `StreamJobs`, `ProcessJobs`) or
+> `extension_secs` (`RenewLease`) is omitted or `0`, the lease is the server's
+> `GRPC_DEFAULT_LEASE_DURATION_SECS`: 300 s unless the operator changes it (at most
+> 3600 s, always longer than the heartbeat interval). This is separate from the REST default (`WORKER_LEASE_DURATION_SECS`, 30 s on
+> Spooled Cloud) because some SDK calls, such as the Go SDK's `StreamJobs`, cannot send a
+> lease. An explicit lease (5-3600 s) is honoured. For jobs that can run longer than the
+> lease, send a longer one or call `RenewLease` before it expires.
+
+**`Enqueue` limits** (same as REST, `INVALID_ARGUMENT` otherwise): queue name up to 100
+characters, `priority` -100..100, `idempotency_key` up to 255 characters, `tags` up to 64 KB
+as JSON, `scheduled_at` between years 1 and 9999 (an all-zero Timestamp means unset).
+Struct numbers that are whole and below 2^53 come back as integers (`42`, not `42.0`).
+
+**Responses and messages**: a `Dequeue` batch stops at about 3 MiB so it fits the 4 MiB
+message limit (it always returns at least one job; the rest stay pending). A job too large for
+one message is dead-lettered with the reason `Job too large for a gRPC message`.
+
+**Settling a job that already finished** (`Complete`, `Fail`, `RenewLease`) returns
+`FAILED_PRECONDITION` `Job is already <status>` (inside `ProcessJobs`: error code `CONFLICT`),
+like REST's 409. `NOT_FOUND` means the job is not this worker's or not in the key's scope.
+
+**`StreamJobs`**: a stream hands the worker one job at a time. The next job is sent once the
+previous one is completed or failed, released, or its lease has run out, so settle each job with
+`Complete` or `Fail`; to run several jobs at once, open one stream per job slot. A job claimed
+but not yet handed over when the client disconnects goes back to pending without using a
+retry. At most 100 open streams per organization per server (`RESOURCE_EXHAUSTED` beyond
+that). The rate limit is charged when the stream opens and per delivered job, not per idle
+poll; a stream over its limit waits instead of ending.
+
+**Errors from authentication**: `UNAUTHENTICATED` for a bad key, `UNAVAILABLE` (retry) when
+the key could not be checked: the database cannot be reached, or a key created before
+0.1.90 (no `lookup_hash` yet) waited for the bcrypt scan of such keys longer than about one
+scan (at most 10 s) while other unknown keys held it. It authenticates on a retry.
+
 ### 2. WorkerService (`spooled.v1.WorkerService`)
 
 Worker lifecycle management for registering and monitoring workers.
 
 | Method | Request | Response | Description |
 |--------|---------|----------|-------------|
-| `Register` | `RegisterWorkerRequest` | `RegisterWorkerResponse` | Register a new worker |
+| `Register` | `RegisterWorkerRequest` | `RegisterWorkerResponse` | Register a worker (optional stable `worker_id`) |
 | `Heartbeat` | `HeartbeatRequest` | `HeartbeatResponse` | Send worker heartbeat |
 | `Deregister` | `DeregisterRequest` | `DeregisterResponse` | Deregister a worker |
+
+`Register` returns `lease_duration_secs` = the lease a gRPC claim without one gets
+(`GRPC_DEFAULT_LEASE_DURATION_SECS`, 300 by default) and `heartbeat_interval_secs` =
+`WORKER_HEARTBEAT_INTERVAL_SECS`.
+Send `worker_id` (1-128 characters: letters, digits, `-`, `_`, `.`) to make registration an upsert:
+a worker that restarts with the same id updates its row and is not counted twice against the
+plan's `max_workers` (an id another organization uses is `ALREADY_EXISTS`). Registration is
+checked under the same lock as REST, so concurrent registrations cannot exceed the limit.
+Healthy, degraded and draining workers (draining only while they keep heartbeating, 2 minutes)
+count toward the limit. Limits: metadata 64 KB, `worker_type` and `version` 50 characters,
+`max_concurrency` 1-100 (larger values are lowered, 0 means 5). `Heartbeat` without metadata
+keeps the stored metadata, and without a status keeps the stored status.
 
 ### 3. Health Service (`grpc.health.v1.Health`)
 
@@ -205,6 +252,11 @@ Output:
   "status": "SERVING"
 }
 ```
+
+The status follows database reachability (checked every 10 s) and turns `NOT_SERVING` for the
+whole server and for each service when the shutdown starts, before in-flight calls are drained
+for up to 10 s. If the gRPC port is busy or the TLS certificate or key cannot be loaded, the
+backend exits instead of running without gRPC.
 
 ### Check Specific Service Health
 

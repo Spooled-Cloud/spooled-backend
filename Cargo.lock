@@ -2992,10 +2992,13 @@ dependencies = [
  "num-bigint 0.5.1",
  "percent-encoding",
  "pin-project-lite",
+ "rustls",
+ "rustls-native-certs",
  "ryu",
  "sha1_smol",
  "socket2",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "url",
  "xxhash-rust",
@@ -3688,7 +3691,7 @@ dependencies = [
 
 [[package]]
 name = "spooled-backend"
-version = "0.1.118"
+version = "0.1.119"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3784,6 +3787,7 @@ dependencies = [
  "log",
  "memchr",
  "percent-encoding",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3794,6 +3798,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "webpki-roots",
 ]
 
 [[package]]

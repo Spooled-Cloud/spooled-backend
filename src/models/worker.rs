@@ -17,8 +17,8 @@ pub const VALID_WORKER_STATUSES: &[&str] = &["healthy", "degraded", "draining", 
 ///
 /// Kept deliberately narrow: the id is a primary key that ends up in log lines,
 /// Redis channel names and error messages, so only characters that are safe in
-/// all three are allowed.
-fn validate_worker_id(worker_id: &str) -> Result<(), validator::ValidationError> {
+/// all three are allowed. Shared with gRPC `RegisterWorker`.
+pub(crate) fn validate_worker_id(worker_id: &str) -> Result<(), validator::ValidationError> {
     if !worker_id
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
@@ -73,8 +73,10 @@ fn validate_worker_status(status: &str) -> Result<(), validator::ValidationError
     Ok(())
 }
 
-/// Validate metadata size
-fn validate_metadata_size(metadata: &serde_json::Value) -> Result<(), validator::ValidationError> {
+/// Validate metadata size (shared with the gRPC worker RPCs)
+pub(crate) fn validate_metadata_size(
+    metadata: &serde_json::Value,
+) -> Result<(), validator::ValidationError> {
     let json_str = serde_json::to_string(metadata).unwrap_or_default();
     if json_str.len() > MAX_WORKER_METADATA_SIZE {
         let mut err = validator::ValidationError::new("metadata_too_large");

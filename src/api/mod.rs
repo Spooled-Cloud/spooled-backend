@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
+    extract::DefaultBodyLimit,
     routing::{delete, get, post, put},
     Router,
 };
@@ -57,6 +58,8 @@ impl AppState {
         settings: Settings,
     ) -> Self {
         let stripe = settings.stripe.clone();
+        // Sample pool usage on every scrape (spooled_database_connections_*).
+        metrics.attach_pool(db.pool().clone());
         let outgoing_webhooks = Arc::new(OutgoingWebhookService::new(
             db.pool().clone(),
             settings.outgoing_webhooks.max_attempts,
@@ -136,6 +139,11 @@ pub fn router(state: AppState) -> Router {
     let timeout_layer = TimeoutLayer::new(Duration::from_secs(30));
 
     let middleware = ServiceBuilder::new()
+        // Outermost, so the duration covers every other layer (timeout included).
+        .layer(axum::middleware::from_fn_with_state(
+            state.metrics.clone(),
+            crate::observability::track_http_metrics,
+        ))
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(TraceLayer::new_for_http())
@@ -174,6 +182,33 @@ pub fn router(state: AppState) -> Router {
         .method_not_allowed_fallback(middleware::error_body::method_not_allowed)
         .layer(middleware)
         .with_state(state)
+}
+
+/// Jobs accepted by one `/jobs/bulk` request (see `BulkEnqueueRequest`).
+const BULK_MAX_JOBS: usize = 100;
+/// JSON envelope allowance per bulk item (priority, idempotency key, schedule...).
+const BULK_ITEM_OVERHEAD_BYTES: usize = 4 * 1024;
+/// Hard ceiling for a `/jobs/bulk` body. 100 jobs at a 1 MiB payload cap would
+/// be ~100 MiB buffered per request, so the cap stays at 32 MiB; a batch that
+/// needs more is split by the client. Every other route keeps axum's 2 MiB default.
+const BULK_BODY_LIMIT_CEILING: usize = 32 * 1024 * 1024;
+
+/// Body limit for `/jobs/bulk`: 100 jobs at the largest plan payload cap plus
+/// envelope overhead, never below axum's 2 MiB default and never above the ceiling.
+fn bulk_body_limit() -> usize {
+    let largest_payload = crate::config::PlanLimits::all_tiers()
+        .iter()
+        .map(|plan| plan.max_payload_size_bytes)
+        .max()
+        .unwrap_or(0);
+    bulk_body_limit_for(largest_payload)
+}
+
+fn bulk_body_limit_for(largest_payload: usize) -> usize {
+    const AXUM_DEFAULT: usize = 2 * 1024 * 1024;
+    BULK_MAX_JOBS
+        .saturating_mul(largest_payload.saturating_add(BULK_ITEM_OVERHEAD_BYTES))
+        .clamp(AXUM_DEFAULT, BULK_BODY_LIMIT_CEILING)
 }
 
 /// API v1 routes - split into public and protected
@@ -264,7 +299,10 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
         .route("/jobs", post(handlers::jobs::create))
         .route("/jobs/stats", get(handlers::jobs::stats))
         .route("/jobs/status", get(handlers::jobs::batch_status))
-        .route("/jobs/bulk", post(handlers::jobs::bulk_enqueue))
+        .route(
+            "/jobs/bulk",
+            post(handlers::jobs::bulk_enqueue).layer(DefaultBodyLimit::max(bulk_body_limit())),
+        )
         .route("/jobs/claim", post(handlers::jobs::claim))
         .route("/jobs/{id}", get(handlers::jobs::get))
         .route("/jobs/{id}", delete(handlers::jobs::cancel))
@@ -452,4 +490,21 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
         .merge(protected_routes)
         .merge(realtime_routes)
         .merge(admin_routes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bulk_body_limit_fits_100_default_free_jobs_and_respects_the_ceiling() {
+        // Free plan cap (64 KiB) x 100 jobs is well past axum's 2 MiB default.
+        assert!(bulk_body_limit_for(64 * 1024) >= 100 * 64 * 1024);
+        // 1 MiB plan caps would need ~100 MiB: clamped to the ceiling.
+        assert_eq!(bulk_body_limit_for(1024 * 1024), BULK_BODY_LIMIT_CEILING);
+        assert_eq!(bulk_body_limit_for(usize::MAX), BULK_BODY_LIMIT_CEILING);
+        // Tiny caps never go below the axum default.
+        assert_eq!(bulk_body_limit_for(0), 2 * 1024 * 1024);
+        assert_eq!(bulk_body_limit(), BULK_BODY_LIMIT_CEILING);
+    }
 }

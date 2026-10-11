@@ -17,6 +17,10 @@ use crate::config::DatabaseSettings;
 pub struct Database {
     /// PostgreSQL connection pool
     pool: Arc<PgPool>,
+    /// Direct (non-pooled) URL used for migrations when `DATABASE_DIRECT_URL` is set.
+    /// Behind PgBouncer in transaction mode the migrator's session-level advisory lock
+    /// is not reliable, so migrations bypass the pooler.
+    direct_url: Option<String>,
 }
 
 impl Database {
@@ -59,6 +63,7 @@ impl Database {
 
         Ok(Self {
             pool: Arc::new(pool),
+            direct_url: settings.direct_url.clone().filter(|u| !u.trim().is_empty()),
         })
     }
 
@@ -66,10 +71,22 @@ impl Database {
     pub async fn run_migrations(&self) -> Result<()> {
         info!("Running database migrations");
 
-        sqlx::migrate!("./migrations")
-            .run(&*self.pool)
-            .await
-            .context("Failed to run migrations")?;
+        match &self.direct_url {
+            Some(url) => {
+                let direct = PgPoolOptions::new()
+                    .max_connections(1)
+                    .connect(url)
+                    .await
+                    // Don't include URL in error message to prevent credential exposure
+                    .context(
+                        "Failed to connect for migrations - check DATABASE_DIRECT_URL configuration",
+                    )?;
+                let result = run_migrator(&direct).await;
+                direct.close().await;
+                result?;
+            }
+            None => run_migrator(&self.pool).await?,
+        }
 
         info!("Migrations completed successfully");
         Ok(())
@@ -165,8 +182,22 @@ pub struct PoolStats {
 impl Database {
     /// Create a Database from an existing pool (for testing)
     pub fn from_pool(pool: Arc<PgPool>) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            direct_url: None,
+        }
     }
+}
+
+/// Apply the embedded migrations.
+///
+/// `ignore_missing` lets an older image start against a database that a newer release
+/// already migrated (the documented rollback): the unknown applied rows are skipped,
+/// while checksums of the migrations this binary does know are still validated.
+async fn run_migrator(pool: &PgPool) -> Result<()> {
+    let mut migrator = sqlx::migrate!("./migrations");
+    migrator.set_ignore_missing(true);
+    migrator.run(pool).await.context("Failed to run migrations")
 }
 
 #[cfg(test)]

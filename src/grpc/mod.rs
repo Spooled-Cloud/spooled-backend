@@ -26,7 +26,6 @@ pub mod proto {
 }
 
 // Re-exports
-pub use server::start_grpc_server;
 
 /// Constants for gRPC validation (re-exported for testing)
 pub mod constants {
@@ -42,11 +41,13 @@ pub mod constants {
     /// Maximum lease duration in seconds (1 hour)
     pub const MAX_LEASE_DURATION_SECS: i32 = 3600;
 
-    /// Default lease duration in seconds (5 minutes)
-    pub const DEFAULT_LEASE_DURATION_SECS: i32 = 300;
-
     /// Maximum batch size for dequeue
     pub const MAX_BATCH_SIZE: i32 = 100;
+
+    /// Largest message the server encodes (`max_encoding_message_size`, 4 MiB).
+    /// tonic enforces it only after a handler returns, so claim paths check a
+    /// job against it before handing it out.
+    pub const MAX_GRPC_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 }
 
 /// Validation functions for gRPC requests (exported for testing)
@@ -77,13 +78,21 @@ pub mod validation {
         Ok(())
     }
 
-    /// Validate and clamp lease duration to safe range
+    /// Clamp a requested lease duration to the safe range (5 s to 1 h).
     pub fn safe_lease_duration(secs: i32) -> i32 {
         use super::constants::*;
+        secs.clamp(MIN_LEASE_DURATION_SECS, MAX_LEASE_DURATION_SECS)
+    }
+
+    /// Lease for a claim or renewal. Proto3 sends an omitted int32 as 0, so
+    /// `<= 0` means "server default": `default_secs` is
+    /// `GRPC_DEFAULT_LEASE_DURATION_SECS` (300 unless configured), not the
+    /// 30 s REST default, because the Go SDK's `StreamJobs` cannot send a lease.
+    pub fn lease_duration_or_default(secs: i32, default_secs: u64) -> i32 {
         if secs <= 0 {
-            DEFAULT_LEASE_DURATION_SECS
+            safe_lease_duration(i32::try_from(default_secs).unwrap_or(i32::MAX))
         } else {
-            secs.clamp(MIN_LEASE_DURATION_SECS, MAX_LEASE_DURATION_SECS)
+            safe_lease_duration(secs)
         }
     }
 
@@ -107,5 +116,25 @@ pub mod validation {
             ));
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // BEGRPC-10 / W3R-03: an omitted lease is the configured gRPC default,
+        // clamped like any requested one.
+        #[test]
+        fn test_lease_duration_or_default() {
+            assert_eq!(lease_duration_or_default(0, 300), 300);
+            assert_eq!(lease_duration_or_default(0, 30), 30);
+            assert_eq!(lease_duration_or_default(-10, 30), 30);
+            assert_eq!(lease_duration_or_default(0, 7200), 3600);
+            assert_eq!(lease_duration_or_default(0, 1), 5);
+            assert_eq!(lease_duration_or_default(0, u64::MAX), 3600);
+            assert_eq!(lease_duration_or_default(1, 30), 5);
+            assert_eq!(lease_duration_or_default(60, 30), 60);
+            assert_eq!(lease_duration_or_default(10_000, 30), 3600);
+        }
     }
 }

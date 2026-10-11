@@ -7,10 +7,10 @@ Public operator guide for self-hosters using [Portainer](https://www.portainer.i
 1. Create a **Git** stack (not Web editor) from this repository.
 2. Compose path: `docker-compose.prod.yml` (repo root).
 3. Branch: `main` (or the release branch you track).
-4. Set required secrets in the **stack environment** (see compose file header / `.env.example`). Do not commit real secrets.
+4. Set required secrets in the **stack environment** (see compose file header / `.env.example`). Do not commit real secrets. `EMAIL_PROVIDER` (resend, sendgrid, postmark or smtp) is required: the backend refuses to start with `console` in production.
 5. Image: leave unset or set  
    `BACKEND_IMAGE=ghcr.io/spooled-cloud/spooled-backend:latest`  
-   The compose default is `:latest` with `pull_policy: always` so **Pull and redeploy** picks up new CI builds. Prefer `:latest` day-to-day. Rolling back to an older version tag after a newer migration has already been applied will fail sqlx (`migration … previously applied but is missing`) — recover by deploying tip / `:latest` again, not by pinning forever.
+   The compose default is `:latest` with `pull_policy: always` so **Pull and redeploy** picks up new CI builds. Prefer `:latest` day-to-day. Rolling back to an older version tag after a newer migration has already been applied works from 0.1.119 on (an image that does not know the newer migrations starts anyway, as long as its code still works on the newer schema); an image older than 0.1.119 fails sqlx (`migration … previously applied but is missing`). Recover by deploying tip / `:latest` again, not by pinning forever.
 6. Deploy, then use **Pull and redeploy** for updates (same as other Git stacks).
 
 Git stacks in Portainer CE show **Git configuration** + **Pull and redeploy**, not the Web **Editor** tab. That is normal.
@@ -22,7 +22,7 @@ Git stacks in Portainer CE show **Git configuration** + **Pull and redeploy**, n
 | Concern | Behavior |
 |---------|----------|
 | gRPC origin TLS | Helper writes/renews certs into volume `grpc_tls`, then stays **Up/healthy**. For CI one-shot checks set `GRPC_TLS_INIT_ONCE=1`. |
-| Prometheus | Writes scrape config on start, then runs. |
+| Prometheus | Writes scrape config on start (sending `METRICS_TOKEN` as a bearer credential when set), loads alert rules from the checkout's `docker/prometheus` when present, then runs. A single downloaded compose file runs without alert rules. |
 | Grafana | Writes datasource provisioning on start, then runs. |
 
 No busybox one-shot “Exited (0)” init containers are required.

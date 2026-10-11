@@ -21,7 +21,8 @@
 ### 1. Check Current Connection Count
 
 ```bash
-# Via metrics endpoint
+# Via metrics endpoint (spooled_database_connections_active / spooled_database_connections_max
+# is the pool usage ratio the alerts use)
 curl -s http://localhost:9090/metrics | grep spooled_database_connections
 
 # Via PostgreSQL directly
@@ -179,7 +180,8 @@ docker-compose restart spooled-backend
    # Application connects to PgBouncer (port 6432)
    DATABASE_URL=postgres://user:pass@pgbouncer:6432/spooled
    
-   # Migrations use direct connection (port 5432)
+   # Migrations use direct connection (port 5432); since 0.1.119 the backend
+   # runs them over this URL when it is set
    DATABASE_DIRECT_URL=postgres://user:pass@postgres:5432/spooled
    ```
 

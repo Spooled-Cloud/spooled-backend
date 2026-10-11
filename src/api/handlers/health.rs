@@ -7,15 +7,58 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::Arc;
 
 use crate::api::AppState;
 use crate::models::ApiKeyContext;
 
-// Track server start time
-lazy_static::lazy_static! {
-    static ref SERVER_START_TIME: Instant = Instant::now();
-    static ref SERVER_START_UTC: DateTime<Utc> = Utc::now();
+/// A scheduler that has not finished a loop pass for this long is reported
+/// as down. The loop wakes at least every 5 s; the slowest passes (metrics
+/// aggregate, retention, DB waits of up to the 30 s acquire timeout) stay well
+/// below this.
+pub const SCHEDULER_STALL_AFTER_SECS: i64 = 120;
+
+/// Liveness of the long-running tasks that share the process with the HTTP
+/// API. main.rs installs one instance on the router as an `Extension`; the
+/// gRPC server and the scheduler update it and `/health` reports it.
+#[derive(Debug, Default)]
+pub struct RuntimeHealth {
+    grpc_serving: AtomicBool,
+    scheduler_running: AtomicBool,
+    /// Unix seconds of the scheduler's last loop pass.
+    scheduler_last_tick: AtomicI64,
+}
+
+impl RuntimeHealth {
+    pub fn set_grpc_serving(&self, serving: bool) {
+        self.grpc_serving.store(serving, Ordering::Relaxed);
+    }
+
+    pub fn grpc_serving(&self) -> bool {
+        self.grpc_serving.load(Ordering::Relaxed)
+    }
+
+    /// Record one pass of the scheduler loop.
+    pub fn scheduler_tick(&self) {
+        self.scheduler_last_tick
+            .store(Utc::now().timestamp(), Ordering::Relaxed);
+        self.scheduler_running.store(true, Ordering::Relaxed);
+    }
+
+    /// The scheduler loop has ended (shutdown, error or panic).
+    pub fn scheduler_stopped(&self) {
+        self.scheduler_running.store(false, Ordering::Relaxed);
+    }
+
+    pub fn scheduler_alive(&self) -> bool {
+        self.scheduler_alive_at(Utc::now().timestamp())
+    }
+
+    fn scheduler_alive_at(&self, now: i64) -> bool {
+        self.scheduler_running.load(Ordering::Relaxed)
+            && now - self.scheduler_last_tick.load(Ordering::Relaxed) <= SCHEDULER_STALL_AFTER_SECS
+    }
 }
 
 /// Health check response
@@ -30,35 +73,59 @@ pub struct HealthResponse {
     pub version: Option<String>,
     pub database: bool,
     pub cache: bool,
+    /// The gRPC server is accepting calls. Absent when the router runs
+    /// without the process's background tasks (router-only tests).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grpc: Option<bool>,
+    /// The background scheduler is running and finished a pass recently.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheduler: Option<bool>,
 }
 
 /// Basic health check endpoint
 ///
 /// No longer exposes server version to unauthenticated users.
 /// Version info could be used by attackers to find known vulnerabilities.
-pub async fn health_check(State(state): State<AppState>) -> Json<HealthResponse> {
+///
+/// Answers 503 (same body) when the database is down, so `curl -f`
+/// healthchecks fail; Redis or a background task being down only degrades
+/// service and keeps 200 with the flags in the body.
+pub async fn health_check(
+    State(state): State<AppState>,
+    runtime: Option<Extension<Arc<RuntimeHealth>>>,
+) -> (StatusCode, Json<HealthResponse>) {
     let db_healthy = state.db.health_check().await.unwrap_or(false);
     let cache_healthy = if let Some(ref cache) = state.cache {
         cache.health_check().await.unwrap_or(false)
     } else {
         true // Cache is optional
     };
+    let grpc = runtime.as_ref().map(|Extension(r)| r.grpc_serving());
+    let scheduler = runtime.as_ref().map(|Extension(r)| r.scheduler_alive());
+
+    // A configured Redis that does not answer degrades rate limiting,
+    // session revocation and realtime, so report it instead of "healthy";
+    // the same goes for a stopped gRPC server or scheduler.
+    let healthy = db_healthy && cache_healthy && grpc.unwrap_or(true) && scheduler.unwrap_or(true);
+    let code = if db_healthy {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
 
     // Don't expose version to unauthenticated users
     // Version is only shown in dashboard_data which requires authentication
-    Json(HealthResponse {
-        // A configured Redis that does not answer degrades rate limiting,
-        // session revocation and realtime, so report it instead of "healthy".
-        status: if db_healthy && cache_healthy {
-            "healthy"
-        } else {
-            "degraded"
-        }
-        .to_string(),
-        version: None, // Hidden from unauthenticated endpoint
-        database: db_healthy,
-        cache: cache_healthy,
-    })
+    (
+        code,
+        Json(HealthResponse {
+            status: if healthy { "healthy" } else { "degraded" }.to_string(),
+            version: None, // Hidden from unauthenticated endpoint
+            database: db_healthy,
+            cache: cache_healthy,
+            grpc,
+            scheduler,
+        }),
+    )
 }
 
 /// Kubernetes liveness probe
@@ -156,10 +223,12 @@ pub async fn dashboard_data(
         true
     };
 
+    // `start_time` is taken when the state is built at boot.
+    let uptime = state.start_time.elapsed();
     let system = SystemInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
-        uptime_seconds: SERVER_START_TIME.elapsed().as_secs(),
-        started_at: *SERVER_START_UTC,
+        uptime_seconds: uptime.as_secs(),
+        started_at: Utc::now() - chrono::Duration::from_std(uptime).unwrap_or_default(),
         database_status: if db_healthy { "healthy" } else { "unhealthy" }.to_string(),
         cache_status: if cache_healthy {
             "healthy"
@@ -359,6 +428,8 @@ mod tests {
             version: Some("0.1.0".to_string()), // Now Option<String>
             database: true,
             cache: true,
+            grpc: None,
+            scheduler: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -374,10 +445,31 @@ mod tests {
             version: None,
             database: true,
             cache: true,
+            grpc: None,
+            scheduler: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("healthy"));
         assert!(!json.contains("version")); // Should be omitted
+        assert!(!json.contains("grpc") && !json.contains("scheduler"));
+    }
+
+    #[test]
+    fn scheduler_counts_as_down_once_its_loop_stalls_or_stops() {
+        let runtime = RuntimeHealth::default();
+        let now = Utc::now().timestamp();
+        assert!(!runtime.scheduler_alive_at(now), "never started");
+
+        runtime.scheduler_tick();
+        assert!(runtime.scheduler_alive_at(now));
+        assert!(runtime.scheduler_alive_at(now + SCHEDULER_STALL_AFTER_SECS));
+        assert!(
+            !runtime.scheduler_alive_at(now + SCHEDULER_STALL_AFTER_SECS + 2),
+            "no pass for longer than the stall limit"
+        );
+
+        runtime.scheduler_stopped();
+        assert!(!runtime.scheduler_alive_at(now));
     }
 }

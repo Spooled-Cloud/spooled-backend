@@ -58,6 +58,7 @@ Configure via environment variables:
 |----------|---------|-------------|
 | `RATE_LIMIT_REQUESTS_PER_SECOND` | `100` | Global requests per second per client |
 | `RATE_LIMIT_BURST_SIZE` | `200` | Burst capacity for sudden traffic |
+| `RATE_LIMIT_FAIL_CLOSED` | `false` | `true` rejects requests (and gRPC calls) while Redis cannot answer, instead of letting them through. Set it on a hosted service |
 
 ### Per-Client Rate Limiting
 
@@ -91,7 +92,8 @@ unauthenticated traffic shares one bucket. Set one of the two variables.
 
 | Limit | Value | Description |
 |-------|-------|-------------|
-| `MAX_CONTENT_LENGTH` | `5 MB` | Maximum request body size |
+| Request body | `2 MiB` | Default body limit of every route (axum) |
+| `POST /api/v1/jobs/bulk` body | up to `32 MiB` | 100 jobs x the largest plan payload cap (+ 4 KiB each), clamped between 2 and 32 MiB; split bigger batches |
 | `MAX_PAYLOAD_SIZE` | `1 MB` | Maximum job payload size |
 | `MAX_WEBHOOK_PAYLOAD_SIZE` | `5 MB` | Maximum webhook payload |
 
@@ -117,7 +119,7 @@ Monitor these metrics for backpressure:
 |--------|---------|----------|--------|
 | `spooled_job_max_age_seconds` | > 300s | > 900s | Add workers or scale |
 | `spooled_jobs_pending` | Growing | > 10,000 | Check worker capacity |
-| `spooled_database_connections_active` | > 80 | > 95 | Increase pool size |
+| `spooled_database_connections_active / spooled_database_connections_max` | > 80% | > 95% | Increase pool size |
 
 ---
 
@@ -241,6 +243,17 @@ VACUUM FULL jobs;
 | `spooled_workers_healthy` | Healthy workers | == 0 critical |
 | `spooled_jobs_deadlettered_total` | DLQ rate | > 5 in 15 min |
 | `spooled_api_request_duration_seconds` | API latency | p99 > 1s |
+| `spooled_database_connections_active` / `spooled_database_connections_max` | Pool usage | > 80% warning, > 95% critical |
+
+`spooled_api_requests_total{method,route,status}` and `spooled_api_request_duration_seconds{method,route}` use the matched route template (`unmatched` for 404s) and a status class (`2xx`, `4xx`, ...). There is no Redis metric.
+
+### Health, Supervision and Shutdown
+
+- `GET /health` answers `503` (same JSON body) while the database is down, so `curl -f` healthchecks fail. A Redis outage, a stopped gRPC server or a stalled scheduler keep `200` and show as `"cache": false`, `"grpc": false` or `"scheduler": false` with `"status": "degraded"`. `/health/live` and `/health/ready` are unchanged.
+- The process exits non-zero (so `restart: unless-stopped` or the orchestrator restarts it) when the gRPC port is busy or the gRPC TLS certificate or key is bad, and when the gRPC server, the scheduler or the metrics server stops. A `METRICS_PORT` that cannot be bound therefore causes a restart loop.
+- On SIGTERM the gRPC health status turns `NOT_SERVING`, in-flight gRPC calls get up to 10 s while HTTP drains, and the whole shutdown is bounded by 30 s before jobs held by the instance are released and the database pool is closed. Give the container at least 40 s: `docker-compose.prod.yml` sets `stop_grace_period: 40s`; the Kubernetes base manifest sets `terminationGracePeriodSeconds: 40` (raise both together if you lengthen the shutdown).
+- gRPC health (`grpc.health.v1`, whole server and each service) follows database reachability, checked every 10 s. Redis state is deliberately not part of it.
+- Every Redis call is capped at 500 ms, so a stalled Redis degrades features (rate limiting, session revocation, API-key cache) instead of stalling requests. See the [Redis runbook](./runbooks/redis-unavailable.md).
 
 ### Prometheus Scrape Config
 
@@ -250,9 +263,11 @@ VACUUM FULL jobs;
     - targets: ['spooled-backend:9090']
   metrics_path: '/metrics'
   scrape_interval: 10s
-  # Optional: add auth token
-  # bearer_token: 'your-metrics-token'
+  # Needed when the backend has METRICS_TOKEN set
+  # authorization: { type: Bearer, credentials: 'your-metrics-token' }
 ```
+
+The bundled Prometheus in `docker-compose.prod.yml` does this itself: it reads `METRICS_TOKEN`, sends it as a bearer credential, and loads the alert rules from `docker/prometheus/spooled-rules.yml` (mounted from the checkout; a single downloaded compose file has no rules directory and therefore loads no rules).
 
 ### Grafana Dashboard
 
@@ -284,11 +299,10 @@ These alerts require immediate attention:
 | Alert | Condition | Action |
 |-------|-----------|--------|
 | `NoHealthyWorkers` | No workers reporting healthy | Check worker processes, network, deployments |
-| `DatabaseConnectionsCritical` | > 95 connections in use | Scale pool, investigate connection leaks |
+| `DatabaseConnectionsCritical` | > 95% of the pool in use | Scale pool, investigate connection leaks |
 | `CriticalJobFailureRate` | > 25% job failure rate | Check job handlers, payloads, downstream services |
 | `JobQueueBacklogCritical` | Oldest job > 15 min | Scale workers, check processing bottlenecks |
 | `CriticalAPILatency` | p99 > 5 seconds | Check database, reduce load, scale |
-| `RedisUnavailable` | No Redis ops for 2 min | Check Redis connectivity (workers fallback to polling) |
 | `AllWorkersDegraded` | Workers active but unhealthy | Check network, heartbeat issues |
 
 #### Warning Alerts (Non-Urgent)
@@ -388,16 +402,26 @@ custom webhooks must include the `X-Webhook-Token` header with the correct value
 | `PORT` | `8080` | REST API port |
 | `GRPC_PORT` | `50051` | gRPC API port (HTTP/2 + Protobuf) |
 | `METRICS_PORT` | `9090` | Prometheus metrics port |
-| `RUST_ENV` | `development` | Environment (development/staging/production) |
+| `RUST_ENV` | `production` | Environment (development/staging/production); unset or unknown means production |
+| `EXTERNAL_URL` | Unset | Public base URL of the API |
+| `CORS_ALLOWED_ORIGINS` | spooled.cloud origins | Comma-separated allowed origins; blank keeps the default list, so self-hosters on their own domain must set it for the dashboard |
+| `ENABLE_HSTS` | `false` | Send `Strict-Transport-Security` (only behind HTTPS) |
+| `METRICS_TOKEN` | Unset | Bearer token required on `/metrics` (and sent by the bundled Prometheus) |
+
+`docker-compose.prod.yml` forwards the settings in this table as `${NAME:-default}`. A blank value counts as unset for numeric, flag and optional-string settings, so forwarding an empty variable changes nothing.
 
 ### Database
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DATABASE_URL` | Required | PostgreSQL URL (via PgBouncer) |
-| `DATABASE_DIRECT_URL` | Optional | Direct PostgreSQL URL (for migrations) |
+| `DATABASE_DIRECT_URL` | Optional | Direct PostgreSQL URL, bypassing PgBouncer. When set, migrations run over it (one connection) instead of `DATABASE_URL`; blank = unset |
 | `DATABASE_MAX_CONNECTIONS` | `25` | Connection pool max |
 | `DATABASE_MIN_CONNECTIONS` | `5` | Connection pool min |
+| `DATABASE_ACQUIRE_TIMEOUT_SECS` | `30` | How long a request waits for a pooled connection |
+| `DATABASE_TEST_BEFORE_ACQUIRE` | `false` | Validate each connection on checkout (adds about 5 ms) |
+
+Postgres connections use TLS when the URL asks for it (`sslmode=require` / `verify-*`), and Redis when the URL is `rediss://` (rustls with the ring provider and the bundled public web roots; a private CA may need a different root setup). Plain `postgres://` and `redis://` URLs behave as before.
 
 ### Redis
 
@@ -411,7 +435,8 @@ custom webhooks must include the `X-Webhook-Token` header with the correct value
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `WORKER_HEARTBEAT_INTERVAL_SECS` | `10` | Heartbeat frequency |
-| `WORKER_LEASE_DURATION_SECS` | `30` | Job lock timeout |
+| `WORKER_LEASE_DURATION_SECS` | `30` | Default job lease for a REST claim or heartbeat that sets none |
+| `GRPC_DEFAULT_LEASE_DURATION_SECS` | `300` | Lease for gRPC `Dequeue` / `StreamJobs` / `ProcessJobs` / `RenewLease` when the request sets none (`0` or blank = 300; at most 3600 s; at or below `WORKER_HEARTBEAT_INTERVAL_SECS` the server refuses to start). Returned by gRPC `Register`. Kept at 300 by default because the Go SDK's `StreamJobs` cannot send a lease |
 | `WORKER_MAX_CONCURRENCY` | `5` | Max jobs per worker |
 | `WORKER_FALLBACK_POLL_INTERVAL_SECS` | `5` | Poll interval when Redis unavailable |
 
@@ -449,6 +474,13 @@ entry is not trusted.
 | `GRPC_MAX_MESSAGE_SIZE` | `4194304` | Max message size (4MB) |
 | `GRPC_HEALTH_ENABLED` | `true` | Enable gRPC health service |
 | `GRPC_REFLECTION_ENABLED` | `true` | Enable gRPC reflection (disable in prod if needed) |
+
+### Email
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `EMAIL_PROVIDER` | `console` | `resend`, `sendgrid`, `postmark` or `smtp`. **Required when `RUST_ENV=production`**: the backend refuses to start with `console` (login codes would only be logged), and an unset or misspelled value resolves to `console` |
+| `EMAIL_API_KEY` | Unset | API key of the provider (SMTP uses `SMTP_*`) |
 
 ### Tracing
 

@@ -241,10 +241,20 @@ message ErrorResponse {
 message RegisterWorkerRequest {
     string queue_name = 1;
     string hostname = 2;
+    // At most 50 characters.
     string worker_type = 3;
+    // 1-100; larger values are lowered to 100. 0 means the default (5).
     int32 max_concurrency = 4;
+    // At most 50 characters.
     string version = 5;
+    // At most 64 KB as JSON.
     map<string, string> metadata = 6;
+    // Stable worker id (optional). Send the same id after a restart and the
+    // server updates that worker instead of adding one, so a restarting worker
+    // does not count twice against the plan's worker limit. Omitted or empty:
+    // the server assigns a new id. 1-128 characters: letters, digits, `-`,
+    // `_`, `.`. An id another organization already uses returns ALREADY_EXISTS.
+    optional string worker_id = 7;
 }
 
 // Worker Registration Response
@@ -258,7 +268,12 @@ message RegisterWorkerResponse {
 message HeartbeatRequest {
     string worker_id = 1;
     int32 current_jobs = 2;
+    // healthy, degraded, draining or offline. Empty keeps the current status,
+    // except that a worker marked offline comes back as healthy. Draining
+    // stays until the worker registers again.
     string status = 3;
+    // Replaces the stored metadata (at most 64 KB as JSON). Empty keeps what
+    // is stored.
     map<string, string> metadata = 4;
 }
 

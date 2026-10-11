@@ -143,9 +143,10 @@ pub async fn register(
     // Re-registering an id this org already owns adds no worker, so it must not
     // be charged against the cap — otherwise a worker at the limit could not
     // restart. Counted inside the advisory lock so the answer cannot change
-    // between here and the upsert.
+    // between here and the upsert, and by the same rule as the cap's count
+    // (which includes live draining workers).
     let already_registered: Option<(i64,)> = sqlx::query_as(
-        "SELECT COUNT(*) FROM workers WHERE id = $1 AND organization_id = $2 AND status IN ('healthy', 'degraded')",
+        "SELECT COUNT(*) FROM workers WHERE id = $1 AND organization_id = $2 AND worker_counts_toward_cap(status, last_heartbeat)",
     )
     .bind(&worker_id)
     .bind(&ctx.organization_id)

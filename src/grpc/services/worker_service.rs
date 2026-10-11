@@ -5,6 +5,7 @@
 // tonic::Status is a standard gRPC error type, size is acceptable
 #![allow(clippy::result_large_err)]
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -12,29 +13,36 @@ use sqlx::PgPool;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
+use crate::api::middleware::limits::{check_resource_limit_conn, lock_resource};
 use crate::cache::RedisCache;
 use crate::config::PlanLimits;
-use crate::grpc::auth::authenticate_request;
+use crate::grpc::auth::authenticate_request_with_cache;
 use crate::grpc::proto::{
     worker_service_server::WorkerService, DeregisterRequest, DeregisterResponse, HeartbeatRequest,
     HeartbeatResponse, RegisterWorkerRequest, RegisterWorkerResponse,
 };
 use crate::observability::Metrics;
 
-/// Maximum concurrent jobs a worker can handle
-const MAX_CONCURRENT_JOBS: i32 = 1000;
+/// Maximum concurrent jobs a worker can declare (REST's upper bound).
+///
+/// Larger values are clamped rather than rejected: gRPC used to accept up to
+/// 1000, and failing Register would take down fleets that send such values.
+const MAX_CONCURRENT_JOBS: i32 = 100;
 
 /// Minimum concurrent jobs
 const MIN_CONCURRENT_JOBS: i32 = 1;
 
+/// Concurrency used when the request leaves `max_concurrency` at 0 (REST default)
+const DEFAULT_CONCURRENT_JOBS: i32 = 5;
+
+/// Highest `current_jobs` a heartbeat can report (REST's upper bound)
+const MAX_CURRENT_JOBS: i32 = 1000;
+
 /// Maximum hostname length
 const MAX_HOSTNAME_LENGTH: usize = 255;
 
-/// Default lease duration for workers (seconds)
-const DEFAULT_LEASE_DURATION_SECS: i32 = 300;
-
-/// Default heartbeat interval (seconds)
-const DEFAULT_HEARTBEAT_INTERVAL_SECS: i32 = 10;
+/// Maximum `worker_type` and `version` length, in characters (as REST)
+const MAX_WORKER_TEXT_LENGTH: usize = 50;
 
 /// Valid worker statuses
 const VALID_WORKER_STATUSES: &[&str] = &["healthy", "degraded", "draining", "offline"];
@@ -46,6 +54,11 @@ pub struct WorkerServiceImpl {
     metrics: Arc<Metrics>,
     cache: Option<RedisCache>,
     outgoing_webhooks: Arc<crate::outgoing_webhooks::service::OutgoingWebhookService>,
+    /// Mirror REST `RATE_LIMIT_FAIL_CLOSED`.
+    rate_limit_fail_closed: bool,
+    /// `Register` reports `GRPC_DEFAULT_LEASE_DURATION_SECS` (the lease an
+    /// omitted gRPC lease gets) and `WORKER_HEARTBEAT_INTERVAL_SECS`.
+    worker_settings: crate::config::WorkerSettings,
 }
 
 impl WorkerServiceImpl {
@@ -54,15 +67,21 @@ impl WorkerServiceImpl {
         metrics: Arc<Metrics>,
         cache: Option<RedisCache>,
         outgoing_webhooks: Arc<crate::outgoing_webhooks::service::OutgoingWebhookService>,
+        rate_limit_fail_closed: bool,
+        worker_settings: crate::config::WorkerSettings,
     ) -> Self {
         Self {
             pool,
             metrics,
             cache,
             outgoing_webhooks,
+            rate_limit_fail_closed,
+            worker_settings,
         }
     }
 
+    /// Same policy as QueueService: a Redis error allows the call unless
+    /// `RATE_LIMIT_FAIL_CLOSED` is set, and fail-closed without Redis denies.
     async fn enforce_rate_limits(
         &self,
         org_id: &str,
@@ -70,6 +89,12 @@ impl WorkerServiceImpl {
         api_key_per_minute: Option<i32>,
     ) -> Result<(), Status> {
         let Some(ref cache) = self.cache else {
+            if self.rate_limit_fail_closed {
+                return Err(Status::resource_exhausted(
+                    "Rate limit unavailable (Redis not configured)",
+                ));
+            }
+            // Redis optional for self-host; can't enforce distributed rate limits.
             return Ok(());
         };
 
@@ -111,37 +136,38 @@ impl WorkerServiceImpl {
         };
 
         let bucket_key = format!("rate_limit:grpc:org:{}", org_id);
-        let result = cache
+        match cache
             .check_token_bucket(&bucket_key, org_limits.rps, org_limits.burst)
             .await
-            .map_err(|e| {
-                tracing::error!(
-                    error = %e,
-                    org_id = %org_id,
-                    "Redis error during gRPC org rate limit"
-                );
-                Status::internal("Rate limiting unavailable")
-            })?;
-        if !result.allowed {
-            return Err(Status::resource_exhausted("Rate limit exceeded"));
+        {
+            Ok(result) if !result.allowed => {
+                return Err(Status::resource_exhausted("Rate limit exceeded"));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                if self.rate_limit_fail_closed {
+                    warn!(error = %e, org_id = %org_id, "Redis error during gRPC org rate limit — denying (fail-closed)");
+                    return Err(Status::resource_exhausted("Rate limit unavailable"));
+                }
+                warn!(error = %e, org_id = %org_id, "Redis error during gRPC org rate limit — allowing (fail-open)");
+            }
         }
 
         if let Some(per_min) = api_key_per_minute {
             let per_min = per_min.max(1) as u32;
             let key = format!("rate_limit:grpc:api_key:{}", api_key_id);
-            let rl = cache
-                .check_rate_limit(&key, per_min, 60)
-                .await
-                .map_err(|e| {
-                    tracing::error!(
-                        error = %e,
-                        api_key_id = %api_key_id,
-                        "Redis error during gRPC api-key rate limit"
-                    );
-                    Status::internal("Rate limiting unavailable")
-                })?;
-            if !rl.allowed {
-                return Err(Status::resource_exhausted("Rate limit exceeded"));
+            match cache.check_rate_limit(&key, per_min, 60).await {
+                Ok(rl) if !rl.allowed => {
+                    return Err(Status::resource_exhausted("Rate limit exceeded"));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    if self.rate_limit_fail_closed {
+                        warn!(error = %e, api_key_id = %api_key_id, "Redis error during gRPC api-key rate limit — denying (fail-closed)");
+                        return Err(Status::resource_exhausted("Rate limit unavailable"));
+                    }
+                    warn!(error = %e, api_key_id = %api_key_id, "Redis error during gRPC api-key rate limit — allowing (fail-open)");
+                }
             }
         }
 
@@ -187,23 +213,105 @@ impl WorkerServiceImpl {
         Ok(())
     }
 
-    /// Validate worker status
-    fn validate_status(status: &str) -> &str {
-        if VALID_WORKER_STATUSES.contains(&status) {
-            status
-        } else {
-            warn!(status = %status, "Invalid worker status, defaulting to healthy");
-            "healthy"
+    /// `worker_type` / `version` are capped like REST (50 characters).
+    fn validate_worker_text(field: &str, value: &str) -> Result<(), Status> {
+        if value.chars().count() > MAX_WORKER_TEXT_LENGTH {
+            return Err(Status::invalid_argument(format!(
+                "{} must be at most {} characters",
+                field, MAX_WORKER_TEXT_LENGTH
+            )));
+        }
+        Ok(())
+    }
+
+    /// The caller's stable worker id, or `None` to mint one. Empty counts as
+    /// omitted; anything else follows the REST rules (1-128 safe characters).
+    fn requested_worker_id(worker_id: Option<&str>) -> Result<Option<String>, Status> {
+        match worker_id {
+            None | Some("") => Ok(None),
+            Some(id) => {
+                if id.chars().count() > 128 {
+                    return Err(Status::invalid_argument(
+                        "Worker ID must be 1-128 characters",
+                    ));
+                }
+                crate::models::validate_worker_id(id).map_err(|e| {
+                    Status::invalid_argument(
+                        e.message
+                            .map(|m| m.to_string())
+                            .unwrap_or_else(|| "Invalid worker ID".to_string()),
+                    )
+                })?;
+                Ok(Some(id.to_string()))
+            }
         }
     }
 
-    /// Preserve an admin/server drain request while accepting normal worker heartbeats.
-    #[cfg(test)]
-    fn resolve_heartbeat_status<'a>(current_status: &'a str, requested_status: &'a str) -> &'a str {
-        if current_status == "draining" || requested_status == "draining" {
-            "draining"
+    /// Clamp `max_concurrency` into REST's range; 0 (unset in proto3) means
+    /// the REST default.
+    fn resolve_max_concurrency(requested: i32) -> i32 {
+        if requested == 0 {
+            return DEFAULT_CONCURRENT_JOBS;
+        }
+        let clamped = requested.clamp(MIN_CONCURRENT_JOBS, MAX_CONCURRENT_JOBS);
+        if clamped != requested {
+            warn!(
+                requested,
+                adjusted = clamped,
+                "Adjusted max_concurrency to safe range"
+            );
+        }
+        clamped
+    }
+
+    /// Worker metadata as JSON, `None` for an empty map (proto3 cannot tell an
+    /// empty map from an omitted one). Capped at 64 KB like REST.
+    fn metadata_json(
+        metadata: &HashMap<String, String>,
+    ) -> Result<Option<serde_json::Value>, Status> {
+        if metadata.is_empty() {
+            return Ok(None);
+        }
+        let json: serde_json::Value = metadata
+            .iter()
+            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+            .collect();
+        crate::models::validate_metadata_size(&json).map_err(|e| {
+            Status::invalid_argument(
+                e.message
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| "Metadata too large".to_string()),
+            )
+        })?;
+        Ok(Some(json))
+    }
+
+    /// The status a heartbeat asks for. `None` (empty in the request) keeps the
+    /// stored one; an unknown value falls back to healthy as before.
+    fn requested_heartbeat_status(status: &str) -> Option<&str> {
+        if status.is_empty() {
+            None
+        } else if VALID_WORKER_STATUSES.contains(&status) {
+            Some(status)
         } else {
-            requested_status
+            warn!(status = %status, "Invalid worker status, defaulting to healthy");
+            Some("healthy")
+        }
+    }
+
+    /// Mirrors the heartbeat UPDATE's CASE: a drain request is sticky, and a
+    /// heartbeat without a status keeps the stored one, except that a worker
+    /// marked offline is alive again and comes back as healthy.
+    #[cfg(test)]
+    fn resolve_heartbeat_status<'a>(
+        current_status: &'a str,
+        requested_status: Option<&'a str>,
+    ) -> &'a str {
+        match requested_status {
+            _ if current_status == "draining" => "draining",
+            Some(requested) => requested,
+            None if current_status == "offline" => "healthy",
+            None => current_status,
         }
     }
 
@@ -219,16 +327,38 @@ impl WorkerServiceImpl {
             queue_names
         }
     }
+
+    /// Turn the REST limit check's rejection into a gRPC status, keeping its
+    /// message (`check_resource_limit_conn` answers with an HTTP response).
+    async fn limit_rejection_status(response: axum::response::Response) -> Status {
+        let code = response.status();
+        let message = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .ok()
+            .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
+            .and_then(|body| body.get("message")?.as_str().map(str::to_string));
+        match code {
+            axum::http::StatusCode::TOO_MANY_REQUESTS => Status::resource_exhausted(
+                message.unwrap_or_else(|| "Worker limit reached".to_string()),
+            ),
+            axum::http::StatusCode::FORBIDDEN => Status::permission_denied(
+                message.unwrap_or_else(|| "Workers are not available on this plan".to_string()),
+            ),
+            _ => Status::internal("Registration failed"),
+        }
+    }
 }
 
 #[tonic::async_trait]
 impl WorkerService for WorkerServiceImpl {
-    /// Register a new worker
+    /// Register a worker, or re-register one under its stable id
     async fn register(
         &self,
         request: Request<RegisterWorkerRequest>,
     ) -> Result<Response<RegisterWorkerResponse>, Status> {
-        let auth = authenticate_request(self.pool.as_ref(), &request).await?;
+        let auth =
+            authenticate_request_with_cache(self.pool.as_ref(), self.cache.as_ref(), &request)
+                .await?;
         self.enforce_rate_limits(&auth.organization_id, &auth.api_key_id, auth.rate_limit)
             .await?;
         let req = request.into_inner();
@@ -244,77 +374,71 @@ impl WorkerService for WorkerServiceImpl {
             )));
         }
 
-        // Validate hostname
+        // Same input limits as REST, so bad input is INVALID_ARGUMENT here
+        // rather than a DB error surfacing as INTERNAL.
         Self::validate_hostname(&req.hostname)?;
+        Self::validate_worker_text("Worker type", &req.worker_type)?;
+        Self::validate_worker_text("Version", &req.version)?;
+        let requested_worker_id = Self::requested_worker_id(req.worker_id.as_deref())?;
+        let metadata_json =
+            Self::metadata_json(&req.metadata)?.unwrap_or_else(|| serde_json::json!({}));
+        let max_concurrent = Self::resolve_max_concurrency(req.max_concurrency);
 
-        // Validate max_concurrency
-        let safe_max_concurrent = req
-            .max_concurrency
-            .clamp(MIN_CONCURRENT_JOBS, MAX_CONCURRENT_JOBS);
-        if req.max_concurrency != safe_max_concurrent && req.max_concurrency != 0 {
-            warn!(
-                requested = req.max_concurrency,
-                adjusted = safe_max_concurrent,
-                "Adjusted max_concurrency to safe range"
-            );
-        }
-        let max_concurrent = if req.max_concurrency == 0 {
-            5 // Default
-        } else {
-            safe_max_concurrent
-        };
+        // A caller-supplied id makes this an upsert of one row, as on REST, so
+        // a restarting worker takes its row back instead of adding one that
+        // holds a slot of the plan's worker cap until the reaper runs.
+        let worker_id = requested_worker_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let now = Utc::now();
 
-        // Enforce plan-based worker limits (supports env overrides + org custom_limits).
-        let (plan_tier, custom_limits): (String, Option<serde_json::Value>) =
-            sqlx::query_as("SELECT plan_tier, custom_limits FROM organizations WHERE id = $1")
-                .bind(&auth.organization_id)
-                .fetch_one(self.pool.as_ref())
-                .await
-                .map_err(|e| {
-                    tracing::error!(error = %e, "Failed to fetch org plan limits");
-                    Status::internal("Registration failed")
-                })?;
+        // Check the cap and insert in one transaction under the advisory lock
+        // REST takes, so concurrent registrations cannot overshoot it.
+        let mut tx = self.pool.begin().await.map_err(|e| {
+            tracing::error!(error = %e, "Failed to start worker registration");
+            Status::internal("Registration failed")
+        })?;
+        lock_resource(&mut tx, &auth.organization_id, "workers")
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "Failed to lock worker limit");
+                Status::internal("Registration failed")
+            })?;
 
-        let limits = PlanLimits::for_tier_with_overrides(&plan_tier, custom_limits.as_ref());
+        // An id this org already holds a slot for adds no worker, so it is not
+        // charged against the cap; otherwise a worker at the limit could not
+        // restart. Uses the same rule as the count itself.
+        let (already_registered,): (bool,) = sqlx::query_as(
+            "SELECT EXISTS (SELECT 1 FROM workers WHERE id = $1 AND organization_id = $2 \
+             AND worker_counts_toward_cap(status, last_heartbeat))",
+        )
+        .bind(&worker_id)
+        .bind(&auth.organization_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to look up worker registration");
+            Status::internal("Registration failed")
+        })?;
+        let adding = if already_registered { 0 } else { 1 };
 
-        // Read current worker count using the same source as HTTP limit checks.
-        let counts: (i64, i64, i64, i64, i64, i64, i64, i64) =
-            sqlx::query_as("SELECT * FROM get_org_resource_counts($1)")
-                .bind(&auth.organization_id)
-                .fetch_one(self.pool.as_ref())
-                .await
-                .map_err(|e| {
-                    tracing::error!(error = %e, "Failed to fetch org resource counts");
-                    Status::internal("Registration failed")
-                })?;
-
-        let current_workers = counts.2.max(0) as u64;
-        if let Err(err) = limits.check_limit("workers", current_workers, 1) {
+        if let Err(response) =
+            check_resource_limit_conn(&mut tx, &auth.organization_id, "workers", adding).await
+        {
+            let status = Self::limit_rejection_status(response).await;
             warn!(
                 org_id = %auth.organization_id,
-                current = current_workers,
-                limit = err.limit,
-                "Organization exceeded worker limit"
+                code = ?status.code(),
+                message = %status.message(),
+                "Worker registration rejected by plan limit"
             );
-            return Err(Status::resource_exhausted(err.to_string()));
+            return Err(status);
         }
-
-        let now = Utc::now();
-        let worker_id = uuid::Uuid::new_v4().to_string();
-
-        // Convert metadata to JSON
-        let metadata_json: serde_json::Value = req
-            .metadata
-            .iter()
-            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-            .collect();
 
         // Insert or update worker
         let result = sqlx::query(
             r#"
             INSERT INTO workers (
                 id, organization_id, queue_name, queue_names, max_concurrent_jobs,
-                hostname, worker_type, version, metadata, status, 
+                hostname, worker_type, version, metadata, status,
                 last_heartbeat, current_job_count, created_at, updated_at
             )
             VALUES ($1, $2, $3, ARRAY[$3], $4, $5, $6, $7, $8::JSONB, 'healthy', $9, 0, $9, $9)
@@ -329,6 +453,7 @@ impl WorkerService for WorkerServiceImpl {
                 status = 'healthy',
                 last_heartbeat = EXCLUDED.last_heartbeat,
                 updated_at = EXCLUDED.updated_at
+            -- Guards a caller-supplied id from taking over another org's worker.
             WHERE workers.organization_id = EXCLUDED.organization_id
             RETURNING id
             "#,
@@ -350,7 +475,7 @@ impl WorkerService for WorkerServiceImpl {
         })
         .bind(&metadata_json)
         .bind(now)
-        .fetch_optional(self.pool.as_ref())
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "Failed to register worker");
@@ -367,14 +492,23 @@ impl WorkerService for WorkerServiceImpl {
             ));
         }
 
-        self.metrics.workers_active.inc();
-        self.metrics.workers_healthy.inc();
+        tx.commit().await.map_err(|e| {
+            tracing::error!(error = %e, "Failed to commit worker registration");
+            Status::internal("Failed to register worker")
+        })?;
+
+        // Only a new worker moves the gauges; a re-registration already counted.
+        if adding > 0 {
+            self.metrics.workers_active.inc();
+            self.metrics.workers_healthy.inc();
+        }
 
         info!(
             worker_id = %worker_id,
             queue = %req.queue_name,
             hostname = %req.hostname,
             org_id = %auth.organization_id,
+            reregistered = adding == 0,
             "Worker registered via gRPC"
         );
 
@@ -391,8 +525,13 @@ impl WorkerService for WorkerServiceImpl {
 
         Ok(Response::new(RegisterWorkerResponse {
             worker_id,
-            lease_duration_secs: DEFAULT_LEASE_DURATION_SECS,
-            heartbeat_interval_secs: DEFAULT_HEARTBEAT_INTERVAL_SECS,
+            // The lease this worker's claims get when they send none.
+            lease_duration_secs: i32::try_from(
+                self.worker_settings.grpc_default_lease_duration_secs,
+            )
+            .unwrap_or(i32::MAX),
+            heartbeat_interval_secs: i32::try_from(self.worker_settings.heartbeat_interval_secs)
+                .unwrap_or(i32::MAX),
         }))
     }
 
@@ -401,7 +540,9 @@ impl WorkerService for WorkerServiceImpl {
         &self,
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
-        let auth = authenticate_request(self.pool.as_ref(), &request).await?;
+        let auth =
+            authenticate_request_with_cache(self.pool.as_ref(), self.cache.as_ref(), &request)
+                .await?;
         self.enforce_rate_limits(&auth.organization_id, &auth.api_key_id, auth.rate_limit)
             .await?;
         let req = request.into_inner();
@@ -410,7 +551,9 @@ impl WorkerService for WorkerServiceImpl {
             return Err(Status::invalid_argument("Worker ID is required"));
         }
 
-        let safe_status = Self::validate_status(&req.status);
+        let requested_status = Self::requested_heartbeat_status(&req.status);
+        // Empty metadata binds NULL so the stored metadata is kept.
+        let metadata_json = Self::metadata_json(&req.metadata)?;
 
         let worker_queues: Option<(String, Vec<String>)> = sqlx::query_as(
             "SELECT queue_name, queue_names FROM workers WHERE id = $1 AND organization_id = $2",
@@ -449,21 +592,16 @@ impl WorkerService for WorkerServiceImpl {
             }));
         }
 
-        // Convert metadata to JSON
-        let metadata_json: serde_json::Value = req
-            .metadata
-            .iter()
-            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-            .collect();
-
         let result = sqlx::query_as::<_, (String,)>(
             r#"
             UPDATE workers
-            SET 
+            SET
                 last_heartbeat = NOW(),
                 status = CASE
                     WHEN status = 'draining' OR $1 = 'draining' THEN 'draining'
-                    ELSE $1
+                    WHEN $1 IS NOT NULL THEN $1
+                    WHEN status = 'offline' THEN 'healthy'
+                    ELSE status
                 END,
                 current_job_count = $2,
                 metadata = COALESCE($3::JSONB, metadata),
@@ -472,8 +610,8 @@ impl WorkerService for WorkerServiceImpl {
             RETURNING status
             "#,
         )
-        .bind(safe_status)
-        .bind(req.current_jobs)
+        .bind(requested_status)
+        .bind(req.current_jobs.clamp(0, MAX_CURRENT_JOBS))
         .bind(&metadata_json)
         .bind(&req.worker_id)
         .bind(&auth.organization_id)
@@ -510,7 +648,9 @@ impl WorkerService for WorkerServiceImpl {
         &self,
         request: Request<DeregisterRequest>,
     ) -> Result<Response<DeregisterResponse>, Status> {
-        let auth = authenticate_request(self.pool.as_ref(), &request).await?;
+        let auth =
+            authenticate_request_with_cache(self.pool.as_ref(), self.cache.as_ref(), &request)
+                .await?;
         self.enforce_rate_limits(&auth.organization_id, &auth.api_key_id, auth.rate_limit)
             .await?;
         let req = request.into_inner();
@@ -554,8 +694,8 @@ impl WorkerService for WorkerServiceImpl {
         // This prevents jobs from being stuck in 'processing' state
         let released = sqlx::query(
             r#"
-            UPDATE jobs 
-            SET 
+            UPDATE jobs
+            SET
                 status = 'pending',
                 assigned_worker_id = NULL,
                 lease_id = NULL,
@@ -581,23 +721,41 @@ impl WorkerService for WorkerServiceImpl {
             );
         }
 
-        // Then mark worker as offline
-        let result = sqlx::query(
-            "UPDATE workers SET status = 'offline', updated_at = NOW() WHERE id = $1 AND organization_id = $2",
+        // Then mark worker as offline, reading the status it had under the row
+        // lock: a repeated (or concurrent) Deregister must not move the gauges
+        // again.
+        let previous_status: Option<(String,)> = sqlx::query_as(
+            r#"
+            WITH previous AS (
+                SELECT id, status FROM workers
+                WHERE id = $1 AND organization_id = $2
+                FOR UPDATE
+            )
+            UPDATE workers w
+            SET status = 'offline', updated_at = NOW()
+            FROM previous
+            WHERE w.id = previous.id AND w.organization_id = $2
+            RETURNING previous.status
+            "#,
         )
         .bind(&req.worker_id)
         .bind(&auth.organization_id)
-        .execute(self.pool.as_ref())
+        .fetch_optional(self.pool.as_ref())
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "Failed to deregister worker");
             Status::internal("Failed to deregister worker")
         })?;
 
-        let success = result.rows_affected() > 0;
+        let success = previous_status.is_some();
 
-        if success {
-            self.metrics.workers_active.dec();
+        if let Some((previous_status,)) = previous_status {
+            if previous_status != "offline" {
+                self.metrics.workers_active.dec();
+            }
+            if previous_status == "healthy" {
+                self.metrics.workers_healthy.dec();
+            }
             info!(
                 worker_id = %req.worker_id,
                 org_id = %auth.organization_id,
@@ -643,18 +801,38 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_status() {
-        assert_eq!(WorkerServiceImpl::validate_status("healthy"), "healthy");
-        assert_eq!(WorkerServiceImpl::validate_status("degraded"), "degraded");
-        assert_eq!(WorkerServiceImpl::validate_status("draining"), "draining");
-        assert_eq!(WorkerServiceImpl::validate_status("offline"), "offline");
-        assert_eq!(WorkerServiceImpl::validate_status("invalid"), "healthy");
+    fn test_requested_heartbeat_status() {
+        assert_eq!(
+            WorkerServiceImpl::requested_heartbeat_status("healthy"),
+            Some("healthy")
+        );
+        assert_eq!(
+            WorkerServiceImpl::requested_heartbeat_status("degraded"),
+            Some("degraded")
+        );
+        assert_eq!(
+            WorkerServiceImpl::requested_heartbeat_status("draining"),
+            Some("draining")
+        );
+        assert_eq!(
+            WorkerServiceImpl::requested_heartbeat_status("offline"),
+            Some("offline")
+        );
+        assert_eq!(
+            WorkerServiceImpl::requested_heartbeat_status("invalid"),
+            Some("healthy")
+        );
+        assert_eq!(WorkerServiceImpl::requested_heartbeat_status(""), None);
     }
 
     #[test]
     fn test_resolve_heartbeat_status_preserves_existing_draining() {
         assert_eq!(
-            WorkerServiceImpl::resolve_heartbeat_status("draining", "healthy"),
+            WorkerServiceImpl::resolve_heartbeat_status("draining", Some("healthy")),
+            "draining"
+        );
+        assert_eq!(
+            WorkerServiceImpl::resolve_heartbeat_status("draining", None),
             "draining"
         );
     }
@@ -662,7 +840,7 @@ mod tests {
     #[test]
     fn test_resolve_heartbeat_status_accepts_requested_draining() {
         assert_eq!(
-            WorkerServiceImpl::resolve_heartbeat_status("healthy", "draining"),
+            WorkerServiceImpl::resolve_heartbeat_status("healthy", Some("draining")),
             "draining"
         );
     }
@@ -670,12 +848,28 @@ mod tests {
     #[test]
     fn test_resolve_heartbeat_status_keeps_normal_statuses() {
         assert_eq!(
-            WorkerServiceImpl::resolve_heartbeat_status("healthy", "healthy"),
+            WorkerServiceImpl::resolve_heartbeat_status("healthy", Some("healthy")),
             "healthy"
         );
         assert_eq!(
-            WorkerServiceImpl::resolve_heartbeat_status("healthy", "degraded"),
+            WorkerServiceImpl::resolve_heartbeat_status("healthy", Some("degraded")),
             "degraded"
+        );
+    }
+
+    #[test]
+    fn test_resolve_heartbeat_status_without_status_keeps_the_stored_one() {
+        assert_eq!(
+            WorkerServiceImpl::resolve_heartbeat_status("degraded", None),
+            "degraded"
+        );
+        assert_eq!(
+            WorkerServiceImpl::resolve_heartbeat_status("healthy", None),
+            "healthy"
+        );
+        assert_eq!(
+            WorkerServiceImpl::resolve_heartbeat_status("offline", None),
+            "healthy"
         );
     }
 
@@ -688,5 +882,58 @@ mod tests {
         assert!(WorkerServiceImpl::should_drain_from_status(Some(
             "draining"
         )));
+    }
+
+    #[test]
+    fn test_requested_worker_id() {
+        assert_eq!(WorkerServiceImpl::requested_worker_id(None).unwrap(), None);
+        assert_eq!(
+            WorkerServiceImpl::requested_worker_id(Some("")).unwrap(),
+            None
+        );
+        assert_eq!(
+            WorkerServiceImpl::requested_worker_id(Some("pod-7.worker_a")).unwrap(),
+            Some("pod-7.worker_a".to_string())
+        );
+        let max = "w".repeat(128);
+        assert!(WorkerServiceImpl::requested_worker_id(Some(&max)).is_ok());
+
+        for bad in ["bad id", "a/b", "ü", &"w".repeat(129)] {
+            let err = WorkerServiceImpl::requested_worker_id(Some(bad)).unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{bad}");
+        }
+    }
+
+    #[test]
+    fn test_resolve_max_concurrency_clamps_to_rest_range() {
+        assert_eq!(WorkerServiceImpl::resolve_max_concurrency(0), 5);
+        assert_eq!(WorkerServiceImpl::resolve_max_concurrency(-3), 1);
+        assert_eq!(WorkerServiceImpl::resolve_max_concurrency(40), 40);
+        assert_eq!(WorkerServiceImpl::resolve_max_concurrency(100), 100);
+        assert_eq!(WorkerServiceImpl::resolve_max_concurrency(1000), 100);
+    }
+
+    #[test]
+    fn test_validate_worker_text() {
+        assert!(WorkerServiceImpl::validate_worker_text("Version", "").is_ok());
+        assert!(WorkerServiceImpl::validate_worker_text("Version", &"v".repeat(50)).is_ok());
+        let err = WorkerServiceImpl::validate_worker_text("Version", &"v".repeat(51)).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn test_metadata_json() {
+        assert_eq!(
+            WorkerServiceImpl::metadata_json(&HashMap::new()).unwrap(),
+            None
+        );
+        let small = HashMap::from([("region".to_string(), "eu".to_string())]);
+        assert_eq!(
+            WorkerServiceImpl::metadata_json(&small).unwrap(),
+            Some(serde_json::json!({"region": "eu"}))
+        );
+        let big = HashMap::from([("blob".to_string(), "x".repeat(64 * 1024))]);
+        let err = WorkerServiceImpl::metadata_json(&big).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 }

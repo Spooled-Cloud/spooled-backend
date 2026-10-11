@@ -19,5 +19,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Re-run build if proto file changes
     println!("cargo:rerun-if-changed=proto/spooled.proto");
 
+    // `sqlx::migrate!` embeds the migrations directory but does not track it, so a
+    // new .sql file alone would not trigger a rebuild of the embedding crate.
+    println!("cargo:rerun-if-changed=migrations");
+
     Ok(())
 }

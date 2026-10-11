@@ -135,6 +135,17 @@ cargo install sqlx-cli --no-default-features --features postgres
 sqlx migrate run
 ```
 
+The backend also applies pending migrations itself at startup, so `sqlx migrate run` only prepares a database ahead of time. When `DATABASE_DIRECT_URL` is set, the migrations run over that URL (one connection, bypassing PgBouncer, whose transaction mode does not keep the migrator's session-level lock reliable); otherwise over `DATABASE_URL`.
+
+**Rolling back.** Since 0.1.119 an older image boots against a database that a newer release already migrated: applied migrations it does not know are ignored, while the checksums of the migrations it does know are still checked. Images before 0.1.119 stop with `migration ... previously applied but is missing`. The older code still has to work on the newer schema, so keep schema changes backward compatible for one release.
+
+**Writing a migration** (new files in `migrations/`):
+
+1. Never edit a migration that has been applied anywhere: sqlx stores its checksum and the next start fails. Fix forward with a new file.
+2. Start the file with `SET LOCAL lock_timeout = '5s';` so it fails fast instead of queueing every other statement behind a long-running transaction. The migration runs in one transaction, so `LOCAL` applies to all of it.
+3. Add foreign keys `NOT VALID`, then run `ALTER TABLE ... VALIDATE CONSTRAINT ...` as a separate statement (ideally a later migration): validation then holds only a `SHARE UPDATE EXCLUSIVE` lock instead of blocking reads and writes of the table during the full scan. Same idea for big indexes: avoid holding `ACCESS EXCLUSIVE` while scanning.
+4. `build.rs` tracks the `migrations/` directory, so a new `.sql` file alone triggers a rebuild that embeds it.
+
 ### 4. Start the Server
 
 ```bash
@@ -149,7 +160,9 @@ cargo run
 
 ```bash
 curl http://localhost:8080/health
-# {"status":"healthy","database":true,"cache":true}
+# {"status":"healthy","database":true,"cache":true,"grpc":true,"scheduler":true}
+# HTTP 503 (same body) while the database is down; Redis down stays 200 with
+# "cache":false and "status":"degraded".
 
 # Public /health intentionally omits the version. Verify a rollout through the
 # authenticated GET /api/v1/dashboard response (system.version and uptime_seconds).
@@ -220,6 +233,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+      # /health is 503 while the database is down, so this marks the container unhealthy then.
 
   db:
     image: postgres:16-alpine
@@ -270,10 +284,12 @@ Summary:
 | Concern | What happens on `up` |
 |---------|----------------------|
 | gRPC origin TLS | `grpc-tls-init` writes/renews certs into volume `grpc_tls`, then stays **healthy** (not Exited 0). CI uses `GRPC_TLS_INIT_ONCE=1` for a one-shot exit. |
-| Prometheus | Service writes scrape config to `/tmp/prometheus.yml` then starts Prometheus. |
+| Prometheus | Service writes scrape config to `/tmp/prometheus.yml` (with `METRICS_TOKEN` as a bearer credential when it is set) then starts Prometheus. Alert rules come from `./docker/prometheus`, mounted read-only; run the stack from a checkout to get them. |
 | Grafana | Service writes Prometheus datasource provisioning under its data volume then starts Grafana. |
 
-No bind-mount of repo `deploy/` paths is required. A raw `curl` of the compose file + `.env` is enough. Full Git clones still get optional richer assets under `docker/prometheus` and `docker/grafana` for local/dev compose.
+No bind-mount of repo `deploy/` paths is required. A raw `curl` of the compose file + `.env` is enough; the stack then runs without Prometheus alert rules (the missing rules directory is not an error). Full Git clones also get the alert rules and Grafana assets under `docker/prometheus` and `docker/grafana`.
+
+Set `EMAIL_PROVIDER` (and `EMAIL_API_KEY`) in the stack environment: the backend refuses to start with the compose default `console` when `RUST_ENV=production`. The backend container has `stop_grace_period: 40s` so the 30 s shutdown drain is not cut by Docker's 10 s default.
 
 ---
 
@@ -510,8 +526,9 @@ spooled_workers_active        # Active workers
 spooled_workers_healthy       # Healthy workers
 
 # API
-spooled_api_requests_total    # Total API requests
-spooled_api_request_duration  # Request latency histogram
+spooled_api_requests_total    # Total API requests {method,route,status}
+spooled_api_request_duration_seconds  # Request latency histogram {method,route}
+spooled_database_connections_active   # Pool connections in use (with ..._max = pool size)
 ```
 
 ### Grafana Dashboard

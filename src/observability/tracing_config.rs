@@ -69,7 +69,7 @@ impl TracingConfig {
         let log_span_events = environment == "production";
 
         // OpenTelemetry endpoint from environment
-        let otlp_endpoint = env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
+        let otlp_endpoint = crate::config::non_empty_env("OTEL_EXPORTER_OTLP_ENDPOINT");
 
         Self {
             service_name: env::var("OTEL_SERVICE_NAME")
@@ -93,7 +93,7 @@ impl TracingConfig {
             log_level: Level::INFO,
             json_logs: true,
             log_span_events: true,
-            otlp_endpoint: env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok(),
+            otlp_endpoint: crate::config::non_empty_env("OTEL_EXPORTER_OTLP_ENDPOINT"),
         }
     }
 

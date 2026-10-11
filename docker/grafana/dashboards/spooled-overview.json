@@ -462,17 +462,17 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, rate(spooled_api_request_duration_seconds_bucket[5m]))",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(spooled_api_request_duration_seconds_bucket[5m])))",
           "legendFormat": "p50",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.95, rate(spooled_api_request_duration_seconds_bucket[5m]))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(spooled_api_request_duration_seconds_bucket[5m])))",
           "legendFormat": "p95",
           "refId": "B"
         },
         {
-          "expr": "histogram_quantile(0.99, rate(spooled_api_request_duration_seconds_bucket[5m]))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(spooled_api_request_duration_seconds_bucket[5m])))",
           "legendFormat": "p99",
           "refId": "C"
         }
@@ -581,8 +581,13 @@
       "targets": [
         {
           "expr": "spooled_database_connections_active",
-          "legendFormat": "Database Connections",
+          "legendFormat": "In use",
           "refId": "A"
+        },
+        {
+          "expr": "spooled_database_connections_max",
+          "legendFormat": "Pool max",
+          "refId": "B"
         }
       ],
       "title": "Database Connections",
@@ -596,7 +601,7 @@
           "custom": {
             "axisCenteredZero": false,
             "axisColorMode": "text",
-            "axisLabel": "Ops/sec",
+            "axisLabel": "Requests/sec",
             "axisPlacement": "auto",
             "barAlignment": 0,
             "drawStyle": "line",
@@ -626,12 +631,12 @@
       },
       "targets": [
         {
-          "expr": "rate(spooled_redis_operations_total[1m])",
-          "legendFormat": "Redis Operations/sec",
+          "expr": "sum by (status) (rate(spooled_api_requests_total[1m]))",
+          "legendFormat": "{{status}}",
           "refId": "A"
         }
       ],
-      "title": "Redis Operations",
+      "title": "API Requests by Status",
       "type": "timeseries"
     },
     {

@@ -1,8 +1,7 @@
 # Runbook: Redis Unavailable
 
 **Severity**: Warning (degraded) / Critical (if persistent)  
-**Alert**: `RedisUnavailable` (no operations for 2+ minutes)  
-**Related Alert**: `RedisOperationsLow` (significant drop in operations)
+**Detection**: `GET /health` returns `"cache": false` and `"status": "degraded"` (still HTTP 200). No Redis alert rule ships with the backend, because it exports no Redis metric; alert on the `/health` body or on a Redis exporter (`redis_up == 0`).
 
 ---
 
@@ -11,8 +10,8 @@
 - Workers logging `Redis connection failed, using fallback polling`
 - Real-time features (WebSocket, SSE) not working
 - Rate limiting using conservative fallback (10 req/min)
-- Alert firing: `RedisUnavailable` or `RedisOperationsLow`
-- Grafana shows Redis operations dropped to zero
+- `GET /health` reports `"cache": false` and `"status": "degraded"`
+- Calls that use Redis (rate limiting, logout and session revocation, the API-key cache) take their fail-open / fail-closed path (`RATE_LIMIT_FAIL_CLOSED`) after at most half a second each: every Redis call is capped at 500 ms
 
 ---
 
@@ -155,12 +154,15 @@ docker logs spooled-backend --tail 50 | grep -i redis
 # Should see: "Redis connection restored" or similar
 ```
 
-#### 7. Verify Metrics Flowing
+#### 7. Verify Health
 
 ```bash
-# Redis operations should resume
-curl -s http://localhost:9090/metrics | grep spooled_redis_operations
+# "cache" should be true again and "status" healthy
+curl -s http://localhost:8080/health
+# {"status":"healthy","database":true,"cache":true,"grpc":true,"scheduler":true}
 ```
+
+No backend restart is needed: the cache reconnects by itself, and a half-open connection (Redis host crashed or network path changed, so calls only time out) is replaced after three timeouts in a row. That includes a Redis that was down when the backend started, as long as `REDIS_URL` is set or `RATE_LIMIT_FAIL_CLOSED` is on (from 0.1.119; before, the backend ran without Redis until restarted). Without either, a Redis missing at startup counts as not configured and `/health` stays `healthy`. The `spooled_redis_operations_total` metric and its alerts were removed in 0.1.119 because nothing ever updated them.
 
 ---
 
@@ -197,7 +199,7 @@ curl -s http://localhost:9090/metrics | grep spooled_redis_operations
 ### Monitoring
 
 Add to your monitoring checklist:
-- [ ] Alert when Redis ping fails
+- [ ] Alert when `/health` reports `"cache": false` (watch the JSON body; the status code stays 200) or when a Redis exporter reports `redis_up == 0`
 - [ ] Alert when memory > 80%
 - [ ] Dashboard panel for Redis memory and connections
 - [ ] Track fallback polling activations

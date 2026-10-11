@@ -160,6 +160,17 @@ pub struct WorkerSettings {
     pub heartbeat_interval_secs: u64,
     /// Lease duration in seconds (job lock timeout)
     pub lease_duration_secs: u64,
+    /// Lease for a gRPC claim or renewal that sends none (proto3 0), and the
+    /// lease gRPC `Register` reports (`GRPC_DEFAULT_LEASE_DURATION_SECS`:
+    /// unset, blank or 0 is 300; above 3600 is lowered to 3600; at or below
+    /// `WORKER_HEARTBEAT_INTERVAL_SECS`, or below 5, fails startup).
+    ///
+    /// Separate from [`Self::lease_duration_secs`] on purpose: the Go SDK's
+    /// `StreamJobs` has no lease parameter and the Go/PHP `Dequeue` and
+    /// `RenewLease` send 0 unless set, so those workers have always run on a
+    /// 300 s lease. Following the 30 s REST default re-delivered their longer
+    /// jobs to a second worker while the first still ran them.
+    pub grpc_default_lease_duration_secs: u64,
     /// Maximum concurrent jobs per worker
     pub max_concurrency: u32,
     /// Fallback poll interval when Redis unavailable
@@ -315,41 +326,106 @@ pub fn non_empty_env(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// Parse an optional numeric setting, falling back to `default` when the
+/// variable is unset or blank (see [`non_empty_env`]).
+fn env_parse<T>(name: &str, default: &str) -> Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    parse_setting(name, non_empty_env(name).as_deref(), default)
+}
+
+fn parse_setting<T>(name: &str, raw: Option<&str>, default: &str) -> Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    raw.unwrap_or(default)
+        .parse()
+        .with_context(|| format!("Invalid {name}"))
+}
+
+/// Read a boolean flag (`1`/`true`/`yes`, case-insensitive). Unset or blank
+/// keeps `default`; any other non-blank value is `false`.
+fn env_flag(name: &str, default: bool) -> bool {
+    flag_from(non_empty_env(name).as_deref(), default)
+}
+
+fn flag_from(raw: Option<&str>, default: bool) -> bool {
+    match raw {
+        None => default,
+        Some(v) => matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"),
+    }
+}
+
+/// Default of `GRPC_DEFAULT_LEASE_DURATION_SECS`: the lease gRPC has always
+/// given a claim that sends none.
+const GRPC_DEFAULT_LEASE_SECS: u64 = 300;
+
+/// The lease bounds gRPC applies to any requested lease.
+const GRPC_LEASE_SECS_RANGE: std::ops::RangeInclusive<u64> = 5..=3600;
+
+/// `GRPC_DEFAULT_LEASE_DURATION_SECS`: unset, blank or `0` is 300 (0 is what
+/// "no lease" means on the gRPC wire), a larger value is lowered to 3600.
+///
+/// A small value is NOT raised to the 5 s minimum any more: `0` (or `1`-`9`)
+/// became a 5-9 s lease, below the 10 s heartbeat, so every job of a worker
+/// that sends no lease went to a second worker while the first still ran it
+/// (W3R-03 review).
+/// [`Settings::validate`] refuses a value at or below
+/// `WORKER_HEARTBEAT_INTERVAL_SECS` or below 5 instead.
+fn grpc_default_lease_secs(raw: Option<&str>) -> Result<u64> {
+    let secs: u64 = parse_setting("GRPC_DEFAULT_LEASE_DURATION_SECS", raw, "0")?;
+    Ok(match secs {
+        0 => GRPC_DEFAULT_LEASE_SECS,
+        secs => secs.min(*GRPC_LEASE_SECS_RANGE.end()),
+    })
+}
+
+/// Origins allowed by CORS when `CORS_ALLOWED_ORIGINS` is unset or blank.
+///
+/// Matches the live production topology: the marketing site (apex + www) and
+/// the dashboard SPA. The dashboard is served at dashboard.spooled.cloud;
+/// omitting it here (an earlier default listed a non-existent
+/// app.spooled.cloud) CORS-blocks every dashboard->API call, including admin
+/// login. Deployments should still set CORS_ALLOWED_ORIGINS explicitly.
+const DEFAULT_CORS_ORIGINS: &str =
+    "https://spooled.cloud,https://www.spooled.cloud,https://dashboard.spooled.cloud";
+
+/// Split a comma-separated origin list. An unset, blank or all-separator value
+/// keeps the default list: compose passes `CORS_ALLOWED_ORIGINS: ${...:-}` as an
+/// empty string, which must not turn into "no origin allowed".
+fn parse_cors_origins(raw: Option<&str>) -> Vec<String> {
+    let split = |value: &str| -> Vec<String> {
+        value
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+    let origins = raw.map(split).unwrap_or_default();
+    if origins.is_empty() {
+        split(DEFAULT_CORS_ORIGINS)
+    } else {
+        origins
+    }
+}
+
 impl Settings {
     /// Load settings from environment variables
     pub fn load() -> Result<Self> {
         let settings = Settings {
             server: ServerSettings {
                 host: env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
-                port: env::var("PORT")
-                    .unwrap_or_else(|_| "8080".to_string())
-                    .parse()
-                    .context("Invalid PORT")?,
-                metrics_port: env::var("METRICS_PORT")
-                    .unwrap_or_else(|_| "9090".to_string())
-                    .parse()
-                    .context("Invalid METRICS_PORT")?,
-                grpc_port: env::var("GRPC_PORT")
-                    .unwrap_or_else(|_| "50051".to_string())
-                    .parse()
-                    .context("Invalid GRPC_PORT")?,
+                port: env_parse("PORT", "8080")?,
+                metrics_port: env_parse("METRICS_PORT", "9090")?,
+                grpc_port: env_parse("GRPC_PORT", "50051")?,
                 external_url: non_empty_env("EXTERNAL_URL"),
                 metrics_token: non_empty_env("METRICS_TOKEN"),
-                cors_allowed_origins: env::var("CORS_ALLOWED_ORIGINS")
-                    .unwrap_or_else(|_| {
-                        // Default matches the live production topology: the marketing
-                        // site (apex + www) and the dashboard SPA. The dashboard is
-                        // served at dashboard.spooled.cloud — omitting it here (an
-                        // earlier default listed a non-existent app.spooled.cloud)
-                        // CORS-blocks every dashboard→API call, including admin login.
-                        // Deployments should still set CORS_ALLOWED_ORIGINS explicitly.
-                        "https://spooled.cloud,https://www.spooled.cloud,https://dashboard.spooled.cloud"
-                            .to_string()
-                    })
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect(),
+                cors_allowed_origins: parse_cors_origins(
+                    non_empty_env("CORS_ALLOWED_ORIGINS").as_deref(),
+                ),
                 // Fail-safe: an unset or unrecognized RUST_ENV resolves to
                 // Production, not Development. Development disables JWT-secret
                 // strength validation and uses permissive CORS, so a prod deploy
@@ -381,103 +457,53 @@ impl Settings {
                 url: env::var("DATABASE_URL").map_err(|_| {
                     anyhow::anyhow!("DATABASE_URL environment variable must be set")
                 })?,
-                direct_url: env::var("DATABASE_DIRECT_URL").ok(),
-                max_connections: env::var("DATABASE_MAX_CONNECTIONS")
-                    .unwrap_or_else(|_| "25".to_string())
-                    .parse()
-                    .context("Invalid DATABASE_MAX_CONNECTIONS")?,
-                min_connections: env::var("DATABASE_MIN_CONNECTIONS")
-                    .unwrap_or_else(|_| "5".to_string())
-                    .parse()
-                    .context("Invalid DATABASE_MIN_CONNECTIONS")?,
-                acquire_timeout_secs: env::var("DATABASE_ACQUIRE_TIMEOUT_SECS")
-                    .unwrap_or_else(|_| "30".to_string())
-                    .parse()
-                    .context("Invalid DATABASE_ACQUIRE_TIMEOUT_SECS")?,
+                direct_url: non_empty_env("DATABASE_DIRECT_URL"),
+                max_connections: env_parse("DATABASE_MAX_CONNECTIONS", "25")?,
+                min_connections: env_parse("DATABASE_MIN_CONNECTIONS", "5")?,
+                acquire_timeout_secs: env_parse("DATABASE_ACQUIRE_TIMEOUT_SECS", "30")?,
             },
             redis: RedisSettings {
                 url: env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string()),
-                pool_size: env::var("REDIS_POOL_SIZE")
-                    .unwrap_or_else(|_| "10".to_string())
-                    .parse()
-                    .context("Invalid REDIS_POOL_SIZE")?,
+                pool_size: env_parse("REDIS_POOL_SIZE", "10")?,
             },
             jwt: JwtSettings {
                 secret: env::var("JWT_SECRET")
                     .unwrap_or_else(|_| "development-secret-change-in-production".to_string()),
-                expiration_hours: env::var("JWT_EXPIRATION_HOURS")
-                    .unwrap_or_else(|_| "24".to_string())
-                    .parse()
-                    .context("Invalid JWT_EXPIRATION_HOURS")?,
+                expiration_hours: env_parse("JWT_EXPIRATION_HOURS", "24")?,
             },
             rate_limit: RateLimitSettings {
-                requests_per_second: env::var("RATE_LIMIT_REQUESTS_PER_SECOND")
-                    .unwrap_or_else(|_| "100".to_string())
-                    .parse()
-                    .context("Invalid RATE_LIMIT_REQUESTS_PER_SECOND")?,
-                burst_size: env::var("RATE_LIMIT_BURST_SIZE")
-                    .unwrap_or_else(|_| "200".to_string())
-                    .parse()
-                    .context("Invalid RATE_LIMIT_BURST_SIZE")?,
-                fail_closed_on_redis_error: env::var("RATE_LIMIT_FAIL_CLOSED")
-                    .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-                    .unwrap_or(false),
+                requests_per_second: env_parse("RATE_LIMIT_REQUESTS_PER_SECOND", "100")?,
+                burst_size: env_parse("RATE_LIMIT_BURST_SIZE", "200")?,
+                fail_closed_on_redis_error: env_flag("RATE_LIMIT_FAIL_CLOSED", false),
             },
             worker: WorkerSettings {
-                heartbeat_interval_secs: env::var("WORKER_HEARTBEAT_INTERVAL_SECS")
-                    .unwrap_or_else(|_| "10".to_string())
-                    .parse()
-                    .context("Invalid WORKER_HEARTBEAT_INTERVAL_SECS")?,
-                lease_duration_secs: env::var("WORKER_LEASE_DURATION_SECS")
-                    .unwrap_or_else(|_| "30".to_string())
-                    .parse()
-                    .context("Invalid WORKER_LEASE_DURATION_SECS")?,
-                max_concurrency: env::var("WORKER_MAX_CONCURRENCY")
-                    .unwrap_or_else(|_| "5".to_string())
-                    .parse()
-                    .context("Invalid WORKER_MAX_CONCURRENCY")?,
-                fallback_poll_interval_secs: env::var("WORKER_FALLBACK_POLL_INTERVAL_SECS")
-                    .unwrap_or_else(|_| "5".to_string())
-                    .parse()
-                    .context("Invalid WORKER_FALLBACK_POLL_INTERVAL_SECS")?,
+                heartbeat_interval_secs: env_parse("WORKER_HEARTBEAT_INTERVAL_SECS", "10")?,
+                lease_duration_secs: env_parse("WORKER_LEASE_DURATION_SECS", "30")?,
+                grpc_default_lease_duration_secs: grpc_default_lease_secs(
+                    non_empty_env("GRPC_DEFAULT_LEASE_DURATION_SECS").as_deref(),
+                )?,
+                max_concurrency: env_parse("WORKER_MAX_CONCURRENCY", "5")?,
+                fallback_poll_interval_secs: env_parse("WORKER_FALLBACK_POLL_INTERVAL_SECS", "5")?,
             },
             queue: QueueSettings {
-                default_max_retries: env::var("QUEUE_DEFAULT_MAX_RETRIES")
-                    .unwrap_or_else(|_| "3".to_string())
-                    .parse()
-                    .context("Invalid QUEUE_DEFAULT_MAX_RETRIES")?,
-                default_timeout_secs: env::var("QUEUE_DEFAULT_TIMEOUT_SECS")
-                    .unwrap_or_else(|_| "300".to_string())
-                    .parse()
-                    .context("Invalid QUEUE_DEFAULT_TIMEOUT_SECS")?,
-                max_payload_size_bytes: env::var("QUEUE_MAX_PAYLOAD_SIZE_BYTES")
-                    .unwrap_or_else(|_| "1048576".to_string())
-                    .parse()
-                    .context("Invalid QUEUE_MAX_PAYLOAD_SIZE_BYTES")?,
+                default_max_retries: env_parse("QUEUE_DEFAULT_MAX_RETRIES", "3")?,
+                default_timeout_secs: env_parse("QUEUE_DEFAULT_TIMEOUT_SECS", "300")?,
+                max_payload_size_bytes: env_parse("QUEUE_MAX_PAYLOAD_SIZE_BYTES", "1048576")?,
             },
             webhooks: WebhookSettings::default(),
             outgoing_webhooks: OutgoingWebhookSettings {
-                max_attempts: env::var("OUTGOING_WEBHOOK_MAX_ATTEMPTS")
-                    .unwrap_or_else(|_| "5".to_string())
-                    .parse()
-                    .context("Invalid OUTGOING_WEBHOOK_MAX_ATTEMPTS")?,
-                max_concurrent_deliveries: env::var("OUTGOING_WEBHOOK_MAX_CONCURRENT_DELIVERIES")
-                    .unwrap_or_else(|_| "64".to_string())
-                    .parse()
-                    .context("Invalid OUTGOING_WEBHOOK_MAX_CONCURRENT_DELIVERIES")?,
+                max_attempts: env_parse("OUTGOING_WEBHOOK_MAX_ATTEMPTS", "5")?,
+                max_concurrent_deliveries: env_parse(
+                    "OUTGOING_WEBHOOK_MAX_CONCURRENT_DELIVERIES",
+                    "64",
+                )?,
             },
             trusted_proxy: TrustedProxySettings {
-                client_ip_header: env::var("TRUSTED_CLIENT_IP_HEADER").ok().and_then(|v| {
-                    let trimmed = v.trim().to_string();
-                    (!trimmed.is_empty()).then_some(trimmed)
-                }),
-                forwarded_hops: env::var("TRUSTED_PROXY_HOPS")
-                    .unwrap_or_else(|_| "0".to_string())
-                    .parse()
-                    .context("Invalid TRUSTED_PROXY_HOPS")?,
+                client_ip_header: non_empty_env("TRUSTED_CLIENT_IP_HEADER"),
+                forwarded_hops: env_parse("TRUSTED_PROXY_HOPS", "0")?,
             },
             tracing: TracingSettings {
-                otlp_endpoint: env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok(),
+                otlp_endpoint: non_empty_env("OTEL_EXPORTER_OTLP_ENDPOINT"),
                 service_name: env::var("OTEL_SERVICE_NAME")
                     .unwrap_or_else(|_| "spooled-backend".to_string()),
                 json_logs: env::var("JSON_LOGS")
@@ -585,6 +611,20 @@ impl Settings {
             }
         }
 
+        // The console provider logs every login code (and the address) instead of
+        // sending it: in production users never receive a code, the API still
+        // answers 200, and anyone with log access can sign in as any user. It is
+        // also what an unset or misspelled EMAIL_PROVIDER resolves to.
+        if self.server.environment == Environment::Production
+            && self.email.provider == EmailProvider::Console
+        {
+            anyhow::bail!(
+                "EMAIL_PROVIDER=console is not allowed when RUST_ENV=production: login codes \
+                 would be written to the log and never delivered. Set EMAIL_PROVIDER to \
+                 resend, sendgrid, postmark or smtp (with EMAIL_API_KEY or SMTP_*)"
+            );
+        }
+
         // Validate port ranges
         if self.server.port == 0 {
             anyhow::bail!("PORT cannot be 0");
@@ -600,6 +640,22 @@ impl Settings {
         // Validate heartbeat interval is not 0
         if self.worker.heartbeat_interval_secs == 0 {
             anyhow::bail!("WORKER_HEARTBEAT_INTERVAL_SECS cannot be 0");
+        }
+
+        // A gRPC worker that sends no lease gets this one and heartbeats every
+        // WORKER_HEARTBEAT_INTERVAL_SECS: a shorter lease expires between
+        // heartbeats and its job goes to a second worker.
+        let grpc_lease = self.worker.grpc_default_lease_duration_secs;
+        if grpc_lease <= self.worker.heartbeat_interval_secs
+            || grpc_lease < *GRPC_LEASE_SECS_RANGE.start()
+        {
+            anyhow::bail!(
+                "GRPC_DEFAULT_LEASE_DURATION_SECS ({grpc_lease}) must be greater than \
+                 WORKER_HEARTBEAT_INTERVAL_SECS ({}) and at least {}; leave it unset \
+                 or 0 for the 300 s default",
+                self.worker.heartbeat_interval_secs,
+                GRPC_LEASE_SECS_RANGE.start()
+            );
         }
 
         // Validate rate limit settings are positive
@@ -696,6 +752,7 @@ impl Settings {
             worker: WorkerSettings {
                 heartbeat_interval_secs: 10,
                 lease_duration_secs: 30,
+                grpc_default_lease_duration_secs: 300,
                 max_concurrency: 5,
                 fallback_poll_interval_secs: 5,
             },
@@ -825,5 +882,220 @@ mod tests {
 
         // Payload size should be at least 1KB
         assert!(settings.queue.max_payload_size_bytes >= 1024);
+    }
+
+    // ---- wave 3 / opscfg ----
+
+    /// Names forwarded by docker-compose.prod.yml as `${NAME:-...}`.
+    const FORWARDED_EMPTY_VARS: &[&str] = &[
+        "EXTERNAL_URL",
+        "CORS_ALLOWED_ORIGINS",
+        "RATE_LIMIT_FAIL_CLOSED",
+        "TRUSTED_CLIENT_IP_HEADER",
+        "TRUSTED_PROXY_HOPS",
+        "OUTGOING_WEBHOOK_MAX_ATTEMPTS",
+        "OUTGOING_WEBHOOK_MAX_CONCURRENT_DELIVERIES",
+        "DATABASE_DIRECT_URL",
+        "GRPC_PORT",
+        "METRICS_TOKEN",
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "GRPC_DEFAULT_LEASE_DURATION_SECS",
+    ];
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn load_treats_empty_forwarded_env_vars_as_unset() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RUST_ENV", "development");
+        std::env::set_var("DATABASE_URL", "postgres://u:p@localhost/db");
+        for name in FORWARDED_EMPTY_VARS {
+            std::env::set_var(name, "");
+        }
+
+        let loaded = Settings::load();
+
+        for name in FORWARDED_EMPTY_VARS {
+            std::env::remove_var(name);
+        }
+        std::env::remove_var("RUST_ENV");
+        std::env::remove_var("DATABASE_URL");
+
+        let settings = loaded.expect("blank forwarded variables must not fail startup");
+        assert_eq!(
+            settings.server.cors_allowed_origins,
+            vec![
+                "https://spooled.cloud".to_string(),
+                "https://www.spooled.cloud".to_string(),
+                "https://dashboard.spooled.cloud".to_string()
+            ]
+        );
+        assert!(!settings.rate_limit.fail_closed_on_redis_error);
+        assert_eq!(settings.server.external_url, None);
+        assert_eq!(settings.server.metrics_token, None);
+        assert_eq!(settings.server.grpc_port, 50051);
+        assert_eq!(settings.database.direct_url, None);
+        assert_eq!(settings.trusted_proxy.client_ip_header, None);
+        assert_eq!(settings.trusted_proxy.forwarded_hops, 0);
+        assert_eq!(settings.outgoing_webhooks.max_attempts, 5);
+        assert_eq!(settings.outgoing_webhooks.max_concurrent_deliveries, 64);
+        assert_eq!(settings.tracing.otlp_endpoint, None);
+        assert_eq!(settings.worker.grpc_default_lease_duration_secs, 300);
+    }
+
+    fn production_settings(provider: EmailProvider) -> Settings {
+        let mut settings = Settings::load_for_testing();
+        settings.server.environment = Environment::Production;
+        settings.jwt.secret = "Zx9fQ2mL7vB4nK8pR3tY6wC1hJ5dS0aG".to_string();
+        settings.email.provider = provider;
+        settings
+    }
+
+    #[test]
+    fn production_refuses_the_console_email_provider() {
+        let err = production_settings(EmailProvider::Console)
+            .validate()
+            .expect_err("console must be refused in production")
+            .to_string();
+        assert!(err.contains("EMAIL_PROVIDER=console"), "{err}");
+
+        for provider in [
+            EmailProvider::Resend,
+            EmailProvider::Sendgrid,
+            EmailProvider::Postmark,
+            EmailProvider::Smtp,
+        ] {
+            production_settings(provider).validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn console_email_provider_is_allowed_outside_production() {
+        for environment in [Environment::Development, Environment::Staging] {
+            let mut settings = production_settings(EmailProvider::Console);
+            settings.server.environment = environment;
+            settings.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn cors_origins_blank_or_unset_keep_the_default_list() {
+        let default = parse_cors_origins(None);
+        assert_eq!(default.len(), 3);
+        assert!(default.contains(&"https://dashboard.spooled.cloud".to_string()));
+        assert_eq!(parse_cors_origins(Some("")), default);
+        assert_eq!(parse_cors_origins(Some("  ")), default);
+        assert_eq!(parse_cors_origins(Some(" , ,")), default);
+        assert_eq!(
+            parse_cors_origins(Some(" https://a.example , https://b.example,")),
+            vec![
+                "https://a.example".to_string(),
+                "https://b.example".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn flags_and_numbers_blank_or_unset_keep_their_defaults() {
+        assert!(!flag_from(None, false));
+        assert!(flag_from(None, true));
+        assert!(flag_from(Some("TRUE"), false));
+        assert!(flag_from(Some("1"), false));
+        assert!(flag_from(Some("yes"), false));
+        assert!(!flag_from(Some("no"), true));
+
+        assert_eq!(parse_setting::<u32>("X", None, "64").unwrap(), 64);
+        assert_eq!(parse_setting::<u32>("X", Some("7"), "64").unwrap(), 7);
+        let err = parse_setting::<u32>("TRUSTED_PROXY_HOPS", Some("abc"), "0")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Invalid TRUSTED_PROXY_HOPS"), "{err}");
+    }
+
+    // W3R-03: a gRPC claim or renewal without a lease keeps the 300 s it always
+    // had (Go SDK StreamJobs cannot send one), independent of the 30 s REST
+    // default; a large operator value is lowered to the gRPC lease maximum.
+    // 0 means unset (300), not a 5 s lease.
+    #[test]
+    fn grpc_default_lease_is_300_unless_configured_and_clamped() {
+        assert_eq!(grpc_default_lease_secs(None).unwrap(), 300);
+        assert_eq!(grpc_default_lease_secs(Some("120")).unwrap(), 120);
+        assert_eq!(grpc_default_lease_secs(Some("0")).unwrap(), 300);
+        assert_eq!(grpc_default_lease_secs(Some("86400")).unwrap(), 3600);
+        let err = grpc_default_lease_secs(Some("5m")).unwrap_err().to_string();
+        assert!(
+            err.contains("Invalid GRPC_DEFAULT_LEASE_DURATION_SECS"),
+            "{err}"
+        );
+
+        let settings = Settings::load_for_testing();
+        assert_eq!(settings.worker.grpc_default_lease_duration_secs, 300);
+        assert_ne!(
+            settings.worker.grpc_default_lease_duration_secs,
+            settings.worker.lease_duration_secs
+        );
+    }
+
+    // W3R-03 review: GRPC_DEFAULT_LEASE_DURATION_SECS=0 (or 1-9) silently
+    // became a 5-9 s lease, below the 10 s heartbeat, so a worker that sends no
+    // lease lost every job to a second worker. 0 is now unset (300) and a lease
+    // at or below the heartbeat interval fails startup, like
+    // WORKER_LEASE_DURATION_SECS.
+    #[test]
+    fn grpc_default_lease_at_or_below_the_heartbeat_fails_validation() {
+        let with_lease = |raw: &str| {
+            let mut settings = Settings::load_for_testing();
+            settings.worker.grpc_default_lease_duration_secs =
+                grpc_default_lease_secs(Some(raw)).unwrap();
+            settings.validate()
+        };
+        for raw in ["1", "5", "9", "10"] {
+            let err = with_lease(raw)
+                .expect_err("a lease at or below the 10 s heartbeat must be refused")
+                .to_string();
+            assert!(err.contains("GRPC_DEFAULT_LEASE_DURATION_SECS"), "{err}");
+            assert!(err.contains("WORKER_HEARTBEAT_INTERVAL_SECS (10)"), "{err}");
+        }
+        for raw in ["0", "11", "300", "86400"] {
+            with_lease(raw).unwrap_or_else(|e| panic!("{raw}: {e}"));
+        }
+
+        // Follows the configured heartbeat, and never below the 5 s minimum.
+        let mut settings = Settings::load_for_testing();
+        settings.worker.heartbeat_interval_secs = 2;
+        settings.worker.grpc_default_lease_duration_secs = 4;
+        assert!(settings.validate().is_err());
+        settings.worker.grpc_default_lease_duration_secs = 5;
+        settings.validate().unwrap();
+        settings.worker.heartbeat_interval_secs = 30;
+        settings.worker.lease_duration_secs = 60;
+        settings.worker.grpc_default_lease_duration_secs = 30;
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn prod_compose_forwards_every_operator_setting() {
+        let compose = include_str!("../../docker-compose.prod.yml");
+        for name in [
+            "RATE_LIMIT_FAIL_CLOSED",
+            "CORS_ALLOWED_ORIGINS",
+            "EXTERNAL_URL",
+            "ENABLE_HSTS",
+            "TRUSTED_CLIENT_IP_HEADER",
+            "TRUSTED_PROXY_HOPS",
+            "OUTGOING_WEBHOOK_MAX_ATTEMPTS",
+            "OUTGOING_WEBHOOK_MAX_CONCURRENT_DELIVERIES",
+            "DATABASE_TEST_BEFORE_ACQUIRE",
+            "DATABASE_DIRECT_URL",
+            "GRPC_PORT",
+            "GRPC_DEFAULT_LEASE_DURATION_SECS",
+        ] {
+            assert!(
+                compose.contains(&format!("      {name}: ${{{name}:-")),
+                "docker-compose.prod.yml must forward {name}"
+            );
+        }
+        assert!(compose.contains("rule_files:"));
+        assert!(compose.contains("credentials_file: /tmp/metrics-token"));
     }
 }

@@ -22,6 +22,14 @@ info:
     Authorization: Bearer sp_live_your_api_key_here
     ```
 
+    Every authenticated endpoint can answer `503 SERVICE_UNAVAILABLE`
+    ("Authentication is temporarily unavailable", with `Retry-After: 5`) when the
+    credential could not be checked: the database cannot be reached, or an API key
+    created before 0.1.90 waited longer than about one bcrypt scan of such keys (at most
+    10 s) while other unknown keys held the scan. It is safe to retry. Any other database failure
+    during authentication answers `500 INTERNAL_ERROR` ("Authentication failed"). Database
+    error text is never returned.
+
     ## Security
 
     - **Multi-tenant isolation**: All operations are scoped to your organization
@@ -105,21 +113,42 @@ paths:
     get:
       tags: [Health]
       summary: Health check
-      description: Returns the health status of the service and its dependencies
+      description: |
+        Returns the health status of the service and its dependencies.
+
+        The status code follows the database only: `200` while the database answers, `503`
+        (with the same body) while it does not, so `curl -f` healthchecks fail. A
+        configured Redis that does not answer, a stopped gRPC server or a stalled
+        background scheduler keep the `200` and set `status` to `degraded` with the matching
+        boolean `false`. The version is not part of this unauthenticated response (see
+        `GET /api/v1/dashboard`).
       operationId: healthCheck
       security: []
       responses:
         '200':
-          description: Service is healthy
+          description: Service is healthy, or degraded with the database still reachable
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/HealthResponse'
               example:
                 status: healthy
-                version: '1.0.0'
                 database: true
                 cache: true
+                grpc: true
+                scheduler: true
+        '503':
+          description: The database is not reachable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              example:
+                status: degraded
+                database: false
+                cache: true
+                grpc: true
+                scheduler: true
 
   /health/live:
     get:
@@ -154,6 +183,7 @@ paths:
         queue summaries, worker status, and recent activity.
 
         Requires authentication. Data is scoped to the authenticated organization.
+        `system.uptime_seconds` and `system.started_at` count from process start.
       operationId: dashboardData
       security:
         - BearerAuth: []
@@ -165,6 +195,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DashboardData'
+        '503':
+          $ref: '#/components/responses/AuthUnavailable'
 
   /metrics:
     get:
@@ -179,9 +211,13 @@ paths:
         - `spooled_jobs_failed_total`: Total jobs failed
         - `spooled_jobs_pending`: Current pending jobs
         - `spooled_jobs_processing`: Current processing jobs
-        - `spooled_job_duration_seconds`: Job processing duration histogram
+        - `spooled_job_duration_seconds`: Job processing duration histogram (REST and gRPC completions)
         - `spooled_workers_active`: Active workers
-        - `spooled_api_requests_total`: Total API requests
+        - `spooled_api_requests_total{method,route,status}`: Total API requests by method,
+          matched route template (`unmatched` for 404s) and status class (`2xx`, `4xx`, ...)
+        - `spooled_api_request_duration_seconds{method,route}`: API latency histogram
+        - `spooled_database_connections_active` / `spooled_database_connections_max`:
+          pool connections in use and the configured pool size
       operationId: prometheusMetrics
       security: []
       responses:
@@ -204,7 +240,10 @@ paths:
     post:
       tags: [Authentication]
       summary: Login with API key
-      description: Exchange an API key for JWT access and refresh tokens
+      description: |
+        Exchange an API key for JWT access and refresh tokens. The key is resolved exactly
+        like an `Authorization: Bearer` API key on any other route; keys of soft-deleted
+        organizations are refused (401).
       operationId: login
       security: []
       requestBody:
@@ -222,6 +261,19 @@ paths:
                 $ref: '#/components/schemas/LoginResponse'
         '401':
           description: Invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: |
+            The key could not be checked (`service_unavailable`): the database cannot be
+            reached, or the scan of keys created before 0.1.90 stayed busy. Retry after
+            `Retry-After` seconds.
+          headers:
+            Retry-After:
+              schema:
+                type: integer
           content:
             application/json:
               schema:
@@ -295,6 +347,8 @@ paths:
                 $ref: '#/components/schemas/CurrentUserResponse'
         '401':
           description: Not authenticated
+        '503':
+          $ref: '#/components/responses/AuthUnavailable'
 
   /api/v1/auth/validate:
     post:
@@ -624,6 +678,8 @@ paths:
       description: |
         Returns current resource usage and plan limits for the authenticated organization.
         Includes daily job counts, resource counts, and warnings for approaching limits.
+        `workers` counts healthy and degraded workers plus draining workers that sent a
+        heartbeat in the last 2 minutes.
       operationId: getOrganizationUsage
       responses:
         '200':
@@ -1302,6 +1358,13 @@ paths:
         Enqueue multiple jobs in a single request. 
         Maximum 100 jobs per request.
         Jobs are processed atomically where possible.
+
+        The request body may be up to 100 jobs at the largest plan payload cap (plus 4 KiB
+        per job for the envelope), capped at 32 MiB, which is the current limit. A larger
+        body is refused (`413 PAYLOAD_TOO_LARGE`, or `400 INVALID_JSON` when the body
+        reader reports the length limit); split the batch. Every other endpoint accepts
+        bodies up to 2 MiB. Each job's payload is still checked against the plan's payload
+        limit.
       operationId: bulkEnqueueJobs
       requestBody:
         required: true
@@ -1324,6 +1387,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/BulkEnqueueResponse'
+        '413':
+          description: The request body is over the bulk limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /api/v1/jobs/{id}/priority:
     parameters:
@@ -1608,6 +1677,11 @@ paths:
     post:
       tags: [Workers]
       summary: Register worker
+      description: |
+        Registers a worker, or updates it when `worker_id` names a worker this organization
+        already holds. The plan's `max_workers` limit counts healthy and degraded workers
+        plus draining workers that sent a heartbeat in the last 2 minutes; re-registering a
+        counted id does not take a second slot.
       operationId: registerWorker
       requestBody:
         required: true
@@ -1622,6 +1696,18 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RegisterWorkerResponse'
+        '409':
+          description: The `worker_id` belongs to another organization
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          description: The plan's worker limit is reached
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /api/v1/workers/{id}:
     parameters:
@@ -2603,6 +2689,19 @@ paths:
           description: Webhook or delivery not found
 
 components:
+  responses:
+    AuthUnavailable:
+      description: |
+        Authentication is temporarily unavailable: the database could not be reached while
+        the credential was checked (`code` `SERVICE_UNAVAILABLE`). Safe to retry.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            code: SERVICE_UNAVAILABLE
+            message: Authentication is temporarily unavailable
+
   securitySchemes:
     bearerAuth:
       type: http
@@ -2617,17 +2716,26 @@ components:
   schemas:
     HealthResponse:
       type: object
-      required: [status, version, database, cache]
+      required: [status, database, cache]
       properties:
         status:
           type: string
           enum: [healthy, degraded]
+          description: '`degraded` when the database, Redis, the gRPC server or the scheduler is not healthy'
         version:
           type: string
+          description: Not returned by the unauthenticated health check
         database:
           type: boolean
         cache:
           type: boolean
+          description: Redis answers (or is not configured)
+        grpc:
+          type: boolean
+          description: The gRPC server is accepting calls. Omitted when the process runs without it.
+        scheduler:
+          type: boolean
+          description: The background scheduler is running and finished a pass within the last 120 s. Omitted when the process runs without it.
 
     # Authentication Schemas
     LoginRequest:
@@ -4510,7 +4618,7 @@ components:
           minimum: 5
           maximum: 3600
           default: 30
-          description: Lease duration in seconds. Omitted → `WORKER_LEASE_DURATION_SECS` (30). gRPC `Dequeue` defaults to 300.
+          description: Lease duration in seconds. Omitted → `WORKER_LEASE_DURATION_SECS` (30). gRPC has its own default for an omitted lease, `GRPC_DEFAULT_LEASE_DURATION_SECS` (300).
 
     ClaimJobsResponse:
       type: object

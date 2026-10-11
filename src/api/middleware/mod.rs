@@ -2,6 +2,7 @@
 
 pub mod admin_auth;
 pub mod auth;
+pub mod bcrypt_gate;
 pub mod client_ip;
 pub mod error_body;
 pub mod limits;

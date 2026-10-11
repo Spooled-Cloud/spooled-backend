@@ -15,7 +15,6 @@ use axum::{
 use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, TokenData, Validation};
 use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
 use tracing::{error, info, warn};
 use validator::Validate;
 
@@ -149,17 +148,6 @@ pub struct OrganizationInfo {
     pub billing_email: Option<String>,
 }
 
-/// API key record for login
-#[derive(Debug, FromRow)]
-struct ApiKeyRecord {
-    id: String,
-    organization_id: String,
-    key_hash: String,
-    queues: Vec<String>,
-    is_active: bool,
-    expires_at: Option<chrono::DateTime<Utc>>,
-}
-
 /// Maximum login attempts per key prefix per minute
 const LOGIN_RATE_LIMIT: i64 = 5;
 /// Rate limit window in seconds
@@ -170,16 +158,42 @@ const LOGIN_RATE_LIMIT_WINDOW: i64 = 60;
 /// POST /api/v1/auth/login
 ///
 /// Previously fetched ANY active API key instead of the provided one.
-/// Now uses key prefix for efficient lookup instead of O(n) scan.
+/// Now resolves the key exactly as the auth middleware does.
 ///
 /// Key format: sp_live_XXXXX or sp_test_XXXXX
-/// Prefix is first 8 chars for indexed lookup
+///
+/// `503` with `Retry-After` when the key could not be checked (the legacy-key
+/// scan stayed busy, or the database is unreachable): a retry can succeed, so
+/// it must not look like a bad key (401) or a server bug (500).
 pub async fn login(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     ValidatedJson(req): ValidatedJson<LoginRequest>,
+) -> Result<Json<LoginResponse>, axum::response::Response> {
+    use axum::response::IntoResponse;
+
+    login_inner(state, headers, req)
+        .await
+        .map_err(|(status, body)| {
+            let mut response = (status, body).into_response();
+            if status == StatusCode::SERVICE_UNAVAILABLE {
+                response.headers_mut().insert(
+                    axum::http::header::RETRY_AFTER,
+                    axum::http::HeaderValue::from(
+                        crate::api::middleware::auth::AUTH_RETRY_AFTER_SECS,
+                    ),
+                );
+            }
+            response
+        })
+}
+
+async fn login_inner(
+    state: AppState,
+    headers: axum::http::HeaderMap,
+    req: LoginRequest,
 ) -> Result<Json<LoginResponse>, (StatusCode, Json<ErrorResponse>)> {
-    // Use key prefix for efficient lookup (similar to auth middleware)
-    // This avoids O(n) bcrypt comparisons which are very expensive
+    // `sp_live_` / `sp_test_`: safe to log, unlike the key itself.
     let key_prefix = req.api_key.chars().take(8).collect::<String>();
 
     // Rate limit login attempts to prevent brute force.
@@ -216,84 +230,41 @@ pub async fn login(
             .await;
     }
 
-    // Resolve the key by its indexed lookup_hash first — a single row read plus one
-    // bcrypt verify — mirroring the auth middleware (v0.1.90). The middleware and gRPC
-    // were ported to lookup_hash but /auth/login was missed, so it kept prefix-scanning
-    // up to 100 sp_live_ keys and bcrypt-verifying each: an UNAUTHENTICATED endpoint
-    // that cost ~seconds of CPU per bogus key (a cheap amplification/DoS vector).
-    let db_err = |e: sqlx::Error| {
-        error!(error = %e, "Database error during login");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse::internal()),
-        )
-    };
-    let lookup_hash = crate::models::api_key_lookup_hash(&req.api_key);
-
-    let by_lookup: Option<ApiKeyRecord> = sqlx::query_as(
-        r#"
-        SELECT id, organization_id, key_hash, queues, is_active, expires_at
-        FROM api_keys
-        WHERE lookup_hash = $1 AND is_active = TRUE
-        LIMIT 1
-        "#,
+    // Resolve the key through the auth middleware's path: record cache, negative
+    // cache, the indexed lookup_hash, then the bounded legacy scan behind the
+    // per-address failed-auth budget. /auth/login used to carry its own copy, with
+    // bcrypt inline on the async worker; it is UNAUTHENTICATED, so a bogus key here
+    // is as cheap to send as anywhere.
+    let client_ip =
+        crate::api::middleware::client_ip::client_ip(&headers, &state.settings.trusted_proxy);
+    let api_key = match crate::api::middleware::auth::resolve_api_key(
+        state.db.pool(),
+        state.cache.as_ref(),
+        &req.api_key,
+        crate::api::middleware::auth::FailedAuthBudget::ClientIp(&client_ip),
     )
-    .bind(&lookup_hash)
-    .fetch_optional(state.db.pool())
     .await
-    .map_err(db_err)?;
-
-    let mut matched_key: Option<ApiKeyRecord> = match by_lookup {
-        Some(key) if bcrypt::verify(&req.api_key, &key.key_hash).unwrap_or(false) => Some(key),
-        _ => None,
-    };
-
-    // Legacy fallback: keys created before lookup_hash existed have it NULL. Scan only
-    // those (the set shrinks to empty as keys re-authenticate) and backfill on a match.
-    if matched_key.is_none() {
-        let candidates: Vec<ApiKeyRecord> = sqlx::query_as(
-            r#"
-            SELECT id, organization_id, key_hash, queues, is_active, expires_at
-            FROM api_keys
-            WHERE is_active = TRUE
-              AND lookup_hash IS NULL
-              AND (key_prefix = $1 OR key_prefix IS NULL)
-            LIMIT 100
-            "#,
-        )
-        .bind(&key_prefix)
-        .fetch_all(state.db.pool())
-        .await
-        .map_err(db_err)?;
-
-        for key in candidates {
-            if bcrypt::verify(&req.api_key, &key.key_hash).unwrap_or(false) {
-                // Backfill lookup_hash so subsequent logins for this key are O(1).
-                let db = state.db.pool_arc();
-                let key_id = key.id.clone();
-                let lh = lookup_hash.clone();
-                tokio::spawn(async move {
-                    let _ = sqlx::query(
-                        "UPDATE api_keys SET lookup_hash = $1 WHERE id = $2 AND lookup_hash IS NULL",
-                    )
-                    .bind(&lh)
-                    .bind(&key_id)
-                    .execute(&*db)
-                    .await;
-                });
-                matched_key = Some(key);
-                break;
-            }
-        }
-    }
-
-    let api_key = match matched_key {
-        Some(key) => key,
-        None => {
+    {
+        Ok(key) if key.is_active => key,
+        Ok(_) | Err((StatusCode::UNAUTHORIZED, _)) => {
             warn!(prefix = %key_prefix, "Login attempt with invalid API key");
             return Err((
                 StatusCode::UNAUTHORIZED,
                 Json(ErrorResponse::unauthorized()),
+            ));
+        }
+        // Not checked: the legacy scan stayed busy or the database is down.
+        Err((StatusCode::SERVICE_UNAVAILABLE, _)) => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse::unavailable()),
+            ));
+        }
+        // Logged where it happened.
+        Err(_) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::internal()),
             ));
         }
     };
@@ -884,6 +855,14 @@ impl ErrorResponse {
         Self {
             error: "internal_error".to_string(),
             message: "An internal error occurred".to_string(),
+        }
+    }
+
+    /// The key could not be checked right now; retry after `Retry-After`.
+    pub fn unavailable() -> Self {
+        Self {
+            error: "service_unavailable".to_string(),
+            message: "Authentication is temporarily unavailable".to_string(),
         }
     }
 

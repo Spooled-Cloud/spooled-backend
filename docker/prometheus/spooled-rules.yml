@@ -121,7 +121,7 @@ groups:
     rules:
       # High API latency (p99 > 1 second)
       - alert: HighAPILatency
-        expr: histogram_quantile(0.99, rate(spooled_api_request_duration_seconds_bucket[5m])) > 1
+        expr: histogram_quantile(0.99, sum by (le) (rate(spooled_api_request_duration_seconds_bucket[5m]))) > 1
         for: 5m
         labels:
           severity: warning
@@ -131,7 +131,7 @@ groups:
 
       # Critical API latency (p99 > 5 seconds)
       - alert: CriticalAPILatency
-        expr: histogram_quantile(0.99, rate(spooled_api_request_duration_seconds_bucket[5m])) > 5
+        expr: histogram_quantile(0.99, sum by (le) (rate(spooled_api_request_duration_seconds_bucket[5m]))) > 5
         for: 3m
         labels:
           severity: critical
@@ -141,7 +141,7 @@ groups:
 
       # Low request rate (service may be down)
       - alert: LowRequestRate
-        expr: rate(spooled_api_requests_total[5m]) < 0.01 and rate(spooled_api_requests_total[1h] offset 1h) > 0.1
+        expr: sum(rate(spooled_api_requests_total[5m])) < 0.01 and sum(rate(spooled_api_requests_total[1h] offset 1h)) > 0.1
         for: 10m
         labels:
           severity: warning
@@ -157,7 +157,7 @@ groups:
     rules:
       # High job duration (p95 > 30 seconds)
       - alert: SlowJobProcessing
-        expr: histogram_quantile(0.95, rate(spooled_job_duration_seconds_bucket[5m])) > 30
+        expr: histogram_quantile(0.95, sum by (le) (rate(spooled_job_duration_seconds_bucket[5m]))) > 30
         for: 10m
         labels:
           severity: warning
@@ -167,7 +167,7 @@ groups:
 
       # Very slow jobs (p95 > 60 seconds)
       - alert: VerySlowJobProcessing
-        expr: histogram_quantile(0.95, rate(spooled_job_duration_seconds_bucket[5m])) > 60
+        expr: histogram_quantile(0.95, sum by (le) (rate(spooled_job_duration_seconds_bucket[5m]))) > 60
         for: 5m
         labels:
           severity: critical
@@ -193,49 +193,31 @@ groups:
   - name: spooled-infrastructure
     interval: 30s
     rules:
-      # Database connection pool exhaustion warning
+      # Database connection pool exhaustion warning. A ratio of the configured pool
+      # size (DATABASE_MAX_CONNECTIONS): the default pool is 25, so an absolute
+      # threshold of 80 could never fire.
       - alert: DatabaseConnectionsHigh
-        expr: spooled_database_connections_active > 80
+        expr: spooled_database_connections_active / spooled_database_connections_max > 0.8 and spooled_database_connections_max > 0
         for: 5m
         labels:
           severity: warning
         annotations:
           summary: "High database connection usage"
-          description: "{{ $value }} database connections in use. Consider increasing pool size."
+          description: "{{ $value | humanizePercentage }} of the database pool is in use. Consider increasing pool size."
 
       # Critical: Database connection pool nearly exhausted
       - alert: DatabaseConnectionsCritical
-        expr: spooled_database_connections_active > 95
+        expr: spooled_database_connections_active / spooled_database_connections_max > 0.95 and spooled_database_connections_max > 0
         for: 2m
         labels:
           severity: critical
         annotations:
           summary: "Database connection pool nearly exhausted"
-          description: "{{ $value }} database connections in use. New requests may fail. Immediate action required."
+          description: "{{ $value | humanizePercentage }} of the database pool is in use. New requests may fail. Immediate action required."
 
-      # Redis operation rate drop (may indicate connectivity issues)
-      - alert: RedisOperationsLow
-        expr: |
-          rate(spooled_redis_operations_total[5m]) < 0.1 
-          and rate(spooled_redis_operations_total[1h] offset 1h) > 1
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Low Redis operation rate"
-          description: "Redis operations have dropped significantly. Check Redis connectivity."
-
-      # Redis completely unavailable (zero operations when expected)
-      - alert: RedisUnavailable
-        expr: |
-          rate(spooled_redis_operations_total[2m]) == 0
-          and rate(spooled_redis_operations_total[1h] offset 1h) > 0.5
-        for: 3m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Redis appears unavailable"
-          description: "No Redis operations in the last 2 minutes. Workers are likely using fallback polling."
+      # No Redis alerts here: the backend does not export a Redis series yet (the
+      # never-updated spooled_redis_operations_total was removed with its rules).
+      # Add one together with the metric that feeds it, or use a redis exporter.
 
   # =============================================================================
   # Worker Heartbeat Alerts

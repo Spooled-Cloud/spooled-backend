@@ -2319,6 +2319,13 @@ async fn test_grpc_unary_transport_rejects_out_of_scope_settlement() {
             max_payload_size_bytes: 1024 * 1024,
         },
         false,
+        spooled_backend::config::WorkerSettings {
+            heartbeat_interval_secs: 10,
+            lease_duration_secs: 30,
+            grpc_default_lease_duration_secs: 300,
+            max_concurrency: 10,
+            fallback_poll_interval_secs: 5,
+        },
     );
 
     let complete = service

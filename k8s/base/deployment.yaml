@@ -327,5 +327,6 @@ spec:
             matchLabels:
               app: spooled-backend
       
-      # Graceful shutdown
-      terminationGracePeriodSeconds: 30
+      # Graceful shutdown: SHUTDOWN_TIMEOUT (30 s) plus releasing jobs and
+      # closing the pool; matches stop_grace_period 40s in docker-compose.prod.yml
+      terminationGracePeriodSeconds: 40

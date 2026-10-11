@@ -47,7 +47,9 @@
 #   ADMIN_API_KEY        - Secret key for creating orgs when mode is "closed"
 #
 # Email Configuration:
-#   EMAIL_PROVIDER       - console, resend, sendgrid, postmark, smtp
+#   EMAIL_PROVIDER       - resend, sendgrid, postmark or smtp (REQUIRED here: the backend
+#                          refuses to start with `console` when RUST_ENV=production, because
+#                          login codes would only be written to the log)
 #   EMAIL_API_KEY        - API key for the email provider
 #   EMAIL_FROM_ADDRESS   - From email address
 #   EMAIL_FROM_NAME      - From name
@@ -173,6 +175,8 @@ services:
     # platform: linux/arm64  # Uncomment if you need to force ARM64
     container_name: spooled_backend
     restart: unless-stopped
+    # SHUTDOWN_TIMEOUT 30 s plus cleanup; the Docker default of 10 s would SIGKILL the drain
+    stop_grace_period: 40s
     depends_on:
       db:
         condition: service_healthy
@@ -188,6 +192,10 @@ services:
       DATABASE_MAX_CONNECTIONS: ${DATABASE_MAX_CONNECTIONS:-25}
       DATABASE_MIN_CONNECTIONS: ${DATABASE_MIN_CONNECTIONS:-5}
       DATABASE_ACQUIRE_TIMEOUT_SECS: ${DATABASE_ACQUIRE_TIMEOUT_SECS:-30}
+      # Validate each connection on checkout (adds ~5ms); off by default.
+      DATABASE_TEST_BEFORE_ACQUIRE: ${DATABASE_TEST_BEFORE_ACQUIRE:-false}
+      # Direct (non-PgBouncer) URL; blank = unset.
+      DATABASE_DIRECT_URL: ${DATABASE_DIRECT_URL:-}
       
       # =====================
       # Redis
@@ -201,9 +209,17 @@ services:
       HOST: 0.0.0.0
       PORT: 8080
       METRICS_PORT: 9090
+      GRPC_PORT: ${GRPC_PORT:-50051}
       RUST_ENV: ${RUST_ENV:-production}
       RUST_LOG: ${RUST_LOG:-info,tower_http=info}
       JSON_LOGS: ${JSON_LOGS:-true}
+      # Public base URL of the API (webhook URLs etc.). Blank = unset.
+      EXTERNAL_URL: ${EXTERNAL_URL:-}
+      # Comma-separated CORS origins. Blank keeps the built-in spooled.cloud list;
+      # self-hosters on their own domain must set this for the dashboard.
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
+      # Send Strict-Transport-Security (only behind HTTPS).
+      ENABLE_HSTS: ${ENABLE_HSTS:-false}
       
       # =====================
       # Security
@@ -224,6 +240,11 @@ services:
       # =====================
       RATE_LIMIT_REQUESTS_PER_SECOND: ${RATE_LIMIT_REQUESTS_PER_SECOND:-100}
       RATE_LIMIT_BURST_SIZE: ${RATE_LIMIT_BURST_SIZE:-200}
+      # true = reject requests (503) while Redis is down instead of failing open.
+      RATE_LIMIT_FAIL_CLOSED: ${RATE_LIMIT_FAIL_CLOSED:-false}
+      # Client-IP resolution behind a proxy (e.g. CF-Connecting-IP behind Cloudflare).
+      TRUSTED_CLIENT_IP_HEADER: ${TRUSTED_CLIENT_IP_HEADER:-}
+      TRUSTED_PROXY_HOPS: ${TRUSTED_PROXY_HOPS:-0}
       
       # =====================
       # Queue Settings
@@ -237,6 +258,9 @@ services:
       # =====================
       WORKER_HEARTBEAT_INTERVAL_SECS: ${WORKER_HEARTBEAT_INTERVAL_SECS:-10}
       WORKER_LEASE_DURATION_SECS: ${WORKER_LEASE_DURATION_SECS:-30}
+      # Lease for gRPC claims/renewals that send none (Go SDK StreamJobs, Go/PHP
+      # Dequeue and RenewLease without a lease); 5-3600 s.
+      GRPC_DEFAULT_LEASE_DURATION_SECS: ${GRPC_DEFAULT_LEASE_DURATION_SECS:-300}
       WORKER_MAX_CONCURRENCY: ${WORKER_MAX_CONCURRENCY:-5}
       WORKER_FALLBACK_POLL_INTERVAL_SECS: ${WORKER_FALLBACK_POLL_INTERVAL_SECS:-5}
       
@@ -273,6 +297,8 @@ services:
       # =====================
       GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      OUTGOING_WEBHOOK_MAX_ATTEMPTS: ${OUTGOING_WEBHOOK_MAX_ATTEMPTS:-5}
+      OUTGOING_WEBHOOK_MAX_CONCURRENT_DELIVERIES: ${OUTGOING_WEBHOOK_MAX_CONCURRENT_DELIVERIES:-64}
       
       # =====================
       # OpenTelemetry
@@ -324,6 +350,9 @@ services:
     container_name: spooled_prometheus
     restart: unless-stopped
     entrypoint: ["/bin/sh", "-ec"]
+    environment:
+      # Same token the backend requires on /metrics; blank = backend is open.
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
     command:
       - |
         cat > /tmp/prometheus.yml <<'EOF'
@@ -333,16 +362,26 @@ services:
           external_labels:
             cluster: spooled
             environment: production
+        rule_files:
+          - /etc/prometheus/rules/spooled-rules.yml
         scrape_configs:
+          - job_name: prometheus
+            static_configs:
+              - targets: ["localhost:9090"]
           - job_name: spooled-backend
             static_configs:
               - targets: ["backend:9090"]
             metrics_path: /metrics
             scrape_interval: 10s
-          - job_name: prometheus
-            static_configs:
-              - targets: ["localhost:9090"]
         EOF
+        if [ -n "$$METRICS_TOKEN" ]; then
+          printf '%s' "$$METRICS_TOKEN" > /tmp/metrics-token
+          cat >> /tmp/prometheus.yml <<'EOF'
+            authorization:
+              type: Bearer
+              credentials_file: /tmp/metrics-token
+        EOF
+        fi
         exec /bin/prometheus \
           --config.file=/tmp/prometheus.yml \
           --storage.tsdb.path=/prometheus \
@@ -350,6 +389,9 @@ services:
           --web.enable-lifecycle
     volumes:
       - prometheus_data:/prometheus
+      # Alert rules ship in the repo (Git stacks check it out). Missing directory
+      # (single downloaded compose file) = glob matches nothing = no rules, not an error.
+      - ./docker/prometheus:/etc/prometheus/rules:ro
     networks:
       - spooled-network
     depends_on:

@@ -50,8 +50,12 @@ Manual `POST /jobs/{id}/retry` resets `retry_count` to 0 and removes the job's
 `retry_count > max_retries`).
 
 REST claim default lease = `WORKER_LEASE_DURATION_SECS` (30); since 0.1.115 a
-heartbeat that omits `lease_duration_secs` renews for that same default (it was a 422). gRPC `Dequeue` default
-is 300 (`grpc/services/queue_service.rs` `DEFAULT_LEASE_DURATION_SECS`).
+heartbeat that omits `lease_duration_secs` renews for that same default (it was a 422). gRPC has its
+own default: an omitted/`<= 0` lease on `Dequeue`, `StreamJobs`, `ProcessJobs` and `RenewLease` is
+`GRPC_DEFAULT_LEASE_DURATION_SECS` (default 300; `0` = unset, at most 3600, must exceed `WORKER_HEARTBEAT_INTERVAL_SECS`; `grpc/services/queue_service.rs:273`
+`lease_secs`, `grpc/mod.rs:91` `lease_duration_or_default`). Since **0.1.119** it is a setting instead of
+the hard-coded `DEFAULT_LEASE_DURATION_SECS`, and `Register` reports it (BEGRPC-10). It must not follow
+the 30 s REST default: the Go SDK `StreamJobs` cannot send a lease (W3R-03).
 
 REST validation allows `max_retries` range `min = 0` (`models/job.rs` ~214).
 
@@ -61,13 +65,19 @@ REST validation allows `max_retries` range `min = 0` (`models/job.rs` ~214).
 
 `POST /jobs/{id}/dependencies` sets `dependencies_met` from `check_job_dependencies_met`. A SQL/decode error fails the request; it must not default to met.
 
+`POST /jobs/bulk` has its own body limit (`api/mod.rs:194-213` `bulk_body_limit`): 100 jobs x
+(largest plan payload cap + 4 KiB), clamped between axum's 2 MiB default and a 32 MiB ceiling
+(`BULK_BODY_LIMIT_CEILING`); today that resolves to the 32 MiB ceiling. A body over it is refused
+as 413 or `400 INVALID_JSON` (the extractor's length-limit error). Every other route keeps 2 MiB.
+Before 0.1.119 a bulk of 100 jobs of 25 KB was refused (BEOPS-16).
+
 ## Idempotency
 
 `ON CONFLICT (organization_id, idempotency_key) WHERE idempotency_key IS NOT NULL` in queue enqueue path.
 
 ## Scheduler loops (in-process)
 
-Activated scheduled jobs (~5s), cron (~10s), lease recovery (~10s), metrics (~15s), stale workers (~300s), dependency/workflow progress (~10s). See `scheduler/mod.rs`.
+Activated scheduled jobs (~5s), cron (~10s), lease recovery (~10s), metrics (~15s), stale workers (~300s), dependency/workflow progress (~10s). See `scheduler/mod.rs`. Every loop pass reports to `RuntimeHealth::scheduler_tick` (`scheduler/mod.rs:95`) and a drop guard marks it stopped however `run` ends (`:42`, `:76`); `/health` reports the scheduler down after 120 s without a pass.
 
 Cron catch-up (`scheduler/mod.rs` ~395–418): if `next_run_at` is far in the past after downtime, **skip missed fires, run once now**, advance `next_run_at` via `next_run_after_in_timezone` (DST-aware). Live re-verified 2026-07-15 on `0.1.107`.
 
@@ -100,8 +110,9 @@ jump goes to the real next local midnight, so 23-hour days no longer skip
 
 ## Stale workers vs live leases (0.1.118)
 
-`Scheduler::cleanup_stale_workers` marks workers offline after 2 min without a
-worker heartbeat, but only releases or dead-letters their jobs once the job
+`Scheduler::cleanup_stale_workers` (`scheduler/mod.rs:1049`) marks workers offline after 2 min without a
+worker heartbeat (since 0.1.119 `healthy`, `degraded` and `draining` alike, `:1056`; a crashed
+draining worker used to stay `draining` for ever), but only releases or dead-letters their jobs once the job
 lease has expired (`lease_expires_at IS NULL OR <= NOW()`). A live lease means a
 worker is still renewing it (BEJOB-01: the PHP SDK sent no worker heartbeat
 during a long handler and its jobs were re-run). `QueueManager::renew_lease`
@@ -113,3 +124,59 @@ also refreshes `workers.last_heartbeat` on success.
 "Job failed", over `MAX_FAILURE_MESSAGE_BYTES` (4096) → truncated with
 `FAILURE_TRUNCATION_SUFFIX`. Never a 400 (BEJOB-11).
 
+## Draining workers and the worker cap (0.1.119)
+
+`max_workers` counts a worker via the SQL function `worker_counts_toward_cap(status, last_heartbeat)`
+(migration `20261011150300_count_draining_workers.sql`): healthy, degraded, or draining with a heartbeat
+in the last 2 minutes. Before, a worker that heartbeated `status = 'draining'` dropped out of
+`get_org_resource_counts` and an org could run any number of workers (BEGRPC-15). Visible effects:
+a new REST or gRPC registration is refused (429 / `RESOURCE_EXHAUSTED`) when the cap is full of live
+draining workers; `GET /organizations/usage` includes them; a live draining worker can still re-register
+its own id at the cap. Claim/dequeue still does not require a registered worker (deferred, owner decision).
+
+## Process supervision, shutdown and `/health` (0.1.119)
+
+- Startup: `GrpcServer::bind` runs before anything is spawned (`main.rs:121`), so a busy port or a
+  bad/missing PEM exits the process with `gRPC server failed to start on <addr>`. The metrics server, the
+  gRPC server and the scheduler each run under `supervise` (`main.rs:331`); if any ends or panics before
+  shutdown the process logs it, runs the normal bounded shutdown and exits 1, so the restart policy
+  brings it back (BEGRPC-14, BEOPS-09). A `METRICS_PORT` clash is therefore a restart loop, by design.
+- Shutdown: SIGTERM/Ctrl+C or a task failure sets the shutdown watch. gRPC health turns NOT_SERVING,
+  then tonic drains alongside axum for `GRPC_DRAIN_TIMEOUT` = 10 s (`grpc/server.rs:61`); the scheduler
+  finishes its pass; the metrics server is aborted. Everything together, HTTP drain included, is bounded
+  by `SHUTDOWN_TIMEOUT` = 30 s (`main.rs:38`), then `release_local_jobs` and `db.close()` run. Compose sets
+  `stop_grace_period: 40s` and `k8s/base/deployment.yaml:332` `terminationGracePeriodSeconds: 40`
+  (was 30, shorter than the bound); `main.rs` `tests::orchestrators_wait_past_the_shutdown_timeout` keeps
+  both at least `SHUTDOWN_TIMEOUT` + 10 s. Open StreamJobs/ProcessJobs streams and SSE streams have no
+  shutdown hook; they hold the drain until their timeout (open, BEOPS-24).
+- `GET /health` (`api/handlers/health.rs:93`): 503 with the same body when the database check fails
+  (`:113`); Redis down is 200 with `cache:false`, `status:"degraded"`. `grpc` and `scheduler` are optional
+  booleans from the `RuntimeHealth` extension (`:26`; omitted in router-only tests); either false makes
+  `status` degraded; scheduler is false after `SCHEDULER_STALL_AFTER_SECS` = 120 (`:20`). `/health/live`
+  and `/health/ready` are unchanged. The compose/Docker `HEALTHCHECK curl -f /health` therefore fails while
+  the DB is down (intended).
+- Dashboard `system.uptime_seconds` / `started_at` come from `state.start_time` (set when `AppState` is
+  built), not from the first dashboard request (BEOPS-22).
+- Redis (`cache/mod.rs`): every call, pipeline, Lua script and the health PING goes through
+  `RedisCache::bounded` (`:192`), capped at `COMMAND_TIMEOUT` 500 ms (`:43`) including any reconnect
+  wait. `TimeoutTracker` (`:63`) replaces the `ConnectionManager` after
+  `TIMEOUTS_BEFORE_RECONNECT` = 3 timeouts in a row (`:50`) or a failed health PING, at most once per
+  `MIN_RECONNECT_INTERVAL` 1 s (`:54`), because redis' `ConnectionManager` only reconnects on I/O errors and a
+  response timeout is `TimedOut` (a half-open socket was never replaced). Sockets use TCP keepalive
+  30 s / 10 s (`:58`); `subscribe()` is capped at 2 s (`:47`). Any call slower than 500 ms now fails into the
+  caller's fail-open/fail-closed path (a slow Lua script, a SCAN round trip on a huge keyspace).
+- Metrics: `track_http_metrics` (`observability/mod.rs:293`, outermost layer in `api::router`) feeds
+  `spooled_api_requests_total{method,route,status}` and `spooled_api_request_duration_seconds{method,route}`
+  with the matched route template (`unmatched` for 404s); the pool is attached in `AppState::new` and
+  sampled into `spooled_database_connections_active` / `_max` on each scrape. REST fail increments
+  `jobs_failed` (and `jobs_deadlettered` on dead-letter, `handlers/jobs.rs:710`); REST complete
+  (`handlers/jobs.rs:601`) and gRPC complete (`queue_service.rs:879`) observe `job_duration`.
+  `spooled_redis_operations_total` no longer exists. gRPC Enqueue/Dequeue still do not update the
+  `jobs_pending` gauge (the scheduler corrects it every 15 s; open, BEGRPC-25 residual).
+- `POST /workflows` checks the queue cap on the transaction's own connection
+  (`limits::check_new_queue_limit_conn`, `limits.rs:436`; call site `handlers/workflows.rs:432`). A second
+  pool connection there deadlocked the pool when pool-size creates waited on the advisory lock (BEOPS-10).
+- Migrator (`db/mod.rs` `run_migrator`): `set_ignore_missing(true)`, so an older image boots after a
+  rollback; migrations run over a one-connection pool on `DATABASE_DIRECT_URL` when set. `build.rs` emits
+  `rerun-if-changed=migrations`. Residual: an accidentally deleted local migration file is no longer
+  noticed either.

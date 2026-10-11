@@ -25,14 +25,43 @@ pub fn datetime_to_timestamp_opt(dt: Option<DateTime<Utc>>) -> Option<Timestamp>
     dt.map(datetime_to_timestamp)
 }
 
-/// Convert protobuf Timestamp to chrono DateTime
+/// First second a `google.protobuf.Timestamp` may hold (0001-01-01T00:00:00Z).
+const MIN_TIMESTAMP_SECONDS: i64 = -62_135_596_800;
+
+/// Last second a `google.protobuf.Timestamp` may hold (9999-12-31T23:59:59Z).
+const MAX_TIMESTAMP_SECONDS: i64 = 253_402_300_799;
+
+/// Convert protobuf Timestamp to chrono DateTime.
+///
+/// `None` for a value outside the Timestamp spec: seconds outside years
+/// 1-9999 (chrono alone accepts years far past 9999) or nanos outside `0..1e9`.
 pub fn timestamp_to_datetime(ts: Timestamp) -> Option<DateTime<Utc>> {
+    if !(MIN_TIMESTAMP_SECONDS..=MAX_TIMESTAMP_SECONDS).contains(&ts.seconds)
+        || !(0..1_000_000_000).contains(&ts.nanos)
+    {
+        return None;
+    }
     Utc.timestamp_opt(ts.seconds, ts.nanos as u32).single()
 }
 
-/// Convert optional protobuf Timestamp to optional chrono DateTime
-pub fn timestamp_to_datetime_opt(ts: Option<Timestamp>) -> Option<DateTime<Utc>> {
-    ts.and_then(timestamp_to_datetime)
+/// Read an optional request Timestamp: absent, or the all-zero message some
+/// clients send for "unset", is `Ok(None)`; a value outside the Timestamp
+/// spec is `Err` so the caller can reject it instead of dropping it.
+pub fn timestamp_to_datetime_opt(ts: Option<Timestamp>) -> Result<Option<DateTime<Utc>>, String> {
+    match ts {
+        None
+        | Some(Timestamp {
+            seconds: 0,
+            nanos: 0,
+        }) => Ok(None),
+        Some(ts) => timestamp_to_datetime(ts).map(Some).ok_or_else(|| {
+            format!(
+                "Invalid timestamp (seconds={}, nanos={}): must be between \
+                 0001-01-01T00:00:00Z and 9999-12-31T23:59:59Z with nanos in 0..999999999",
+                ts.seconds, ts.nanos
+            )
+        }),
+    }
 }
 
 /// Convert serde_json::Value to protobuf Struct
@@ -96,15 +125,27 @@ pub fn value_to_json(v: &Value) -> serde_json::Value {
         None => serde_json::Value::Null,
         Some(Kind::NullValue(_)) => serde_json::Value::Null,
         Some(Kind::BoolValue(b)) => serde_json::Value::Bool(*b),
-        Some(Kind::NumberValue(n)) => {
-            serde_json::json!(n)
-        }
+        Some(Kind::NumberValue(n)) => number_to_json(*n),
         Some(Kind::StringValue(s)) => serde_json::Value::String(s.clone()),
         Some(Kind::ListValue(list)) => {
             let arr: Vec<serde_json::Value> = list.values.iter().map(value_to_json).collect();
             serde_json::Value::Array(arr)
         }
         Some(Kind::StructValue(s)) => struct_to_json(s),
+    }
+}
+
+/// 2^53: above this an f64 no longer holds every integer exactly.
+const MAX_SAFE_INTEGER_F64: f64 = 9_007_199_254_740_992.0;
+
+/// A Struct number is always a double. Whole values that a double holds
+/// exactly come back as JSON integers, so `{"count": 42}` round-trips as `42`
+/// and not `42.0` (which typed decoders in Go, Python and PHP reject as an int).
+fn number_to_json(n: f64) -> serde_json::Value {
+    if n.fract() == 0.0 && n.abs() < MAX_SAFE_INTEGER_F64 {
+        serde_json::Value::from(n as i64)
+    } else {
+        serde_json::json!(n)
     }
 }
 
@@ -245,5 +286,70 @@ mod tests {
         let back = struct_to_map(&s);
 
         assert_eq!(map, back);
+    }
+
+    // BEGRPC-05: whole numbers survive a Struct round trip as JSON integers.
+    #[test]
+    fn test_struct_round_trip_keeps_integers() {
+        let json = serde_json::json!({
+            "count": 42,
+            "negative": -7,
+            "zero": 0,
+            "ratio": 1.5,
+            "below_2_53": 9_007_199_254_740_991_i64,
+            "nested": {"qty": 3, "items": [1, 2.25, -4]}
+        });
+
+        let back = struct_to_json(&json_to_struct(&json).unwrap());
+
+        assert_eq!(back, json);
+        assert_eq!(back.to_string(), json.to_string());
+        assert!(back["count"].is_i64(), "{}", back["count"]);
+        assert!(back["ratio"].is_f64());
+    }
+
+    // BEGRPC-05: at 2^53 a double stops holding every integer, so the value
+    // stays a float instead of claiming an exactness it does not have.
+    #[test]
+    fn test_number_to_json_boundary() {
+        let two_53 = 9_007_199_254_740_992.0_f64;
+        let number = |n: f64| value_to_json(&json_to_value(&serde_json::json!(n)));
+
+        assert_eq!(
+            number(two_53 - 1.0),
+            serde_json::json!(9_007_199_254_740_991_i64)
+        );
+        assert_eq!(
+            number(-(two_53 - 1.0)),
+            serde_json::json!(-9_007_199_254_740_991_i64)
+        );
+        assert!(number(two_53).is_f64());
+        assert!(number(-two_53).is_f64());
+        assert!(number(1e300).is_f64());
+        assert_eq!(number(-0.5), serde_json::json!(-0.5));
+        let nan = Value {
+            kind: Some(Kind::NumberValue(f64::NAN)),
+        };
+        assert_eq!(value_to_json(&nan), serde_json::Value::Null);
+    }
+
+    // BEGRPC-21: values outside the Timestamp spec do not convert.
+    #[test]
+    fn test_timestamp_to_datetime_rejects_out_of_spec_values() {
+        let ts = |seconds: i64, nanos: i32| Timestamp { seconds, nanos };
+
+        assert!(timestamp_to_datetime(ts(1_700_000_000, 1_000_000_000)).is_none());
+        assert!(timestamp_to_datetime(ts(1_700_000_000, -1)).is_none());
+        assert!(timestamp_to_datetime(ts(253_402_300_800, 0)).is_none());
+        assert!(timestamp_to_datetime(ts(-62_135_596_801, 0)).is_none());
+
+        assert!(timestamp_to_datetime(ts(253_402_300_799, 999_999_999)).is_some());
+        assert!(timestamp_to_datetime(ts(-62_135_596_800, 0)).is_some());
+        assert_eq!(
+            timestamp_to_datetime(ts(1_700_000_000, 5))
+                .unwrap()
+                .timestamp(),
+            1_700_000_000
+        );
     }
 }

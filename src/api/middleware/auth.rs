@@ -16,10 +16,17 @@ use axum::{
 };
 use chrono::Utc;
 use jsonwebtoken::{decode, DecodingKey, Validation};
-use sqlx::FromRow;
+use sqlx::{FromRow, PgPool};
+
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
+use std::time::Duration;
 
 use crate::api::handlers::auth::Claims;
+use crate::api::middleware::bcrypt_gate::{self, ScanLane};
+use crate::api::middleware::client_ip::client_ip;
 use crate::api::AppState;
+use crate::cache::RedisCache;
 use crate::error::ErrorResponse;
 use crate::models::ApiKeyContext;
 
@@ -39,6 +46,7 @@ fn auth_error_response(status: StatusCode, message: String) -> Response {
         StatusCode::UNAUTHORIZED => "UNAUTHORIZED",
         StatusCode::FORBIDDEN => "ACCESS_DENIED",
         StatusCode::INTERNAL_SERVER_ERROR => "INTERNAL_ERROR",
+        StatusCode::SERVICE_UNAVAILABLE => "SERVICE_UNAVAILABLE",
         _ => "ERROR",
     };
     let body = Json(ErrorResponse {
@@ -46,24 +54,106 @@ fn auth_error_response(status: StatusCode, message: String) -> Response {
         message,
         details: None,
     });
-    (status, body).into_response()
+    let mut response = (status, body).into_response();
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        response.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from(AUTH_RETRY_AFTER_SECS),
+        );
+    }
+    response
 }
+
+/// `Retry-After` of a 503 from authentication: the legacy scan turn stayed
+/// busy for its bounded wait, or the database could not be reached. Either
+/// way the key was not checked, so the client should retry, not give up.
+pub const AUTH_RETRY_AFTER_SECS: u64 = 5;
 
 /// Type alias for organization context extractor
 /// Use `Option<Extension<ApiKeyContext>>` in handlers to get the org context
 /// from authenticated requests. Returns None if not authenticated.
 pub type OrgContext = Extension<ApiKeyContext>;
 
-/// API key record from database
-#[derive(Debug, FromRow)]
-struct ApiKeyRecord {
-    id: String,
-    organization_id: String,
+/// Failed API-key authentications one client address may cause per minute
+/// before the legacy bcrypt scan is skipped for it.
+///
+/// Over the budget only the scan is skipped (401): a key found by
+/// `lookup_hash` still authenticates. Without a trusted client-address header
+/// every caller lands in the same bucket (the proxy's, or `unknown`), so the
+/// budget must never gate the path legitimate modern keys take.
+///
+/// A request is charged BEFORE it scans and refunded when the scan finds its
+/// key or never runs (see [`charge_failed_auth`]).
+pub const FAILED_AUTH_PER_IP_LIMIT: u32 = 20;
+
+/// Failed API-key authentications all gRPC callers together may cause per
+/// minute before the legacy bcrypt scan is skipped for gRPC.
+///
+/// gRPC sees the ingress as its peer and has no trusted client-address
+/// metadata, so it cannot be budgeted per address. Like the per-IP budget it
+/// only skips the scan: keys found by `lookup_hash` always work. gRPC scans
+/// also take their own turn ([`bcrypt_gate::ScanLane::Grpc`]), so unknown gRPC
+/// tokens under this budget can delay only gRPC legacy keys, never REST ones
+/// (W3R-06, W3R-08).
+pub const FAILED_AUTH_GRPC_LIMIT: u32 = 60;
+
+/// Redis counter of [`FAILED_AUTH_GRPC_LIMIT`]. Its own prefix, so no client
+/// address (`auth_fail:{ip}`) can land in it.
+pub const FAILED_AUTH_GRPC_KEY: &str = "auth_fail_grpc";
+
+/// Window of [`FAILED_AUTH_PER_IP_LIMIT`] and [`FAILED_AUTH_GRPC_LIMIT`].
+const FAILED_AUTH_WINDOW_SECS: u64 = 60;
+
+/// The failed-auth budget a token that misses `lookup_hash` is charged to.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum FailedAuthBudget<'a> {
+    /// REST and `/auth/login`: the client address
+    /// ([`FAILED_AUTH_PER_IP_LIMIT`]).
+    ClientIp(&'a str),
+    /// gRPC: one bucket for every caller ([`FAILED_AUTH_GRPC_LIMIT`]).
+    Grpc,
+}
+
+impl FailedAuthBudget<'_> {
+    fn key(&self) -> String {
+        match self {
+            Self::ClientIp(ip) => format!("auth_fail:{}", ip),
+            Self::Grpc => FAILED_AUTH_GRPC_KEY.to_string(),
+        }
+    }
+
+    fn limit(&self) -> u32 {
+        match self {
+            Self::ClientIp(_) => FAILED_AUTH_PER_IP_LIMIT,
+            Self::Grpc => FAILED_AUTH_GRPC_LIMIT,
+        }
+    }
+
+    /// The scan turn requests under this budget take.
+    fn lane(&self) -> ScanLane {
+        match self {
+            Self::ClientIp(_) => ScanLane::Rest,
+            Self::Grpc => ScanLane::Grpc,
+        }
+    }
+}
+
+/// How long a token that matched no key is answered from Redis without
+/// touching the database.
+const AUTH_MISS_TTL_SECS: u64 = 60;
+
+/// API key record from database, and the value cached under
+/// `api_key:{sha256(token)}`. Shared by the REST middleware, `/auth/login` and
+/// gRPC, so a revoke that clears the cache entry ends all three.
+#[derive(Debug, Clone, FromRow)]
+pub(crate) struct ApiKeyRecord {
+    pub(crate) id: String,
+    pub(crate) organization_id: String,
     key_hash: String,
-    queues: Vec<String>,
-    rate_limit: Option<i32>,
-    is_active: bool,
-    expires_at: Option<chrono::DateTime<Utc>>,
+    pub(crate) queues: Vec<String>,
+    pub(crate) rate_limit: Option<i32>,
+    pub(crate) is_active: bool,
+    pub(crate) expires_at: Option<chrono::DateTime<Utc>>,
 }
 
 /// Authenticate API key or JWT token middleware
@@ -151,9 +241,15 @@ async fn authenticate_inner(
             .await
             .map_err(|(s, m)| auth_error_response(s, m))?
     } else {
-        authenticate_api_key_token(&state, &token)
-            .await
-            .map_err(|(s, m)| auth_error_response(s, m))?
+        let client_ip = client_ip(request.headers(), &state.settings.trusted_proxy);
+        authenticate_api_key_token(
+            state.db.pool(),
+            state.cache.as_ref(),
+            &token,
+            FailedAuthBudget::ClientIp(&client_ip),
+        )
+        .await
+        .map_err(|(s, m)| auth_error_response(s, m))?
     };
 
     // Store context for downstream handlers
@@ -263,13 +359,7 @@ async fn authenticate_jwt_token(
     .bind(&token_data.claims.api_key_id)
     .fetch_optional(state.db.pool())
     .await
-    .map_err(|e| {
-        tracing::error!(error = %e, "Failed to check API key status");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Database error".to_string(),
-        )
-    })?;
+    .map_err(auth_db_error)?;
 
     match api_key_row {
         Some((true, rate_limit, expires_at, queues)) => {
@@ -285,13 +375,7 @@ async fn authenticate_jwt_token(
                     .bind(&token_data.claims.org_id)
                     .fetch_optional(state.db.pool())
                     .await
-                    .map_err(|e| {
-                        tracing::error!(error = %e, "Failed to check organization status");
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "Database error".to_string(),
-                        )
-                    })?;
+                    .map_err(auth_db_error)?;
             if !matches!(org_tier.as_ref().map(|(t,)| t.as_str()), Some(t) if t != "deleted") {
                 return Err((
                     StatusCode::UNAUTHORIZED,
@@ -326,26 +410,17 @@ async fn authenticate_jwt_token(
     }
 }
 
-/// Authenticate API key token and return context
-async fn authenticate_api_key_token(
-    state: &AppState,
+/// Authenticate a raw API key and return its context.
+///
+/// Shared by the REST middleware and gRPC. `budget` is the failed-auth budget
+/// the legacy scan is charged to (see [`resolve_api_key`]).
+pub(crate) async fn authenticate_api_key_token(
+    pool: &PgPool,
+    cache: Option<&RedisCache>,
     token: &str,
+    budget: FailedAuthBudget<'_>,
 ) -> Result<ApiKeyContext, (StatusCode, String)> {
-    // Try cache first for hot keys (99% hit rate expected)
-    let api_key = if let Some(ref cache) = state.cache {
-        let cache_key = format!("api_key:{}", hash_for_lookup(token));
-        match cache.get_json::<ApiKeyRecord>(&cache_key).await {
-            Ok(Some(cached)) => {
-                // Cache hit - trust it! The cache key already includes token hash.
-                // No need to re-verify bcrypt (saves 50-100ms per request).
-                // Bcrypt was already verified when initially cached.
-                cached
-            }
-            _ => fetch_and_cache_api_key(state, token).await?,
-        }
-    } else {
-        fetch_api_key(state, token).await?
-    };
+    let api_key = resolve_api_key(pool, cache, token, budget).await?;
 
     // Verify active status
     if !api_key.is_active {
@@ -359,7 +434,7 @@ async fn authenticate_api_key_token(
         }
     }
 
-    touch_last_used(state, &api_key.id).await;
+    touch_last_used(pool, cache, &api_key.id).await;
 
     Ok(ApiKeyContext {
         api_key_id: api_key.id,
@@ -369,60 +444,399 @@ async fn authenticate_api_key_token(
     })
 }
 
-/// Fetch API key from database.
+/// Find the key a raw token belongs to.
 ///
-/// Fast path: `lookup_hash = sha256(token)` is unique, so a single indexed row read
-/// yields the one candidate, which is then bcrypt-verified. This replaces the old
-/// prefix scan, where every `sp_live_` key shared the same `key_prefix` so a bogus
-/// key cost up to 100 bcrypt verifications (~7.7s) — a CPU-amplification vector.
+/// In order:
+/// 1. The Redis record cache (`api_key:{sha256}`): no database, no bcrypt.
+///    Bcrypt was verified when the record was cached.
+/// 2. The negative cache (`auth_miss:{sha256}`): a token that matched nothing
+///    in the last [`AUTH_MISS_TTL_SECS`] is refused without the database.
+/// 3. Fast path: `lookup_hash = sha256(token)` is unique, so a single indexed row
+///    read yields the one candidate, which is then bcrypt-verified. This replaced
+///    the old prefix scan, where every `sp_live_` key shared the same
+///    `key_prefix` so a bogus key cost up to 100 bcrypt verifications.
+/// 4. Legacy fallback ([`resolve_legacy`]): rows created before `lookup_hash`
+///    existed have it NULL and can't be backfilled offline (the plaintext isn't
+///    recoverable from bcrypt), so they get the bounded prefix scan and are
+///    backfilled on a match. Any unknown token can trigger it, so it is charged
+///    to `budget` first and skipped once the budget is spent
+///    ([`FAILED_AUTH_PER_IP_LIMIT`] per client address on REST,
+///    [`FAILED_AUTH_GRPC_LIMIT`] for all of gRPC); REST and gRPC scans take
+///    separate turns, a request waits for its turn about one scan at most, and
+///    concurrent requests for one token share one scan. A miss after a scan is
+///    negatively cached. A spent budget is a 401 and a turn still busy after
+///    the wait a 503; neither is negatively cached: they proved nothing about
+///    the token.
 ///
-/// Legacy fallback: rows created before `lookup_hash` existed have it NULL and can't
-/// be backfilled offline (the plaintext isn't recoverable from bcrypt). For those we
-/// fall back to the bounded prefix scan and, on a match, backfill `lookup_hash` so
-/// the key uses the fast path from then on. The fallback only scans `lookup_hash IS
-/// NULL` rows, so it shrinks to empty as keys re-authenticate after deploy.
-async fn fetch_api_key(
-    state: &AppState,
+/// Steps 1-3 never touch the budget: a key found there is never gated.
+///
+/// Every bcrypt verify runs through [`bcrypt_gate`], off the async workers.
+/// Redis errors fail open for the caches and the budget: the request takes the
+/// database path as if Redis were not configured.
+pub(crate) async fn resolve_api_key(
+    pool: &PgPool,
+    cache: Option<&RedisCache>,
     token: &str,
+    budget: FailedAuthBudget<'_>,
 ) -> Result<ApiKeyRecord, (StatusCode, String)> {
-    let db_err = |e: sqlx::Error| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
+    let lookup_hash = hash_for_lookup(token);
+
+    if let Some(cache) = cache {
+        // Cache hit - trust it! The cache key is the full SHA-256 of the token.
+        if let Ok(Some(cached)) = cache
+            .get_json::<ApiKeyRecord>(&api_key_cache_key(&lookup_hash))
+            .await
+        {
+            return Ok(cached);
+        }
+        if let Ok(true) = cache.exists(&auth_miss_key(&lookup_hash)).await {
+            return Err(invalid_api_key());
+        }
+    }
+
+    if let Some(record) = find_by_lookup_hash(pool, token, &lookup_hash).await? {
+        return cache_api_key(pool, cache, &lookup_hash, record).await;
+    }
+
+    match resolve_legacy(pool, cache, token, &lookup_hash, budget).await? {
+        Legacy::Found(record) => cache_api_key(pool, cache, &lookup_hash, record).await,
+        Legacy::OverBudget => {
+            // The scan never looked at this token, so the miss proves nothing
+            // and is not negatively cached.
+            tracing::debug!(
+                ?budget,
+                "Failed-auth budget spent; skipping the legacy key scan"
+            );
+            Err(invalid_api_key())
+        }
+        Legacy::Busy => {
+            // Not checked either: no negative cache, or a legacy key refused
+            // during a flood would stay refused for the cache TTL; a 503 so the
+            // client retries instead of treating its key as invalid.
+            tracing::debug!(?budget, "Legacy API key scan busy; token not checked");
+            Err(auth_unavailable())
+        }
+        Legacy::Missed { charge } => {
+            // A concurrent legacy-key backfill can commit after the fast lookup
+            // but before the fallback query, moving the row between both
+            // snapshots. Retry the indexed lookup once before rejecting the key.
+            let retried = find_by_lookup_hash(pool, token, &lookup_hash).await;
+            if !matches!(retried, Ok(None)) {
+                refund_failed_auth(cache, charge).await;
+            }
+            if let Some(record) = retried? {
+                return cache_api_key(pool, cache, &lookup_hash, record).await;
+            }
+            if let Some(cache) = cache {
+                let _ = cache
+                    .set(&auth_miss_key(&lookup_hash), "1", AUTH_MISS_TTL_SECS)
+                    .await;
+            }
+            Err(invalid_api_key())
+        }
+    }
+}
+
+/// Outcome of [`scan_legacy_keys`], shared by the requests of one flight
+/// ([`resolve_legacy`]).
+#[derive(Clone)]
+enum LegacyScan {
+    Found(ApiKeyRecord),
+    /// Every candidate was checked (or there were none): the token is unknown.
+    Missed,
+    /// The lane's scan turn stayed busy for the bounded wait; the token was not
+    /// checked.
+    Busy,
+}
+
+/// Outcome of [`resolve_legacy`] for one request.
+enum Legacy {
+    /// The scan, or the re-check after waiting for it, found the key. Any charge
+    /// was refunded.
+    Found(ApiKeyRecord),
+    /// No legacy key matched. `charge` is this request's failed-auth charge
+    /// (only the request that ran the scan has one), refunded if the caller's
+    /// final `lookup_hash` retry still finds the key.
+    Missed { charge: Option<BudgetCharge> },
+    /// The scan turn, or the request already scanning this token, stayed busy
+    /// past the bounded wait. Not charged.
+    Busy,
+    /// The budget was spent: no scan. Charged.
+    OverBudget,
+}
+
+/// Longest a request waits for a concurrent request already resolving the same
+/// token on the same lane: that request's wait for the turn (at most
+/// [`bcrypt_gate::LEGACY_SCAN_MAX_WAIT`]) plus its scan. Past it the request
+/// is a 503 like a busy turn; under the 30 s request timeout.
+const LEGACY_FLIGHT_MAX_WAIT: Duration = Duration::from_secs(20);
+
+/// Requests resolving one token on one lane at the same time: the first runs
+/// the scan, the rest wait for it and take its outcome (W3R-07). Before, each
+/// queued for the scan turn on its own, and those that got it re-scanned the
+/// candidate list the first had already settled.
+struct LegacyFlight {
+    /// Set by the request that scanned, for the others. Holding the lock is
+    /// leading the flight; a leader that leaves without an outcome (cancelled,
+    /// over its budget, a database error) hands the lead to the next waiter.
+    outcome: tokio::sync::Mutex<Option<LegacyScan>>,
+}
+
+type FlightKey = (ScanLane, String);
+
+/// Open flights by lane and `lookup_hash`. An entry lives while a request is
+/// in its flight: every [`FlightTicket`] is created and dropped under this lock.
+static FLIGHTS: LazyLock<Mutex<HashMap<FlightKey, Weak<LegacyFlight>>>> =
+    LazyLock::new(Default::default);
+
+/// One request's place in a [`LegacyFlight`]; the last one out removes the
+/// flight.
+struct FlightTicket {
+    key: FlightKey,
+    flight: Option<Arc<LegacyFlight>>,
+}
+
+impl FlightTicket {
+    fn join(lane: ScanLane, lookup_hash: &str) -> Self {
+        let key = (lane, lookup_hash.to_string());
+        let mut flights = FLIGHTS.lock().unwrap_or_else(PoisonError::into_inner);
+        let flight = match flights.get(&key).and_then(Weak::upgrade) {
+            Some(flight) => flight,
+            None => {
+                let flight = Arc::new(LegacyFlight {
+                    outcome: tokio::sync::Mutex::new(None),
+                });
+                flights.insert(key.clone(), Arc::downgrade(&flight));
+                flight
+            }
+        };
+        Self {
+            key,
+            flight: Some(flight),
+        }
+    }
+
+    fn flight(&self) -> &LegacyFlight {
+        self.flight
+            .as_deref()
+            .expect("a ticket holds its flight until dropped")
+    }
+}
+
+impl Drop for FlightTicket {
+    fn drop(&mut self) {
+        let mut flights = FLIGHTS.lock().unwrap_or_else(PoisonError::into_inner);
+        // Dropped under the lock, like every join, so a dead entry is exact.
+        drop(self.flight.take());
+        if flights
+            .get(&self.key)
+            .is_some_and(|flight| flight.strong_count() == 0)
+        {
+            flights.remove(&self.key);
+        }
+    }
+}
+
+/// Resolve a token that missed `lookup_hash` through the legacy scan of its
+/// lane ([`FailedAuthBudget::lane`]).
+///
+/// Concurrent requests for the token join one [`LegacyFlight`]: the leader is
+/// charged to its budget and scans, the others wait at most
+/// [`LEGACY_FLIGHT_MAX_WAIT`] and take its outcome without a charge or a scan
+/// of their own. A shared outcome is the leader's scan of this exact token
+/// (the flight key is its full SHA-256, as for the record cache), and a found
+/// record is still re-checked for `is_active` by [`cache_api_key`].
+async fn resolve_legacy(
+    pool: &PgPool,
+    cache: Option<&RedisCache>,
+    token: &str,
+    lookup_hash: &str,
+    budget: FailedAuthBudget<'_>,
+) -> Result<Legacy, (StatusCode, String)> {
+    let ticket = FlightTicket::join(budget.lane(), lookup_hash);
+    let Ok(mut outcome) =
+        tokio::time::timeout(LEGACY_FLIGHT_MAX_WAIT, ticket.flight().outcome.lock()).await
+    else {
+        tracing::debug!("Legacy API key scan of this token still running; not waiting longer");
+        return Ok(Legacy::Busy);
     };
+    match outcome.as_ref() {
+        Some(LegacyScan::Found(record)) => return Ok(Legacy::Found(record.clone())),
+        Some(LegacyScan::Missed) => return Ok(Legacy::Missed { charge: None }),
+        Some(LegacyScan::Busy) => return Ok(Legacy::Busy),
+        None => {}
+    }
 
-    let lookup_hash = crate::models::api_key_lookup_hash(token);
+    // This request leads: charge first, so neither concurrency nor a cancelled
+    // request gets a scan for free.
+    let Ok(charge) = charge_failed_auth(cache, budget).await else {
+        return Ok(Legacy::OverBudget);
+    };
+    let scanned = scan_legacy_keys(pool, cache, token, lookup_hash, budget.lane()).await;
+    if let Ok(scan) = &scanned {
+        *outcome = Some(scan.clone());
+    }
+    drop(outcome);
 
-    // Fast path: exactly one row (or none). Mirrors the old scan's `is_active = TRUE`
-    // filter; expiry is checked by the caller from the returned `expires_at`.
-    // Soft-deleted orgs (`plan_tier = 'deleted'`) are excluded so a leftover or
-    // revived key cannot authenticate after soft-delete.
-    let by_lookup: Option<ApiKeyRecord> = sqlx::query_as(
+    match scanned {
+        Ok(LegacyScan::Missed) => Ok(Legacy::Missed { charge }),
+        Ok(LegacyScan::Found(record)) => {
+            refund_failed_auth(cache, charge).await;
+            Ok(Legacy::Found(record))
+        }
+        Ok(LegacyScan::Busy) => {
+            refund_failed_auth(cache, charge).await;
+            Ok(Legacy::Busy)
+        }
+        Err(e) => {
+            refund_failed_auth(cache, charge).await;
+            Err(e)
+        }
+    }
+}
+
+fn invalid_api_key() -> (StatusCode, String) {
+    (StatusCode::UNAUTHORIZED, "Invalid API key".to_string())
+}
+
+fn auth_unavailable() -> (StatusCode, String) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Authentication is temporarily unavailable".to_string(),
+    )
+}
+
+/// Map a database failure during authentication to a response for a caller
+/// who is not authenticated yet: never the sqlx text (pool state, server error
+/// detail), and 503 when the database cannot be reached so clients retry
+/// instead of treating it as a server bug.
+fn auth_db_error(e: sqlx::Error) -> (StatusCode, String) {
+    tracing::error!(error = %e, "Database error during authentication");
+    match e {
+        sqlx::Error::PoolTimedOut
+        | sqlx::Error::PoolClosed
+        | sqlx::Error::WorkerCrashed
+        | sqlx::Error::Io(_)
+        | sqlx::Error::Tls(_) => auth_unavailable(),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Authentication failed".to_string(),
+        ),
+    }
+}
+
+/// [`bcrypt_gate::verify`], with a failure to run the check reported as an
+/// error rather than read as "no match" (which could be negatively cached).
+async fn verify_key(token: &str, key_hash: &str) -> Result<bool, (StatusCode, String)> {
+    bcrypt_gate::verify(token, key_hash).await.map_err(|e| {
+        tracing::error!(error = %e, "API key verification could not run");
+        auth_unavailable()
+    })
+}
+
+/// The active key whose `lookup_hash` matches, if bcrypt agrees.
+///
+/// Mirrors the old scan's `is_active = TRUE` filter; expiry is checked by the
+/// caller from the returned `expires_at`. Soft-deleted orgs (`plan_tier =
+/// 'deleted'`) are excluded so a leftover or revived key cannot authenticate
+/// after soft-delete.
+async fn find_by_lookup_hash(
+    pool: &PgPool,
+    token: &str,
+    lookup_hash: &str,
+) -> Result<Option<ApiKeyRecord>, (StatusCode, String)> {
+    let record: Option<ApiKeyRecord> = sqlx::query_as(
         "SELECT k.id, k.organization_id, k.key_hash, k.queues, k.rate_limit, k.is_active, k.expires_at
          FROM api_keys k
          INNER JOIN organizations o ON o.id = k.organization_id
          WHERE k.lookup_hash = $1 AND k.is_active = TRUE AND o.plan_tier <> 'deleted'
          LIMIT 1",
     )
-    .bind(&lookup_hash)
-    .fetch_optional(state.db.pool())
+    .bind(lookup_hash)
+    .fetch_optional(pool)
     .await
-    .map_err(db_err)?;
+    .map_err(auth_db_error)?;
 
-    if let Some(record) = by_lookup {
+    match record {
         // Defense in depth: verify bcrypt even though lookup_hash matched, so a
-        // (practically impossible) SHA-256 collision can't authenticate.
-        if bcrypt::verify(token, &record.key_hash).unwrap_or(false) {
-            return Ok(record);
-        }
-        // Collision without a bcrypt match: fall through to the legacy scan rather
-        // than trust the lookup_hash hit.
+        // (practically impossible) SHA-256 collision can't authenticate. A
+        // collision without a bcrypt match falls through to the legacy scan.
+        Some(record) if verify_key(token, &record.key_hash).await? => Ok(Some(record)),
+        _ => Ok(None),
     }
+}
 
-    // Legacy fallback: only keys not yet carrying a lookup_hash.
+/// Bounded scan of the keys that carry no `lookup_hash` yet, on `lane`'s turn;
+/// backfills it on a match so the key uses the fast path from then on. Only
+/// `lookup_hash IS NULL` rows are scanned, so the set shrinks as keys
+/// re-authenticate.
+///
+/// A request that had to wait for the turn re-checks the token first (the
+/// record cache, the negative cache, `lookup_hash`): the request on the other
+/// lane or another replica it waited behind may have resolved it. It then reads
+/// the candidates again, without the rows backfilled meanwhile.
+async fn scan_legacy_keys(
+    pool: &PgPool,
+    cache: Option<&RedisCache>,
+    token: &str,
+    lookup_hash: &str,
+    lane: ScanLane,
+) -> Result<LegacyScan, (StatusCode, String)> {
+    let candidates = legacy_candidates(pool, token).await?;
+    if candidates.is_empty() {
+        return Ok(LegacyScan::Missed);
+    }
+    let units = candidates
+        .iter()
+        .map(|record| bcrypt_gate::verify_units(&record.key_hash))
+        .fold(0u64, u64::saturating_add);
+    let turn = bcrypt_gate::legacy_scan_turn(lane, units)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "Legacy API key scan could not run");
+            auth_unavailable()
+        })?;
+    let Some(turn) = turn else {
+        return Ok(LegacyScan::Busy);
+    };
+
+    let candidates = if turn.waited() {
+        if let Some(cache) = cache {
+            if let Ok(Some(record)) = cache
+                .get_json::<ApiKeyRecord>(&api_key_cache_key(lookup_hash))
+                .await
+            {
+                return Ok(LegacyScan::Found(record));
+            }
+            if let Ok(true) = cache.exists(&auth_miss_key(lookup_hash)).await {
+                return Ok(LegacyScan::Missed);
+            }
+        }
+        if let Some(record) = find_by_lookup_hash(pool, token, lookup_hash).await? {
+            return Ok(LegacyScan::Found(record));
+        }
+        legacy_candidates(pool, token).await?
+    } else {
+        candidates
+    };
+
+    for record in candidates {
+        if verify_key(token, &record.key_hash).await? {
+            backfill_lookup_hash(pool, &record.id, lookup_hash).await;
+            return Ok(LegacyScan::Found(record));
+        }
+    }
+    Ok(LegacyScan::Missed)
+}
+
+/// The active legacy keys a token may be: no `lookup_hash`, and its prefix or
+/// none, at most 100.
+async fn legacy_candidates(
+    pool: &PgPool,
+    token: &str,
+) -> Result<Vec<ApiKeyRecord>, (StatusCode, String)> {
     let key_prefix: String = token.chars().take(8).collect();
-    let records: Vec<ApiKeyRecord> = sqlx::query_as(
+    sqlx::query_as(
         "SELECT k.id, k.organization_id, k.key_hash, k.queues, k.rate_limit, k.is_active, k.expires_at
          FROM api_keys k
          INNER JOIN organizations o ON o.id = k.organization_id
@@ -433,52 +847,96 @@ async fn fetch_api_key(
          LIMIT 100",
     )
     .bind(&key_prefix)
-    .fetch_all(state.db.pool())
+    .fetch_all(pool)
     .await
-    .map_err(db_err)?;
+    .map_err(auth_db_error)
+}
 
-    for record in records {
-        if bcrypt::verify(token, &record.key_hash).unwrap_or(false) {
-            // Backfill lookup_hash so the next auth for this key is O(1). Fire-and-forget;
-            // guarded by `lookup_hash IS NULL` so concurrent backfills are idempotent.
-            let db = state.db.pool_arc();
-            let key_id = record.id.clone();
-            let lh = lookup_hash.clone();
-            tokio::spawn(async move {
-                let _ = sqlx::query(
-                    "UPDATE api_keys SET lookup_hash = $1 WHERE id = $2 AND lookup_hash IS NULL",
-                )
-                .bind(&lh)
-                .bind(&key_id)
-                .execute(&*db)
-                .await;
-            });
-            return Ok(record);
+/// Store `lookup_hash` on a legacy key that just verified, so every lane and
+/// replica finds it on the fast path from now on.
+///
+/// Awaited, so the key's next request (and one that waited for this scan)
+/// finds it by `lookup_hash`; run as its own task, so a cancelled request still
+/// completes it. Guarded by `lookup_hash IS NULL`, so concurrent backfills are
+/// idempotent. A failure only means the next request scans again.
+async fn backfill_lookup_hash(pool: &PgPool, key_id: &str, lookup_hash: &str) {
+    let db = pool.clone();
+    let key_id = key_id.to_string();
+    let lookup_hash = lookup_hash.to_string();
+    let backfill = tokio::spawn(async move {
+        sqlx::query("UPDATE api_keys SET lookup_hash = $1 WHERE id = $2 AND lookup_hash IS NULL")
+            .bind(&lookup_hash)
+            .bind(&key_id)
+            .execute(&db)
+            .await
+    });
+    match backfill.await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "Legacy API key lookup_hash backfill failed"),
+        Err(e) => tracing::warn!(error = %e, "Legacy API key lookup_hash backfill did not run"),
+    }
+}
+
+/// One failed authentication charged to a budget before the legacy scan.
+struct BudgetCharge {
+    key: String,
+}
+
+/// The budget was spent before this request: it must not scan.
+struct OverBudget;
+
+/// Charge `budget` one failed authentication BEFORE the legacy scan: INCR, then
+/// compare the new count to the limit.
+///
+/// Charging after the scan (and reading the counter before it) let concurrent
+/// requests all read the counter before any was charged, and a request
+/// cancelled mid-scan was never charged at all (W3R-08). The charge is taken
+/// back ([`refund_failed_auth`]) when the scan finds the key or never runs
+/// (turn busy, database error): those are not failed authentications, so a
+/// burst of requests for a dormant legacy key does not use up the budget its
+/// address shares. Over the limit the request is charged and skips the scan.
+///
+/// `Ok(None)`: nothing to refund (no Redis, or a Redis error: the budget fails
+/// open).
+async fn charge_failed_auth(
+    cache: Option<&RedisCache>,
+    budget: FailedAuthBudget<'_>,
+) -> Result<Option<BudgetCharge>, OverBudget> {
+    let Some(cache) = cache else {
+        return Ok(None);
+    };
+    let key = budget.key();
+    // Fixed window: the first failure starts it and later ones do not extend
+    // it, so a slow trickle of failures behind one shared proxy address cannot
+    // keep the scan switched off.
+    match cache
+        .check_rate_limit(&key, budget.limit(), FAILED_AUTH_WINDOW_SECS)
+        .await
+    {
+        Ok(counted) if counted.allowed => Ok(Some(BudgetCharge { key })),
+        Ok(_) => Err(OverBudget),
+        Err(e) => {
+            tracing::debug!(error = %e, "Failed-auth counter unavailable");
+            Ok(None)
         }
     }
+}
 
-    // A concurrent legacy-key backfill can commit after the fast lookup but before
-    // the fallback query, moving the row between both snapshots. Retry the indexed
-    // lookup once before rejecting the key.
-    let by_lookup: Option<ApiKeyRecord> = sqlx::query_as(
-        "SELECT k.id, k.organization_id, k.key_hash, k.queues, k.rate_limit, k.is_active, k.expires_at
-         FROM api_keys k
-         INNER JOIN organizations o ON o.id = k.organization_id
-         WHERE k.lookup_hash = $1 AND k.is_active = TRUE AND o.plan_tier <> 'deleted'
-         LIMIT 1",
-    )
-    .bind(&lookup_hash)
-    .fetch_optional(state.db.pool())
-    .await
-    .map_err(db_err)?;
-
-    if let Some(record) = by_lookup {
-        if bcrypt::verify(token, &record.key_hash).unwrap_or(false) {
-            return Ok(record);
+/// Take back a [`charge_failed_auth`] charge.
+async fn refund_failed_auth(cache: Option<&RedisCache>, charge: Option<BudgetCharge>) {
+    if let (Some(cache), Some(charge)) = (cache, charge) {
+        if let Err(e) = cache.decr(&charge.key).await {
+            tracing::debug!(error = %e, "Failed-auth refund unavailable");
         }
     }
+}
 
-    Err((StatusCode::UNAUTHORIZED, "Invalid API key".to_string()))
+fn api_key_cache_key(lookup_hash: &str) -> String {
+    format!("api_key:{}", lookup_hash)
+}
+
+fn auth_miss_key(lookup_hash: &str) -> String {
+    format!("auth_miss:{}", lookup_hash)
 }
 
 /// TTL for cached API-key records. Kept short so that if a key is revoked in the
@@ -487,47 +945,50 @@ async fn fetch_api_key(
 /// staying valid for an hour.
 const API_KEY_CACHE_TTL_SECS: u64 = 60;
 
-/// Fetch API key from database and cache it
-async fn fetch_and_cache_api_key(
-    state: &AppState,
-    token: &str,
+/// Cache a freshly verified key record (a no-op without Redis).
+async fn cache_api_key(
+    pool: &PgPool,
+    cache: Option<&RedisCache>,
+    lookup_hash: &str,
+    record: ApiKeyRecord,
 ) -> Result<ApiKeyRecord, (StatusCode, String)> {
-    let record = fetch_api_key(state, token).await?;
+    let Some(cache) = cache else {
+        return Ok(record);
+    };
 
-    if let Some(ref cache) = state.cache {
-        // Re-check is_active immediately before caching. fetch_api_key's SELECT runs
-        // BEFORE the (slow) bcrypt verify, so a revoke that commits during bcrypt would
-        // otherwise be papered over by caching a stale active record for the full TTL.
-        // If the key was revoked in that window, refuse it and do not cache.
-        let still_active: Option<(bool,)> =
-            sqlx::query_as("SELECT is_active FROM api_keys WHERE id = $1")
-                .bind(&record.id)
-                .fetch_optional(state.db.pool())
-                .await
-                .ok()
-                .flatten();
-        if !matches!(still_active, Some((true,))) {
-            return Err((StatusCode::UNAUTHORIZED, "API key is inactive".to_string()));
-        }
-
-        let lookup_hash = hash_for_lookup(token);
-        let cache_key = format!("api_key:{}", lookup_hash);
-        let _ = cache
-            .set_json(&cache_key, &record, API_KEY_CACHE_TTL_SECS)
-            .await;
-
-        // CRITICAL: Also set reverse mapping (bcrypt hash prefix -> lookup hash)
-        // This allows cache invalidation when the API key is revoked.
-        let hash_prefix = if record.key_hash.len() >= 16 {
-            &record.key_hash[..16]
-        } else {
-            &record.key_hash
-        };
-        let reverse_key = format!("api_key_reverse:{}", hash_prefix);
-        let _ = cache
-            .set(&reverse_key, &lookup_hash, API_KEY_CACHE_TTL_SECS)
-            .await;
+    // Re-check is_active immediately before caching. The SELECT that found the
+    // record ran BEFORE the (slow) bcrypt verify, so a revoke that commits during
+    // bcrypt would otherwise be papered over by caching a stale active record for
+    // the full TTL. If the key was revoked in that window, refuse it and do not cache.
+    let still_active: Option<(bool,)> =
+        sqlx::query_as("SELECT is_active FROM api_keys WHERE id = $1")
+            .bind(&record.id)
+            .fetch_optional(pool)
+            .await
+            .map_err(auth_db_error)?;
+    if !matches!(still_active, Some((true,))) {
+        return Err((StatusCode::UNAUTHORIZED, "API key is inactive".to_string()));
     }
+
+    let _ = cache
+        .set_json(
+            &api_key_cache_key(lookup_hash),
+            &record,
+            API_KEY_CACHE_TTL_SECS,
+        )
+        .await;
+
+    // CRITICAL: Also set reverse mapping (bcrypt hash prefix -> lookup hash)
+    // This allows cache invalidation when the API key is revoked.
+    let hash_prefix = if record.key_hash.len() >= 16 {
+        &record.key_hash[..16]
+    } else {
+        &record.key_hash
+    };
+    let reverse_key = format!("api_key_reverse:{}", hash_prefix);
+    let _ = cache
+        .set(&reverse_key, lookup_hash, API_KEY_CACHE_TTL_SECS)
+        .await;
 
     Ok(record)
 }
@@ -552,8 +1013,8 @@ const LAST_USED_WRITE_INTERVAL_SECS: u64 = 300;
 /// configured we fall back to writing every time — self-hosted deployments do
 /// not have the request volume this protects against, and silently dropping
 /// `last_used` entirely would be worse.
-async fn touch_last_used(state: &AppState, key_id: &str) {
-    if let Some(ref cache) = state.cache {
+async fn touch_last_used(pool: &PgPool, cache: Option<&RedisCache>, key_id: &str) {
+    if let Some(cache) = cache {
         let guard_key = format!("api_key_last_used:{}", key_id);
         match cache
             .set_if_absent(&guard_key, "1", LAST_USED_WRITE_INTERVAL_SECS)
@@ -570,12 +1031,12 @@ async fn touch_last_used(state: &AppState, key_id: &str) {
         }
     }
 
-    let db = state.db.pool_arc();
+    let db = pool.clone();
     let key_id = key_id.to_string();
     tokio::spawn(async move {
         let _ = sqlx::query("UPDATE api_keys SET last_used = NOW() WHERE id = $1")
             .bind(&key_id)
-            .execute(&*db)
+            .execute(&db)
             .await;
     });
 }

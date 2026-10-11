@@ -426,9 +426,11 @@ pub async fn create(
         }
         // Queues this workflow would create count against the plan's queue cap —
         // checked after the workflow feature/cap so a plan without workflows still
-        // gets `feature_disabled`, not a queue error.
-        if let Err(response) = crate::api::middleware::limits::check_new_queue_limit(
-            state.db.pool(),
+        // gets `feature_disabled`, not a queue error. Runs on the transaction's own
+        // connection: a second pool connection here deadlocks the pool when pool-size
+        // creates queue behind the advisory lock.
+        if let Err(response) = crate::api::middleware::limits::check_new_queue_limit_conn(
+            &mut tx,
             &ctx.organization_id,
             new_queues,
         )

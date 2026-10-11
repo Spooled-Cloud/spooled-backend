@@ -5,10 +5,22 @@
 pub mod tracing_config;
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
-use axum::{routing::get, Router};
-use prometheus::{Encoder, Histogram, HistogramOpts, IntCounter, IntGauge, Registry, TextEncoder};
+use anyhow::{Context, Result};
+use axum::{
+    extract::{MatchedPath, Request, State},
+    middleware::Next,
+    response::Response,
+    routing::get,
+    Router,
+};
+use prometheus::{
+    Encoder, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts,
+    Registry, TextEncoder,
+};
+use sqlx::PgPool;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 // Tracing configuration re-exports for advanced usage
@@ -42,17 +54,23 @@ pub struct Metrics {
     pub job_duration: Histogram,
     pub job_max_age_seconds: IntGauge,
 
-    // API metrics
-    pub api_requests_total: IntCounter,
-    pub api_request_duration: Histogram,
+    // API metrics. Labels are bounded: HTTP method (known verbs, else `OTHER`),
+    // the matched route template (`/api/v1/jobs/{id}`, `unmatched` for 404s,
+    // never the raw path) and the status class (`2xx`).
+    pub api_requests_total: IntCounterVec,
+    pub api_request_duration: HistogramVec,
 
     // Worker metrics
     pub workers_active: IntGauge,
     pub workers_healthy: IntGauge,
 
     // Infrastructure metrics
+    /// Connections currently checked out of the pool (size - idle).
     pub database_connections: IntGauge,
-    pub redis_operations: IntCounter,
+    /// Configured pool ceiling, so alerts can use a ratio instead of a constant.
+    pub database_connections_max: IntGauge,
+    /// Pool sampled on every scrape (set once by `AppState::new`).
+    pool: Arc<OnceLock<PgPool>>,
 }
 
 impl Metrics {
@@ -99,9 +117,11 @@ impl Metrics {
         .expect("metric creation failed");
 
         // API metrics
-        let api_requests_total =
-            IntCounter::new("spooled_api_requests_total", "Total API requests")
-                .expect("metric creation failed");
+        let api_requests_total = IntCounterVec::new(
+            Opts::new("spooled_api_requests_total", "Total API requests"),
+            &["method", "route", "status"],
+        )
+        .expect("metric creation failed");
 
         let api_request_duration_opts = HistogramOpts::new(
             "spooled_api_request_duration_seconds",
@@ -111,7 +131,8 @@ impl Metrics {
             0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
         ]);
         let api_request_duration =
-            Histogram::with_opts(api_request_duration_opts).expect("metric creation failed");
+            HistogramVec::new(api_request_duration_opts, &["method", "route"])
+                .expect("metric creation failed");
 
         // Worker metrics
         let workers_active = IntGauge::new("spooled_workers_active", "Number of active workers")
@@ -125,9 +146,11 @@ impl Metrics {
             "Active database connections",
         )
         .expect("metric creation failed");
-        let redis_operations =
-            IntCounter::new("spooled_redis_operations_total", "Total Redis operations")
-                .expect("metric creation failed");
+        let database_connections_max = IntGauge::new(
+            "spooled_database_connections_max",
+            "Configured maximum size of the database pool",
+        )
+        .expect("metric creation failed");
 
         // Register all metrics
         registry.register(Box::new(jobs_enqueued.clone())).unwrap();
@@ -159,7 +182,7 @@ impl Metrics {
             .register(Box::new(database_connections.clone()))
             .unwrap();
         registry
-            .register(Box::new(redis_operations.clone()))
+            .register(Box::new(database_connections_max.clone()))
             .unwrap();
 
         Self {
@@ -178,12 +201,41 @@ impl Metrics {
             workers_active,
             workers_healthy,
             database_connections,
-            redis_operations,
+            database_connections_max,
+            pool: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Attach the database pool whose usage is sampled on every scrape. The
+    /// first pool wins; clones of `Metrics` share it.
+    pub fn attach_pool(&self, pool: PgPool) {
+        let _ = self.pool.set(pool);
+    }
+
+    /// Refresh the pool gauges from the attached pool (no-op until attached).
+    fn sample_pool(&self) {
+        if let Some(pool) = self.pool.get() {
+            let in_use = (i64::from(pool.size()) - pool.num_idle() as i64).max(0);
+            self.database_connections.set(in_use);
+            self.database_connections_max
+                .set(i64::from(pool.options().get_max_connections()));
+        }
+    }
+
+    /// Record one finished HTTP request.
+    pub fn observe_http_request(&self, method: &str, route: &str, status: u16, elapsed_secs: f64) {
+        let method = normalize_method(method);
+        self.api_requests_total
+            .with_label_values(&[method, route, status_class(status)])
+            .inc();
+        self.api_request_duration
+            .with_label_values(&[method, route])
+            .observe(elapsed_secs);
     }
 
     /// Encode metrics to Prometheus format
     pub fn encode(&self) -> String {
+        self.sample_pool();
         let encoder = TextEncoder::new();
         let metric_families = self.registry.gather();
         let mut buffer = Vec::new();
@@ -193,6 +245,7 @@ impl Metrics {
 
     /// Get all metric families for Prometheus scraping
     pub fn gather(&self) -> Vec<prometheus::proto::MetricFamily> {
+        self.sample_pool();
         self.registry.gather()
     }
 }
@@ -201,6 +254,64 @@ impl Default for Metrics {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Known HTTP verbs only: the method is client-controlled and must not grow the
+/// label set.
+fn normalize_method(method: &str) -> &'static str {
+    match method {
+        "GET" => "GET",
+        "POST" => "POST",
+        "PUT" => "PUT",
+        "PATCH" => "PATCH",
+        "DELETE" => "DELETE",
+        "HEAD" => "HEAD",
+        "OPTIONS" => "OPTIONS",
+        _ => "OTHER",
+    }
+}
+
+fn status_class(status: u16) -> &'static str {
+    match status / 100 {
+        1 => "1xx",
+        2 => "2xx",
+        3 => "3xx",
+        4 => "4xx",
+        5 => "5xx",
+        _ => "other",
+    }
+}
+
+/// Route label for requests the router did not match (404s, scanners).
+const UNMATCHED_ROUTE: &str = "unmatched";
+
+/// Tower layer (via `axum::middleware::from_fn_with_state`) feeding
+/// `spooled_api_requests_total` and `spooled_api_request_duration_seconds`.
+///
+/// The route label is the matched route template, never the request path, so
+/// ids and scanner noise cannot create new series.
+pub async fn track_http_metrics(
+    State(metrics): State<Arc<Metrics>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let started = Instant::now();
+    let method = request.method().as_str().to_owned();
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|path| path.as_str().to_owned())
+        .unwrap_or_else(|| UNMATCHED_ROUTE.to_string());
+
+    let response = next.run(request).await;
+
+    metrics.observe_http_request(
+        &method,
+        &route,
+        response.status().as_u16(),
+        started.elapsed().as_secs_f64(),
+    );
+    response
 }
 
 /// Constant-time string comparison to prevent timing attacks
@@ -304,11 +415,13 @@ impl MetricsRateLimiter {
 /// restrict access with `METRICS_TOKEN` and/or network policy. A warning is
 /// logged at startup when no token is configured.
 ///
+/// Returns an error (bind failure or server error) instead of panicking, so the
+/// task that supervises the `JoinHandle` can report it.
 pub async fn start_metrics_server(
     addr: SocketAddr,
     metrics: Arc<Metrics>,
     metrics_token: Option<String>,
-) {
+) -> Result<()> {
     let metrics_clone = metrics.clone();
     let token = metrics_token.clone();
     let rate_limiter = Arc::new(MetricsRateLimiter::new());
@@ -374,8 +487,13 @@ pub async fn start_metrics_server(
         );
     }
 
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("Failed to bind metrics server on {addr}"))?;
+    axum::serve(listener, app)
+        .await
+        .context("Metrics server failed")?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -497,26 +615,29 @@ mod tests {
     fn test_api_metrics() {
         let metrics = Metrics::new();
 
-        metrics.api_requests_total.inc();
-        metrics.api_requests_total.inc();
-        metrics.api_requests_total.inc();
+        for _ in 0..3 {
+            metrics.observe_http_request("GET", "/api/v1/jobs/{id}", 200, 0.01);
+        }
 
         let output = metrics.encode();
-        assert!(output.contains("spooled_api_requests_total"));
-        assert!(output.contains("3")); // Should have 3 requests
+        assert!(output.contains(
+            r#"spooled_api_requests_total{method="GET",route="/api/v1/jobs/{id}",status="2xx"} 3"#
+        ));
     }
 
     #[test]
     fn test_api_request_duration() {
         let metrics = Metrics::new();
 
-        metrics.api_request_duration.observe(0.050); // 50ms
-        metrics.api_request_duration.observe(0.100); // 100ms
-        metrics.api_request_duration.observe(0.500); // 500ms
+        metrics.observe_http_request("POST", "/api/v1/jobs", 201, 0.050); // 50ms
+        metrics.observe_http_request("POST", "/api/v1/jobs", 201, 0.100); // 100ms
+        metrics.observe_http_request("POST", "/api/v1/jobs", 500, 0.500); // 500ms
 
         let output = metrics.encode();
         assert!(output.contains("spooled_api_request_duration_seconds"));
-        assert!(output.contains("_count 3"));
+        assert!(output.contains(
+            r#"spooled_api_request_duration_seconds_count{method="POST",route="/api/v1/jobs"} 3"#
+        ));
     }
 
     #[test]
@@ -535,14 +656,23 @@ mod tests {
     }
 
     #[test]
-    fn test_redis_operations_metric() {
+    fn http_metric_labels_are_bounded() {
         let metrics = Metrics::new();
-
-        metrics.redis_operations.inc();
-        metrics.redis_operations.inc();
+        metrics.observe_http_request("PURGE-0001", "unmatched", 404, 0.001);
+        metrics.observe_http_request("PURGE-0002", "unmatched", 799, 0.001);
 
         let output = metrics.encode();
-        assert!(output.contains("spooled_redis_operations_total"));
-        assert!(output.contains("2")); // Should have 2 operations
+        assert!(output.contains(r#"method="OTHER",route="unmatched",status="4xx""#));
+        assert!(output.contains(r#"method="OTHER",route="unmatched",status="other""#));
+        assert!(!output.contains("PURGE"));
+    }
+
+    #[test]
+    fn pool_gauges_stay_zero_until_a_pool_is_attached() {
+        let metrics = Metrics::new();
+        let output = metrics.encode();
+        assert!(output.contains("spooled_database_connections_active 0"));
+        assert!(output.contains("spooled_database_connections_max 0"));
+        assert!(!output.contains("spooled_redis_operations_total"));
     }
 }

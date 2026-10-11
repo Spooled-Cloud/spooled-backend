@@ -8,9 +8,13 @@
 
 use std::sync::Arc;
 
+use axum::http::StatusCode;
 use sqlx::PgPool;
 use tonic::{Request, Status};
-use tracing::{info, warn};
+use tracing::{debug, warn};
+
+use crate::api::middleware::auth::{authenticate_api_key_token, FailedAuthBudget};
+use crate::cache::RedisCache;
 
 /// Authenticated organization context for gRPC requests
 #[derive(Debug, Clone)]
@@ -43,16 +47,31 @@ impl GrpcAuthContext {
     }
 }
 
-/// Extract authentication context from gRPC request metadata
+/// Extract authentication context from gRPC request metadata, without the
+/// Redis key cache: every call pays a bcrypt verify and a `last_used` write.
+/// Services that hold a cache use [`authenticate_request_with_cache`].
 pub async fn authenticate_request<T>(
     pool: &PgPool,
+    request: &Request<T>,
+) -> Result<GrpcAuthContext, Status> {
+    authenticate_request_with_cache(pool, None, request).await
+}
+
+/// Extract authentication context from gRPC request metadata.
+///
+/// Same path as REST API-key auth: the `api_key:{sha256}` record cache (so a
+/// repeat call within its TTL skips bcrypt, and a REST revoke ends it here too),
+/// the negative cache, and the debounced `last_used` write.
+pub async fn authenticate_request_with_cache<T>(
+    pool: &PgPool,
+    cache: Option<&RedisCache>,
     request: &Request<T>,
 ) -> Result<GrpcAuthContext, Status> {
     // Try x-api-key first, then authorization header
     let token = extract_token(request)?;
 
     // Validate API key and get context
-    validate_api_key(pool, &token).await
+    validate_api_key(pool, cache, &token).await
 }
 
 /// Extract token from request and validate asynchronously
@@ -61,8 +80,17 @@ pub async fn authenticate_from_metadata(
     pool: &PgPool,
     metadata: &tonic::metadata::MetadataMap,
 ) -> Result<GrpcAuthContext, Status> {
+    authenticate_from_metadata_with_cache(pool, None, metadata).await
+}
+
+/// [`authenticate_from_metadata`] through the shared Redis key cache.
+pub async fn authenticate_from_metadata_with_cache(
+    pool: &PgPool,
+    cache: Option<&RedisCache>,
+    metadata: &tonic::metadata::MetadataMap,
+) -> Result<GrpcAuthContext, Status> {
     let token = extract_token_from_metadata(metadata)?;
-    validate_api_key(pool, &token).await
+    validate_api_key(pool, cache, &token).await
 }
 
 /// Extract token from metadata map directly
@@ -128,125 +156,57 @@ fn extract_token<T>(request: &Request<T>) -> Result<String, Status> {
     ))
 }
 
-/// API key record from database
+/// API key record from database, for re-checking an open stream
 #[derive(Debug, sqlx::FromRow)]
 struct ApiKeyRecord {
     id: String,
     organization_id: String,
-    key_hash: String,
     queues: Vec<String>,
     rate_limit: Option<i32>,
 }
 
-/// Validate API key using bcrypt verification.
+/// Validate an API key through the REST key path
+/// ([`crate::api::middleware::auth::authenticate_api_key_token`]): Redis record
+/// cache, negative cache, the unique `lookup_hash` index, then the bounded
+/// legacy scan, with every bcrypt verify off the async workers.
 ///
-/// Fast path resolves the key via the unique `lookup_hash = sha256(token)` index
-/// (single row + one bcrypt verify). This replaces the old prefix scan, where every
-/// key shared the `sp_live_`/`sp_test_` prefix so a bogus key cost up to 100 bcrypt
-/// verifications — the same CPU-amplification vector fixed on the REST path. Legacy
-/// keys with a NULL `lookup_hash` fall back to the bounded scan and are backfilled
-/// on match. gRPC has no auth cache, so this path is hit on every request.
-async fn validate_api_key(pool: &PgPool, token: &str) -> Result<GrpcAuthContext, Status> {
-    let db_err = |e: sqlx::Error| {
-        tracing::error!(error = %e, "Database error during gRPC authentication");
-        Status::internal("Authentication failed")
-    };
+/// No per-client failed-auth budget here: the peer address tonic sees is the
+/// ingress, not the client, and there is no trusted client-address metadata to
+/// key it on. Instead every gRPC caller shares one budget
+/// ([`crate::api::middleware::auth::FAILED_AUTH_GRPC_LIMIT`] per minute,
+/// charged before the scan) that skips only the legacy scan, and gRPC scans
+/// take their own turn, so a gRPC flood of unknown tokens can delay only gRPC
+/// legacy keys, never REST ones (W3R-06, W3R-08). A legacy key not checked
+/// because the turn stayed busy is `UNAVAILABLE` (retryable), not
+/// `UNAUTHENTICATED`.
+async fn validate_api_key(
+    pool: &PgPool,
+    cache: Option<&RedisCache>,
+    token: &str,
+) -> Result<GrpcAuthContext, Status> {
+    let context = authenticate_api_key_token(pool, cache, token, FailedAuthBudget::Grpc)
+        .await
+        .map_err(|(status, message)| match status {
+            StatusCode::UNAUTHORIZED => {
+                warn!("Invalid API key provided for gRPC request");
+                Status::unauthenticated(message)
+            }
+            StatusCode::SERVICE_UNAVAILABLE => Status::unavailable(message),
+            _ => Status::internal(message),
+        })?;
 
-    let lookup_hash = crate::models::api_key_lookup_hash(token);
+    debug!(
+        org_id = %context.organization_id,
+        api_key_id = %context.api_key_id,
+        "gRPC request authenticated"
+    );
 
-    // Fast path: unique indexed lookup. is_active + expiry are filtered in SQL because
-    // the gRPC record does not carry those columns. Soft-deleted orgs are excluded.
-    let candidate: Option<ApiKeyRecord> = sqlx::query_as(
-        r#"
-        SELECT k.id, k.organization_id, k.key_hash, k.queues, k.rate_limit
-        FROM api_keys k
-        INNER JOIN organizations o ON o.id = k.organization_id
-        WHERE k.lookup_hash = $1
-          AND k.is_active = TRUE
-          AND (k.expires_at IS NULL OR k.expires_at > NOW())
-          AND o.plan_tier <> 'deleted'
-        LIMIT 1
-        "#,
-    )
-    .bind(&lookup_hash)
-    .fetch_optional(pool)
-    .await
-    .map_err(db_err)?;
-
-    if let Some(record) = candidate {
-        if bcrypt::verify(token, &record.key_hash).unwrap_or(false) {
-            return Ok(authenticated_context(pool, record));
-        }
-        // SHA-256 collision without a bcrypt match: fall through to the legacy scan.
-    }
-
-    // Legacy fallback: only keys not yet carrying a lookup_hash.
-    let key_prefix: String = token.chars().take(8).collect();
-    let records: Vec<ApiKeyRecord> = sqlx::query_as(
-        r#"
-        SELECT k.id, k.organization_id, k.key_hash, k.queues, k.rate_limit
-        FROM api_keys k
-        INNER JOIN organizations o ON o.id = k.organization_id
-        WHERE k.is_active = TRUE
-          AND k.lookup_hash IS NULL
-          AND (k.key_prefix = $1 OR k.key_prefix IS NULL)
-          AND (k.expires_at IS NULL OR k.expires_at > NOW())
-          AND o.plan_tier <> 'deleted'
-        LIMIT 100
-        "#,
-    )
-    .bind(&key_prefix)
-    .fetch_all(pool)
-    .await
-    .map_err(db_err)?;
-
-    for record in records {
-        if bcrypt::verify(token, &record.key_hash).unwrap_or(false) {
-            // Backfill lookup_hash so subsequent auths for this key are O(1).
-            let pool_clone = pool.clone();
-            let key_id = record.id.clone();
-            let lh = lookup_hash.clone();
-            tokio::spawn(async move {
-                let _ = sqlx::query(
-                    "UPDATE api_keys SET lookup_hash = $1 WHERE id = $2 AND lookup_hash IS NULL",
-                )
-                .bind(&lh)
-                .bind(&key_id)
-                .execute(&pool_clone)
-                .await;
-            });
-            return Ok(authenticated_context(pool, record));
-        }
-    }
-
-    // A concurrent legacy-key backfill can commit after the fast lookup but before
-    // the fallback query, moving the row between both snapshots. Retry the indexed
-    // lookup once before rejecting the key.
-    let candidate: Option<ApiKeyRecord> = sqlx::query_as(
-        r#"
-        SELECT k.id, k.organization_id, k.key_hash, k.queues, k.rate_limit
-        FROM api_keys k
-        INNER JOIN organizations o ON o.id = k.organization_id
-        WHERE k.lookup_hash = $1
-          AND k.is_active = TRUE
-          AND (k.expires_at IS NULL OR k.expires_at > NOW())
-          AND o.plan_tier <> 'deleted'
-        LIMIT 1
-        "#,
-    )
-    .bind(&lookup_hash)
-    .fetch_optional(pool)
-    .await
-    .map_err(db_err)?;
-
-    if let Some(record) = candidate {
-        if bcrypt::verify(token, &record.key_hash).unwrap_or(false) {
-            return Ok(authenticated_context(pool, record));
-        }
-    }
-
-    warn!("Invalid API key provided for gRPC request");
-    Err(Status::unauthenticated("Invalid API key"))
+    Ok(GrpcAuthContext {
+        organization_id: context.organization_id,
+        api_key_id: context.api_key_id,
+        queues: context.queues,
+        rate_limit: context.rate_limit,
+    })
 }
 
 /// Reload an established stream's current authorization state without re-running
@@ -259,7 +219,7 @@ pub async fn reload_api_key_context(
 ) -> Result<GrpcAuthContext, Status> {
     let record: Option<ApiKeyRecord> = sqlx::query_as(
         r#"
-        SELECT k.id, k.organization_id, k.key_hash, k.queues, k.rate_limit
+        SELECT k.id, k.organization_id, k.queues, k.rate_limit
         FROM api_keys k
         INNER JOIN organizations o ON o.id = k.organization_id
         WHERE k.id = $1
@@ -290,27 +250,6 @@ impl From<ApiKeyRecord> for GrpcAuthContext {
             rate_limit: record.rate_limit,
         }
     }
-}
-
-/// Build the gRPC auth context for a verified key and refresh its `last_used`
-/// timestamp asynchronously (fire-and-forget).
-fn authenticated_context(pool: &PgPool, record: ApiKeyRecord) -> GrpcAuthContext {
-    info!(
-        org_id = %record.organization_id,
-        api_key_id = %record.id,
-        "gRPC request authenticated"
-    );
-
-    let pool_clone = pool.clone();
-    let key_id = record.id.clone();
-    tokio::spawn(async move {
-        let _ = sqlx::query("UPDATE api_keys SET last_used = NOW() WHERE id = $1")
-            .bind(&key_id)
-            .execute(&pool_clone)
-            .await;
-    });
-
-    record.into()
 }
 
 /// Extension trait for accessing auth context from request

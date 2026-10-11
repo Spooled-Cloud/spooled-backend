@@ -764,7 +764,14 @@ pub async fn history(
             .bind(&ctx.organization_id)
             .fetch_optional(state.db.pool())
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            // Don't leak database error details (BEOPS-27)
+            .map_err(|e| {
+                error!(error = %e, schedule_id = %id, "Failed to look up schedule for history");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to get schedule history".to_string(),
+                )
+            })?;
 
     if schedule_exists.is_none() {
         return Err((StatusCode::NOT_FOUND, "Schedule not found".to_string()));

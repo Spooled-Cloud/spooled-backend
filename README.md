@@ -103,6 +103,16 @@ Portainer details (Git stacks, ephemeral checkouts, recreate): [docs/guides/prod
 | `TRUSTED_PROXY_HOPS` | ❌ | `0` | Entries **your own** proxies append to `X-Forwarded-For`, counted from the right. `0` = never consult that header |
 | `OUTGOING_WEBHOOK_MAX_ATTEMPTS` | ❌ | `5` | Delivery attempts per outgoing webhook event |
 | `OUTGOING_WEBHOOK_MAX_CONCURRENT_DELIVERIES` | ❌ | `64` | Process-wide ceiling on webhook deliveries in flight |
+| `EMAIL_PROVIDER` | ✅ in production | `console` | `resend`/`sendgrid`/`postmark`/`smtp`. The backend refuses to start with `console` when `RUST_ENV=production` (login codes would only be logged) |
+| `RATE_LIMIT_FAIL_CLOSED` | ❌ | `false` | `true` rejects requests while Redis cannot answer instead of letting them through |
+| `CORS_ALLOWED_ORIGINS` | ❌ | spooled.cloud origins | Comma-separated allowed origins; blank keeps the default list |
+| `EXTERNAL_URL` | ❌ | - | Public base URL of the API |
+| `ENABLE_HSTS` | ❌ | `false` | Send `Strict-Transport-Security` (only behind HTTPS) |
+| `DATABASE_DIRECT_URL` | ❌ | - | Direct (non-PgBouncer) Postgres URL; migrations run over it when set |
+| `WORKER_LEASE_DURATION_SECS` | ❌ | `30` | Default job lease for a REST claim that sends none |
+| `GRPC_DEFAULT_LEASE_DURATION_SECS` | ❌ | `300` | Lease for gRPC claims and renewals that send none (`0` = 300, at most 3600, must be greater than `WORKER_HEARTBEAT_INTERVAL_SECS`); reported by gRPC `Register` |
+
+A blank value counts as unset, so compose `${NAME:-}` forwarding is safe. `docker-compose.prod.yml` forwards all of the above.
 
 The leftmost `X-Forwarded-For` entry is whatever the caller sent, so it is never trusted for rate limiting: set `TRUSTED_CLIENT_IP_HEADER` or `TRUSTED_PROXY_HOPS` if you terminate behind a proxy that sets neither `CF-Connecting-IP` nor `X-Real-IP`. Details in [docs/guides/operations.md](docs/guides/operations.md).
 

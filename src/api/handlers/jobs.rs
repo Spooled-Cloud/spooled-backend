@@ -598,6 +598,14 @@ pub async fn complete(
     let (queue_name, result, completion_webhook, completion_webhook_secret, duration_ms) =
         job_data.unwrap_or_else(|| ("unknown".to_string(), None, None, None, None));
     // Processing time (claim -> completion). Was hard-coded to 0 before 0.1.114.
+    // Feeds spooled_job_duration_seconds (SlowJobProcessing alerts); skipped when
+    // the timing columns were unavailable rather than observing a fake 0.
+    if let Some(ms) = duration_ms {
+        state
+            .metrics
+            .job_duration
+            .observe(ms.max(0) as f64 / 1000.0);
+    }
     let duration_ms = duration_ms.unwrap_or(0).max(0);
 
     // Best-effort realtime publish
@@ -695,8 +703,14 @@ pub async fn fail(
         }
     }
 
-    // Metrics: processing -> pending (retry) OR processing -> deadletter.
+    // Metrics: processing -> pending (retry) OR processing -> deadletter. The gRPC
+    // fail path counts the same series; without this REST workers' failures never
+    // reached spooled_jobs_failed_total / spooled_jobs_deadlettered_total.
     state.metrics.jobs_processing.dec();
+    state.metrics.jobs_failed.inc();
+    if outcome.new_status.as_deref() == Some("deadletter") {
+        state.metrics.jobs_deadlettered.inc();
+    }
 
     // Best-effort realtime publish (status after fail may be pending (retry), failed, or deadletter)
     type FailJobRow = (String, String, i32, Option<String>, Option<String>);

@@ -17,6 +17,7 @@ use tokio::sync::watch;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
+use crate::api::handlers::health::RuntimeHealth;
 use crate::api::middleware::limits::{
     check_job_limits_generic, check_payload_size_generic, daily_jobs_limit, refund_daily_jobs,
     try_increment_daily_jobs,
@@ -32,6 +33,18 @@ pub struct Scheduler {
     cache: Option<Arc<RedisCache>>,
     metrics: Arc<Metrics>,
     outgoing_webhooks: Arc<OutgoingWebhookService>,
+    /// Where each loop pass is reported for `/health`.
+    runtime: Option<Arc<RuntimeHealth>>,
+}
+
+/// Marks the scheduler stopped when dropped, so `/health` sees it however
+/// `run` ends, a panic included.
+struct MarkStoppedOnDrop(Arc<RuntimeHealth>);
+
+impl Drop for MarkStoppedOnDrop {
+    fn drop(&mut self) {
+        self.0.scheduler_stopped();
+    }
 }
 
 impl Scheduler {
@@ -47,12 +60,20 @@ impl Scheduler {
             cache,
             metrics,
             outgoing_webhooks,
+            runtime: None,
         }
+    }
+
+    /// Report every loop pass to `runtime`, which `/health` reads.
+    pub fn with_runtime_health(mut self, runtime: Arc<RuntimeHealth>) -> Self {
+        self.runtime = Some(runtime);
+        self
     }
 
     /// Run all background tasks
     pub async fn run(&self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
         info!("Background scheduler starting");
+        let _stopped = self.runtime.clone().map(MarkStoppedOnDrop);
 
         // Task intervals
         let mut scheduled_job_ticker = interval(Duration::from_secs(5));
@@ -68,6 +89,11 @@ impl Scheduler {
         let mut dependency_ticker = interval(Duration::from_secs(10)); // Check job dependencies
 
         loop {
+            // The loop passes at least every 5 s; a pass that hangs stops
+            // these heartbeats and `/health` reports the scheduler down.
+            if let Some(runtime) = &self.runtime {
+                runtime.scheduler_tick();
+            }
             tokio::select! {
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
@@ -1027,7 +1053,7 @@ impl Scheduler {
             UPDATE workers
             SET status = 'offline'
             WHERE 
-                status IN ('healthy', 'degraded')
+                status IN ('healthy', 'degraded', 'draining')
                 AND last_heartbeat < NOW() - INTERVAL '2 minutes'
             "#,
         )
