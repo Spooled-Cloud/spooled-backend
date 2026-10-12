@@ -9,6 +9,16 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+---
+
+## [0.1.123] - 2026-10-12
+
+Wave 9, from the final production verification of waves 3-8 (2026-10-12): one runtime fix (a website signup can no longer take a reserved slug), the findings that are documented or deferred rather than fixed, and a test that pins those statements to the code. No migration, no new route and no change to an API response shape.
+
+### Fixed
+
+- **Website signup took reserved slugs** (FESF-17, backend half). `POST /api/v1/auth/signup/complete` checked only the characters and the hyphens of the slug and never read `RESERVED_SLUGS`, so a signup could create an organization called `admin`, `api` or `dashboard`, names that `POST /organizations` has always refused. The slug is now trimmed, lower-cased and checked against that list before the one-time signup token is consumed (`normalize_signup_slug`): a reserved name is a `400 VALIDATION_ERROR` ("This slug is reserved and cannot be used"), and the same token still completes the signup with another slug. `GET /organizations/check-slug` already reported these names as reserved, which is what the website pre-checks. Organizations that already exist are untouched, and `docs/openapi.yaml` documents the `400`. Left as it was: `POST /organizations` also requires a leading letter and no `--` (`SLUG_REGEX`), signup does not, and the website itself suggests slugs that start with a digit (`3m-labs-x7k2q9`), so requiring it would turn a green pre-check into a failed signup (owner decision, recorded with FESF-17 in the knowledge base). Tests: `email_login::tests::test_signup_slug_*` and `test_complete_signup_checks_the_slug_before_it_consumes_the_token` (no Docker), `w9_signup::w9_signup_refuses_reserved_slugs_and_keeps_the_token` (Docker).
+
 ### Security
 
 - Test fixtures no longer carry literals that secret scanners report as leaked keys: the production-config test builds its JWT secret at runtime, and so does the inbound-webhook log test for its token. Neither value was ever a real credential (the production JWT secret was checked to differ).
@@ -16,9 +26,9 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Documentation
 
-Wave 9, from the final production verification of waves 3-8 (2026-10-12). Documentation, knowledge base and tests only: no code, no migration, no version change.
+Documentation, knowledge base and tests for what wave 9 does not fix in code.
 
-- **gRPC payloads and results are `google.protobuf.Struct`** (BEGRPC-05, remainder, now `open (documented)`). `docs/guides/grpc-server.md` says that a payload or result that is not a JSON object (an array, a string, a number, a boolean or `null`) reaches a gRPC worker with the field absent, that an integer of 2^53 or more comes back rounded as a float, and that REST keeps both; use REST or wrap the value. The fix needs new proto fields and is not made here.
+- **gRPC payloads and results are `google.protobuf.Struct`** (BEGRPC-05, remainder, now `open (documented)`). `docs/guides/grpc-server.md` says that a payload or result that is not a JSON object (an array, a string, a number, a boolean or `null`) reaches a gRPC worker with the field absent, that every number a worker receives is a double (`{"n": 42}` arrives as `42.0` in Python, Go and PHP and as `42` in JavaScript; whole values below 2^53 are exact, and an integer of 2^53 or more can be rounded), and that REST keeps both; use REST or wrap the value. Only the other direction, a Struct a client sends in `Enqueue` or `Complete`, is stored as a JSON integer when it is whole and below 2^53 (0.1.119). The fix needs new proto fields and is not made here.
 - **`POST /workflows` is documented as `200`** (BEFLOW-23, status half). `docs/openapi.yaml` said `201`; the handler answers `200`, so the document now matches what callers see today. The documented `GET /workflows/{id}` shape (`WorkflowResponse`) still differs from the real body (`progress`, `jobs`, `dependencies`) and stays open in the knowledge base. The OpenAPI drift check is unchanged and passes (105 operations).
 - **`jobs_partitioned` is fenced off** (BEJOB-17, deferred). A warning in the operations guide, the architecture guide and the knowledge base: the table is empty scaffolding, and the "swap tables" notes in migration `20241209000009` would break idempotency (its index is unique per key *and* `created_at`, so `ON CONFLICT (organization_id, idempotency_key)` has no index to use), and the copy would fail on missing columns and drop the foreign keys, CHECKs and triggers. The migration is untouched.
 - **Scale costs are recorded as deferred** (BEJOB-21). Measured at 320k `jobs` rows: three sweep `UPDATE` scans of about 47 ms each every 10 s, one history `INSERT` per job in a 100-job `dequeue_batch`, and whole-organization scans in `GET /queues` and `GET /jobs/stats`. Production holds about 130k jobs, so nothing is user-visible; the work is scheduled after the SDK wave.

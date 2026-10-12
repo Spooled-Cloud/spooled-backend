@@ -197,9 +197,18 @@ Dead-letter keeps `retry_count` (the statements at `:958-966` and `:2417-2424`),
 
 ## Struct numbers
 
-`google.protobuf.Struct` numbers are doubles. Whole values with |n| < 2^53 come back as JSON
-integers (`src/grpc/convert.rs:144-149` `number_to_json`): `42` stays `42`, `1.5` stays a
-float, `2^53` and above stay floats, NaN/infinity become null.
+`google.protobuf.Struct` numbers are doubles. The conversion to an integer runs in ONE
+direction only, from a Struct a client sends (`EnqueueRequest.payload`,
+`CompleteRequest.result`; `struct_to_json_opt`) to the stored JSON: whole values with
+|n| < 2^53 become JSON integers (`src/grpc/convert.rs` `number_to_json`), so REST reads `42`;
+`1.5` stays a float, `2^53` and above stay floats, NaN/infinity become null.
+
+The other direction (a job delivered to a worker, `job_to_proto` -> `json_to_struct` ->
+`json_to_value`, `convert.rs:86`) sends EVERY number as `Kind::NumberValue(f64)`. A REST
+payload `{"n": 42}` reaches a gRPC worker as `42.0` in Python (`MessageToDict`), Go
+(`structpb.AsMap`) and PHP, and as `42` in JavaScript; reproduced against production 0.1.122
+on 2026-10-12 (final verification, BEGRPC-05). Whole values below 2^53 are exact, so a worker
+may convert them back; `9007199254740993` arrives as `9007199254740992.0`.
 
 Only a JSON object is a Struct. `json_to_struct` (`src/grpc/convert.rs:68`) returns `None` for
 any other top-level value, so `job_to_proto` sends `Job.payload` / `Job.result` **absent** for

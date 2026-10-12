@@ -119,7 +119,9 @@ Job queue operations for enqueueing, processing, and managing jobs.
 **`Enqueue` limits** (same as REST, `INVALID_ARGUMENT` otherwise): queue name up to 100
 characters, `priority` -100..100, `idempotency_key` up to 255 characters, `tags` up to 64 KB
 as JSON, `scheduled_at` between years 1 and 9999 (an all-zero Timestamp means unset).
-Struct numbers that are whole and below 2^53 come back as integers (`42`, not `42.0`).
+A whole number below 2^53 in a Struct that a client sends (an `Enqueue` payload, a `Complete`
+result) is stored as a JSON integer, so REST reads `42`, not `42.0`. The way back to a worker
+is different, see "Numbers are doubles" below.
 
 **Payloads and results are `google.protobuf.Struct`.** `Job.payload`, `Job.result`,
 `EnqueueRequest.payload` and `CompleteRequest.result` are Struct fields, and the proto has no
@@ -131,11 +133,16 @@ JSON string or bytes field for them. REST accepts any JSON value; over gRPC two 
   over gRPC without a payload is stored as `{}` and arrives as an empty Struct, so an absent
   field means the value was not an object; `GET /api/v1/jobs/{id}` over REST returns it. An
   object is delivered whole, with anything nested inside it (arrays, strings, nulls).
-- **Numbers are doubles.** An integer below 2^53 (2^53 = 9007199254740992) comes back as an
-  integer. An integer of 2^53 or more cannot be held exactly in a Struct: it comes back as a
-  float, rounded (`9007199254740993` arrives as `9007199254740992.0`). A Struct number is a
-  double on the wire, so a client cannot send such an integer exactly either.
-  REST keeps such integers exactly.
+- **Numbers are doubles.** A Struct number is a double on the wire, and the server sends every
+  JSON number to a worker that way: `{"n": 42}` arrives as `42.0` (a float) in Python, Go and
+  PHP, and as `42` in JavaScript, which has one number type. Do not test a received number
+  with an integer type check. A whole value below 2^53 (2^53 = 9007199254740992) is exact in a
+  double, so converting it back to an integer in the worker is safe. At 2^53 or more a double
+  cannot hold every integer and the value can be rounded: `9007199254740993` arrives as
+  `9007199254740992.0`. A client cannot send such an integer exactly either, because its own
+  Struct holds a double. In the other direction a whole number below 2^53 that a client sends
+  in a Struct is stored as a JSON integer (`42`, see the `Enqueue` limits above).
+  REST keeps every integer exactly, in both directions.
 
 Jobs that carry non-object payloads or integers of 2^53 or more (snowflake ids, 64-bit
 counters) belong on REST, or the value has to be wrapped: put the array in an object

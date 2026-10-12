@@ -139,8 +139,11 @@ pub fn value_to_json(v: &Value) -> serde_json::Value {
 const MAX_SAFE_INTEGER_F64: f64 = 9_007_199_254_740_992.0;
 
 /// A Struct number is always a double. Whole values that a double holds
-/// exactly come back as JSON integers, so `{"count": 42}` round-trips as `42`
-/// and not `42.0` (which typed decoders in Go, Python and PHP reject as an int).
+/// exactly are stored as JSON integers when a client sends a Struct (`Enqueue`
+/// payload, `Complete` result), so REST reads `{"count": 42}` as `42` and not
+/// `42.0` (which typed decoders in Go, Python and PHP reject as an int). Only
+/// this direction converts: `json_to_value` sends every number to a worker as a
+/// double, so a delivered `42` is `42.0` in Python, Go and PHP.
 fn number_to_json(n: f64) -> serde_json::Value {
     if n.fract() == 0.0 && n.abs() < MAX_SAFE_INTEGER_F64 {
         serde_json::Value::from(n as i64)

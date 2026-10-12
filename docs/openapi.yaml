@@ -555,7 +555,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/CompleteSignupResponse'
         '400':
-          description: Invalid token or organization name
+          description: Invalid organization name or slug, including a reserved slug (`admin`, `api`, `dashboard`, ...); the signup token stays valid
         '403':
           description: Email signup disabled, or closed-mode request missing a valid X-Admin-Key
 
@@ -6022,6 +6022,10 @@ components:
           type: string
           minLength: 3
           maxLength: 50
+          description: |
+            Lowercase letters, digits and hyphens, not starting or ending with a hyphen. It is
+            trimmed and lower-cased first. The slugs `POST /organizations` reserves (`admin`,
+            `api`, `dashboard`, ...) answer `400`, and the signup token can be used again.
 
     CompleteSignupResponse:
       type: object

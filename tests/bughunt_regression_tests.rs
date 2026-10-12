@@ -15628,3 +15628,103 @@ mod w8_review_ratelimit_reset {
         assert_eq!(body["reset_at"].as_u64(), Some(reset), "{body}");
     }
 }
+
+// ---- wave 9 / signup ----
+/// FESF-17 (backend half): `POST /auth/signup/complete` never looked at
+/// `RESERVED_SLUGS`, so a website signup could take `admin`, `api` or
+/// `dashboard`, names `POST /organizations` refuses. A refused slug must leave
+/// the one-time signup token usable.
+mod w9_signup {
+    use super::*;
+
+    /// A live signup token row, as `POST /auth/email/verify` leaves it.
+    async fn signup_token(pool: &sqlx::PgPool, email: &str) -> String {
+        let token = format!("w9{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO email_login_codes (email, code, expires_at) \
+             VALUES ($1, $2, NOW() + INTERVAL '15 minutes')",
+        )
+        .bind(email)
+        .bind(format!("signup:{token}"))
+        .execute(pool)
+        .await
+        .expect("signup token row");
+        token
+    }
+
+    async fn token_is_used(pool: &sqlx::PgPool, token: &str) -> bool {
+        let used: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT used_at FROM email_login_codes WHERE code = $1")
+                .bind(format!("signup:{token}"))
+                .fetch_one(pool)
+                .await
+                .expect("token row");
+        used.is_some()
+    }
+
+    async fn complete(app: &Router, token: &str, slug: &str) -> (StatusCode, Value) {
+        call(
+            app,
+            "POST",
+            "/api/v1/auth/signup/complete",
+            &[],
+            Some(json!({"signup_token": token, "name": "Wave Nine Co", "slug": slug})),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn w9_signup_refuses_reserved_slugs_and_keeps_the_token() {
+        let db = TestDatabase::new().await;
+        let app = app(&db);
+        let email = format!("w9-signup-{}@example.com", uuid::Uuid::new_v4().simple());
+        let token = signup_token(db.pool(), &email).await;
+
+        // The names, in the forms a visitor can type them.
+        for slug in ["admin", "api", "dashboard", "Admin", " api ", "SETTINGS"] {
+            let (status, body) = complete(&app, &token, slug).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{slug:?}: {body}");
+            assert_eq!(body["code"], "VALIDATION_ERROR", "{slug:?}: {body}");
+            assert!(
+                body["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("reserved")),
+                "{slug:?}: {body}"
+            );
+            assert!(
+                !token_is_used(db.pool(), &token).await,
+                "{slug:?} must not burn the signup token"
+            );
+        }
+        let taken: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM organizations WHERE slug IN ('admin', 'api', 'dashboard', 'settings')",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(taken, 0, "no organization took a reserved slug");
+
+        // The same token still completes the signup with a normal slug.
+        let slug = format!("w9-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        let (status, body) = complete(&app, &token, &slug).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["organization"]["slug"], slug.as_str(), "{body}");
+        assert!(token_is_used(db.pool(), &token).await);
+    }
+
+    /// Only the reserved names are new: a name that merely contains one, and a
+    /// slug the website suggests (a leading digit), still sign up.
+    #[tokio::test]
+    async fn w9_signup_still_accepts_slugs_that_contain_a_reserved_name_or_start_with_a_digit() {
+        let db = TestDatabase::new().await;
+        let app = app(&db);
+        let tag = &uuid::Uuid::new_v4().simple().to_string()[..8];
+        for slug in [format!("admin-{tag}"), format!("3m-labs-{tag}")] {
+            let email = format!("w9-{slug}@example.com");
+            let token = signup_token(db.pool(), &email).await;
+            let (status, body) = complete(&app, &token, &slug).await;
+            assert_eq!(status, StatusCode::CREATED, "{slug}: {body}");
+            assert_eq!(body["organization"]["slug"], slug.as_str(), "{body}");
+        }
+    }
+}

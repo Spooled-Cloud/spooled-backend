@@ -10,6 +10,7 @@
 
 use serde_json::{json, Value};
 
+use prost_types::value::Kind;
 use spooled_backend::grpc::convert::{json_to_struct, struct_to_json, struct_to_json_opt};
 
 const GRPC_GUIDE: &str = include_str!("../docs/guides/grpc-server.md");
@@ -22,6 +23,10 @@ const FINDINGS_JSONL: &str = include_str!("../docs/ai/knowledge/bugs/findings.js
 const FINDINGS_MD: &str = include_str!("../docs/ai/knowledge/bugs/findings.md");
 const OPENAPI: &str = include_str!("../docs/openapi.yaml");
 const PROTO: &str = include_str!("../proto/spooled.proto");
+const SERVER_CONVERT: &str = include_str!("../src/grpc/convert.rs");
+const EMAIL_LOGIN: &str = include_str!("../src/api/handlers/email_login.rs");
+const AUTH_DATAFLOW: &str = include_str!("../docs/ai/knowledge/dataflows/auth.md");
+const CHANGELOG: &str = include_str!("../CHANGELOG.md");
 const WORKFLOW_HANDLERS: &str = include_str!("../src/api/handlers/workflows.rs");
 const SCHEDULER: &str = include_str!("../src/scheduler/mod.rs");
 const QUEUE: &str = include_str!("../src/queue/mod.rs");
@@ -160,12 +165,45 @@ fn grpc_struct_limits_are_true_and_documented() {
     let back = struct_to_json(&json_to_struct(&object).expect("an object is a Struct"));
     assert_eq!(back, object, "an object arrives whole, with what is nested");
 
+    // Delivery to a worker (`job_to_proto` -> `json_to_struct`): EVERY number is a double on the
+    // wire, whole or not. A REST payload {"n": 42} reaches a Python, Go or PHP worker as 42.0,
+    // and an integer of 2^53 or more can arrive rounded.
+    let delivered = json_to_struct(&json!({"n": 42, "big": 9_007_199_254_740_993_i64, "f": 1.5}))
+        .expect("an object is a Struct");
+    let number = |name: &str| match delivered.fields[name].kind {
+        Some(Kind::NumberValue(n)) => n,
+        ref other => panic!("{name} is not a number on the wire: {other:?}"),
+    };
+    assert_eq!(
+        number("n"),
+        42.0,
+        "a whole number below 2^53 is sent as a double"
+    );
+    assert_eq!(
+        number("big"),
+        9_007_199_254_740_992.0,
+        "2^53 + 1 is rounded"
+    );
+    assert_eq!(number("f"), 1.5);
+    assert!(
+        SERVER_CONVERT.contains("serde_json::Value::Number(n) => Kind::NumberValue(")
+            && SERVER_CONVERT.contains("payload: json_to_struct(&job.payload),")
+            && SERVER_CONVERT.contains("result: job.result.as_ref().and_then(json_to_struct),"),
+        "job_to_proto sends the payload and the result through json_to_struct"
+    );
+
+    // Enqueue / Complete to REST (`struct_to_json_opt`): the Struct a client sends is stored as
+    // JSON, and a whole number below 2^53 becomes an integer there. This is the only direction
+    // that converts to an integer; it is not what a worker receives.
     let below = struct_to_json(&json_to_struct(&json!({"n": 9_007_199_254_740_991_i64})).unwrap());
-    assert!(below["n"].is_i64(), "below 2^53 stays an integer: {below}");
+    assert!(
+        below["n"].is_i64(),
+        "a Struct number below 2^53 is stored as an integer: {below}"
+    );
     let above = struct_to_json(&json_to_struct(&json!({"n": 9_007_199_254_740_993_i64})).unwrap());
     assert!(
         above["n"].is_f64(),
-        "2^53 + 1 is a float over gRPC: {above}"
+        "2^53 + 1 is stored as a float when it came over gRPC: {above}"
     );
     assert_eq!(above["n"].as_f64(), Some(9_007_199_254_740_992.0));
 
@@ -186,10 +224,12 @@ fn grpc_struct_limits_are_true_and_documented() {
         "the proto gained a JSON field: update the gRPC guide, the dataflow note and BEGRPC-05"
     );
 
-    // The statements.
+    // The statements. The guide is re-wrapped by hand now and then, so it is read with its
+    // white space collapsed.
+    let guide = squash(GRPC_GUIDE);
     assert_mentions(
         "docs/guides/grpc-server.md",
-        GRPC_GUIDE,
+        &guide,
         &[
             "Payloads and results are `google.protobuf.Struct`",
             "`EnqueueRequest.payload`",
@@ -197,22 +237,88 @@ fn grpc_struct_limits_are_true_and_documented() {
             "field **absent**",
             "arrives as an empty Struct",
             "(`Dequeue`, `StreamJobs`, `ProcessJobs`,",
+            // Delivery: every number is a double.
+            "**Numbers are doubles.**",
+            "the server sends every JSON number to a worker that way",
+            "`{\"n\": 42}` arrives as `42.0` (a float) in Python, Go and PHP, and as `42` in JavaScript",
+            "Do not test a received number with an integer type check",
+            "converting it back to an integer in the worker is safe",
             "9007199254740993",
             "9007199254740992.0",
-            "REST keeps such integers exactly",
+            "REST keeps every integer exactly, in both directions",
+            // Enqueue / Complete to REST: the one direction that converts.
+            "in a Struct that a client sends (an `Enqueue` payload, a `Complete` result) is stored as a JSON integer, so REST reads `42`, not `42.0`",
             "`bytes payload_json`",
         ],
     );
+    // What the guide used to say, and what a worker does not get.
+    for wrong in [
+        "comes back as an integer",
+        "Struct numbers that are whole and below 2^53 come back as integers",
+        "it comes back as a float",
+    ] {
+        assert!(
+            !guide.contains(wrong),
+            "docs/guides/grpc-server.md says {wrong:?}, but a worker receives every number as a double"
+        );
+    }
     assert_mentions(
         "dataflows/grpc-rest.md",
-        GRPC_DATAFLOW,
-        &["Only a JSON object is a Struct", "**open (documented)**"],
+        &squash(GRPC_DATAFLOW),
+        &[
+            "Only a JSON object is a Struct",
+            "**open (documented)**",
+            "sends EVERY number as `Kind::NumberValue(f64)`",
+            "reaches a gRPC worker as `42.0` in Python",
+        ],
     );
     assert_finding(
         "BEGRPC-05",
         "open (documented)",
         &["new proto fields", "use REST", "DOCUMENTED, not fixed"],
     );
+}
+
+// ---------------------------------------------------------------------------
+// FESF-17 (backend half): website signup refuses the reserved slugs.
+// ---------------------------------------------------------------------------
+#[test]
+fn signup_reserved_slugs_are_recorded() {
+    // The code: complete_signup reads the same list POST /organizations does, through one helper
+    // that also refuses before the token is consumed (the unit tests in email_login.rs pin the
+    // behaviour and the order).
+    assert_mentions(
+        "src/api/handlers/email_login.rs",
+        EMAIL_LOGIN,
+        &[
+            "fn normalize_signup_slug(raw: &str) -> AppResult<String> {",
+            "crate::models::validate_slug_not_reserved(&slug)",
+            "let slug = normalize_signup_slug(&request.slug)?;",
+        ],
+    );
+
+    let fixed = finding("FESF-17");
+    assert_eq!(fixed["fixed_in"], "0.1.123", "{fixed}");
+    assert_finding(
+        "FESF-17",
+        "fixed",
+        &[
+            "`normalize_signup_slug`",
+            "before the one-time token is consumed",
+            "Deliberately NOT applied: `SLUG_REGEX`",
+            "`check-slug`",
+        ],
+    );
+    assert_mentions(
+        "dataflows/auth.md",
+        AUTH_DATAFLOW,
+        &[
+            "`normalize_signup_slug`",
+            "`RESERVED_SLUGS`",
+            "`SLUG_REGEX`",
+        ],
+    );
+    assert_mentions("CHANGELOG.md", CHANGELOG, &["(FESF-17, backend half)"]);
 }
 
 // ---------------------------------------------------------------------------

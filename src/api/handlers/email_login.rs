@@ -1020,6 +1020,42 @@ fn authorize_email_signup(
     }
 }
 
+/// The slug a website signup asks for, trimmed and lower-cased, or the reason
+/// it is refused. `complete_signup` calls this before the signup token is
+/// consumed, so a refused slug leaves the token valid for a retry.
+///
+/// Characters and hyphens are what `GET /organizations/check-slug` (the
+/// website's pre-check) accepts, so a slug it calls valid still signs up. The
+/// names in `RESERVED_SLUGS` are refused here as they are by
+/// `POST /organizations`: a signup used to be able to take `admin`, `api` or
+/// `dashboard`. `POST /organizations` also requires `SLUG_REGEX` (a leading
+/// letter, no `--`); signup does not, because the website suggests slugs that
+/// start with a digit (`3m-labs-x7k2q9`).
+fn normalize_signup_slug(raw: &str) -> AppResult<String> {
+    let slug = raw.to_lowercase().trim().to_string();
+    if !slug
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(AppError::Validation(
+            "Slug can only contain lowercase letters, digits, and hyphens".to_string(),
+        ));
+    }
+    if slug.starts_with('-') || slug.ends_with('-') {
+        return Err(AppError::Validation(
+            "Slug cannot start or end with a hyphen".to_string(),
+        ));
+    }
+    if let Err(e) = crate::models::validate_slug_not_reserved(&slug) {
+        return Err(AppError::Validation(
+            e.message
+                .map(|m| m.into_owned())
+                .unwrap_or_else(|| "This slug is reserved and cannot be used".to_string()),
+        ));
+    }
+    Ok(slug)
+}
+
 /// Complete signup with verified email
 ///
 /// POST /api/v1/auth/signup/complete
@@ -1061,21 +1097,8 @@ pub async fn complete_signup(
     // validation passes — burning it here meant a bad slug or a taken email/slug left
     // the user unable to retry without re-verifying their email.
 
-    // Validate slug format
-    let slug = request.slug.to_lowercase().trim().to_string();
-    if !slug
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-    {
-        return Err(AppError::Validation(
-            "Slug can only contain lowercase letters, digits, and hyphens".to_string(),
-        ));
-    }
-    if slug.starts_with('-') || slug.ends_with('-') {
-        return Err(AppError::Validation(
-            "Slug cannot start or end with a hyphen".to_string(),
-        ));
-    }
+    // Validate the slug (format and reserved names) before the token is consumed.
+    let slug = normalize_signup_slug(&request.slug)?;
 
     // Check for duplicate email (race condition guard)
     let existing_email: Option<(String,)> = sqlx::query_as(VERIFIED_ORG_BY_EMAIL)
@@ -2259,6 +2282,90 @@ mod tests {
             slug: "a".repeat(51),
         };
         assert!(long_slug.validate().is_err());
+    }
+
+    fn refusal(raw: &str) -> String {
+        match normalize_signup_slug(raw) {
+            Err(AppError::Validation(message)) => message,
+            other => panic!("{raw:?} should be refused with a validation error, got {other:?}"),
+        }
+    }
+
+    /// FESF-17 (backend half): a website signup could take `admin`, `api` or
+    /// `dashboard` because `complete_signup` never looked at `RESERVED_SLUGS`.
+    #[test]
+    fn test_signup_slug_refuses_every_reserved_name() {
+        for reserved in crate::models::RESERVED_SLUGS {
+            assert!(
+                refusal(reserved).contains("reserved"),
+                "{reserved} is reserved for POST /organizations and must be refused at signup"
+            );
+        }
+        for name in ["admin", "api", "dashboard"] {
+            assert!(crate::models::RESERVED_SLUGS.contains(&name));
+        }
+    }
+
+    #[test]
+    fn test_signup_slug_is_normalised_before_the_reserved_check() {
+        // `complete_signup` lower-cases and trims what the visitor typed: the check has to see
+        // that form, or `Admin` and ` api ` would still get through.
+        for typed in ["Admin", "ADMIN", " admin ", "  Dashboard\t", "\nApi"] {
+            assert!(refusal(typed).contains("reserved"), "{typed:?}");
+        }
+    }
+
+    #[test]
+    fn test_signup_slug_accepts_what_it_accepted_before() {
+        // Only reserved names are new. Names that merely contain one, a leading digit and a
+        // double hyphen (the website suggests `3m-labs-x7k2q9`; check-slug calls both valid) keep
+        // working.
+        for (typed, stored) in [
+            ("my-company", "my-company"),
+            ("My-Company", "my-company"),
+            (" acme ", "acme"),
+            ("admin-1a2b3c", "admin-1a2b3c"),
+            ("api2", "api2"),
+            ("my-api", "my-api"),
+            ("3m-labs-x7k2q9", "3m-labs-x7k2q9"),
+            ("123", "123"),
+            ("acme--co", "acme--co"),
+        ] {
+            assert_eq!(normalize_signup_slug(typed).unwrap(), stored, "{typed:?}");
+        }
+    }
+
+    #[test]
+    fn test_signup_slug_keeps_the_format_rules_and_their_messages() {
+        assert!(refusal("my_company").contains("lowercase letters, digits, and hyphens"));
+        assert!(refusal("my company").contains("lowercase letters, digits, and hyphens"));
+        assert!(refusal("-acme").contains("start or end with a hyphen"));
+        assert!(refusal("acme-").contains("start or end with a hyphen"));
+    }
+
+    /// The reserved name has to be refused BEFORE the one-time signup token is
+    /// consumed: a refused slug must leave the token usable for a retry.
+    #[test]
+    fn test_complete_signup_checks_the_slug_before_it_consumes_the_token() {
+        let source = include_str!("email_login.rs");
+        let body = &source[source
+            .find("pub async fn complete_signup(")
+            .expect("complete_signup")..];
+        let checked = body
+            .find("normalize_signup_slug(&request.slug)?")
+            .expect("complete_signup validates the slug with normalize_signup_slug");
+        let consumed = body
+            .find("UPDATE email_login_codes SET used_at = NOW() WHERE id = $1 AND used_at IS NULL")
+            .expect("complete_signup consumes the token");
+        assert!(
+            checked < consumed,
+            "the slug check must come before the token is consumed"
+        );
+        // The organization is created after both.
+        let created = body
+            .find("INSERT INTO organizations")
+            .expect("complete_signup creates the organization");
+        assert!(consumed < created);
     }
 
     #[test]

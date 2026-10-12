@@ -38,6 +38,14 @@ registration controls as `POST /organizations`:
 0.1.111 rejected every non-`open` completion and ignored the admin header, which
 broke SaaS (`REGISTRATION_MODE=closed`, `EMAIL_SIGNUP_ENABLED=true`).
 
+Slug (0.1.123, FESF-17): `normalize_signup_slug` trims and lower-cases the slug, accepts
+lowercase letters, digits and hyphens (not at either end) and refuses every name in
+`RESERVED_SLUGS` (`src/models/organization.rs`, the list `POST /organizations` uses) with a 400
+`VALIDATION_ERROR`. It runs before the one-time token is consumed, so a refused slug leaves the
+token usable. `SLUG_REGEX` (leading letter, no `--`) is NOT applied here: the website suggests
+slugs that start with a digit and `GET /organizations/check-slug` calls them valid. Pinned by
+`email_login::tests::test_complete_signup_checks_the_slug_before_it_consumes_the_token`.
+
 `GET /api/v1/auth/check-email` returns `available`, `exists`, and `signup_enabled`
 (`EMAIL_SIGNUP_ENABLED`). The marketing signup page gates on `signup_enabled === false`
 before sending a verification code.
