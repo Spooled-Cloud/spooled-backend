@@ -45,3 +45,6 @@ criterion/
 
 # Allow .env.example to be committed
 !.env.example
+
+# Local gRPC TLS experiments (certs/README.md); never commit key material
+certs/*.pem

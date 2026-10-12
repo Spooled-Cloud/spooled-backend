@@ -9,6 +9,11 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- Test fixtures no longer carry literals that secret scanners report as leaked keys: the production-config test builds its JWT secret at runtime, and so does the inbound-webhook log test for its token. Neither value was ever a real credential (the production JWT secret was checked to differ).
+- The development gRPC TLS pair `certs/grpc-key.pem` / `certs/grpc-cert.pem` is removed from the tree. Production never used it (its Compose stack generates its own keypair in the `grpc_tls` volume, confirmed different on the host); `certs/README.md` shows how to generate a throwaway local pair.
+
 ---
 
 ## [0.1.122] - 2026-10-12

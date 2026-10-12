@@ -1,9 +1,19 @@
 # Local TLS material (development only)
 
-The `grpc-cert.pem` / `grpc-key.pem` pair in this directory is for **local/dev** gRPC TLS experiments.
+This directory holds no key material. The development pair that used to live
+here (`grpc-cert.pem` / `grpc-key.pem`) was removed from the tree on 2026-10-12;
+it stays in Git history, so treat it as public and never use it anywhere.
+Production does not use it: the production Compose stack generates its own
+keypair in the `grpc_tls` volume (`docker-compose.prod.yml`, `grpc-tls-init`).
 
-- Treat the private key as **disposable**. Do not reuse it on any production host.
-- Prefer generating fresh certs per environment (see `docs/guides/grpc-server.md`).
-- Never commit real production private keys. If a production key was ever copied here, rotate it on the host and replace this file with a newly generated local-only key.
+For local gRPC TLS experiments, generate a throwaway pair here (`*.pem` is
+ignored by Docker builds through `.dockerignore`; do not commit it):
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj "/CN=localhost"   -keyout certs/grpc-key.pem -out certs/grpc-cert.pem
+GRPC_TLS_ENABLED=true GRPC_TLS_CERT_PATH=certs/grpc-cert.pem GRPC_TLS_KEY_PATH=certs/grpc-key.pem cargo run
+```
+
+Never commit real production private keys.
 
 Agents: do not paste key material into docs, chat, or knowledge bases.
