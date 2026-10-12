@@ -1024,9 +1024,15 @@ fn authorize_email_signup(
 /// it is refused. `complete_signup` calls this before the signup token is
 /// consumed, so a refused slug leaves the token valid for a retry.
 ///
-/// Characters and hyphens are what `GET /organizations/check-slug` (the
-/// website's pre-check) accepts, so a slug it calls valid still signs up. The
-/// names in `RESERVED_SLUGS` are refused here as they are by
+/// The characters and hyphens accepted are those of `GET /organizations/check-slug`
+/// (the website's pre-check), so those two rules do not turn a green check into
+/// a failed signup. The length rules differ, and did before this function
+/// existed: `check-slug` takes 1-100 characters after the trim, while the signup
+/// request is 3-50 characters as sent (`CompleteSignupRequest`, validated before
+/// this function trims). A 1-2 or 51-100 character slug can therefore pass the
+/// pre-check and fail at signup with a `400`; not changed here (W9-R1).
+///
+/// The names in `RESERVED_SLUGS` are refused here as they are by
 /// `POST /organizations`: a signup used to be able to take `admin`, `api` or
 /// `dashboard`. `POST /organizations` also requires `SLUG_REGEX` (a leading
 /// letter, no `--`); signup does not, because the website suggests slugs that
@@ -2348,9 +2354,23 @@ mod tests {
     #[test]
     fn test_complete_signup_checks_the_slug_before_it_consumes_the_token() {
         let source = include_str!("email_login.rs");
-        let body = &source[source
+        let from_start = &source[source
             .find("pub async fn complete_signup(")
             .expect("complete_signup")..];
+        // Search the handler only: it ends at the first `}` in column 0. The literals this
+        // test searches for are also written further down the file (in this test itself), and
+        // they must not be able to satisfy it when the handler loses a statement.
+        let body = &from_start[..from_start
+            .find("\n}\n")
+            .expect("the end of complete_signup")];
+        assert!(
+            body.contains("Signup completed"),
+            "the searched slice must reach the end of complete_signup"
+        );
+        assert!(
+            !body.contains("#[cfg(test)]"),
+            "the searched slice must not reach the tests"
+        );
         let checked = body
             .find("normalize_signup_slug(&request.slug)?")
             .expect("complete_signup validates the slug with normalize_signup_slug");

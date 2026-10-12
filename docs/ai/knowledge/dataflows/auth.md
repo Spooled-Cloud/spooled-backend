@@ -45,6 +45,9 @@ lowercase letters, digits and hyphens (not at either end) and refuses every name
 token usable. `SLUG_REGEX` (leading letter, no `--`) is NOT applied here: the website suggests
 slugs that start with a digit and `GET /organizations/check-slug` calls them valid. Pinned by
 `email_login::tests::test_complete_signup_checks_the_slug_before_it_consumes_the_token`.
+Length is NOT aligned: `check-slug` takes 1-100 characters after the trim, the signup request 3-50
+as sent (before the trim), so a very short or very long slug can pass the pre-check and be a 400 at
+signup (W9-R1); `generate-slug` does not read `RESERVED_SLUGS` (W9-R2). Both open, P3.
 
 `GET /api/v1/auth/check-email` returns `available`, `exists`, and `signup_enabled`
 (`EMAIL_SIGNUP_ENABLED`). The marketing signup page gates on `signup_enabled === false`

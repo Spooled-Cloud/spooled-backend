@@ -556,8 +556,25 @@ paths:
                 $ref: '#/components/schemas/CompleteSignupResponse'
         '400':
           description: Invalid organization name or slug, including a reserved slug (`admin`, `api`, `dashboard`, ...); the signup token stays valid
+        '401':
+          description: >-
+            `AUTHENTICATION_FAILED`: the signup token is invalid, expired or already used;
+            verify the email again to get a new one
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '403':
           description: Email signup disabled, or closed-mode request missing a valid X-Admin-Key
+        '409':
+          description: >-
+            `CONFLICT`: a verified organization already uses this email, or the slug is
+            already taken. Neither check uses up the signup token, so a taken slug can be
+            retried with another one
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   # Billing Endpoints
   /api/v1/billing/status:
