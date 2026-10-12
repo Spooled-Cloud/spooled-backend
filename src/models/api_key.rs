@@ -25,8 +25,9 @@ pub fn api_key_lookup_hash(token: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Validate queue names in list
-fn validate_queues(queues: &Vec<String>) -> Result<(), validator::ValidationError> {
+/// Validate an API key's `queues` list (count, characters, wildcard placement).
+/// Used by the key create/update requests and by the admin create route.
+pub fn validate_queues(queues: &Vec<String>) -> Result<(), validator::ValidationError> {
     if queues.len() > MAX_QUEUES_PER_KEY {
         let mut err = validator::ValidationError::new("too_many_queues");
         err.message = Some(std::borrow::Cow::Owned(format!(
@@ -54,9 +55,73 @@ fn validate_queues(queues: &Vec<String>) -> Result<(), validator::ValidationErro
             ));
             return Err(err);
         }
+        // `*` used to be accepted anywhere while it matched only as the whole
+        // entry, so `orders*` or `*.eu` created a key that could reach no queue.
+        if queue.contains('*') && queue != "*" && queue_pattern_prefix(queue).is_none() {
+            let mut err = validator::ValidationError::new("invalid_queue_pattern");
+            err.message = Some(std::borrow::Cow::Borrowed(
+                "The wildcard (*) is only allowed alone (every queue) or as a trailing `.*` after \
+                 a queue-name prefix (`orders.*` covers every queue whose name starts with `orders.`)",
+            ));
+            return Err(err);
+        }
     }
 
     Ok(())
+}
+
+/// The prefix a `prefix.*` queue pattern covers, dot included: `Some("orders.")`
+/// for `orders.*`. `None` for `*` alone, for exact names, and for any other use
+/// of `*` (`orders*`, `*.eu`, `a.*.b`, `.*`), which [`validate_queues`] rejects.
+fn queue_pattern_prefix(pattern: &str) -> Option<&str> {
+    let prefix = pattern.strip_suffix('*')?;
+    (prefix.len() > 1 && prefix.ends_with('.') && !prefix.contains('*')).then_some(prefix)
+}
+
+/// Whether one entry of an API key's `queues` list covers `queue_name`.
+///
+/// - `*` covers every queue;
+/// - `prefix.*` covers every queue whose name starts with `prefix.`: `orders.*`
+///   covers `orders.eu` and `orders.eu.west`, but not `orders` or `ordersx`
+///   (list `orders` too to reach the parent queue);
+/// - any other entry covers only the queue with exactly that name.
+///
+/// The one matching rule for REST ([`ApiKeyContext`]) and gRPC
+/// (`GrpcAuthContext`), and the rule the `queue_in_key_scope()` SQL function
+/// mirrors, so the paths cannot drift apart.
+pub fn queue_pattern_matches(pattern: &str, queue_name: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    match queue_pattern_prefix(pattern) {
+        Some(prefix) => queue_name.starts_with(prefix),
+        None => pattern == queue_name,
+    }
+}
+
+/// Whether a key's `queues` list grants every queue: empty, or a `*` entry.
+pub fn queue_scope_is_unrestricted(scope: &[String]) -> bool {
+    scope.is_empty() || scope.iter().any(|q| q == "*")
+}
+
+/// Whether a key's `queues` list lets it operate on `queue_name` (see
+/// [`queue_pattern_matches`]).
+pub fn queue_scope_allows(scope: &[String], queue_name: &str) -> bool {
+    scope.is_empty() || scope.iter().any(|q| queue_pattern_matches(q, queue_name))
+}
+
+/// Whether a key's `queues` list covers the whole `requested` entry, which may
+/// itself be a `prefix.*` pattern: `orders.*` covers `orders.eu` and
+/// `orders.eu.*`, while `orders.eu` covers neither `orders.*` nor `orders.eu.*`.
+fn queue_scope_covers(scope: &[String], requested: &str) -> bool {
+    match queue_pattern_prefix(requested) {
+        Some(requested_prefix) => scope.iter().any(|own| {
+            own == "*"
+                || own == requested
+                || queue_pattern_prefix(own).is_some_and(|p| requested_prefix.starts_with(p))
+        }),
+        None => queue_scope_allows(scope, requested),
+    }
 }
 
 /// Reject the `permissions` field on API key create/update.
@@ -239,11 +304,12 @@ impl ApiKeyContext {
     /// Whether this key is allowed to operate on the given queue.
     ///
     /// A key with an empty `queues` list (or one containing the `*` wildcard)
-    /// may access every queue. Otherwise the queue must be explicitly listed.
+    /// may access every queue. Otherwise the queue must be listed by name or
+    /// fall under a listed `prefix.*` pattern (see [`queue_pattern_matches`]).
     /// Used to enforce queue scoping consistently across enqueue, claim,
     /// bulk enqueue, worker registration, and the gRPC equivalents.
     pub fn can_access_queue(&self, queue_name: &str) -> bool {
-        self.queues.is_empty() || self.queues.iter().any(|q| q == "*" || q == queue_name)
+        queue_scope_allows(&self.queues, queue_name)
     }
 
     /// Whether this key may operate on a worker that can process the supplied
@@ -260,12 +326,13 @@ impl ApiKeyContext {
     /// `*` entry. Restricted keys must have every operation constrained to their
     /// listed queues.
     pub fn is_unrestricted(&self) -> bool {
-        self.queues.is_empty() || self.queues.iter().any(|q| q == "*")
+        queue_scope_is_unrestricted(&self.queues)
     }
 
     /// Whether this key may GRANT the `requested` queue set to a new/updated API
     /// key. An unrestricted key may grant anything; a restricted key may only
-    /// grant a subset of its own queues and may never grant the `*` wildcard.
+    /// grant a subset of its own queues (a `prefix.*` pattern only under one of
+    /// its own patterns at least as broad) and may never grant the `*` wildcard.
     /// Prevents a queue-scoped key from minting a broader key (privilege
     /// escalation).
     pub fn can_grant_queues(&self, requested: &[String]) -> bool {
@@ -274,12 +341,17 @@ impl ApiKeyContext {
         }
         !requested.is_empty()
             && !requested.iter().any(|q| q == "*")
-            && requested.iter().all(|q| self.can_access_queue(q))
+            && requested
+                .iter()
+                .all(|q| queue_scope_covers(&self.queues, q))
     }
 
     /// The allowed-queue list to use as a SQL filter, or `None` when the key is
     /// unrestricted (no queue predicate needed). Lets read/list/delete queries
-    /// restrict rows to the key's queues with `queue_name = ANY($list)`.
+    /// restrict rows to the key's queues. Use it as
+    /// `queue_in_key_scope(queue_name, $list)` (migration 20261013130100), which
+    /// also honours `prefix.*` entries: `queue_name = ANY($list)` matches listed
+    /// names only, so it hides every queue a prefix entry covers.
     pub fn queue_scope_filter(&self) -> Option<&[String]> {
         if self.is_unrestricted() {
             None
@@ -615,5 +687,94 @@ mod tests {
     #[test]
     fn test_max_queues_per_key_constant() {
         assert_eq!(MAX_QUEUES_PER_KEY, 50);
+    }
+
+    // FEAT B2 / QW6: `prefix.*` was accepted at create and then matched no queue.
+    #[test]
+    fn test_queue_prefix_pattern_matches_by_prefix() {
+        let key = ctx(&["orders.*"]);
+        assert!(key.can_access_queue("orders.eu"));
+        assert!(key.can_access_queue("orders.eu.west"));
+        assert!(
+            !key.can_access_queue("orders"),
+            "the bare parent is not below `orders.`"
+        );
+        assert!(!key.can_access_queue("ordersx"));
+        assert!(!key.can_access_queue("ordersx.eu"));
+        assert!(
+            !key.can_access_queue("Orders.eu"),
+            "case-sensitive, like exact names"
+        );
+        assert!(!key.is_unrestricted());
+        assert!(key.can_access_all_queues(&["orders.eu".into(), "orders.us".into()]));
+        assert!(!key.can_access_all_queues(&["orders.eu".into(), "orders".into()]));
+
+        let nested = ctx(&["restaurant.prints.*", "billing"]);
+        assert!(nested.can_access_queue("restaurant.prints.store-12"));
+        assert!(nested.can_access_queue("billing"));
+        assert!(!nested.can_access_queue("restaurant.kitchen"));
+        assert!(
+            !nested.can_access_queue("billing.eu"),
+            "an exact name is not a prefix"
+        );
+
+        // `*` alone still means every queue.
+        assert!(ctx(&["*"]).can_access_queue("orders"));
+        assert!(ctx(&["*"]).is_unrestricted());
+    }
+
+    #[test]
+    fn test_queue_prefix_pattern_grants_only_narrower_scopes() {
+        let key = ctx(&["orders.*"]);
+        assert!(key.can_grant_queues(&["orders.eu".into()]));
+        assert!(key.can_grant_queues(&["orders.*".into()]));
+        assert!(key.can_grant_queues(&["orders.eu.*".into()]));
+        assert!(!key.can_grant_queues(&["orders".into()]));
+        assert!(!key.can_grant_queues(&["ordersx.*".into()]));
+        assert!(!key.can_grant_queues(&["*".into()]));
+
+        let exact = ctx(&["orders.eu"]);
+        assert!(!exact.can_grant_queues(&["orders.*".into()]));
+        assert!(!exact.can_grant_queues(&["orders.eu.*".into()]));
+
+        let narrow = ctx(&["orders.eu.*"]);
+        assert!(!narrow.can_grant_queues(&["orders.*".into()]));
+        assert!(narrow.can_grant_queues(&["orders.eu.west".into()]));
+    }
+
+    #[test]
+    fn test_validate_queues_accepts_only_star_or_trailing_dot_star() {
+        for ok in ["*", "orders.*", "restaurant.prints.*", "a.b-c_d.*"] {
+            assert!(validate_queues(&vec![ok.to_string()]).is_ok(), "{ok}");
+        }
+        for bad in [
+            "orders*",
+            "*.eu",
+            "orders.*.eu",
+            "or*ders",
+            ".*",
+            "**",
+            "orders.**",
+            "*orders",
+            "a*.*",
+        ] {
+            let err = validate_queues(&vec![bad.to_string()]).expect_err(bad);
+            assert_eq!(err.code, "invalid_queue_pattern", "{bad}");
+        }
+
+        // Through the request type, as the handler sees it.
+        let create: CreateApiKeyRequest = serde_json::from_value(serde_json::json!({
+            "name": "prints",
+            "queues": ["restaurant.prints*"]
+        }))
+        .unwrap();
+        assert!(create
+            .validate()
+            .unwrap_err()
+            .field_errors()
+            .contains_key("queues"));
+        let update: UpdateApiKeyRequest =
+            serde_json::from_value(serde_json::json!({ "queues": ["*.prints"] })).unwrap();
+        assert!(update.validate().is_err());
     }
 }

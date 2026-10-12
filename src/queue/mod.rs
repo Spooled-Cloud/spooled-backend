@@ -51,6 +51,43 @@ pub struct FailByWorkerOutcome {
     pub new_status: Option<String>,
 }
 
+/// The batch claim behind `POST /jobs/claim`.
+///
+/// The selection's predicate and order are exactly those of the partial index
+/// `idx_jobs_claim` (migration 20261013100000): a partial index is only used
+/// when the query implies its predicate, so change the two together.
+///
+/// Binds: `$1` worker id, `$2` lease id prefix, `$3` lease expiry, `$4` now,
+/// `$5` org id, `$6` queue, `$7` batch size, `$8` lease length in seconds.
+pub const CLAIM_BATCH_SQL: &str = r#"
+    WITH eligible_jobs AS (
+        SELECT id
+        FROM jobs
+        WHERE
+            organization_id = $5
+            AND queue_name = $6
+            AND status IN ('pending', 'scheduled')
+            AND (scheduled_at IS NULL OR scheduled_at <= $4)
+            AND (expires_at IS NULL OR expires_at > $4)
+            AND (dependencies_met IS NULL OR dependencies_met = TRUE)
+        ORDER BY priority DESC, created_at ASC
+        LIMIT $7
+        FOR UPDATE SKIP LOCKED
+    )
+    UPDATE jobs
+    SET
+        status = 'processing',
+        assigned_worker_id = $1,
+        lease_id = $2 || '-' || jobs.id,
+        lease_expires_at = $3,
+        lease_duration_secs = $8,
+        started_at = $4,
+        updated_at = $4
+    FROM eligible_jobs
+    WHERE jobs.id = eligible_jobs.id
+    RETURNING jobs.*
+"#;
+
 /// Queue manager for enqueueing and dequeuing jobs
 #[derive(Clone)]
 pub struct QueueManager {
@@ -225,44 +262,17 @@ impl QueueManager {
         // Each job gets the same lease_id prefix with a unique suffix
         let lease_id_prefix = Uuid::new_v4().to_string();
 
-        let jobs: Vec<Job> = sqlx::query_as(
-            r#"
-            WITH eligible_jobs AS (
-                SELECT id
-                FROM jobs
-                WHERE
-                    organization_id = $5
-                    AND queue_name = $6
-                    AND status IN ('pending', 'scheduled')
-                    AND (scheduled_at IS NULL OR scheduled_at <= $4)
-                    AND (expires_at IS NULL OR expires_at > $4)
-                    AND (dependencies_met IS NULL OR dependencies_met = TRUE)
-                ORDER BY priority DESC, created_at ASC
-                LIMIT $7
-                FOR UPDATE SKIP LOCKED
-            )
-            UPDATE jobs
-            SET
-                status = 'processing',
-                assigned_worker_id = $1,
-                lease_id = $2 || '-' || jobs.id,
-                lease_expires_at = $3,
-                started_at = $4,
-                updated_at = $4
-            FROM eligible_jobs
-            WHERE jobs.id = eligible_jobs.id
-            RETURNING jobs.*
-            "#,
-        )
-        .bind(worker_id)
-        .bind(&lease_id_prefix)
-        .bind(lease_expires)
-        .bind(now)
-        .bind(org_id)
-        .bind(queue_name)
-        .bind(safe_batch_size)
-        .fetch_all(&*self.db)
-        .await?;
+        let jobs: Vec<Job> = sqlx::query_as(CLAIM_BATCH_SQL)
+            .bind(worker_id)
+            .bind(&lease_id_prefix)
+            .bind(lease_expires)
+            .bind(now)
+            .bind(org_id)
+            .bind(queue_name)
+            .bind(safe_batch_size)
+            .bind(safe_lease_duration as i32)
+            .fetch_all(&*self.db)
+            .await?;
 
         // Record history for each claimed job (batch operation, don't fail on history errors)
         for job in &jobs {
@@ -353,6 +363,7 @@ impl QueueManager {
                 assigned_worker_id = $1,
                 lease_id = $2,
                 lease_expires_at = $3,
+                lease_duration_secs = $7,
                 started_at = $4,
                 updated_at = $4
             WHERE id = (
@@ -377,6 +388,7 @@ impl QueueManager {
         .bind(now)
         .bind(org_id)
         .bind(queue_name)
+        .bind(safe_lease_duration as i32)
         .fetch_optional(&*self.db)
         .await?;
 
@@ -649,7 +661,7 @@ impl QueueManager {
               AND lease_expires_at IS NOT NULL
               AND lease_expires_at > NOW()
               AND lease_id = $5
-              AND ($6::TEXT[] IS NULL OR queue_name = ANY($6))
+              AND queue_in_key_scope(queue_name, $6::TEXT[])
             "#,
         )
         .bind(&result_json)
@@ -730,7 +742,7 @@ impl QueueManager {
             WHERE id = $1
               AND organization_id = $2
               AND assigned_worker_id = $3
-              AND ($4::TEXT[] IS NULL OR queue_name = ANY($4))
+              AND queue_in_key_scope(queue_name, $4::TEXT[])
             "#,
         )
         .bind(job_id)
@@ -809,7 +821,7 @@ impl QueueManager {
               AND lease_expires_at IS NOT NULL
               AND lease_expires_at > NOW()
               AND lease_id = $4
-              AND ($5::TEXT[] IS NULL OR queue_name = ANY($5))
+              AND queue_in_key_scope(queue_name, $5::TEXT[])
             "#,
         )
         .bind(job_id)
@@ -859,7 +871,7 @@ impl QueueManager {
                   AND lease_expires_at IS NOT NULL
                   AND lease_expires_at > NOW()
                   AND lease_id = $7
-                  AND ($8::TEXT[] IS NULL OR queue_name = ANY($8))
+                  AND queue_in_key_scope(queue_name, $8::TEXT[])
                 "#,
             )
             .bind(retry_count + 1)
@@ -936,7 +948,7 @@ impl QueueManager {
                       AND lease_expires_at IS NOT NULL
                       AND lease_expires_at > NOW()
                       AND lease_id = $5
-                      AND ($6::TEXT[] IS NULL OR queue_name = ANY($6))
+                      AND queue_in_key_scope(queue_name, $6::TEXT[])
                     RETURNING id, organization_id, queue_name, payload
                 )
                 INSERT INTO dead_letter_queue (
@@ -1170,12 +1182,47 @@ impl QueueManager {
         allowed_queues: Option<&[String]>,
         lease_duration_secs: i64,
     ) -> Result<WorkerOpOutcome> {
-        let lease_expires = Utc::now() + Duration::seconds(lease_duration_secs);
+        self.renew_lease_for(
+            job_id,
+            worker_id,
+            organization_id,
+            lease_id,
+            allowed_queues,
+            Some(lease_duration_secs),
+            lease_duration_secs,
+        )
+        .await
+    }
+
+    /// [`Self::renew_lease`] for a heartbeat that may leave the length out.
+    ///
+    /// `requested = None` renews for the length the job's lease was granted
+    /// with (the claim's `lease_duration_secs`, or the last heartbeat that named
+    /// one), and `default_secs` only when that is unknown. Renewing an omitted
+    /// length for the 30 s default cut a 600 s claim down to 30 s at its first
+    /// heartbeat.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn renew_lease_for(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        organization_id: &str,
+        lease_id: Option<&str>,
+        allowed_queues: Option<&[String]>,
+        requested: Option<i64>,
+        default_secs: i64,
+    ) -> Result<WorkerOpOutcome> {
+        let requested = requested.map(|secs| secs.clamp(1, i32::MAX as i64) as i32);
+        let default_secs = default_secs.clamp(1, i32::MAX as i64) as i32;
 
         let result = sqlx::query(
             r#"
             UPDATE jobs
-            SET lease_expires_at = $1, updated_at = NOW()
+            SET lease_expires_at = NOW() + make_interval(
+                    secs => COALESCE($1::INT, lease_duration_secs, $7::INT)
+                ),
+                lease_duration_secs = COALESCE($1::INT, lease_duration_secs),
+                updated_at = NOW()
             WHERE id = $2
               AND assigned_worker_id = $3
               AND organization_id = $4
@@ -1183,15 +1230,16 @@ impl QueueManager {
               AND lease_expires_at IS NOT NULL
               AND lease_expires_at > NOW()
               AND lease_id = $5
-              AND ($6::TEXT[] IS NULL OR queue_name = ANY($6))
+              AND queue_in_key_scope(queue_name, $6::TEXT[])
             "#,
         )
-        .bind(lease_expires)
+        .bind(requested)
         .bind(job_id)
         .bind(worker_id)
         .bind(organization_id)
         .bind(lease_id)
         .bind(allowed_queues)
+        .bind(default_secs)
         .execute(&*self.db)
         .await?;
 

@@ -128,6 +128,19 @@ pub struct Job {
 /// Maximum payload size in bytes (1MB)
 pub const MAX_JOB_PAYLOAD_SIZE: usize = 1024 * 1024;
 
+/// `last_error` the scheduler's dependency sweep writes on a pending job it
+/// cancels because its `parent_job_id` failed, was dead-lettered or cancelled.
+pub const PARENT_FAILED_CANCEL_REASON: &str = "Parent job failed or was deadlettered";
+
+/// `last_error` the scheduler's dependency sweep writes on a pending job it
+/// cancels because a `job_dependencies` entry can no longer complete.
+pub const DEPENDENCY_FAILED_CANCEL_REASON: &str = "Dependency job failed or was deadlettered";
+
+/// Both sweep reasons. A job or DLQ retry re-opens only dependents cancelled
+/// with one of these; a job someone cancelled stays cancelled.
+pub const DEPENDENCY_CANCEL_REASONS: &[&str] =
+    &[DEPENDENCY_FAILED_CANCEL_REASON, PARENT_FAILED_CANCEL_REASON];
+
 /// Validate webhook URL for SSRF protection
 ///
 /// Uses the centralized URL validator from the security module.
@@ -152,7 +165,38 @@ fn validate_payload_size(payload: &serde_json::Value) -> Result<(), validator::V
         )));
         return Err(err);
     }
+    if contains_nul(payload) {
+        let mut err = validator::ValidationError::new("payload_contains_nul");
+        err.message = Some(std::borrow::Cow::Borrowed(
+            "Payload must not contain the NUL character (\\u0000)",
+        ));
+        return Err(err);
+    }
     Ok(())
+}
+
+/// Whether any string or object key in `value` holds U+0000. Postgres `jsonb`
+/// rejects it, so such a payload failed the INSERT with a 500 (and took a whole
+/// bulk batch down with it) instead of being refused as invalid input.
+fn contains_nul(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(s) => s.contains('\0'),
+        serde_json::Value::Array(items) => items.iter().any(contains_nul),
+        serde_json::Value::Object(map) => map
+            .iter()
+            .any(|(key, item)| key.contains('\0') || contains_nul(item)),
+        _ => false,
+    }
+}
+
+/// A blank idempotency key means "no key".
+///
+/// Clients that always send the field (`idempotency_key: key ?? ""`) used to
+/// collapse every keyless job of the org onto the first one: `""` is a value to
+/// the unique index, so each later job answered 200 with the first job's id and
+/// was never created. gRPC already treated an empty key as absent.
+pub fn normalize_idempotency_key(key: Option<String>) -> Option<String> {
+    key.filter(|k| !k.trim().is_empty())
 }
 
 /// Maximum tags size in bytes (64KB)
@@ -168,6 +212,13 @@ fn validate_tags_size(tags: &serde_json::Value) -> Result<(), validator::Validat
             json_str.len(),
             MAX_TAGS_SIZE
         )));
+        return Err(err);
+    }
+    if contains_nul(tags) {
+        let mut err = validator::ValidationError::new("tags_contain_nul");
+        err.message = Some(std::borrow::Cow::Borrowed(
+            "Tags must not contain the NUL character (\\u0000)",
+        ));
         return Err(err);
     }
     Ok(())
@@ -340,10 +391,12 @@ pub struct CompleteJobRequest {
     /// Optional result payload
     pub result: Option<serde_json::Value>,
 
-    /// Lease fencing token from the claim response. When provided, the
-    /// completion succeeds only if it matches the job's current lease.
+    /// Lease fencing token from the claim response; the completion succeeds
+    /// only if it matches the job's current lease. Required: it was declared
+    /// optional, but a call without it can never match a lease and was answered
+    /// 409 LEASE_EXPIRED instead of saying the field is missing (now a 422).
     #[validate(length(min = 1, max = 255, message = "Lease ID must be 1-255 characters"))]
-    pub lease_id: Option<String>,
+    pub lease_id: String,
 }
 
 /// Longest failure message stored for a job, in bytes (REST and gRPC).
@@ -387,10 +440,11 @@ pub struct FailJobRequest {
     /// truncated), so a failure is never rejected for its wording.
     pub error: String,
 
-    /// Lease fencing token from the claim response. When provided, the
-    /// failure succeeds only if it matches the job's current lease.
+    /// Lease fencing token from the claim response; the failure succeeds only
+    /// if it matches the job's current lease. Required (see
+    /// [`CompleteJobRequest::lease_id`]).
     #[validate(length(min = 1, max = 255, message = "Lease ID must be 1-255 characters"))]
-    pub lease_id: Option<String>,
+    pub lease_id: String,
 }
 
 /// Request to extend a job lease (heartbeat)
@@ -400,10 +454,11 @@ pub struct HeartbeatJobRequest {
     #[validate(length(min = 1, max = 255, message = "Worker ID must be 1-255 characters"))]
     pub worker_id: String,
 
-    /// New lease duration from now (in seconds). Omitted = the default claim
-    /// lease (`WORKER_LEASE_DURATION_SECS`, 30). It used to be required, and the
-    /// Go SDK's `Heartbeat` leaves it out unless set, so every such heartbeat
-    /// was a 422.
+    /// New lease duration from now (in seconds). Omitted = the length the lease
+    /// was granted with (the claim's `lease_duration_secs`, or the last
+    /// heartbeat that named one), else `WORKER_LEASE_DURATION_SECS` (30). It
+    /// used to be required, and the Go SDK's `Heartbeat` leaves it out unless
+    /// set, so every such heartbeat was a 422.
     #[validate(range(
         min = 5,
         max = 3600,
@@ -411,10 +466,11 @@ pub struct HeartbeatJobRequest {
     ))]
     pub lease_duration_secs: Option<i64>,
 
-    /// Lease fencing token from the claim response. When provided, the
-    /// renewal succeeds only if it matches the job's current lease.
+    /// Lease fencing token from the claim response; the renewal succeeds only
+    /// if it matches the job's current lease. Required (see
+    /// [`CompleteJobRequest::lease_id`]).
     #[validate(length(min = 1, max = 255, message = "Lease ID must be 1-255 characters"))]
-    pub lease_id: Option<String>,
+    pub lease_id: String,
 }
 
 /// Job summary for list responses
@@ -507,20 +563,33 @@ pub struct ListJobsQuery {
 }
 
 impl ListJobsQuery {
-    /// Get safe order_by field (validated against whitelist)
-    pub fn safe_order_by(&self) -> &str {
-        match &self.order_by {
-            Some(field) if ALLOWED_ORDER_BY_FIELDS.contains(&field.as_str()) => field,
-            _ => "created_at",
-        }
-    }
-
-    /// Get safe order direction
-    pub fn safe_order_dir(&self) -> &str {
-        match &self.order_dir {
+    /// The requested sort as `(column, direction)`, both taken from fixed
+    /// strings so they can be written into SQL. Omitted (or empty) means
+    /// `created_at`, `DESC`. An unknown column or direction is an error: both
+    /// parameters were silently ignored before, so a caller asking for
+    /// `order_by=priority&order_dir=asc` got newest-first without noticing.
+    pub fn order(&self) -> Result<(&'static str, &'static str), String> {
+        let column = match self.order_by.as_deref().map(str::trim) {
+            None | Some("") => "created_at",
+            Some(field) => ALLOWED_ORDER_BY_FIELDS
+                .iter()
+                .copied()
+                .find(|allowed| allowed.eq_ignore_ascii_case(field))
+                .ok_or_else(|| {
+                    format!(
+                        "Invalid order_by '{}': expected one of {}",
+                        field,
+                        ALLOWED_ORDER_BY_FIELDS.join(", ")
+                    )
+                })?,
+        };
+        let direction = match self.order_dir.as_deref().map(str::trim) {
+            None | Some("") => "DESC",
+            Some(dir) if dir.eq_ignore_ascii_case("desc") => "DESC",
             Some(dir) if dir.eq_ignore_ascii_case("asc") => "ASC",
-            _ => "DESC",
-        }
+            Some(dir) => return Err(format!("Invalid order_dir '{}': expected asc or desc", dir)),
+        };
+        Ok((column, direction))
     }
 }
 
@@ -611,17 +680,34 @@ pub struct BulkEnqueueRequest {
     #[validate(custom(function = "validate_queue_name_chars"))]
     pub queue_name: String,
 
-    /// Jobs to enqueue (max 100)
+    /// Jobs to enqueue (max 100). Items are validated one by one by the
+    /// handler (not `nested` here): an invalid item is reported in `failed`
+    /// under its index while the valid items are still created.
     #[validate(length(min = 1, max = 100, message = "Must provide 1-100 jobs"))]
     pub jobs: Vec<BulkJobItem>,
 
     /// Default priority for all jobs
+    #[validate(range(
+        min = -100,
+        max = 100,
+        message = "Default priority must be between -100 and 100"
+    ))]
     pub default_priority: Option<i32>,
 
     /// Default max retries for all jobs
+    #[validate(range(
+        min = 0,
+        max = 100,
+        message = "Default max retries must be between 0 and 100"
+    ))]
     pub default_max_retries: Option<i32>,
 
     /// Default timeout for all jobs
+    #[validate(range(
+        min = 1,
+        max = 86400,
+        message = "Default timeout must be between 1 and 86400 seconds"
+    ))]
     pub default_timeout_seconds: Option<i32>,
 }
 
@@ -719,6 +805,10 @@ pub struct RetryDlqResponse {
     pub retried_count: i64,
     /// Job IDs that were retried
     pub retried_jobs: Vec<String>,
+    /// Dead-lettered steps of failed workflows left in the DLQ because
+    /// reviving their workflow would exceed the plan's max_workflows (oldest
+    /// first, at most `limit`). They can be retried once a workflow slot frees.
+    pub skipped_jobs: Vec<String>,
 }
 
 /// Maximum jobs to purge per request
@@ -1036,6 +1126,7 @@ mod tests {
         let response = RetryDlqResponse {
             retried_count: 5,
             retried_jobs: vec!["job-1".to_string(), "job-2".to_string()],
+            skipped_jobs: vec![],
         };
 
         assert_eq!(response.retried_count, 5);
@@ -1109,6 +1200,65 @@ mod tests {
         let via_canonical: ListJobsQuery =
             serde_json::from_value(serde_json::json!({ "queue_name": "billing" })).unwrap();
         assert_eq!(via_canonical.queue_name.as_deref(), Some("billing"));
+    }
+
+    #[test]
+    fn list_order_defaults_and_whitelist() {
+        let query = |by: Option<&str>, dir: Option<&str>| ListJobsQuery {
+            order_by: by.map(str::to_string),
+            order_dir: dir.map(str::to_string),
+            ..Default::default()
+        };
+        assert_eq!(query(None, None).order(), Ok(("created_at", "DESC")));
+        assert_eq!(
+            query(Some(""), Some("")).order(),
+            Ok(("created_at", "DESC"))
+        );
+        assert_eq!(
+            query(Some("Priority"), Some("ASC")).order(),
+            Ok(("priority", "ASC"))
+        );
+        assert_eq!(
+            query(Some("completed_at"), Some("desc")).order(),
+            Ok(("completed_at", "DESC"))
+        );
+        assert!(query(Some("payload"), None).order().is_err());
+        assert!(query(Some("created_at; DROP TABLE jobs"), None)
+            .order()
+            .is_err());
+        assert!(query(None, Some("sideways")).order().is_err());
+    }
+
+    #[test]
+    fn blank_idempotency_keys_are_no_key() {
+        assert_eq!(normalize_idempotency_key(None), None);
+        assert_eq!(normalize_idempotency_key(Some(String::new())), None);
+        assert_eq!(normalize_idempotency_key(Some(" \t ".to_string())), None);
+        assert_eq!(
+            normalize_idempotency_key(Some(" order-1 ".to_string())).as_deref(),
+            Some(" order-1 ")
+        );
+    }
+
+    #[test]
+    fn payloads_and_tags_with_nul_are_invalid() {
+        assert!(validate_payload_size(&serde_json::json!({"a": ["ok", {"b": "x\u{0}"}]})).is_err());
+        assert!(validate_payload_size(&serde_json::json!({"k\u{0}": 1})).is_err());
+        // An escaped backslash-u0000 sequence is ordinary text.
+        assert!(validate_payload_size(&serde_json::json!({"a": "\\u0000"})).is_ok());
+        assert!(validate_tags_size(&serde_json::json!(["fine", "bad\u{0}"])).is_err());
+        assert!(validate_tags_size(&serde_json::json!(["customer:42"])).is_ok());
+    }
+
+    #[test]
+    fn worker_requests_require_lease_id() {
+        let missing = serde_json::json!({"worker_id": "w"});
+        assert!(serde_json::from_value::<CompleteJobRequest>(missing.clone()).is_err());
+        assert!(serde_json::from_value::<HeartbeatJobRequest>(missing).is_err());
+        assert!(serde_json::from_value::<FailJobRequest>(
+            serde_json::json!({"worker_id": "w", "error": "x"})
+        )
+        .is_err());
     }
 
     #[test]

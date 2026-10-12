@@ -157,7 +157,10 @@ Worker lifecycle management for registering and monitoring workers.
 `WORKER_HEARTBEAT_INTERVAL_SECS`.
 Send `worker_id` (1-128 characters: letters, digits, `-`, `_`, `.`) to make registration an upsert:
 a worker that restarts with the same id updates its row and is not counted twice against the
-plan's `max_workers` (an id another organization uses is `ALREADY_EXISTS`). Registration is
+plan's `max_workers` (an id another organization uses is `ALREADY_EXISTS`, and so is, for a
+queue-scoped key, the id of a worker of your organization that serves a queue outside the key's
+queues; both carry the same message, "This worker_id cannot be used: register with a different
+worker_id, or omit it to get a generated one"). Registration is
 checked under the same lock as REST, so concurrent registrations cannot exceed the limit.
 Healthy, degraded and draining workers (draining only while they keep heartbeating, 2 minutes)
 count toward the limit. Limits: metadata 64 KB, `worker_type` and `version` 50 characters,

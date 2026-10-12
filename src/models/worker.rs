@@ -13,6 +13,14 @@ pub const MAX_WORKER_METADATA_SIZE: usize = 64 * 1024;
 /// Valid worker statuses
 pub const VALID_WORKER_STATUSES: &[&str] = &["healthy", "degraded", "draining", "offline"];
 
+/// The answer (REST 409, gRPC ALREADY_EXISTS) when a caller-supplied worker id
+/// names a worker the key cannot take: another organization's (worker ids are
+/// global), or, for a queue-scoped key, one of its own organization serving a
+/// queue outside the key's scope. Both read the same and neither names another
+/// organization, so the answer does not say which one it was.
+pub const WORKER_ID_UNAVAILABLE: &str = "This worker_id cannot be used: register with a \
+     different worker_id, or omit it to get a generated one";
+
 /// Validate a client-supplied worker id.
 ///
 /// Kept deliberately narrow: the id is a primary key that ends up in log lines,

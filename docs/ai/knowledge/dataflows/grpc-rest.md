@@ -46,6 +46,25 @@ was a hard-coded 300 before 0.1.119 and stays 300 unless the operator changes it
 `WorkerService.Register` returns this gRPC default as `lease_duration_secs` and
 `WORKER_HEARTBEAT_INTERVAL_SECS` as `heartbeat_interval_secs` (`worker_service.rs:529-534`).
 
+## Lease length is remembered (0.1.121, BEJOB-15)
+
+Every gRPC claim (`Dequeue` `queue_service.rs:515`, `StreamJobs` `:1739`, `ProcessJobs` `:2203`) stores the granted
+lease in `jobs.lease_duration_secs` (migration `20261013100200`), and `RenewLease` stores the renewed one
+(`:1287`, `:2844`), so a REST `POST /jobs/{id}/heartbeat` without `lease_duration_secs` after a gRPC claim keeps
+the 300 s (or whatever was granted) instead of dropping to 30 s. REST claims record theirs through
+`CLAIM_BATCH_SQL`. The gRPC claim queries share the REST claim predicate and therefore `idx_jobs_claim`; edit them
+together (see invariants).
+
+## Queue scope: patterns (0.1.121, FEAT B2 / QW6)
+
+An API key's `queues` entry may be `*`, an exact name or `prefix.*`. `GrpcAuthContext::can_access_queue` and
+`can_access_all_queues` (`grpc/auth.rs:37`) delegate to `models::queue_scope_allows`, the rule REST's
+`ApiKeyContext` uses, so the two cannot drift. Row filters never write `queue_name = ANY(scope)`: unary
+`Complete`/`Fail`/`RenewLease`, `GetJob` and the `StreamJobs`/`ProcessJobs` claims and settles use the SQL function
+`queue_in_key_scope(queue_name, scope)` (for the stream queries `queue_in_key_scope(jobs.queue_name, k.queues)` on the
+locked key row), and stream authorization uses `queue_scope_allows` / `queue_scope_is_unrestricted`
+(`begin_stream_operation` `queue_service.rs:1919`, `queue_scope_filter_from_queues` `:1899`). See `dataflows/auth.md`.
+
 ## Worker field names
 
 The database uses `max_concurrent_jobs`, `current_job_count`, and `created_at`; REST public JSON keeps `max_concurrency`, `current_jobs`, and `registered_at`. Keep handlers and OpenAPI mapped at the boundary so SDKs do not see DB-only column names.
@@ -65,7 +84,15 @@ The database uses `max_concurrent_jobs`, `current_job_count`, and `created_at`; 
   ASCII letters, digits, `-_.`). Re-registering an id this org already holds is an upsert
   that does not count twice; `ON CONFLICT (id) ... WHERE workers.organization_id =
   EXCLUDED.organization_id` (`:444`) means another org's id is `ALREADY_EXISTS` and its
-  row is untouched (BEGRPC-08).
+  row is untouched (BEGRPC-08). Since 0.1.121 (BEJOB-19, KEYS-3) every conflict carries the shared
+  `models::WORKER_ID_UNAVAILABLE` text ("This worker_id cannot be used: register with a different
+  worker_id, or omit it to get a generated one", `models/worker.rs:21`), the same words as REST's 409, which
+  no longer reveals that another organization holds the id (the old "Worker ID already in use by another
+  organization" is gone; no SDK or dashboard code matched it). A queue-scoped key
+  (`!queue_scope_is_unrestricted(&auth.queues)`) that names a same-org worker serving a queue outside its
+  scope gets the identical `ALREADY_EXISTS`: the row is read `FOR UPDATE` under the registration advisory
+  lock, before the upsert, and checked with `can_access_all_queues` (`worker_service.rs:407-430`; REST
+  `workers.rs:160-176`). Worker ids stay one global namespace (a per-org namespace is deferred).
 - Input limits are the REST ones and fail with `INVALID_ARGUMENT` before any write:
   metadata ≤ 64 KB, `worker_type`/`version` ≤ 50, hostname ≤ 255. `max_concurrency` is
   clamped to 1-100 (0 = 5) instead of rejected (existing fleets must keep registering);

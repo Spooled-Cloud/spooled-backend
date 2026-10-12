@@ -4,9 +4,12 @@ use hmac::{Hmac, KeyInit, Mac};
 use reqwest::Client;
 use sha2::Sha256;
 use sqlx::{Pool, Postgres};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-use tracing::{error, info, warn};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tracing::{debug, error, info, warn};
 
 use crate::models::OutgoingWebhook;
 use crate::security::{
@@ -23,49 +26,227 @@ pub const AUTO_DISABLE_FAILURE_THRESHOLD: i32 = 20;
 /// auto-disable apart from a manual one.
 pub const AUTO_DISABLED_STATUS: &str = "auto_disabled";
 
+/// Bytes of the receiver's answer kept in a delivery's `response_body`.
+pub const MAX_STORED_RESPONSE_BODY_BYTES: usize = 1024;
+
+/// Characters of error text kept in a delivery's `error`.
+const MAX_STORED_ERROR_CHARS: usize = 1024;
+
+/// Upper bound on consumers, whatever the configuration says: each one is a
+/// task, and the setting used to size a semaphore, where a huge value was free.
+const MAX_CONSUMERS: usize = 1024;
+
+/// Upper bound on the queue (one channel slot and one semaphore permit each).
+const MAX_QUEUE_CAPACITY: usize = 1 << 20;
+
+/// Lane-map size past which lanes with nothing admitted are forgotten.
+const LANE_PRUNE_THRESHOLD: usize = 1024;
+
+/// User agents, kept distinct now that both kinds share one client.
+const ORG_WEBHOOK_USER_AGENT: &str = "Spooled-OutgoingWebhook/1.0";
+const COMPLETION_WEBHOOK_USER_AGENT: &str = "Spooled-CompletionWebhook/1.0";
+
+/// Bounds on outgoing deliveries.
+///
+/// Every delivery (one event for one webhook) is admitted into a bounded queue
+/// and worked by a fixed set of consumers. The queue bound keeps a failing or
+/// black-holing endpoint from turning into unbounded tasks and payload copies;
+/// the per-webhook bounds keep one such endpoint from taking every consumer, or
+/// every queue slot, from the other tenants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeliveryLimits {
+    /// Consumers, and outbound requests in flight process-wide.
+    pub max_concurrent: usize,
+    /// Events and deliveries admitted but not resolved yet: queued, waiting for
+    /// their webhook's turn, or sleeping before a retry. Past this, new ones are
+    /// dropped and counted ([`OutgoingWebhookService::deliveries_dropped`]).
+    pub queue_capacity: usize,
+    /// Requests in flight to one webhook.
+    pub per_webhook_concurrency: usize,
+    /// Deliveries one webhook may have admitted at once.
+    pub per_webhook_queue: usize,
+}
+
+impl DeliveryLimits {
+    /// Limits derived from `OUTGOING_WEBHOOK_MAX_CONCURRENT_DELIVERIES`: a queue
+    /// of 16 deliveries per slot, and one webhook gets at most a quarter of the
+    /// slots and a quarter of the queue.
+    pub fn from_concurrency(max_concurrent: usize) -> Self {
+        let max_concurrent = max_concurrent.clamp(1, MAX_CONSUMERS);
+        let queue_capacity = max_concurrent * 16;
+        Self {
+            max_concurrent,
+            queue_capacity,
+            per_webhook_concurrency: (max_concurrent / 4).max(1),
+            per_webhook_queue: (queue_capacity / 4).max(1),
+        }
+    }
+
+    fn normalized(self) -> Self {
+        let max_concurrent = self.max_concurrent.clamp(1, MAX_CONSUMERS);
+        let queue_capacity = self.queue_capacity.clamp(1, MAX_QUEUE_CAPACITY);
+        Self {
+            max_concurrent,
+            queue_capacity,
+            per_webhook_concurrency: self.per_webhook_concurrency.clamp(1, max_concurrent),
+            per_webhook_queue: self.per_webhook_queue.clamp(1, queue_capacity),
+        }
+    }
+}
+
+/// Org-configured outgoing webhooks: a bounded delivery queue worked by a fixed
+/// set of consumers (see [`DeliveryLimits`]).
+///
+/// It replaces one spawned task per event, each parked on a global semaphore
+/// with its own payload copy and a webhook list read before the wait: a failing
+/// endpoint grew that pile without bound, kept being called after the breaker
+/// disabled it, and held the global slots through its backoff sleeps, so every
+/// other tenant's deliveries queued behind it.
 #[derive(Clone)]
 pub struct OutgoingWebhookService {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
     pool: Pool<Postgres>,
     client: Client,
     max_attempts: i32,
-    /// Caps deliveries in flight across the whole process.
-    ///
-    /// Delivery tasks are spawned from the hot enqueue/complete paths and each
-    /// one can live for tens of seconds (request timeout plus retry backoff)
-    /// while holding a clone of the job payload. Unbounded, a single tenant
-    /// pointing a webhook at a black-holing endpoint grows tasks, sockets and
-    /// resident memory without limit until the process dies. This is the
-    /// backpressure that turns that into "deliveries queue up" instead.
-    delivery_slots: Arc<tokio::sync::Semaphore>,
-    /// Total slots, kept so in-flight count can be derived from the semaphore.
-    delivery_capacity: usize,
+    limits: DeliveryLimits,
+    /// Outbound requests in flight. Consumers and manual retries hold a slot
+    /// for the request itself only, never across a backoff sleep. Per-job
+    /// completion webhooks have their own pool (see [`CompletionGate`]).
+    delivery_slots: Arc<Semaphore>,
+    /// One permit per admitted event or delivery: the queue bound. A permit
+    /// travels with its item until the delivery resolves.
+    admission: Arc<Semaphore>,
+    /// As large as `admission`, and every item in it holds a permit, so a send
+    /// never finds it full.
+    queue_tx: mpsc::Sender<Work>,
+    queue_rx: tokio::sync::Mutex<mpsc::Receiver<Work>>,
+    /// Consumers start on first use (a runtime is guaranteed there, not in `new`).
+    consumers: OnceLock<()>,
+    lanes: Mutex<HashMap<String, Arc<Lane>>>,
+    dropped: AtomicU64,
+}
+
+/// Per-webhook bounds (per-org ones for completion webhooks).
+struct Lane {
+    /// Requests in flight to this webhook (or for this org).
+    slots: Arc<Semaphore>,
+    /// This webhook's (or org's) share of the queue.
+    share: Arc<Semaphore>,
+}
+
+enum Work {
+    /// An event not matched to webhooks yet (from `spawn_dispatch`).
+    Event {
+        organization_id: String,
+        event: String,
+        resource_id: String,
+        payload: serde_json::Value,
+        admission: OwnedSemaphorePermit,
+    },
+    /// One event for one webhook.
+    Delivery(Delivery),
+}
+
+struct Delivery {
+    /// The webhook as of fan-out; re-read before every attempt.
+    webhook: OutgoingWebhook,
+    /// The signed envelope (`id`/`event`/`created_at`/`data`), same on every attempt.
+    body: serde_json::Value,
+    attempt: i32,
+    lane: Arc<Lane>,
+    /// The webhook's request slot, once granted.
+    lane_slot: Option<OwnedSemaphorePermit>,
+    _share: OwnedSemaphorePermit,
+    _admission: OwnedSemaphorePermit,
+}
+
+/// Result of one delivery attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Attempt {
+    Delivered,
+    /// Transport error or non-2xx answer: worth retrying.
+    Failed,
+    /// The URL fails the SSRF policy, so retrying cannot help. Still a failed
+    /// delivery for the breaker, or such a webhook would never auto-disable.
+    Rejected,
 }
 
 impl OutgoingWebhookService {
     pub fn new(pool: Pool<Postgres>, max_attempts: i32, max_concurrent_deliveries: usize) -> Self {
-        let delivery_capacity = max_concurrent_deliveries.max(1);
-        Self {
+        Self::with_limits(
             pool,
-            // SECURITY: Never fall back to a default client. A default client may have no timeouts
-            // and will follow redirects, increasing SSRF/DoS risk.
-            client: build_outbound_http_client(
-                Duration::from_secs(10),
-                Duration::from_secs(5),
-                "Spooled-OutgoingWebhook/1.0",
-            ),
             max_attempts,
-            delivery_slots: Arc::new(tokio::sync::Semaphore::new(delivery_capacity)),
-            delivery_capacity,
+            DeliveryLimits::from_concurrency(max_concurrent_deliveries),
+        )
+    }
+
+    pub fn with_limits(pool: Pool<Postgres>, max_attempts: i32, limits: DeliveryLimits) -> Self {
+        let limits = limits.normalized();
+        // SECURITY: Never fall back to a default client. A default client may have no timeouts
+        // and will follow redirects, increasing SSRF/DoS risk.
+        let client = build_outbound_http_client(
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+            ORG_WEBHOOK_USER_AGENT,
+        );
+        let delivery_slots = Arc::new(Semaphore::new(limits.max_concurrent));
+        // Per-job completion webhooks have no handle on this service, so the
+        // first one built (AppState's, in production) lends them its client
+        // (one connection pool) and its limits. Not its slots: consumers wait
+        // on those inline, so a tenant's completion backlog queued there would
+        // stall every tenant's org-webhook deliveries.
+        let _ = COMPLETION_GATE.set(CompletionGate::new(client.clone(), limits));
+        let (queue_tx, queue_rx) = mpsc::channel(limits.queue_capacity);
+        Self {
+            inner: Arc::new(Inner {
+                pool,
+                client,
+                max_attempts: max_attempts.max(1),
+                limits,
+                delivery_slots,
+                admission: Arc::new(Semaphore::new(limits.queue_capacity)),
+                queue_tx,
+                queue_rx: tokio::sync::Mutex::new(queue_rx),
+                consumers: OnceLock::new(),
+                lanes: Mutex::new(HashMap::new()),
+                dropped: AtomicU64::new(0),
+            }),
         }
     }
 
-    /// Deliveries currently holding a slot. Exposed for metrics/diagnostics.
+    pub fn limits(&self) -> DeliveryLimits {
+        self.inner.limits
+    }
+
+    /// Requests holding a slot. Exposed for metrics/diagnostics.
     pub fn deliveries_in_flight(&self) -> usize {
-        self.delivery_capacity
-            .saturating_sub(self.delivery_slots.available_permits())
+        self.inner
+            .limits
+            .max_concurrent
+            .saturating_sub(self.inner.delivery_slots.available_permits())
+    }
+
+    /// Events and deliveries admitted and not resolved yet.
+    pub fn deliveries_queued(&self) -> usize {
+        self.inner
+            .limits
+            .queue_capacity
+            .saturating_sub(self.inner.admission.available_permits())
+    }
+
+    /// Events and deliveries dropped because the queue (or the webhook's share
+    /// of it) was full, since start.
+    pub fn deliveries_dropped(&self) -> u64 {
+        self.inner.dropped.load(Ordering::Relaxed)
     }
 
     /// Best-effort fire-and-forget dispatch used by REST/gRPC handlers.
+    ///
+    /// Never blocks and never spawns: the event is queued for the consumers,
+    /// or dropped (and counted) when the queue is full.
     pub fn spawn_dispatch(
         self: &Arc<Self>,
         organization_id: String,
@@ -73,17 +254,22 @@ impl OutgoingWebhookService {
         resource_id: String,
         payload: serde_json::Value,
     ) {
-        let service = Arc::clone(self);
-        tokio::spawn(async move {
-            if let Err(e) = service
-                .dispatch_event(event, &resource_id, payload, &organization_id)
-                .await
-            {
-                warn!(error = %e, org_id = %organization_id, "Outgoing webhook dispatch failed");
-            }
+        let Ok(admission) = Arc::clone(&self.inner.admission).try_acquire_owned() else {
+            self.inner
+                .note_drop("delivery queue full", &organization_id, &event, None);
+            return;
+        };
+        self.inner.enqueue(Work::Event {
+            organization_id,
+            event,
+            resource_id,
+            payload,
+            admission,
         });
     }
 
+    /// Queue one delivery per matching webhook. Returns once they are queued,
+    /// not delivered.
     pub async fn dispatch_event(
         &self,
         event: String,
@@ -91,7 +277,210 @@ impl OutgoingWebhookService {
         payload: serde_json::Value,
         organization_id: &str,
     ) -> Result<()> {
-        // Find matching webhooks
+        self.inner
+            .fan_out(&event, resource_id, payload, organization_id, None)
+            .await
+    }
+
+    pub async fn retry_delivery(&self, delivery_id: uuid::Uuid) -> Result<bool> {
+        // Fetch delivery details using runtime query (no compile-time check)
+        let row = sqlx::query(
+            r#"
+            SELECT d.webhook_id, d.event, d.status, d.payload, d.attempts, d.created_at,
+                   w.url, w.secret
+            FROM outgoing_webhook_deliveries d
+            JOIN outgoing_webhooks w ON d.webhook_id = w.id
+            WHERE d.id = $1
+            "#,
+        )
+        .bind(delivery_id.to_string())
+        .fetch_optional(&self.inner.pool)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Delivery not found"))?;
+
+        use sqlx::Row;
+        let status: String = row.get("status");
+        if status == "success" {
+            return Ok(true);
+        }
+
+        let webhook = OutgoingWebhook {
+            id: row.get("webhook_id"),
+            organization_id: String::new(), // Not needed for delivery
+            url: row.get("url"),
+            secret: row.get("secret"),
+            events: vec![], // Not needed
+            enabled: true,
+            failure_count: 0,
+            last_triggered_at: None,
+            last_status: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            name: String::new(),
+        };
+
+        let payload: serde_json::Value = row.get("payload");
+        let event: String = row.get("event");
+        let created_at: chrono::DateTime<Utc> = row.get("created_at");
+        let attempts: i32 = row.get("attempts");
+
+        // Deliveries store the full signed envelope (`id`/`event`/`data`). Older
+        // rows may only have the inner `data` object — wrap those for retry.
+        let body = if payload.get("event").is_some() && payload.get("data").is_some() {
+            let mut envelope = payload;
+            envelope["id"] = serde_json::json!(delivery_id);
+            envelope
+        } else {
+            serde_json::json!({
+                "id": delivery_id,
+                "event": event,
+                "created_at": created_at,
+                "data": payload,
+            })
+        };
+
+        // A manual retry is a real outbound request, so it must occupy a
+        // delivery slot like any other — otherwise the cap is not process-wide
+        // and the retry endpoint becomes an unmetered path to the same
+        // exhaustion the slots exist to prevent.
+        let slot = self
+            .inner
+            .delivery_slots
+            .acquire()
+            .await
+            .context("Outgoing webhook delivery semaphore closed")?;
+        let outcome = self.inner.try_deliver(&webhook, &body, attempts + 1).await;
+        drop(slot);
+
+        let delivered = outcome == Attempt::Delivered;
+        // A manual retry is a delivery too: a success here must clear the
+        // failure streak, otherwise a webhook the user just fixed stays one
+        // failure away from the auto-disable breaker.
+        self.inner
+            .record_delivery_outcome(&webhook.id, delivered)
+            .await;
+        Ok(delivered)
+    }
+}
+
+impl Inner {
+    fn enqueue(self: &Arc<Self>, work: Work) {
+        self.ensure_consumers();
+        // Cannot fail while the invariant on `queue_tx` holds; never block a
+        // caller over it if it somehow does.
+        if let Err(e) = self.queue_tx.try_send(work) {
+            let (organization_id, event, webhook_id) = match e.into_inner() {
+                Work::Event {
+                    organization_id,
+                    event,
+                    ..
+                } => (organization_id, event, None),
+                Work::Delivery(d) => (
+                    d.webhook.organization_id,
+                    d.body["event"].as_str().unwrap_or_default().to_string(),
+                    Some(d.webhook.id),
+                ),
+            };
+            self.note_drop(
+                "delivery queue closed or full",
+                &organization_id,
+                &event,
+                webhook_id.as_deref(),
+            );
+        }
+    }
+
+    fn note_drop(
+        &self,
+        reason: &str,
+        organization_id: &str,
+        event: &str,
+        webhook_id: Option<&str>,
+    ) {
+        let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+        // Under overload this runs per event: warn on the first and every 100th.
+        if dropped == 1 || dropped.is_multiple_of(100) {
+            warn!(
+                reason,
+                org_id = organization_id,
+                event,
+                webhook_id,
+                dropped_total = dropped,
+                "Outgoing webhook delivery dropped"
+            );
+        } else {
+            debug!(
+                reason,
+                org_id = organization_id,
+                event,
+                webhook_id,
+                "Outgoing webhook delivery dropped"
+            );
+        }
+    }
+
+    fn ensure_consumers(self: &Arc<Self>) {
+        self.consumers.get_or_init(|| {
+            for _ in 0..self.limits.max_concurrent {
+                let inner = Arc::clone(self);
+                tokio::spawn(async move {
+                    // A panic loses the item in hand, not the consumer, so the
+                    // pool never silently shrinks.
+                    loop {
+                        match tokio::spawn(Arc::clone(&inner).consume()).await {
+                            Err(e) if e.is_panic() => {
+                                error!("Outgoing webhook consumer panicked; restarting it")
+                            }
+                            _ => return,
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    async fn consume(self: Arc<Self>) {
+        loop {
+            let work = self.queue_rx.lock().await.recv().await;
+            let Some(work) = work else { return };
+            match work {
+                Work::Event {
+                    organization_id,
+                    event,
+                    resource_id,
+                    payload,
+                    admission,
+                } => {
+                    if let Err(e) = self
+                        .fan_out(
+                            &event,
+                            &resource_id,
+                            payload,
+                            &organization_id,
+                            Some(admission),
+                        )
+                        .await
+                    {
+                        warn!(error = %e, org_id = %organization_id, "Outgoing webhook dispatch failed");
+                    }
+                }
+                Work::Delivery(delivery) => self.work(delivery).await,
+            }
+        }
+    }
+
+    /// Queue one delivery per enabled webhook subscribed to `event`.
+    ///
+    /// `carried` is the event's own queue permit: it passes to the first
+    /// delivery, so fanning out never needs more room than the event held.
+    async fn fan_out(
+        self: &Arc<Self>,
+        event: &str,
+        resource_id: &str,
+        payload: serde_json::Value,
+        organization_id: &str,
+        mut carried: Option<OwnedSemaphorePermit>,
+    ) -> Result<()> {
         let webhooks = sqlx::query_as::<_, OutgoingWebhook>(
             r#"
             SELECT * FROM outgoing_webhooks
@@ -101,7 +490,7 @@ impl OutgoingWebhookService {
             "#,
         )
         .bind(organization_id)
-        .bind(event.clone())
+        .bind(event)
         .fetch_all(&self.pool)
         .await
         .context("Failed to fetch matching webhooks")?;
@@ -119,114 +508,175 @@ impl OutgoingWebhookService {
         );
 
         for webhook in webhooks {
-            let delivery_id = uuid::Uuid::new_v4();
-
-            // Acquire the slot BEFORE spawning and hand the permit to the task.
-            //
-            // Acquiring inside the spawned task would bound concurrent HTTP but
-            // not the number of tasks: they would pile up parked on the
-            // semaphore, each retaining its own clone of the job payload, and
-            // the memory exhaustion this is meant to prevent would happen
-            // anyway. Awaiting here is safe — `dispatch_event` is itself already
-            // running on a detached task (see `spawn_dispatch`), so the caller's
-            // request is never blocked; backpressure lands on the dispatcher,
-            // which is exactly where it belongs.
-            let permit = match Arc::clone(&self.delivery_slots).acquire_owned().await {
-                Ok(p) => p,
-                Err(e) => {
-                    error!(error = %e, "Outgoing webhook delivery semaphore closed");
-                    break;
-                }
+            let Some((lane, share)) = self.lane_share(&webhook.id) else {
+                self.note_drop(
+                    "webhook backlog full",
+                    organization_id,
+                    event,
+                    Some(&webhook.id),
+                );
+                continue;
             };
-
-            let payload = payload.clone();
-            let service = self.clone();
-            let event_clone = event.clone();
-            tokio::spawn(async move {
-                if let Err(e) = service
-                    .deliver_with_permit(webhook, event_clone, payload, delivery_id, permit)
-                    .await
-                {
-                    error!(error = %e, "Failed to deliver webhook");
-                }
+            let admission = match carried.take() {
+                Some(permit) => permit,
+                None => match Arc::clone(&self.admission).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        self.note_drop(
+                            "delivery queue full",
+                            organization_id,
+                            event,
+                            Some(&webhook.id),
+                        );
+                        continue;
+                    }
+                },
+            };
+            let body = serde_json::json!({
+                "id": uuid::Uuid::new_v4(),
+                "event": event,
+                "created_at": Utc::now(),
+                "data": payload.clone(),
             });
+            self.enqueue(Work::Delivery(Delivery {
+                webhook,
+                body,
+                attempt: 1,
+                lane,
+                lane_slot: None,
+                _share: share,
+                _admission: admission,
+            }));
         }
 
         Ok(())
     }
 
-    /// Deliver one event, acquiring a delivery slot first.
-    ///
-    /// Use this from paths that are NOT already holding a permit.
-    pub async fn deliver(
-        &self,
-        webhook: OutgoingWebhook,
-        event: String,
-        payload: serde_json::Value,
-        delivery_id: uuid::Uuid,
-    ) -> Result<()> {
-        let permit = Arc::clone(&self.delivery_slots)
-            .acquire_owned()
-            .await
-            .context("Outgoing webhook delivery semaphore closed")?;
-        self.deliver_with_permit(webhook, event, payload, delivery_id, permit)
-            .await
-    }
-
-    /// Deliver one event using an already-acquired slot.
-    ///
-    /// The permit is held for the WHOLE delivery — retries and backoff sleeps
-    /// included, since those sleeps are the window that made unbounded spawning
-    /// dangerous — and released when this future completes.
-    pub async fn deliver_with_permit(
-        &self,
-        webhook: OutgoingWebhook,
-        event: String,
-        payload: serde_json::Value,
-        delivery_id: uuid::Uuid,
-        permit: tokio::sync::OwnedSemaphorePermit,
-    ) -> Result<()> {
-        let _permit = permit;
-
-        let body = serde_json::json!({
-            "id": delivery_id,
-            "event": event,
-            "created_at": Utc::now(),
-            "data": payload,
+    /// The webhook's lane and one unit of its queue share, if it has any left.
+    fn lane_share(&self, webhook_id: &str) -> Option<(Arc<Lane>, OwnedSemaphorePermit)> {
+        let mut lanes = self.lanes.lock().unwrap_or_else(|e| e.into_inner());
+        if lanes.len() >= LANE_PRUNE_THRESHOLD && !lanes.contains_key(webhook_id) {
+            let full_share = self.limits.per_webhook_queue;
+            lanes.retain(|_, lane| lane.share.available_permits() < full_share);
+        }
+        let lane = lanes.entry(webhook_id.to_string()).or_insert_with(|| {
+            Arc::new(Lane {
+                slots: Arc::new(Semaphore::new(self.limits.per_webhook_concurrency)),
+                share: Arc::new(Semaphore::new(self.limits.per_webhook_queue)),
+            })
         });
+        let share = Arc::clone(&lane.share).try_acquire_owned().ok()?;
+        Some((Arc::clone(lane), share))
+    }
 
-        let max_attempts = self.max_attempts.max(1);
-        let mut delivered = false;
-        for attempt in 1..=max_attempts {
-            delivered = self.try_deliver(&webhook, &body, attempt).await?;
-            if delivered || attempt >= max_attempts {
-                break;
+    /// Run one attempt of `delivery`, then retry it, resolve it or drop it.
+    async fn work(self: &Arc<Self>, mut delivery: Delivery) {
+        if delivery.lane_slot.is_none() {
+            match Arc::clone(&delivery.lane.slots).try_acquire_owned() {
+                Ok(slot) => delivery.lane_slot = Some(slot),
+                Err(_) => {
+                    // The webhook is at its concurrency cap. Wait for its turn
+                    // off the consumer, so a slow endpoint occupies at most
+                    // `per_webhook_concurrency` consumers.
+                    let inner = Arc::clone(self);
+                    tokio::spawn(async move {
+                        if let Ok(slot) = Arc::clone(&delivery.lane.slots).acquire_owned().await {
+                            delivery.lane_slot = Some(slot);
+                            inner.enqueue(Work::Delivery(delivery));
+                        }
+                    });
+                    return;
+                }
             }
-
-            let backoff = Duration::from_secs(2_u64.pow((attempt - 1).min(5) as u32));
-            warn!(
-                "Webhook delivery failed (attempt {}/{}), retrying in {}s",
-                attempt,
-                max_attempts,
-                backoff.as_secs()
-            );
-            tokio::time::sleep(backoff).await;
         }
 
-        // Account the DELIVERY, not each attempt. Bumping failure_count inside
-        // try_deliver multiplied every failed event by the retry count, so the
-        // number the API reports was never "how many deliveries failed".
-        self.record_delivery_outcome(&webhook.id, delivered).await;
+        let outcome = self.attempt(&mut delivery).await;
+        // Free the webhook's slot before any backoff sleep.
+        delivery.lane_slot = None;
 
-        Ok(())
+        match outcome {
+            None => {}
+            Some(Attempt::Delivered) => {
+                self.record_delivery_outcome(&delivery.webhook.id, true)
+                    .await
+            }
+            Some(Attempt::Failed) if delivery.attempt < self.max_attempts => {
+                self.schedule_retry(delivery)
+            }
+            // Account the DELIVERY, not each attempt. Bumping failure_count per
+            // attempt multiplied every failed event by the retry count, so the
+            // number the API reports was never "how many deliveries failed".
+            Some(Attempt::Failed | Attempt::Rejected) => {
+                self.record_delivery_outcome(&delivery.webhook.id, false)
+                    .await
+            }
+        }
+    }
+
+    /// One attempt, or `None` when the webhook was disabled, deleted or
+    /// unsubscribed from the event while the delivery waited (it is then
+    /// abandoned, not counted as a failure).
+    async fn attempt(&self, delivery: &mut Delivery) -> Option<Attempt> {
+        // Re-read the webhook right before calling it. The breaker (or the user)
+        // may have disabled it since the event was queued, and a new URL or
+        // secret applies to the next attempt.
+        let event = delivery.body["event"].as_str().unwrap_or_default();
+        match sqlx::query_as::<_, OutgoingWebhook>("SELECT * FROM outgoing_webhooks WHERE id = $1")
+            .bind(&delivery.webhook.id)
+            .fetch_optional(&self.pool)
+            .await
+        {
+            Ok(Some(current)) if current.enabled && current.events.iter().any(|e| e == event) => {
+                delivery.webhook = current
+            }
+            Ok(_) => {
+                debug!(
+                    webhook_id = %delivery.webhook.id,
+                    attempt = delivery.attempt,
+                    "Outgoing webhook disabled, deleted or unsubscribed; delivery abandoned"
+                );
+                return None;
+            }
+            Err(e) => warn!(
+                error = %e,
+                webhook_id = %delivery.webhook.id,
+                "Could not re-read webhook before delivery; using the queued copy"
+            ),
+        }
+
+        let _slot = self.delivery_slots.acquire().await.ok()?;
+        Some(
+            self.try_deliver(&delivery.webhook, &delivery.body, delivery.attempt)
+                .await,
+        )
+    }
+
+    /// Re-queue `delivery` after its backoff. While it sleeps it keeps its
+    /// queue permit (memory stays bounded) but holds no request slot.
+    fn schedule_retry(self: &Arc<Self>, mut delivery: Delivery) {
+        let backoff = Duration::from_secs(2_u64.pow((delivery.attempt - 1).clamp(0, 5) as u32));
+        warn!(
+            webhook_id = %delivery.webhook.id,
+            "Webhook delivery failed (attempt {}/{}), retrying in {}s",
+            delivery.attempt,
+            self.max_attempts,
+            backoff.as_secs()
+        );
+        delivery.attempt += 1;
+        let inner = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(backoff).await;
+            inner.enqueue(Work::Delivery(delivery));
+        });
     }
 
     /// Update per-webhook health after a delivery resolves, and trip the breaker.
     ///
     /// Success resets the counter; failure increments it once. Crossing
     /// [`AUTO_DISABLE_FAILURE_THRESHOLD`] disables the webhook so a permanently
-    /// dead endpoint stops consuming delivery slots — `dispatch_event` only
-    /// selects `enabled = true` rows, so this is self-enforcing.
+    /// dead endpoint stops consuming delivery slots — `fan_out` only selects
+    /// `enabled = true` rows and every attempt re-checks `enabled`, so this is
+    /// self-enforcing, including for deliveries already queued.
     async fn record_delivery_outcome(&self, webhook_id: &str, delivered: bool) {
         let result = sqlx::query(
             r#"
@@ -275,93 +725,26 @@ impl OutgoingWebhookService {
         }
     }
 
-    pub async fn retry_delivery(&self, delivery_id: uuid::Uuid) -> Result<bool> {
-        // Fetch delivery details using runtime query (no compile-time check)
-        let row = sqlx::query(
-            r#"
-            SELECT d.webhook_id, d.event, d.status, d.payload, d.attempts, d.created_at,
-                   w.url, w.secret 
-            FROM outgoing_webhook_deliveries d
-            JOIN outgoing_webhooks w ON d.webhook_id = w.id
-            WHERE d.id = $1
-            "#,
-        )
-        .bind(delivery_id.to_string())
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("Delivery not found"))?;
-
-        use sqlx::Row;
-        let status: String = row.get("status");
-        if status == "success" {
-            return Ok(true);
-        }
-
-        let webhook = OutgoingWebhook {
-            id: row.get("webhook_id"),
-            organization_id: String::new(), // Not needed for delivery
-            url: row.get("url"),
-            secret: row.get("secret"),
-            events: vec![], // Not needed
-            enabled: true,
-            failure_count: 0,
-            last_triggered_at: None,
-            last_status: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            name: String::new(),
-        };
-
-        let payload: serde_json::Value = row.get("payload");
-        let event: String = row.get("event");
-        let created_at: chrono::DateTime<Utc> = row.get("created_at");
-        let attempts: i32 = row.get("attempts");
-
-        // Deliveries store the full signed envelope (`id`/`event`/`data`). Older
-        // rows may only have the inner `data` object — wrap those for retry.
-        let body = if payload.get("event").is_some() && payload.get("data").is_some() {
-            let mut envelope = payload;
-            envelope["id"] = serde_json::json!(delivery_id);
-            envelope
-        } else {
-            serde_json::json!({
-                "id": delivery_id,
-                "event": event,
-                "created_at": created_at,
-                "data": payload,
-            })
-        };
-
-        // A manual retry is a real outbound request, so it must occupy a
-        // delivery slot like any other — otherwise the cap is not process-wide
-        // and the retry endpoint becomes an unmetered path to the same
-        // exhaustion the semaphore exists to prevent.
-        let _permit = Arc::clone(&self.delivery_slots)
-            .acquire_owned()
-            .await
-            .context("Outgoing webhook delivery semaphore closed")?;
-
-        let delivered = self.try_deliver(&webhook, &body, attempts + 1).await?;
-        // A manual retry is a delivery too: a success here must clear the
-        // failure streak, otherwise a webhook the user just fixed stays one
-        // failure away from the auto-disable breaker.
-        self.record_delivery_outcome(&webhook.id, delivered).await;
-        Ok(delivered)
-    }
-
+    /// Send one attempt and log it. The caller holds a delivery slot.
     async fn try_deliver(
         &self,
         webhook: &OutgoingWebhook,
         body: &serde_json::Value,
         attempt: i32,
-    ) -> Result<bool> {
+    ) -> Attempt {
         let start = Utc::now();
 
         // Validate URL prevents SSRF
         if let Err(e) = self.validate_url(&webhook.url) {
-            self.record_attempt(&webhook.id, body, 0, Some(&e.to_string()), attempt, start)
-                .await?;
-            return Err(e);
+            self.record_attempt(
+                &webhook.id,
+                body,
+                AttemptLog::error(e.to_string()),
+                attempt,
+                start,
+            )
+            .await;
+            return Attempt::Rejected;
         }
 
         let payload_json = serde_json::to_string(body).unwrap_or_default();
@@ -379,56 +762,61 @@ impl OutgoingWebhookService {
         // Prefer the per-webhook secret (matches /outgoing-webhooks/{id}/test).
         if let Some(ref secret) = webhook.secret {
             if !secret.is_empty() {
-                let signature = sign_payload(secret, timestamp, &payload_json)?;
-                request_builder = request_builder.header("X-Spooled-Signature", signature);
+                match sign_payload(secret, timestamp, &payload_json) {
+                    Ok(signature) => {
+                        request_builder = request_builder.header("X-Spooled-Signature", signature)
+                    }
+                    Err(e) => {
+                        let log = AttemptLog::error(e.to_string());
+                        self.record_attempt(&webhook.id, body, log, attempt, start)
+                            .await;
+                        return Attempt::Rejected;
+                    }
+                }
             }
         }
 
-        let response = request_builder.body(payload_json).send().await;
-
-        match response {
+        match request_builder.body(payload_json).send().await {
             Ok(res) => {
-                let status = res.status().as_u16();
-                let success = res.status().is_success();
-                let error = if !success {
-                    Some(format!("HTTP {}", status))
-                } else {
-                    None
+                let status = res.status();
+                let log = AttemptLog {
+                    status_code: Some(i32::from(status.as_u16())),
+                    response_body: read_capped_body(res, MAX_STORED_RESPONSE_BODY_BYTES).await,
+                    error: (!status.is_success()).then(|| format!("HTTP {}", status.as_u16())),
                 };
-
-                self.record_attempt(
-                    &webhook.id,
-                    body,
-                    status as i32,
-                    error.as_deref(),
-                    attempt,
-                    start,
-                )
-                .await?;
-
-                Ok(success)
+                self.record_attempt(&webhook.id, body, log, attempt, start)
+                    .await;
+                if status.is_success() {
+                    Attempt::Delivered
+                } else {
+                    Attempt::Failed
+                }
             }
             Err(e) => {
-                self.record_attempt(&webhook.id, body, 0, Some(&e.to_string()), attempt, start)
-                    .await?;
-                Ok(false)
+                let log = AttemptLog::error(describe_send_error(e));
+                self.record_attempt(&webhook.id, body, log, attempt, start)
+                    .await;
+                Attempt::Failed
             }
         }
     }
 
+    /// Write the delivery row for one attempt.
+    ///
+    /// A database error is logged, not returned: the request has already gone
+    /// out, and failing here must neither re-send a delivery the receiver
+    /// accepted nor abandon one that still has retries left.
     async fn record_attempt(
         &self,
         webhook_id: &str,
         request_payload: &serde_json::Value,
-        response_status: i32,
-        response_body: Option<&str>,
+        log: AttemptLog,
         attempt_count: i32,
         started_at: chrono::DateTime<Utc>,
-    ) -> Result<()> {
-        let status = if (200..300).contains(&response_status) {
-            "success"
-        } else {
-            "failed"
+    ) {
+        let status = match log.status_code {
+            Some(code) if (200..300).contains(&code) => "success",
+            _ => "failed",
         };
 
         let delivery_id = request_payload
@@ -437,18 +825,19 @@ impl OutgoingWebhookService {
             .map(|s| s.to_string())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-        sqlx::query(
+        let inserted = sqlx::query(
             r#"
             INSERT INTO outgoing_webhook_deliveries (
                 id, webhook_id, event, status, payload,
-                status_code, response_body, attempts,
+                status_code, response_body, error, attempts,
                 created_at, delivered_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             ON CONFLICT (id) DO UPDATE SET
                 status = EXCLUDED.status,
                 status_code = EXCLUDED.status_code,
                 response_body = EXCLUDED.response_body,
+                error = EXCLUDED.error,
                 attempts = EXCLUDED.attempts,
                 delivered_at = EXCLUDED.delivered_at
             "#,
@@ -458,19 +847,23 @@ impl OutgoingWebhookService {
         .bind(request_payload["event"].as_str().unwrap_or("unknown"))
         .bind(status)
         .bind(request_payload)
-        .bind(response_status)
-        .bind(response_body)
+        .bind(log.status_code)
+        .bind(log.response_body)
+        .bind(log.error)
         .bind(attempt_count)
         .bind(started_at)
         .bind(Utc::now())
         .execute(&self.pool)
-        .await?;
+        .await;
+        if let Err(e) = inserted {
+            warn!(error = %e, webhook_id, delivery_id, "Failed to record webhook delivery attempt");
+        }
 
         // Keep webhook summary fields current for dashboard / list views.
         // `failure_count` is deliberately NOT touched here: this runs once per
         // ATTEMPT, and the counter must move once per DELIVERY. It is owned by
         // `record_delivery_outcome`, which also owns the auto-disable breaker.
-        sqlx::query(
+        let summary = sqlx::query(
             r#"
             UPDATE outgoing_webhooks
             SET last_triggered_at = NOW(),
@@ -482,9 +875,10 @@ impl OutgoingWebhookService {
         .bind(webhook_id)
         .bind(status)
         .execute(&self.pool)
-        .await?;
-
-        Ok(())
+        .await;
+        if let Err(e) = summary {
+            warn!(error = %e, webhook_id, "Failed to update webhook last status");
+        }
     }
 
     /// Validate webhook URL to prevent SSRF attacks.
@@ -513,6 +907,73 @@ impl OutgoingWebhookService {
     }
 }
 
+/// What one attempt leaves in the delivery log: the HTTP status (`None` when
+/// no response arrived), the start of the receiver's answer, and the reason it
+/// failed.
+struct AttemptLog {
+    status_code: Option<i32>,
+    response_body: Option<String>,
+    error: Option<String>,
+}
+
+impl AttemptLog {
+    fn error(text: String) -> Self {
+        Self {
+            status_code: None,
+            response_body: None,
+            error: Some(clean_text(text, MAX_STORED_ERROR_CHARS)),
+        }
+    }
+}
+
+/// Read at most `limit` bytes of a response as text. Reading to the end of a
+/// short body also lets the connection go back to the pool. `None` if empty.
+async fn read_capped_body(mut response: reqwest::Response, limit: usize) -> Option<String> {
+    let mut buf = Vec::new();
+    while buf.len() < limit {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let take = chunk.len().min(limit - buf.len());
+                buf.extend_from_slice(&chunk[..take]);
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    let mut text = String::from_utf8_lossy(&buf).replace('\0', "");
+    // A character cut at the limit decodes to U+FFFD, which is wider.
+    while text.len() > limit {
+        text.pop();
+    }
+    (!text.is_empty()).then_some(text)
+}
+
+/// A send error with its causes: reqwest's own message ("error sending
+/// request") says little, the chain has the useful part ("connection
+/// refused", "operation timed out"). The URL is left out; the user has it.
+fn describe_send_error(e: reqwest::Error) -> String {
+    let e = e.without_url();
+    let mut text = e.to_string();
+    let mut source = std::error::Error::source(&e);
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        if !text.ends_with(&cause_text) {
+            text.push_str(": ");
+            text.push_str(&cause_text);
+        }
+        source = cause.source();
+    }
+    text
+}
+
+/// Postgres TEXT cannot hold NUL; keep at most `max_chars` characters.
+fn clean_text(text: String, max_chars: usize) -> String {
+    let mut text = text.replace('\0', "");
+    if let Some((cut, _)) = text.char_indices().nth(max_chars) {
+        text.truncate(cut);
+    }
+    text
+}
+
 fn sign_payload(secret: &str, timestamp: i64, payload_json: &str) -> Result<String> {
     type HmacSha256 = Hmac<Sha256>;
     let message = format!("{}.{}", timestamp, payload_json);
@@ -525,6 +986,106 @@ fn sign_payload(secret: &str, timestamp: i64, payload_json: &str) -> Result<Stri
     ))
 }
 
+/// Bounds on per-job `completion_webhook` deliveries.
+///
+/// They share the org-webhook client but have their own request slots and a
+/// per-org share of each bound, the same shape as org webhooks' per-webhook
+/// lanes. One tenant whose completion URL never answers then holds at most a
+/// quarter of the completion slots and of the pending bound, and nothing an
+/// org-webhook consumer waits on.
+struct CompletionGate {
+    /// One client, so one connection pool and resolver, instead of a new
+    /// client (and a cold connection) per delivery.
+    client: Client,
+    limits: DeliveryLimits,
+    /// Completion requests in flight process-wide.
+    slots: Arc<Semaphore>,
+    /// Completion deliveries admitted and not finished; past this they are
+    /// dropped instead of parking a task each on `slots`.
+    pending: Arc<Semaphore>,
+    lanes: Mutex<HashMap<String, Arc<Lane>>>,
+    dropped: AtomicU64,
+}
+
+impl CompletionGate {
+    fn new(client: Client, limits: DeliveryLimits) -> Self {
+        let limits = limits.normalized();
+        Self {
+            client,
+            limits,
+            slots: Arc::new(Semaphore::new(limits.max_concurrent)),
+            pending: Arc::new(Semaphore::new(limits.queue_capacity)),
+            lanes: Mutex::new(HashMap::new()),
+            dropped: AtomicU64::new(0),
+        }
+    }
+
+    /// The org's lane and one unit of its pending share, if it has any left.
+    fn lane_share(&self, organization_id: &str) -> Option<(Arc<Lane>, OwnedSemaphorePermit)> {
+        let mut lanes = self.lanes.lock().unwrap_or_else(|e| e.into_inner());
+        if lanes.len() >= LANE_PRUNE_THRESHOLD && !lanes.contains_key(organization_id) {
+            let full_share = self.limits.per_webhook_queue;
+            lanes.retain(|_, lane| lane.share.available_permits() < full_share);
+        }
+        let lane = lanes.entry(organization_id.to_string()).or_insert_with(|| {
+            Arc::new(Lane {
+                slots: Arc::new(Semaphore::new(self.limits.per_webhook_concurrency)),
+                share: Arc::new(Semaphore::new(self.limits.per_webhook_queue)),
+            })
+        });
+        let share = Arc::clone(&lane.share).try_acquire_owned().ok()?;
+        Some((Arc::clone(lane), share))
+    }
+
+    fn note_drop(&self, reason: &str, organization_id: &str, event: &str) {
+        let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+        if dropped == 1 || dropped.is_multiple_of(100) {
+            warn!(
+                reason,
+                org_id = organization_id,
+                event,
+                dropped_total = dropped,
+                "completion_webhook dropped"
+            );
+        } else {
+            debug!(
+                reason,
+                org_id = organization_id,
+                event,
+                "completion_webhook dropped"
+            );
+        }
+    }
+}
+
+static COMPLETION_GATE: OnceLock<CompletionGate> = OnceLock::new();
+
+/// The gate built by the first [`OutgoingWebhookService`], or a default one if
+/// a completion webhook fires before any service exists.
+fn completion_gate() -> &'static CompletionGate {
+    COMPLETION_GATE.get_or_init(|| {
+        CompletionGate::new(
+            build_outbound_http_client(
+                Duration::from_secs(10),
+                Duration::from_secs(5),
+                COMPLETION_WEBHOOK_USER_AGENT,
+            ),
+            DeliveryLimits::from_concurrency(
+                crate::config::OutgoingWebhookSettings::default().max_concurrent_deliveries,
+            ),
+        )
+    })
+}
+
+/// Completion webhooks dropped because too many were pending, since start.
+pub fn completion_webhooks_dropped() -> u64 {
+    // Read without building the gate: a metrics scrape before the first service
+    // must not install the default gate in place of the service's.
+    COMPLETION_GATE
+        .get()
+        .map_or(0, |gate| gate.dropped.load(Ordering::Relaxed))
+}
+
 /// Deliver a per-job `completion_webhook` URL (best-effort, fire-and-forget).
 ///
 /// When `secret` is `Some` and non-empty, signs with the same HMAC scheme as org
@@ -534,14 +1095,30 @@ fn sign_payload(secret: &str, timestamp: i64, payload_json: &str) -> Result<Stri
 /// The envelope matches org webhooks exactly (`id`/`event`/`created_at`/`data`)
 /// so a receiver can dedupe on `body.id` for BOTH kinds. It previously omitted
 /// `id`, which silently degraded id-keyed dedupe to a constant key.
+///
+/// Bounded by [`CompletionGate`]: when the org's share, or the process-wide
+/// bound, of pending deliveries is used up it is dropped and counted
+/// ([`completion_webhooks_dropped`]) rather than queued without bound.
 pub fn spawn_completion_webhook(
+    organization_id: &str,
     url: String,
     event: String,
     payload: serde_json::Value,
     secret: Option<String>,
 ) {
+    let gate = completion_gate();
+    let Some((lane, share)) = gate.lane_share(organization_id) else {
+        gate.note_drop("org backlog full", organization_id, &event);
+        return;
+    };
+    let Ok(pending) = Arc::clone(&gate.pending).try_acquire_owned() else {
+        gate.note_drop("too many pending", organization_id, &event);
+        return;
+    };
     tokio::spawn(async move {
-        if let Err(e) = deliver_completion_webhook(&url, &event, &payload, secret.as_deref()).await
+        let _admitted = (share, pending);
+        if let Err(e) =
+            deliver_completion_webhook(gate, &lane, &url, &event, &payload, secret.as_deref()).await
         {
             warn!(error = %e, url = %url, event = %event, "completion_webhook delivery failed");
         }
@@ -549,6 +1126,8 @@ pub fn spawn_completion_webhook(
 }
 
 async fn deliver_completion_webhook(
+    gate: &CompletionGate,
+    lane: &Lane,
     url: &str,
     event: &str,
     payload: &serde_json::Value,
@@ -562,11 +1141,6 @@ async fn deliver_completion_webhook(
     };
     validate_url_ssrf(url, &options).map_err(|e| anyhow::anyhow!("Invalid webhook URL: {}", e))?;
 
-    let client = build_outbound_http_client(
-        Duration::from_secs(10),
-        Duration::from_secs(5),
-        "Spooled-CompletionWebhook/1.0",
-    );
     let delivery_id = uuid::Uuid::new_v4();
     let body = serde_json::json!({
         "id": delivery_id,
@@ -576,8 +1150,10 @@ async fn deliver_completion_webhook(
     });
     let payload_json = serde_json::to_string(&body).unwrap_or_default();
 
-    let mut request_builder = client
+    let mut request_builder = gate
+        .client
         .post(url)
+        .header(reqwest::header::USER_AGENT, COMPLETION_WEBHOOK_USER_AGENT)
         .header("Content-Type", "application/json")
         .header("X-Spooled-Event", event)
         .header("X-Spooled-Delivery-Attempt", "1");
@@ -590,9 +1166,25 @@ async fn deliver_completion_webhook(
             .header("X-Spooled-Signature", signature);
     }
 
+    // The org's slot first: a backlog waits on its own org's lane, so at most
+    // `per_webhook_concurrency` of one org's deliveries are ever ahead of
+    // another org's in the line for `gate.slots`.
+    let _org_slot = lane
+        .slots
+        .acquire()
+        .await
+        .context("Completion webhook semaphore closed")?;
+    let _slot = gate
+        .slots
+        .acquire()
+        .await
+        .context("Completion webhook semaphore closed")?;
     let resp = request_builder.body(payload_json).send().await?;
-    if !resp.status().is_success() {
-        anyhow::bail!("HTTP {}", resp.status());
+    let status = resp.status();
+    // Drain a short answer so the connection is reused.
+    read_capped_body(resp, MAX_STORED_RESPONSE_BODY_BYTES).await;
+    if !status.is_success() {
+        anyhow::bail!("HTTP {}", status);
     }
     Ok(())
 }
@@ -610,6 +1202,85 @@ mod tests {
         let again = sign_payload("whsec_test", 1_700_000_000, r#"{"event":"job.completed"}"#)
             .expect("sign again");
         assert_eq!(sig, again);
+    }
+
+    #[test]
+    fn delivery_limits_give_one_webhook_a_quarter() {
+        assert_eq!(
+            DeliveryLimits::from_concurrency(64),
+            DeliveryLimits {
+                max_concurrent: 64,
+                queue_capacity: 1024,
+                per_webhook_concurrency: 16,
+                per_webhook_queue: 256,
+            }
+        );
+        assert_eq!(
+            DeliveryLimits::from_concurrency(0),
+            DeliveryLimits {
+                max_concurrent: 1,
+                queue_capacity: 16,
+                per_webhook_concurrency: 1,
+                per_webhook_queue: 4,
+            }
+        );
+        assert_eq!(
+            DeliveryLimits::from_concurrency(usize::MAX).max_concurrent,
+            MAX_CONSUMERS
+        );
+        let odd = DeliveryLimits {
+            max_concurrent: 2,
+            queue_capacity: 0,
+            per_webhook_concurrency: 9,
+            per_webhook_queue: 9,
+        }
+        .normalized();
+        assert_eq!(
+            (
+                odd.queue_capacity,
+                odd.per_webhook_concurrency,
+                odd.per_webhook_queue
+            ),
+            (1, 2, 1)
+        );
+    }
+
+    #[test]
+    fn completion_gate_has_its_own_slots_and_a_per_org_share() {
+        let limits = DeliveryLimits::from_concurrency(4);
+        let client = build_outbound_http_client(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            COMPLETION_WEBHOOK_USER_AGENT,
+        );
+        let gate = CompletionGate::new(client, limits);
+        assert_eq!(gate.slots.available_permits(), 4);
+        assert_eq!(gate.pending.available_permits(), 64);
+
+        let busy: Vec<_> = (0..limits.per_webhook_queue)
+            .map(|_| gate.lane_share("busy-org").expect("within the org's share"))
+            .collect();
+        assert!(
+            gate.lane_share("busy-org").is_none(),
+            "an org gets a quarter of the pending bound"
+        );
+        let (lane, _share) = gate
+            .lane_share("other-org")
+            .expect("another org is admitted");
+        assert_eq!(lane.slots.available_permits(), 1, "one request per org");
+
+        drop(busy);
+        assert!(
+            gate.lane_share("busy-org").is_some(),
+            "the share comes back"
+        );
+    }
+
+    #[test]
+    fn clean_text_strips_nul_and_cuts_on_a_char_boundary() {
+        assert_eq!(clean_text("a\0b".to_string(), 10), "ab");
+        assert_eq!(clean_text("żółw".to_string(), 2), "żó");
+        assert_eq!(clean_text("ok".to_string(), 10), "ok");
     }
 
     #[test]

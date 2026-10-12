@@ -13,7 +13,10 @@ Update the KB in the **same change** when you touch these areas.
 | `src/outgoing_webhooks/`, `handlers/webhooks.rs` | `dataflows/webhooks.md` |
 | `src/api/middleware/limits.rs`, `config/plans.rs` | `dataflows/billing-stripe.md`, `contracts/invariants.md` |
 | Cap-counting SQL (`get_org_resource_counts`), `handlers/api_keys.rs` / `schedules.rs` / `workflows.rs` re-activation and retry, `custom_limits`, soft delete (`admin.rs`) | `contracts/invariants.md` #25-#29 |
-| `src/scheduler/` | `dataflows/jobs-queue.md`, chesterton fences |
+| `src/scheduler/` | `dataflows/jobs-queue.md` (retention, sweeps, cron), `contracts/invariants.md` #35, chesterton fences |
+| `src/api/handlers/realtime.rs` | `dataflows/auth.md` (Realtime), `contracts/invariants.md` #36 |
+| `src/models/api_key.rs` queue scope, any SQL filtering rows by a key's queues, `queue_in_key_scope` | `dataflows/auth.md` (queue scope), `dataflows/grpc-rest.md`, `contracts/invariants.md` #32 |
+| Claim queries (`queue/mod.rs` `CLAIM_BATCH_SQL`, gRPC claims), indexes on `jobs` | `contracts/invariants.md` #33, `dataflows/jobs-queue.md`, chesterton #24 |
 | Defaults / env (`QUEUE_DEFAULT_*`) | `contracts/invariants.md` + workspace `CROSS-REPO-CONTRACTS.md` |
 | Security-relevant behavior | `bugs/findings.jsonl` + `findings.md` |
 

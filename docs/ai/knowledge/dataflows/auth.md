@@ -58,6 +58,30 @@ There are no per-permission scopes; `queues` is the only way to narrow a key.
 `permissions` on create/update is a 400 `VALIDATION_ERROR` (0.1.114) — it used to be
 dropped silently, so a "read-only" key had full access.
 
+## API key queue scope: patterns (0.1.121, FEAT B2 / QW6)
+
+A `queues` entry is `*` (every queue), an exact name, or `prefix.*` (every queue whose name starts with `prefix.`;
+the bare parent `prefix` is not covered; case-sensitive). Any other use of `*` (`orders*`, `*.eu`, `a.*.b`, `.*`) is a
+400 `VALIDATION_ERROR` (`invalid_queue_pattern`) from `validate_queues` (`models/api_key.rs:30`), run by
+`POST /api-keys`, `PUT /api-keys/{id}` and the admin `POST /admin/organizations/{id}/api-keys`. Stored keys that hold
+such an entry keep matching nothing (the deployment guide has the query).
+- **One rule in Rust**: `queue_pattern_matches` (`:92`), `queue_scope_allows` (`:109`), `queue_scope_is_unrestricted`.
+  `ApiKeyContext::can_access_queue` / `is_unrestricted` and `GrpcAuthContext` delegate to them; never re-inline
+  `q == "*" || q == name`. Realtime fan-out and gRPC stream authorization call them too.
+- **One rule in SQL**: `queue_in_key_scope(queue_name, scope)` (migration `20261013130100`, rewritten by
+  `20261013130200`; NULL, empty or a `*` entry = every queue). Every row filter uses it, bound to
+  `ctx.queue_scope_filter()` (NULL for an unrestricted key), and never `queue_name = ANY(scope)`, which hides every
+  queue a pattern covers. Call sites: REST settle/heartbeat (`queue/mod.rs`), job, DLQ, workflow and schedule lists,
+  dashboard and stats counts (`health.rs`), `GET /jobs/stats`, the workers list (a worker is listed only when every
+  queue it serves is in scope: `NOT EXISTS (... NOT queue_in_key_scope(...))` over `queue_names`, else `queue_name`),
+  gRPC unary settles, `GetJob`, and the StreamJobs/ProcessJobs claims and settles
+  (`queue_in_key_scope(jobs.queue_name, k.queues)` on the locked key row).
+- **Granting**: `can_grant_queues` lets a scoped key grant exact names it can use, and a `prefix.*` only under one of its
+  own patterns at least as broad (`queue_scope_covers`); never `*`, never an empty list.
+- **Planner**: `queue_scope_like_patterns()` is `IMMUTABLE` on purpose (`COST 100` stated), so a bound exact-name scope
+  folds to `queue_name = ANY(...)` (index condition) and a prefix scope to a plain `LIKE ANY`; as a `STABLE` function it
+  kept the pattern arm in every plan (a scoped key's dashboard count went from 1.5 ms to 43 ms at 130k jobs).
+
 ## Billing email: login identity, verification, uniqueness (0.1.117)
 
 Email login resolves an org by its **verified**, lower-cased `billing_email`
@@ -65,9 +89,8 @@ Email login resolves an org by its **verified**, lower-cased `billing_email`
 `signup/complete`). `organizations.billing_email_verified_at` records the proof:
 email signup sets it, `POST /organizations/billing-email/verification` +
 `POST /organizations/billing-email/verify` set it, and an admin create/PATCH that
-write of `billing_email` counts as verified. `PUT /organizations/{id}` with a
-different address clears it; `POST /organizations` stores the address
-unverified. A wrong/expired confirmation code is 400 (not 401, which clients
+write of `billing_email` counts as verified (and, since 0.1.121, drops a pending change). `POST /organizations`
+stores the address unverified. A wrong/expired confirmation code is 400 (not 401, which clients
 read as an expired session). When a login code is verified for an address an
 unconfirmed org holds, the signup response sets `unverified_org_exists: true`
 (a hint only; it never links the caller to that org).
@@ -75,6 +98,19 @@ Before 0.1.117 any key holder could set someone else's address and capture that
 person's later email "signup" into their org (BE-42). Existing addresses were
 grandfathered as verified by migration `20261010120100` where email login could
 already resolve them (stored lower-cased; the oldest org of a duplicate group).
+
+**Pending billing email (0.1.121, W1-14).** `PUT /organizations/{id}` with a different address on an org whose
+billing email is verified stores it in `organizations.pending_billing_email` (migration `20261013130000`) and leaves
+`billing_email` and `billing_email_verified_at` alone: the old address keeps resolving email login and stays the
+Stripe address. `POST /organizations/billing-email/verification` sends the code to the pending address when one is
+set (`billing_email_to_verify`, `email_login.rs:1695`); `.../verify` (`:1808`) then sets `billing_email = pending`,
+`billing_email_verified_at = NOW()`, `pending_billing_email = NULL` in one UPDATE guarded on the pending value.
+Sending the active address again withdraws the change. An org without a verified address is changed directly
+(unverified, no pending), as before. An admin `PATCH` that writes `billing_email` counts as verified and clears
+pending (`admin.rs` `update_organization`). `GET`/`PUT /organizations/{id}` return `pending_billing_email`
+(`OrganizationWithPendingEmail`), and the signup hint `unverified_org_exists` also matches a live org's pending
+address. Open (cross-repo): the dashboard must show the pending address and offer send/verify while it is set,
+even though `billing_email_verified_at` is non-null.
 
 Verification codes live in `email_login_codes` with a `verify:` prefix and the
 org id; the login `verify()` query excludes them so a confirmation code can never
@@ -268,14 +304,50 @@ Its per-key `login_attempts` limiter and its `last_used` write are unchanged.
 
 ## Scoping
 
-Handlers bind org from auth context; `require_queue_access` for queue ACL. Isolation is application-level `WHERE organization_id = …`. RLS policies in DB are **inert** (see architecture guide) — do not rely on them as a backstop.
+Handlers bind org from auth context; `require_queue_access` for queue ACL (patterns: see "API key queue scope" above; row filters use `queue_in_key_scope`). Isolation is application-level `WHERE organization_id = …`. RLS policies in DB are **inert** (see architecture guide) — do not rely on them as a backstop.
 
 ## Realtime
 
 `GET /api/v1/events` (global SSE) forwards the org's Redis pub/sub events (`org:{id}:events`,
 the same channel the WebSocket reads) as named SSE events, plus `system.health` every 10 s;
-it re-checks the key at most every 2 s and caps 100 streams per org. Before 0.1.114 it
+it is capped at 100 streams per org (all four streams share the lifetime rules below). Before 0.1.114 it
 only emitted `system.health`. Published today by REST job create/bulk/complete/fail/cancel/
-retry only — gRPC, schedules, workflows and webhook ingest do not publish realtime events.
+retry, plus (0.1.121) the scheduler's lease-expiry and offline-worker dead-lettering
+(`Scheduler::announce_deadlettered`: `JobStatusChange` + `JobFailed`) — gRPC, schedules, workflows and webhook
+ingest do not publish realtime events.
+
+### Stream lifetime, session expiry and connection caps (0.1.121, BEFLOW-12/13/14/15, BEAUTH-14/19)
+
+All four streams (WS, `/events`, `/events/jobs/{id}`, `/events/queues/{name}`) share `StreamAuth`
+(`realtime.rs:588`) and `stream_session` (`:497`).
+- `stream_session` re-reads the credential `authenticate_api_key_allow_query` accepted (Bearer header first, then the
+  first non-empty `token` / `api_key` query value). For an access JWT it keeps `exp` / `jti` / `sid`, and it refuses a
+  token whose `api_key_id` / `org_id` differ from the `ApiKeyContext`; org and scope still come only from the context.
+  The JWT is decoded twice (middleware and here); an optional follow-up is passing `exp`/`jti`/`sid` on as a request
+  extension from `authenticate_jwt_token`.
+- A stream ends at the earlier of token acceptance end (`exp` + `Validation::default().leeway`, 60 s) and the maximum
+  age (SSE 30 min `MAX_SSE_DURATION_SECS`, WS 1 h `MAX_WEBSOCKET_DURATION_SECS`).
+- Revocation (`token_blacklist:{jti}`, `session_revoked:{sid}`) and the key, org and scope
+  (`load_current_realtime_scope`) are re-checked every `SSE_AUTH_RECHECK_SECS` = 2 s at most: WS and `/events` before
+  revealing anything (the WS also on every 30 s ping, never one query per event), the job stream on its 2 s poll, the
+  queue stream on its 5 s poll. A narrowed queue scope takes effect then too.
+- WS close codes (`StreamEnd`): `1008` token expired or revoked (an `Error` event first; the dashboard goes to
+  `auth_failed` and reconnects when its token changes), `1000` maximum age reached, `1011` Redis pub/sub channel lost
+  or never opened, or the authorization lookup failed (`Error` event first). The pub/sub stream is read in the main
+  select loop, so its end is noticed; with Redis down WS clients reconnect with backoff instead of holding a silent
+  socket.
+- Per-org caps are Redis sorted sets `realtime_connections:{ws|events|job|queue}:{org}`
+  (`realtime_connections_key` `:322`), 100 members per kind. Each member is a connection id scored with its heartbeat
+  (unix seconds); admission is an atomic Lua script (`ADMIT_CONNECTION` `:328`): prune members older than 90 s
+  (`CONNECTION_STALE_SECS`), count, `ZADD`; key TTL 180 s; a 30 s heartbeat; `ConnectionSlot` removes the member on drop;
+  Redis errors or the 500 ms timeout admit (fail open). The old `ws_connections:{org}` / `sse_connections:{org}`
+  counters are gone: they leaked on SIGKILL and the phantom count of an active org never decayed. During a rolling
+  deploy old replicas count in the old keys, new ones in the sets, so the cap is briefly doubled; staleness uses the
+  application clock, so replica clocks must agree within about a minute.
+- Queue-stream counts come from a per-(org, queue) in-process single-flight cache (`QueueStatsCache` `:1169`,
+  `QUEUE_STATS_CACHE_SECS` = 4), not one aggregate per stream every 5 s; with N replicas the aggregate runs at most N
+  times per 4 s.
+- Invariant: a stream must never outlive the token, session or key it was opened with by more than one re-check
+  interval, and must never stay open after its event source is gone.
 
 WS typically JWT via `?token=`; SSE may accept `?api_key=` (the Go SDK's SSE client relies on this). Since **0.1.111** the query-credential fallback is mounted ONLY on the four realtime routes — `authenticate_api_key_allow_query` in `src/api/middleware/auth.rs`, wired to its own router in `src/api/mod.rs`. All other protected routes use `authenticate_api_key`, which is header-only, closing the Referer/log leak on the general REST surface.

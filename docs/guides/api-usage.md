@@ -128,6 +128,14 @@ across jobs, workers, schedules, workflows, realtime subscriptions, and gRPC cal
 Active realtime and gRPC streams periodically revalidate revocation, expiry,
 organization status, and current queue scope.
 
+A `queues` entry is an exact queue name, `*` (every queue), or a prefix pattern
+`prefix.*` that covers every queue whose name starts with `prefix.`: `orders.*`
+covers `orders.eu` and `orders.eu.west`, but not `orders` itself or `ordersx`
+(list `orders` as well to reach it). Names are case-sensitive. Any other use of
+`*` (`orders*`, `*.eu`, `a.*.b`) is rejected with `400 VALIDATION_ERROR` when the
+key is created or updated. A restricted key can grant a pattern only under one of
+its own patterns that is at least as broad.
+
 ### JWT Authentication
 
 For enhanced security, exchange your API key for JWT tokens:
@@ -251,12 +259,18 @@ Authorization: Bearer <token>
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `queue_name` | string | Filter by queue |
-| `status` | string | pending, processing, completed, failed, deadletter |
-| `limit` | integer | Max results (default: 100) |
-| `cursor` | string | Pagination cursor |
-| `order_by` | string | created_at, priority |
-| `order_dir` | string | asc, desc |
+| `queue_name` | string | Filter by queue (letters, digits, `-`, `_`, `.`) |
+| `status` | string | pending, scheduled, processing, completed, failed, deadletter, cancelled (any case) |
+| `tag` | string | One tag, any characters up to 1024 bytes |
+| `limit` | integer | Max results (default: 50, at most 100) |
+| `offset` | integer | Rows to skip (default: 0). There is no cursor |
+| `order_by` | string | created_at (default), updated_at, scheduled_at, completed_at, priority, status, queue_name, retry_count |
+| `order_dir` | string | desc (default), asc |
+
+An invalid `status`, `queue_name`, `tag`, `order_by` or `order_dir` is a `400`; it is not
+ignored (before 0.1.121 it was, and the unfiltered list came back). An empty parameter is no
+filter. Rows that tie on the sort column are ordered by job id, so `offset` pages do not repeat
+or skip jobs.
 
 ### Get Job
 
@@ -279,6 +293,10 @@ POST /api/v1/jobs/{job_id}/retry
 Authorization: Bearer <token>
 ```
 
+Retrying a step of a workflow also re-opens the steps that were cancelled because it failed and puts
+a `failed` workflow back to `running`. That takes a slot of the plan's workflow limit: `429
+QUOTA_EXCEEDED` when none is free, `403 feature_disabled` on a plan without workflows.
+
 ### Boost Priority
 
 ```bash
@@ -299,26 +317,38 @@ Content-Type: application/json
 Authorization: Bearer <token>
 
 {
+  "queue_name": "emails",
   "jobs": [
-    {"queue_name": "emails", "payload": {"id": 1}},
-    {"queue_name": "emails", "payload": {"id": 2}},
-    {"queue_name": "emails", "payload": {"id": 3}}
+    {"payload": {"id": 1}},
+    {"payload": {"id": 2}, "priority": 10},
+    {"payload": {"id": 3}, "idempotency_key": "welcome-3"}
   ]
 }
 ```
 
+Up to 100 jobs, all for one `queue_name`. Optional batch defaults: `default_priority` (-100..100),
+`default_max_retries` (0..100), `default_timeout_seconds` (1..86400).
+
 Response:
 ```json
 {
-  "created": 3,
-  "failed": 0,
-  "jobs": [
-    {"id": "job_xxx1", "status": "pending"},
-    {"id": "job_xxx2", "status": "pending"},
-    {"id": "job_xxx3", "status": "pending"}
-  ]
+  "succeeded": [
+    {"index": 0, "job_id": "job_xxx1", "created": true},
+    {"index": 1, "job_id": "job_xxx2", "created": true},
+    {"index": 2, "job_id": "job_xxx3", "created": true}
+  ],
+  "failed": [],
+  "total": 3,
+  "success_count": 3,
+  "failure_count": 0
 }
 ```
+
+Items are validated one by one: an invalid item is listed in `failed` as `{"index": 1, "error": "..."}`
+and the valid ones are still created. The request is a `400` (not a `200` with everything failed)
+when no item is valid, a batch default is out of range, or the database refuses a value. A blank
+`idempotency_key` is no key; an item whose key already exists is returned with `created: false`
+and uses no quota.
 
 ### Batch Status
 
@@ -402,15 +432,23 @@ Authorization: Bearer <token>
 }
 ```
 
-**Note**: Retry operations respect plan limits for active jobs.
+**Note**: Retry operations respect the plan limit for active jobs. They do not count against the
+daily job limit, because a retry creates no new job.
 
 Response:
 ```json
 {
   "retried_count": 25,
-  "job_ids": ["job_xxxxx", "job_yyyyy", ...]
+  "retried_jobs": ["job_xxxxx", "job_yyyyy", ...],
+  "skipped_jobs": []
 }
 ```
+
+Retrying a dead-lettered step of a failed workflow restarts that workflow, which takes a slot of the
+plan's workflow limit and re-opens the steps that were cancelled because of it. When no slot is
+free those steps stay in the DLQ and are listed in `skipped_jobs`; everything else is still
+retried. If only such steps are left, the request answers the limit's error (`429`, or `403` on a
+plan without workflows).
 
 ### Purge DLQ
 
@@ -427,6 +465,8 @@ Authorization: Bearer <token>
   "older_than": "2024-01-01T00:00:00Z"
 }
 ```
+
+`older_than` selects jobs that were dead-lettered before that time, not jobs created before it.
 
 **Warning**: This action is irreversible!
 
@@ -459,14 +499,19 @@ Response:
 ```json
 {
   "queue_name": "emails",
-  "pending_count": 150,
-  "processing_count": 25,
-  "completed_count": 10000,
-  "failed_count": 12,
-  "avg_processing_time_ms": 250,
-  "oldest_job_age_seconds": 30
+  "pending_jobs": 150,
+  "processing_jobs": 25,
+  "completed_jobs_24h": 10000,
+  "failed_jobs_24h": 12,
+  "deadletter_jobs": 3,
+  "avg_processing_time_ms": 250.0,
+  "max_job_age_seconds": 30,
+  "active_workers": 4
 }
 ```
+
+`failed_jobs_24h` is the number of jobs dead-lettered in the last 24 hours; `deadletter_jobs` is the
+queue's current dead-letter count.
 
 ### Update Queue Config
 
@@ -482,7 +527,11 @@ Authorization: Bearer <token>
 }
 ```
 
-`rate_limit` is accepted, validated (1-100000), stored and returned, but it is **not enforced
+`max_retries` must be 0-100, `default_timeout` 1-86400 seconds, and `rate_limit` 1-100000; a value
+outside its range is a `400` (it is not clamped), and so is a queue name in the path that is not 1-100
+letters, digits, `-`, `_` or `.` or that starts with `.` or `-`.
+
+`rate_limit` is accepted, validated, stored and returned, but it is **not enforced
 yet**: no claim path throttles the queue by it.
 
 ### Pause Queue
@@ -548,7 +597,11 @@ server mints a UUID — the previous behaviour — but each restart then leaves 
 occupying a slot in your plan's worker limit until the stale-worker reaper clears it
 (about two minutes), which is enough for a crash-looping worker on a small plan to `429`
 itself out of registering. Re-registering an id you already own is not charged against the
-cap. An id owned by a different organization returns `409`.
+cap. An id owned by a different organization returns `409`, and so does, for a queue-scoped key, the
+id of a worker of your organization that serves a queue outside the key's scope. Both answer with
+the same text ("This worker_id cannot be used: register with a different worker_id, or omit it to
+get a generated one"), which does not say which case it was. Workers that stay `offline` for more
+than 7 days are removed.
 
 ### Worker Heartbeat
 
@@ -641,6 +694,15 @@ default to `0`.
 `*/2` matches the 1st, 3rd, 5th, … and on month `*/3` matches January, April,
 July, October.
 
+**Day-of-month and day-of-week.** When both are restricted (a number, list or
+range) a day matches if **either** matches: `0 0 15 * 1` runs on the 15th and on
+every Monday. A field that starts with `*` (`*` or `*/N`) is unrestricted, so the
+two fields then combine with **and**, as in Vixie cron: `0 0 */2 * 1` runs on odd
+days that are also Mondays.
+
+**Impossible dates** (`0 0 30 2 *`, `0 0 31 4 *`) and expressions with no upcoming
+run are rejected with `400` when the schedule is created or updated.
+
 **Timezone:** cron fields are evaluated in the schedule's `timezone` (IANA
 name or `+HH:MM` offset, default `UTC`), DST-aware. Times skipped by a
 spring-forward transition are not fired that day; times repeated by a
@@ -655,9 +717,12 @@ everything since last success") rather than from fire count.
 ### List Schedules
 
 ```bash
-GET /api/v1/schedules
+GET /api/v1/schedules?queue_name=reports&is_active=true&limit=50&offset=0
 Authorization: Bearer <token>
 ```
+
+Optional filters: `queue_name` (only schedules for that queue), `is_active` (`true`, `false`, `1` or
+`0`; anything else is a `400`), `limit` (default 100, at most 500) and `offset`. Newest first.
 
 ### Get Schedule
 
@@ -739,24 +804,24 @@ Authorization: Bearer <token>
   "name": "Order Processing",
   "jobs": [
     {
-      "step_name": "validate",
+      "key": "validate",
       "queue_name": "orders",
       "payload": {"action": "validate"}
     },
     {
-      "step_name": "process_payment",
+      "key": "process_payment",
       "queue_name": "payments",
       "payload": {"action": "charge"},
       "depends_on": ["validate"]
     },
     {
-      "step_name": "ship",
+      "key": "ship",
       "queue_name": "shipping",
       "payload": {"action": "ship"},
       "depends_on": ["process_payment"]
     },
     {
-      "step_name": "notify",
+      "key": "notify",
       "queue_name": "notifications",
       "payload": {"action": "notify"},
       "depends_on": ["ship"]
@@ -764,6 +829,9 @@ Authorization: Bearer <token>
   ]
 }
 ```
+
+`depends_on` lists the `key`s of other jobs in the workflow. Listing the same key twice, an unknown
+key or a cycle is a `400`.
 
 ### List Workflows
 
@@ -779,12 +847,21 @@ GET /api/v1/workflows/{workflow_id}
 Authorization: Bearer <token>
 ```
 
+Each job in `jobs` has a `job_type` (the `job_type` of its payload, `"job"` when the payload has
+none) and, for a failed or dead-lettered job, a `failed_at`. A workflow turns `running`, with
+`started_at` set, within about 10 seconds of its first job being claimed. When a step failed the
+workflow ends `failed`; when a step was cancelled and none failed it ends `cancelled`; it is
+`completed` only when every step completed.
+
 ### Cancel Workflow
 
 ```bash
 POST /api/v1/workflows/{workflow_id}/cancel
 Authorization: Bearer <token>
 ```
+
+Only a `pending` or `running` workflow can be cancelled. A `completed`, `failed` or `cancelled`
+workflow answers `409` and keeps its outcome.
 
 ### Retry Failed Workflow
 
@@ -832,6 +909,10 @@ Authorization: Bearer <token>
   "dependency_mode": "all"
 }
 ```
+
+A dependency on the job itself, or one that would close a cycle, is a `400`. `dependency_mode` is
+optional; omitted, the job keeps its current mode. When every listed dependency already existed the
+job is left unchanged and `dependencies_added` is 0.
 
 ---
 
@@ -1016,6 +1097,16 @@ processing failure is `500` and is retried as well.
 ---
 
 ## Organizations
+
+### Change the Billing Email
+
+`PUT /api/v1/organizations/{id}` with a new `billing_email` on an organization whose billing email
+is already confirmed does not replace it yet: the new address is returned as
+`pending_billing_email`, the confirmed address keeps working for email login, and the confirmation
+code is sent to the new one with `POST /api/v1/organizations/billing-email/verification`.
+`POST /api/v1/organizations/billing-email/verify` with that code makes it the billing email.
+Sending the current address again withdraws a pending change. An organization without a confirmed
+billing email is changed directly (the new address stays unconfirmed until verified).
 
 ### Get Organization Usage
 
@@ -1229,6 +1320,18 @@ ws.onmessage = (event) => {
 };
 ```
 
+**Lifetime and close codes.** A realtime connection lasts as long as the token it was opened
+with: the server re-checks the session (logout), the key and its queue scope at most every 2
+seconds, and closes the socket when the token expires or the session is revoked. Close codes:
+
+| Code | Meaning | What to do |
+|------|---------|------------|
+| `1008` | The access token expired, or the token, session or key was revoked (an `Error` event comes first) | Get a new token, then reconnect |
+| `1000` | Maximum age of 1 hour reached | Reconnect |
+| `1011` | The server lost its event channel (after an `Error` event), or the authorization lookup failed | Reconnect with backoff |
+
+An organization can have 100 open WebSockets; the next connection answers `429`.
+
 ### Server-Sent Events (SSE)
 
 #### All Events
@@ -1251,6 +1354,11 @@ curl -N http://localhost:8080/api/v1/events/jobs/{job_id} \
 curl -N http://localhost:8080/api/v1/events/queues/{queue_name} \
   -H "Authorization: Bearer <token>"
 ```
+
+The SSE streams end when the access token expires or the session is logged out, and after 30
+minutes; reconnect to continue. An organization can have 100 open streams of each kind (`/events`,
+`/events/jobs/{id}`, `/events/queues/{name}`); the next one answers `429`. A job stream also ends
+when the job reaches a final status.
 
 **Event Format:**
 ```
@@ -1618,8 +1726,16 @@ key or a paused schedule with `PUT` ... `{"is_active": true}` is checked against
 new one (`429 QUOTA_EXCEEDED`).
 
 History retention covers the delivery history behind
-`GET /api/v1/outgoing-webhooks/{id}/deliveries`. Older delivery records are removed, so on
-Free a failure from yesterday is no longer listed and can no longer be retried.
+`GET /api/v1/outgoing-webhooks/{id}/deliveries`, the run history of schedules
+(`GET /api/v1/schedules/{id}/history`) and job history. Older records are removed, so on
+Free a failure from yesterday is no longer listed and can no longer be retried, and a schedule's
+runs from before yesterday are gone.
+
+Job retention applies to every finished job: completed and cancelled jobs, and also failed and
+dead-lettered jobs together with their dead-letter entries, are removed once they are older than
+your plan's job retention. A failed step of a workflow that still exists is kept until the
+workflow itself is removed, so a failed workflow stays retryable. Workers that have been offline
+for more than 7 days are removed too.
 
 ---
 

@@ -132,6 +132,14 @@ async fn changed_billing_email_does_not_resolve_email_login_until_verified() {
     let app = app(&db);
     let auth = bearer(&squatter.key);
     let victim = "victim-bh@example.com";
+    // Without a verified address of its own, the squatter's change replaces the
+    // billing email directly. (A verified one now stays, with the new address
+    // waiting in `pending_billing_email`: see wave 5 / keys, W1-14.)
+    sqlx::query("UPDATE organizations SET billing_email_verified_at = NULL WHERE id = $1")
+        .bind(&squatter.org_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
 
     // Mixed case is normalised; the change clears verification.
     let (status, body) = call(
@@ -7095,5 +7103,5745 @@ mod wave4_review {
         }
         assert_eq!(granted, 2, "two free slots, two retries");
         assert_eq!(active_workflows(db.pool(), &t.org_id).await, 2);
+    }
+}
+// ---- wave 5 / jobsapi ----
+// Job and queue REST semantics: claim index, queue config and bulk validation,
+// idempotency, queue stats, list filters/order, worker calls, DLQ, and
+// retrying a workflow step.
+mod w5_jobsapi {
+    use super::*;
+
+    async fn post(app: &Router, auth: &str, uri: &str, body: Value) -> (StatusCode, Value) {
+        call(app, "POST", uri, &[("Authorization", auth)], Some(body)).await
+    }
+
+    async fn get(app: &Router, auth: &str, uri: &str) -> (StatusCode, Value) {
+        call(app, "GET", uri, &[("Authorization", auth)], None).await
+    }
+
+    async fn register_worker(app: &Router, auth: &str, queue: &str) -> String {
+        let (status, body) = post(
+            app,
+            auth,
+            "/api/v1/workers/register",
+            json!({"queue_name": queue, "hostname": "w5-host"}),
+        )
+        .await;
+        assert!(status.is_success(), "{body}");
+        body["id"]
+            .as_str()
+            .or_else(|| body["worker_id"].as_str())
+            .expect("worker id")
+            .to_string()
+    }
+
+    /// Claim one job; returns (job id, lease id).
+    async fn claim_one(app: &Router, auth: &str, queue: &str, worker: &str) -> (String, String) {
+        let (status, body) = post(
+            app,
+            auth,
+            "/api/v1/jobs/claim",
+            json!({"queue_name": queue, "worker_id": worker, "limit": 1}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let job = &body["jobs"][0];
+        (
+            job["id"].as_str().expect("a claimable job").to_string(),
+            job["lease_id"].as_str().unwrap().to_string(),
+        )
+    }
+
+    async fn complete(app: &Router, auth: &str, job: &str, worker: &str, lease: &str) {
+        let (status, body) = post(
+            app,
+            auth,
+            &format!("/api/v1/jobs/{job}/complete"),
+            json!({"worker_id": worker, "lease_id": lease}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    async fn job_status(pool: &sqlx::PgPool, job: &str) -> String {
+        sqlx::query_scalar("SELECT status FROM jobs WHERE id = $1")
+            .bind(job)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn workflow_status(pool: &sqlx::PgPool, workflow: &str) -> String {
+        sqlx::query_scalar("SELECT status FROM workflows WHERE id = $1")
+            .bind(workflow)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Move a job's `updated_at` (for a dead-lettered job: when it was
+    /// dead-lettered) `days` into the past. The `jobs_updated_at` trigger stamps
+    /// every UPDATE with the current time, so it is off for this one statement.
+    async fn backdate_updated_at(pool: &sqlx::PgPool, job: &str, days: i32) {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("ALTER TABLE jobs DISABLE TRIGGER jobs_updated_at")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE jobs SET updated_at = NOW() - make_interval(days => $2) WHERE id = $1")
+            .bind(job)
+            .bind(days)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE jobs ENABLE TRIGGER jobs_updated_at")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    async fn set_custom_limits(pool: &sqlx::PgPool, org_id: &str, limits: Value) {
+        sqlx::query("UPDATE organizations SET custom_limits = $2 WHERE id = $1")
+            .bind(org_id)
+            .bind(limits)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    // BEJOB-03: the claim query walks idx_jobs_claim instead of sorting the queue.
+    #[tokio::test]
+    async fn w5_claim_query_uses_the_claim_index() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        sqlx::query(
+            "INSERT INTO jobs (id, organization_id, queue_name, status, payload, priority, created_at, updated_at) \
+             SELECT gen_random_uuid()::TEXT, $1, CASE WHEN g % 4 = 0 THEN 'other' ELSE 'big' END, \
+                    CASE WHEN g % 10 = 0 THEN 'completed' ELSE 'pending' END, '{}'::JSONB, \
+                    (g % 7) - 3, NOW() - make_interval(secs => g), NOW() \
+             FROM generate_series(1, 20000) AS g",
+        )
+        .bind(&t.org_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("ANALYZE jobs")
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let now = chrono::Utc::now();
+        let plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN {}",
+            spooled_backend::queue::CLAIM_BATCH_SQL
+        )))
+        .bind("w5-worker")
+        .bind("w5-lease")
+        .bind(now + chrono::Duration::seconds(30))
+        .bind(now)
+        .bind(&t.org_id)
+        .bind("big")
+        .bind(10_i32)
+        .bind(30_i32)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        let plan = plan.join("\n");
+        assert!(plan.contains("idx_jobs_claim"), "claim plan:\n{plan}");
+    }
+
+    // BEJOB-03: an interrupted concurrent build leaves an INVALID index that
+    // IF NOT EXISTS skips; the repair migration rebuilds it.
+    #[tokio::test]
+    async fn w5_claim_index_repair_rebuilds_an_invalid_index() {
+        let db = TestDatabase::new().await;
+        let valid = |pool: sqlx::PgPool| async move {
+            let valid: bool = sqlx::query_scalar(
+                "SELECT indisvalid FROM pg_index WHERE indexrelid = 'idx_jobs_claim'::regclass",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            valid
+        };
+        assert!(valid(db.pool().clone()).await);
+        sqlx::query(
+            "UPDATE pg_index SET indisvalid = FALSE WHERE indexrelid = 'idx_jobs_claim'::regclass",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert!(!valid(db.pool().clone()).await);
+
+        let mut tx = db.pool().begin().await.unwrap();
+        sqlx::raw_sql(include_str!(
+            "../migrations/20261013100001_job_claim_index_repair.sql"
+        ))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert!(valid(db.pool().clone()).await);
+    }
+
+    // BEJOB-04: queue defaults are validated, and so is the path's queue name.
+    #[tokio::test]
+    async fn w5_queue_config_rejects_out_of_range_defaults_and_bad_names() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let app = app(&db);
+        let auth = bearer(&t.key);
+
+        for body in [
+            json!({"default_timeout": 172800}),
+            json!({"default_timeout": 0}),
+            json!({"max_retries": -5}),
+            json!({"max_retries": 101}),
+            json!({"rate_limit": 0}),
+        ] {
+            let (status, resp) = call(
+                &app,
+                "PUT",
+                "/api/v1/queues/reports/config",
+                &[("Authorization", &auth)],
+                Some(body.clone()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body} -> {resp}");
+        }
+        for name in ["bad%20name", "-dash", &"q".repeat(101)] {
+            let (status, resp) = call(
+                &app,
+                "PUT",
+                &format!("/api/v1/queues/{name}/config"),
+                &[("Authorization", &auth)],
+                Some(json!({"max_retries": 2})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{name} -> {resp}");
+        }
+        let (configured,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM queue_config WHERE organization_id = $1")
+                .bind(&t.org_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(configured, 0, "rejected configs must not be stored");
+
+        // An in-range config is stored and new jobs take it.
+        let (status, resp) = call(
+            &app,
+            "PUT",
+            "/api/v1/queues/reports/config",
+            &[("Authorization", &auth)],
+            Some(json!({"default_timeout": 600, "max_retries": 7})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        let (status, resp) = post(
+            &app,
+            &auth,
+            "/api/v1/jobs",
+            json!({"queue_name": "reports", "payload": {}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{resp}");
+        let (timeout, retries): (i32, i32) =
+            sqlx::query_as("SELECT timeout_seconds, max_retries FROM jobs WHERE id = $1")
+                .bind(resp["id"].as_str().unwrap())
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!((timeout, retries), (600, 7));
+
+        // The table holds the same ranges.
+        let err = sqlx::query(
+            "UPDATE queue_config SET default_timeout = 172800 WHERE organization_id = $1",
+        )
+        .bind(&t.org_id)
+        .execute(db.pool())
+        .await
+        .expect_err("out-of-range default_timeout must violate a CHECK");
+        assert!(
+            err.to_string()
+                .contains("queue_config_default_timeout_check"),
+            "{err}"
+        );
+    }
+
+    // BEJOB-05: bulk items are validated one by one.
+    #[tokio::test]
+    async fn w5_bulk_reports_invalid_items_per_index_and_creates_the_rest() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let app = app(&db);
+        let auth = bearer(&t.key);
+
+        let (status, body) = post(
+            &app,
+            &auth,
+            "/api/v1/jobs/bulk",
+            json!({"queue_name": "bq", "jobs": [
+                {"payload": {"n": 0}},
+                {"payload": {"n": 1}, "priority": 500},
+                {"payload": {"n": 2}, "idempotency_key": "k".repeat(300)},
+                {"payload": {"n": 3, "bad": "nul\u{0}byte"}},
+                {"payload": {"n": 4}, "priority": -100},
+            ]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ok: Vec<u64> = body["succeeded"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["index"].as_u64().unwrap())
+            .collect();
+        assert_eq!(ok, vec![0, 4], "{body}");
+        let failed: Vec<(u64, String)> = body["failed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["index"].as_u64().unwrap(),
+                    r["error"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            failed.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "{body}"
+        );
+        assert!(failed[0].1.contains("Priority"), "{body}");
+        assert!(failed[1].1.contains("Idempotency key"), "{body}");
+        assert!(failed[2].1.contains("NUL"), "{body}");
+        assert_eq!(body["success_count"], 2, "{body}");
+        assert_eq!(body["failure_count"], 3, "{body}");
+        let (created,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM jobs WHERE organization_id = $1 AND queue_name = 'bq'",
+        )
+        .bind(&t.org_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(created, 2);
+
+        // Nothing valid in the batch, or invalid batch defaults: a 4xx, not 200.
+        let (status, body) = post(
+            &app,
+            &auth,
+            "/api/v1/jobs/bulk",
+            json!({"queue_name": "bq", "jobs": [{"payload": {}, "priority": 101}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["message"].as_str().unwrap_or("").contains("jobs[0]"),
+            "{body}"
+        );
+        for defaults in [
+            json!({"default_timeout_seconds": 0}),
+            json!({"default_priority": 500}),
+            json!({"default_max_retries": -1}),
+        ] {
+            let mut request = json!({"queue_name": "bq", "jobs": [{"payload": {}}]});
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(defaults.as_object().unwrap().clone());
+            let (status, body) = post(&app, &auth, "/api/v1/jobs/bulk", request).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{defaults} -> {body}");
+        }
+    }
+
+    // BEJOB-06: a blank idempotency key is no key at all.
+    #[tokio::test]
+    async fn w5_blank_idempotency_key_is_no_key() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let app = app(&db);
+        let auth = bearer(&t.key);
+
+        let mut ids = std::collections::HashSet::new();
+        for key in ["", "", "   "] {
+            let (status, body) = post(
+                &app,
+                &auth,
+                "/api/v1/jobs",
+                json!({"queue_name": "iq", "payload": {}, "idempotency_key": key}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            assert_eq!(body["created"], true, "{body}");
+            ids.insert(body["id"].as_str().unwrap().to_string());
+        }
+        assert_eq!(ids.len(), 3, "every blank-key job is its own job");
+
+        let (status, body) = post(
+            &app,
+            &auth,
+            "/api/v1/jobs/bulk",
+            json!({"queue_name": "iq", "jobs": [
+                {"payload": {"n": 1}, "idempotency_key": ""},
+                {"payload": {"n": 2}, "idempotency_key": ""},
+                {"payload": {"n": 3}, "idempotency_key": " "},
+            ]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["success_count"], 3, "{body}");
+        let created: Vec<bool> = body["succeeded"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["created"].as_bool().unwrap())
+            .collect();
+        assert_eq!(created, vec![true, true, true], "{body}");
+        let (null_keys,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM jobs WHERE organization_id = $1 AND idempotency_key IS NULL",
+        )
+        .bind(&t.org_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(null_keys, 6);
+    }
+
+    // BEJOB-07: a replay is answered before the quota checks and charges nothing.
+    #[tokio::test]
+    async fn w5_idempotent_replay_is_answered_before_quota_checks() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let app = app(&db);
+        let auth = bearer(&t.key);
+        set_custom_limits(
+            db.pool(),
+            &t.org_id,
+            json!({"max_active_jobs": 2, "max_jobs_per_day": 2}),
+        )
+        .await;
+
+        let (status, first) = post(
+            &app,
+            &auth,
+            "/api/v1/jobs",
+            json!({"queue_name": "rq", "payload": {}, "idempotency_key": "order-1"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{first}");
+        let (status, body) = post(
+            &app,
+            &auth,
+            "/api/v1/jobs/bulk",
+            json!({"queue_name": "rq", "jobs": [{"payload": {}, "idempotency_key": "order-2"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["success_count"], 1, "{body}");
+        let second = body["succeeded"][0]["job_id"].as_str().unwrap().to_string();
+
+        // Both caps are now full; replays still answer with the existing jobs.
+        for _ in 0..2 {
+            let (status, body) = post(
+                &app,
+                &auth,
+                "/api/v1/jobs",
+                json!({"queue_name": "rq", "payload": {}, "idempotency_key": "order-1"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["id"], first["id"], "{body}");
+            assert_eq!(body["created"], false, "{body}");
+
+            let (status, body) = post(
+                &app,
+                &auth,
+                "/api/v1/jobs/bulk",
+                json!({"queue_name": "rq", "jobs": [
+                    {"payload": {}, "idempotency_key": "order-1"},
+                    {"payload": {}, "idempotency_key": "order-2"},
+                ]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["succeeded"][0]["job_id"], first["id"], "{body}");
+            assert_eq!(body["succeeded"][1]["job_id"], second.as_str(), "{body}");
+            assert_eq!(body["succeeded"][0]["created"], false, "{body}");
+            assert_eq!(body["succeeded"][1]["created"], false, "{body}");
+        }
+
+        // A genuinely new job is still refused at the cap, and replays charged nothing.
+        let (status, body) = post(
+            &app,
+            &auth,
+            "/api/v1/jobs",
+            json!({"queue_name": "rq", "payload": {}, "idempotency_key": "order-3"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+        let (jobs_today,): (i64,) =
+            sqlx::query_as("SELECT jobs_today FROM get_org_resource_counts($1)")
+                .bind(&t.org_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(jobs_today, 2);
+    }
+
+    // BEJOB-08 / QW5: queue stats count dead-lettered jobs.
+    #[tokio::test]
+    async fn w5_queue_stats_count_dead_lettered_jobs() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let app = app(&db);
+        let auth = bearer(&t.key);
+        let worker = register_worker(&app, &auth, "sq").await;
+
+        for n in 0..2 {
+            let (status, body) = post(
+                &app,
+                &auth,
+                "/api/v1/jobs",
+                json!({"queue_name": "sq", "payload": {"n": n}, "max_retries": 0}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+        }
+        let (job, lease) = claim_one(&app, &auth, "sq", &worker).await;
+        let (status, body) = post(
+            &app,
+            &auth,
+            &format!("/api/v1/jobs/{job}/fail"),
+            json!({"worker_id": worker, "lease_id": lease, "error": "boom"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(job_status(db.pool(), &job).await, "deadletter");
+
+        let (status, stats) = get(&app, &auth, "/api/v1/queues/sq/stats").await;
+        assert_eq!(status, StatusCode::OK, "{stats}");
+        assert_eq!(stats["deadletter_jobs"], 1, "{stats}");
+        assert_eq!(stats["failed_jobs_24h"], 1, "{stats}");
+        assert_eq!(stats["pending_jobs"], 1, "{stats}");
+
+        // A job dead-lettered two days ago is still in the DLQ but not in the 24h count.
+        backdate_updated_at(db.pool(), &job, 2).await;
+        let (_, stats) = get(&app, &auth, "/api/v1/queues/sq/stats").await;
+        assert_eq!(stats["deadletter_jobs"], 1, "{stats}");
+        assert_eq!(stats["failed_jobs_24h"], 0, "{stats}");
+    }
+
+    // BEJOB-09: an invalid filter is a 400, not an unfiltered list.
+    #[tokio::test]
+    async fn w5_list_filters_reject_invalid_values() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let app = app(&db);
+        let auth = bearer(&t.key);
+        for (n, tag) in ["customer:42", "customer:7"].iter().enumerate() {
+            let (status, body) = post(
+                &app,
+                &auth,
+                "/api/v1/jobs",
+                json!({"queue_name": "lq", "payload": {"n": n}, "tags": [tag, "env prod"]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+        }
+        sqlx::query(
+            "UPDATE jobs SET status = 'deadletter' WHERE organization_id = $1 AND tags ? 'customer:42'",
+        )
+        .bind(&t.org_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        for uri in [
+            "/api/v1/jobs?status=dead_letter",
+            "/api/v1/jobs?status=bogus",
+            "/api/v1/jobs?queue_name=bad%20name",
+            "/api/v1/jobs/dlq?queue_name=bad%20name",
+            "/api/v1/jobs/stats?queue_name=bad%20name",
+        ] {
+            let (status, body) = get(&app, &auth, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} -> {body}");
+        }
+
+        // Tags are matched with the characters they are stored with.
+        let (status, body) = get(&app, &auth, "/api/v1/jobs?tag=customer%3A7").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body.as_array().unwrap().len(), 1, "{body}");
+        let (status, body) = get(&app, &auth, "/api/v1/jobs/dlq?tag=customer%3A42").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body.as_array().unwrap().len(), 1, "{body}");
+        let (status, body) = get(&app, &auth, "/api/v1/jobs?tag=env%20prod").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body.as_array().unwrap().len(), 2, "{body}");
+        let (status, body) = get(&app, &auth, "/api/v1/jobs?tag=customer%3A99").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body.as_array().unwrap().len(), 0, "{body}");
+
+        // Status is matched case-insensitively; an empty filter is no filter.
+        let (status, body) = get(&app, &auth, "/api/v1/jobs?status=DeadLetter").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body.as_array().unwrap().len(), 1, "{body}");
+        let (status, body) = get(&app, &auth, "/api/v1/jobs?status=&tag=&queue_name=").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body.as_array().unwrap().len(), 2, "{body}");
+    }
+
+    // BEJOB-10 / BEJOB-14: order_by/order_dir are honoured, ties break on id.
+    #[tokio::test]
+    async fn w5_list_honours_order_by_with_an_id_tiebreak() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let app = app(&db);
+        let auth = bearer(&t.key);
+        for priority in [5, -3, 10] {
+            let (status, body) = post(
+                &app,
+                &auth,
+                "/api/v1/jobs",
+                json!({"queue_name": "oq", "payload": {}, "priority": priority}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+        }
+        let priorities = |body: &Value| -> Vec<i64> {
+            body.as_array()
+                .unwrap()
+                .iter()
+                .map(|j| j["priority"].as_i64().unwrap())
+                .collect()
+        };
+        let (status, body) = get(
+            &app,
+            &auth,
+            "/api/v1/jobs?queue_name=oq&order_by=priority&order_dir=asc",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(priorities(&body), vec![-3, 5, 10], "{body}");
+        let (status, body) = get(&app, &auth, "/api/v1/jobs?queue_name=oq&order_by=priority").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(priorities(&body), vec![10, 5, -3], "{body}");
+
+        for uri in [
+            "/api/v1/jobs?order_by=payload",
+            "/api/v1/jobs?order_dir=sideways",
+            "/api/v1/jobs/dlq?order_by=created_at;DROP",
+        ] {
+            let (status, body) = get(&app, &auth, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} -> {body}");
+        }
+
+        // Rows sharing one created_at (bulk and cron batches do) page stably.
+        sqlx::query(
+            "INSERT INTO jobs (id, organization_id, queue_name, payload, created_at, updated_at) \
+             SELECT 'w5-tie-' || g, $1, 'ties', '{}'::JSONB, '2026-01-01T00:00:00Z', NOW() \
+             FROM generate_series(1, 7) AS g",
+        )
+        .bind(&t.org_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let mut seen = Vec::new();
+        for offset in [0, 3, 6] {
+            // Move a row between pages, as a claim does: the order must not change.
+            sqlx::query("UPDATE jobs SET updated_at = NOW() WHERE id = 'w5-tie-2'")
+                .execute(db.pool())
+                .await
+                .unwrap();
+            let (status, body) = get(
+                &app,
+                &auth,
+                &format!("/api/v1/jobs?queue_name=ties&limit=3&offset={offset}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            seen.extend(
+                body.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|j| j["id"].as_str().unwrap().to_string()),
+            );
+        }
+        let expected: Vec<String> = (1..=7).rev().map(|g| format!("w5-tie-{g}")).collect();
+        assert_eq!(seen, expected);
+    }
+
+    // BEFLOW-04: retrying a dead-lettered workflow step re-opens the steps the
+    // sweep cancelled because of it, and the workflow runs to completion.
+    #[tokio::test]
+    async fn w5_retrying_a_dead_lettered_workflow_step_reopens_its_cancelled_dependents() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let app = app(&db);
+        let auth = bearer(&t.key);
+        let worker = register_worker(&app, &auth, "wq").await;
+        let side_worker = register_worker(&app, &auth, "wx").await;
+
+        for via_dlq in [false, true] {
+            let (status, body) = post(
+                &app,
+                &auth,
+                "/api/v1/workflows",
+                json!({
+                    "name": format!("w5-wf-{via_dlq}"),
+                    "jobs": [
+                        {"key": "a", "queue_name": "wq", "payload": {}},
+                        {"key": "b", "queue_name": "wq", "payload": {}, "depends_on": ["a"], "max_retries": 0},
+                        {"key": "c", "queue_name": "wq", "payload": {}, "depends_on": ["b"]},
+                        {"key": "d", "queue_name": "wq", "payload": {}, "depends_on": ["c"]},
+                        {"key": "x", "queue_name": "wx", "payload": {}},
+                    ],
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let workflow = body["workflow_id"].as_str().unwrap().to_string();
+            let id = |key: &str| -> String {
+                body["job_ids"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|m| m["key"] == key)
+                    .unwrap()["job_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            };
+            let (a, b, c, d) = (id("a"), id("b"), id("c"), id("d"));
+
+            let (job, lease) = claim_one(&app, &auth, "wq", &worker).await;
+            assert_eq!(job, a);
+            complete(&app, &auth, &a, &worker, &lease).await;
+            let (job, lease) = claim_one(&app, &auth, "wq", &worker).await;
+            assert_eq!(job, b);
+            let (status, body) = post(
+                &app,
+                &auth,
+                &format!("/api/v1/jobs/{b}/fail"),
+                json!({"worker_id": worker, "lease_id": lease, "error": "boom"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(job_status(db.pool(), &b).await, "deadletter");
+
+            // What the scheduler's dependency sweep does within 10 s.
+            sqlx::query(
+                "UPDATE jobs SET status = 'cancelled', \
+                 last_error = 'Dependency job failed or was deadlettered', \
+                 completed_at = NOW(), updated_at = NOW() WHERE id = ANY($1)",
+            )
+            .bind(vec![c.clone(), d.clone()])
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+            if via_dlq {
+                // The side branch finished first, so the workflow was closed as failed.
+                let (job, lease) = claim_one(&app, &auth, "wx", &side_worker).await;
+                complete(&app, &auth, &job, &side_worker, &lease).await;
+                sqlx::query(
+                    "UPDATE workflows SET status = 'failed', completed_at = NOW() WHERE id = $1",
+                )
+                .bind(&workflow)
+                .execute(db.pool())
+                .await
+                .unwrap();
+                let (status, body) = post(
+                    &app,
+                    &auth,
+                    "/api/v1/jobs/dlq/retry",
+                    json!({"job_ids": [b]}),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(body["retried_count"], 1, "{body}");
+            } else {
+                let (status, body) =
+                    post(&app, &auth, &format!("/api/v1/jobs/{b}/retry"), json!({})).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+            }
+
+            for dependent in [&c, &d] {
+                let (status, met, error): (String, Option<bool>, Option<String>) = sqlx::query_as(
+                    "SELECT status, dependencies_met, last_error FROM jobs WHERE id = $1",
+                )
+                .bind(dependent)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+                assert_eq!(status, "pending", "via_dlq={via_dlq}");
+                assert_eq!(met, Some(false), "via_dlq={via_dlq}");
+                assert_eq!(error, None, "via_dlq={via_dlq}");
+            }
+            assert_eq!(workflow_status(db.pool(), &workflow).await, "running");
+
+            let (job, lease) = claim_one(&app, &auth, "wq", &worker).await;
+            assert_eq!(job, b);
+            complete(&app, &auth, &b, &worker, &lease).await;
+            if !via_dlq {
+                let (job, lease) = claim_one(&app, &auth, "wx", &side_worker).await;
+                complete(&app, &auth, &job, &side_worker, &lease).await;
+                assert_eq!(workflow_status(db.pool(), &workflow).await, "running");
+            }
+            let (job, lease) = claim_one(&app, &auth, "wq", &worker).await;
+            assert_eq!(job, c);
+            complete(&app, &auth, &c, &worker, &lease).await;
+            let (job, lease) = claim_one(&app, &auth, "wq", &worker).await;
+            assert_eq!(job, d);
+            complete(&app, &auth, &d, &worker, &lease).await;
+
+            let (status, done, total): (String, i32, i32) = sqlx::query_as(
+                "SELECT status, completed_jobs, total_jobs FROM workflows WHERE id = $1",
+            )
+            .bind(&workflow)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(
+                (status.as_str(), done, total),
+                ("completed", 5, 5),
+                "via_dlq={via_dlq}"
+            );
+        }
+    }
+
+    // BEFLOW-04: a workflow whose step was cancelled does not end 'completed'.
+    #[tokio::test]
+    async fn w5_workflow_with_a_cancelled_step_does_not_complete() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let app = app(&db);
+        let auth = bearer(&t.key);
+        let worker = register_worker(&app, &auth, "cq").await;
+        let (status, body) = post(
+            &app,
+            &auth,
+            "/api/v1/workflows",
+            json!({
+                "name": "w5-cancelled-step",
+                "jobs": [
+                    {"key": "a", "queue_name": "cq", "payload": {}, "priority": 10},
+                    {"key": "b", "queue_name": "cq", "payload": {}},
+                ],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let workflow = body["workflow_id"].as_str().unwrap().to_string();
+        let b = body["job_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["key"] == "b")
+            .unwrap()["job_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, body) = call(
+            &app,
+            "DELETE",
+            &format!("/api/v1/jobs/{b}"),
+            &[("Authorization", &auth)],
+            None,
+        )
+        .await;
+        assert!(status.is_success(), "{body}");
+        let (job, lease) = claim_one(&app, &auth, "cq", &worker).await;
+        complete(&app, &auth, &job, &worker, &lease).await;
+        assert_eq!(workflow_status(db.pool(), &workflow).await, "cancelled");
+    }
+
+    // BEJOB-15 / BEJOB-18: heartbeat keeps the claimed lease length; a worker
+    // call without lease_id is a 422.
+    #[tokio::test]
+    async fn w5_heartbeat_keeps_the_claimed_lease_and_lease_id_is_required() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let app = app(&db);
+        let auth = bearer(&t.key);
+        let worker = register_worker(&app, &auth, "hq").await;
+        let (status, body) = post(
+            &app,
+            &auth,
+            "/api/v1/jobs",
+            json!({"queue_name": "hq", "payload": {}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, body) = post(
+            &app,
+            &auth,
+            "/api/v1/jobs/claim",
+            json!({"queue_name": "hq", "worker_id": worker, "lease_duration_secs": 600}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let job = body["jobs"][0]["id"].as_str().unwrap().to_string();
+        let lease = body["jobs"][0]["lease_id"].as_str().unwrap().to_string();
+
+        let remaining = |pool: sqlx::PgPool, job: String| async move {
+            let secs: f64 = sqlx::query_scalar(
+                "SELECT EXTRACT(EPOCH FROM lease_expires_at - NOW())::FLOAT8 FROM jobs WHERE id = $1",
+            )
+            .bind(job)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            secs
+        };
+        let (status, body) = post(
+            &app,
+            &auth,
+            &format!("/api/v1/jobs/{job}/heartbeat"),
+            json!({"worker_id": worker, "lease_id": lease}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let secs = remaining(db.pool().clone(), job.clone()).await;
+        assert!(secs > 590.0, "lease shortened to {secs}s");
+
+        // A heartbeat naming a length uses it, and later omitted ones keep it.
+        let (status, body) = post(
+            &app,
+            &auth,
+            &format!("/api/v1/jobs/{job}/heartbeat"),
+            json!({"worker_id": worker, "lease_id": lease, "lease_duration_secs": 120}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = post(
+            &app,
+            &auth,
+            &format!("/api/v1/jobs/{job}/heartbeat"),
+            json!({"worker_id": worker, "lease_id": lease}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let secs = remaining(db.pool().clone(), job.clone()).await;
+        assert!((110.0..=121.0).contains(&secs), "lease is {secs}s");
+
+        for (action, extra) in [
+            ("heartbeat", json!({})),
+            ("fail", json!({"error": "boom"})),
+            ("complete", json!({})),
+        ] {
+            let mut request = json!({"worker_id": worker});
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let (status, body) = post(
+                &app,
+                &auth,
+                &format!("/api/v1/jobs/{job}/{action}"),
+                request,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{action}: {body}");
+            assert_eq!(body["details"][0]["field"], "lease_id", "{action}: {body}");
+        }
+        assert_eq!(job_status(db.pool(), &job).await, "processing");
+    }
+
+    // BEJOB-22: DLQ retry is not charged against the daily cap; purge's
+    // older_than means "dead-lettered before".
+    #[tokio::test]
+    async fn w5_dlq_retry_ignores_the_daily_cap_and_purge_uses_dead_letter_time() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let app = app(&db);
+        let auth = bearer(&t.key);
+        set_custom_limits(db.pool(), &t.org_id, json!({"max_jobs_per_day": 2})).await;
+        let mut ids = Vec::new();
+        for n in 0..2 {
+            let (status, body) = post(
+                &app,
+                &auth,
+                "/api/v1/jobs",
+                json!({"queue_name": "dq", "payload": {"n": n}}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            ids.push(body["id"].as_str().unwrap().to_string());
+        }
+        sqlx::query("UPDATE jobs SET status = 'deadletter', updated_at = NOW() WHERE id = ANY($1)")
+            .bind(&ids)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let (status, body) = post(
+            &app,
+            &auth,
+            "/api/v1/jobs/dlq/retry",
+            json!({"queue_name": "dq", "limit": 1}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["retried_count"], 1, "{body}");
+
+        // Created long ago, dead-lettered now: not older than a day as a dead letter.
+        let remaining = if body["retried_jobs"][0] == ids[0].as_str() {
+            &ids[1]
+        } else {
+            &ids[0]
+        };
+        sqlx::query("UPDATE jobs SET created_at = NOW() - INTERVAL '10 days' WHERE id = $1")
+            .bind(remaining)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let older_than = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        let (status, body) = post(
+            &app,
+            &auth,
+            "/api/v1/jobs/dlq/purge",
+            json!({"confirm": true, "older_than": older_than}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["purged_count"], 0, "{body}");
+        backdate_updated_at(db.pool(), remaining, 2).await;
+        let (status, body) = post(
+            &app,
+            &auth,
+            "/api/v1/jobs/dlq/purge",
+            json!({"confirm": true, "queue_name": "dq", "older_than": older_than}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["purged_count"], 1, "{body}");
+    }
+
+    // BEJOB-20: at the daily cap a job is refused before it is inserted. It was
+    // inserted first (visible to workers) and deleted again when the counter
+    // said the cap was full.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn w5_daily_cap_refuses_a_job_before_inserting_it() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        set_custom_limits(db.pool(), &t.org_id, json!({"max_jobs_per_day": 3})).await;
+        sqlx::raw_sql(
+            "CREATE TABLE w5_deleted_jobs (id TEXT); \
+             CREATE FUNCTION w5_note_delete() RETURNS TRIGGER AS $$ \
+             BEGIN INSERT INTO w5_deleted_jobs VALUES (OLD.id); RETURN OLD; END $$ LANGUAGE plpgsql; \
+             CREATE TRIGGER w5_note_delete AFTER DELETE ON jobs \
+             FOR EACH ROW EXECUTE FUNCTION w5_note_delete();",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let app = app(&db);
+        let auth = bearer(&t.key);
+        for n in 0..2 {
+            let (status, body) = post(
+                &app,
+                &auth,
+                "/api/v1/jobs",
+                json!({"queue_name": "cap", "payload": {"n": n}}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+        }
+
+        // One slot left; concurrent enqueues all pass the non-atomic pre-check.
+        let barrier = Arc::new(tokio::sync::Barrier::new(10));
+        let mut tasks = Vec::new();
+        for n in 0..10 {
+            let (app, auth, barrier) = (app.clone(), auth.clone(), Arc::clone(&barrier));
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                post(
+                    &app,
+                    &auth,
+                    "/api/v1/jobs",
+                    json!({"queue_name": "cap", "payload": {"racer": n}}),
+                )
+                .await
+            }));
+        }
+        let mut created = 0;
+        for task in tasks {
+            let (status, body) = task.await.unwrap();
+            match status {
+                StatusCode::CREATED => created += 1,
+                StatusCode::TOO_MANY_REQUESTS => {}
+                other => panic!("unexpected {other}: {body}"),
+            }
+        }
+        assert_eq!(created, 1);
+        let (deleted,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM w5_deleted_jobs")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(deleted, 0, "a refused job must never have been inserted");
+        let (jobs,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM jobs WHERE organization_id = $1")
+                .bind(&t.org_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(jobs, 3);
+    }
+
+    // BEJOB-23: an expiry that has passed, or comes before the schedule, is a 400.
+    #[tokio::test]
+    async fn w5_expires_at_in_the_past_or_before_scheduled_at_is_rejected() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let app = app(&db);
+        let auth = bearer(&t.key);
+        let now = chrono::Utc::now();
+        let at = |minutes: i64| (now + chrono::Duration::minutes(minutes)).to_rfc3339();
+
+        for body in [
+            json!({"queue_name": "eq", "payload": {}, "expires_at": at(-1)}),
+            json!({"queue_name": "eq", "payload": {}, "expires_at": at(30), "scheduled_at": at(60)}),
+        ] {
+            let (status, resp) = post(&app, &auth, "/api/v1/jobs", body.clone()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body} -> {resp}");
+        }
+        let (jobs_today,): (i64,) =
+            sqlx::query_as("SELECT jobs_today FROM get_org_resource_counts($1)")
+                .bind(&t.org_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(jobs_today, 0, "a rejected job consumes no quota");
+
+        let (status, resp) = post(
+            &app,
+            &auth,
+            "/api/v1/jobs",
+            json!({"queue_name": "eq", "payload": {}, "expires_at": at(90), "scheduled_at": at(60)}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{resp}");
+    }
+}
+// ---- wave 5 / flow ----
+// Schedules, workflows, dependency edges and the scheduler's failure and
+// retention sweeps: BEFLOW-08/-09/-11/-16/-18/-19/-20/-21/-22 (BEOPS-11, QW7).
+mod wave5_flow {
+    use super::*;
+
+    use std::time::Duration;
+
+    use futures::StreamExt;
+    use spooled_backend::cache::RedisCache;
+    use spooled_backend::config::RedisSettings;
+    use spooled_backend::outgoing_webhooks::service::OutgoingWebhookService;
+    use spooled_backend::scheduler::Scheduler;
+
+    use super::common::TestRedis;
+
+    fn scheduler(db: &TestDatabase, cache: Option<Arc<RedisCache>>) -> Scheduler {
+        Scheduler::new(
+            Arc::clone(&db.pool),
+            cache,
+            Arc::new(Metrics::new()),
+            Arc::new(OutgoingWebhookService::new((*db.pool).clone(), 3, 4)),
+        )
+    }
+
+    async fn create_schedule(
+        app: &Router,
+        auth: &str,
+        name: &str,
+        queue: &str,
+        cron: &str,
+    ) -> (StatusCode, Value) {
+        call(
+            app,
+            "POST",
+            "/api/v1/schedules",
+            &[("Authorization", auth)],
+            Some(json!({
+                "name": name,
+                "cron_expression": cron,
+                "queue_name": queue,
+                "payload_template": {},
+            })),
+        )
+        .await
+    }
+
+    /// Create a workflow through the API; returns (workflow id, key -> job id).
+    async fn create_workflow(
+        app: &Router,
+        auth: &str,
+        jobs: Value,
+    ) -> (String, std::collections::HashMap<String, String>) {
+        let (status, body) = call(
+            app,
+            "POST",
+            "/api/v1/workflows",
+            &[("Authorization", auth)],
+            Some(json!({"name": "w5-flow", "jobs": jobs})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ids = body["job_ids"]
+            .as_array()
+            .expect("job_ids")
+            .iter()
+            .map(|m| {
+                (
+                    m["key"].as_str().unwrap().to_string(),
+                    m["job_id"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        (body["workflow_id"].as_str().unwrap().to_string(), ids)
+    }
+
+    async fn get_workflow(app: &Router, auth: &str, id: &str) -> Value {
+        let (status, body) = call(
+            app,
+            "GET",
+            &format!("/api/v1/workflows/{id}"),
+            &[("Authorization", auth)],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    }
+
+    async fn exists(pool: &sqlx::PgPool, table: &str, id: &str) -> bool {
+        // `table` is always a literal from this module.
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT EXISTS(SELECT 1 FROM {table} WHERE id = $1)"
+        )))
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn seed_job(pool: &sqlx::PgPool, org_id: &str, status: &str, age_days: i32) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO jobs (id, organization_id, queue_name, payload, status, created_at, updated_at) \
+             VALUES ($1, $2, 'w5-ret', '{}'::JSONB, $3, NOW() - make_interval(days => $4), \
+             NOW() - make_interval(days => $4))",
+        )
+        .bind(&id)
+        .bind(org_id)
+        .bind(status)
+        .bind(age_days)
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    /// Wait for the outgoing `event` delivery attempt about `job_id`; returns its data.
+    async fn delivered(pool: &sqlx::PgPool, org_id: &str, event: &str, job_id: &str) -> Value {
+        for _ in 0..100 {
+            let row: Option<Value> = sqlx::query_scalar(
+                "SELECT d.payload->'data' FROM outgoing_webhook_deliveries d \
+                 JOIN outgoing_webhooks w ON w.id = d.webhook_id \
+                 WHERE w.organization_id = $1 AND d.event = $2 \
+                   AND d.payload->'data'->>'job_id' = $3",
+            )
+            .bind(org_id)
+            .bind(event)
+            .bind(job_id)
+            .fetch_optional(pool)
+            .await
+            .unwrap();
+            if let Some(data) = row {
+                return data;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("no {event} delivery for {job_id}");
+    }
+
+    async fn subscribe_events(cache: &RedisCache, org_id: &str) -> redis::aio::PubSub {
+        cache
+            .subscribe(&format!("org:{org_id}:events"))
+            .await
+            .expect("subscribe")
+    }
+
+    /// Realtime event types published for `job_id` within a few seconds.
+    async fn realtime_types(pubsub: &mut redis::aio::PubSub, job_id: &str) -> Vec<String> {
+        let mut seen = Vec::new();
+        let mut stream = pubsub.on_message();
+        while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_secs(3), stream.next()).await
+        {
+            let payload: String = msg.get_payload().unwrap();
+            let event: Value = serde_json::from_str(&payload).unwrap();
+            if event["data"]["job_id"] == job_id {
+                seen.push(event["type"].as_str().unwrap_or_default().to_string());
+                if seen.iter().any(|t| t == "JobFailed") {
+                    break;
+                }
+            }
+        }
+        seen
+    }
+
+    async fn deadletter_history(pool: &sqlx::PgPool, job_id: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM job_history WHERE job_id = $1 AND event_type = 'deadlettered'",
+        )
+        .bind(job_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn subscribe_job_failed(pool: &sqlx::PgPool, org_id: &str) {
+        sqlx::query(
+            "INSERT INTO outgoing_webhooks (organization_id, name, url, events) \
+             VALUES ($1, 'w5', 'http://127.0.0.1:9/w5', ARRAY['job.failed'])",
+        )
+        .bind(org_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    // BEFLOW-08: Feb 30 / Apr 31 were accepted with next_run_at null and never
+    // fired; create and update now refuse them.
+    #[tokio::test]
+    async fn w5_flow_impossible_cron_dates_are_rejected() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let app = app(&db);
+        let auth = bearer(&t.key);
+
+        for cron in ["0 0 0 30 2 *", "0 0 31 4 *"] {
+            let (status, body) = create_schedule(&app, &auth, "never", "w5-cron", cron).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{cron}: {body}");
+        }
+        let stored: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM schedules WHERE organization_id = $1")
+                .bind(&t.org_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(stored, 0, "a refused schedule is not stored");
+
+        let (status, body) = create_schedule(&app, &auth, "leap", "w5-cron", "0 0 29 2 *").await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert!(body["next_run_at"].is_string(), "{body}");
+        let id = body["id"].as_str().unwrap().to_string();
+
+        let (status, body) = call(
+            &app,
+            "PUT",
+            &format!("/api/v1/schedules/{id}"),
+            &[("Authorization", &auth)],
+            Some(json!({"cron_expression": "0 0 31 4 *"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let (cron, next): (String, Option<chrono::DateTime<chrono::Utc>>) =
+            sqlx::query_as("SELECT cron_expression, next_run_at FROM schedules WHERE id = $1")
+                .bind(&id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(cron, "0 0 29 2 *");
+        assert!(next.is_some());
+    }
+
+    // BEFLOW-18: GET /schedules ignored queue_name, is_active and offset, which
+    // the Go and Python SDKs send.
+    #[tokio::test]
+    async fn w5_flow_schedule_list_honours_queue_active_and_offset() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let app = app(&db);
+        let auth = bearer(&t.key);
+
+        let mut ids = Vec::new();
+        for (name, queue) in [("s1", "w5-a"), ("s2", "w5-b"), ("s3", "w5-a")] {
+            let (status, body) = create_schedule(&app, &auth, name, queue, "0 0 * * *").await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            ids.push(body["id"].as_str().unwrap().to_string());
+        }
+        // Newest first is s3, s2, s1.
+        for (age, id) in ids.iter().rev().enumerate() {
+            sqlx::query(
+                "UPDATE schedules SET created_at = NOW() - make_interval(mins => $2) WHERE id = $1",
+            )
+            .bind(id)
+            .bind(age as i32 + 1)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("/api/v1/schedules/{}/pause", ids[0]),
+            &[("Authorization", &auth)],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let names = |body: &Value| -> Vec<String> {
+            body.as_array()
+                .expect("array")
+                .iter()
+                .map(|s| s["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        for (query, expected) in [
+            ("queue_name=w5-a", vec!["s3", "s1"]),
+            ("is_active=false", vec!["s1"]),
+            ("is_active=true&queue_name=w5-a", vec!["s3"]),
+            ("limit=1&offset=1", vec!["s2"]),
+            ("limit=2&offset=2", vec!["s1"]),
+            ("offset=0", vec!["s3", "s2", "s1"]),
+        ] {
+            let (status, body) = call(
+                &app,
+                "GET",
+                &format!("/api/v1/schedules?{query}"),
+                &[("Authorization", &auth)],
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{query}: {body}");
+            assert_eq!(names(&body), expected, "{query}");
+        }
+
+        let (status, body) = call(
+            &app,
+            "GET",
+            "/api/v1/schedules?is_active=maybe",
+            &[("Authorization", &auth)],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    // BEFLOW-16: a duplicate depends_on key hit the unique edge constraint
+    // inside the transaction and answered 500.
+    #[tokio::test]
+    async fn w5_flow_duplicate_workflow_dependency_is_a_bad_request() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let app = app(&db);
+        let auth = bearer(&t.key);
+
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/api/v1/workflows",
+            &[("Authorization", &auth)],
+            Some(json!({
+                "name": "dup",
+                "jobs": [
+                    {"key": "a", "queue_name": "w5-wf", "payload": {}},
+                    {"key": "c", "queue_name": "w5-wf", "payload": {}, "depends_on": ["a", "a"]},
+                ],
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.to_string().contains("more than once"), "{body}");
+        let jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE organization_id = $1")
+            .bind(&t.org_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(jobs, 0);
+    }
+
+    // BEFLOW-19: GET /workflows/{id} hardcoded job_type "job" and failed_at null.
+    #[tokio::test]
+    async fn w5_flow_workflow_jobs_carry_job_type_and_failed_at() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let app = app(&db);
+        let auth = bearer(&t.key);
+
+        let (wf, ids) = create_workflow(
+            &app,
+            &auth,
+            json!([
+                {"key": "a", "queue_name": "w5-wf", "payload": {"job_type": "send_email"}},
+                {"key": "b", "queue_name": "w5-wf", "payload": {}, "depends_on": ["a"]},
+            ]),
+        )
+        .await;
+        sqlx::query(
+            "UPDATE jobs SET status = 'deadletter', last_error = 'boom', updated_at = NOW() WHERE id = $1",
+        )
+        .bind(&ids["a"])
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let body = get_workflow(&app, &auth, &wf).await;
+        let job = |id: &str| -> Value {
+            body["jobs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|j| j["id"] == id)
+                .cloned()
+                .expect("job in workflow")
+        };
+        let a = job(&ids["a"]);
+        assert_eq!(a["job_type"], "send_email", "{a}");
+        assert!(a["failed_at"].is_string(), "{a}");
+        assert_eq!(a["backoff_type"], "exponential", "{a}");
+        let b = job(&ids["b"]);
+        assert_eq!(b["job_type"], "job", "{b}");
+        assert!(b["failed_at"].is_null(), "{b}");
+    }
+
+    // BEFLOW-20: started_at was never set and a workflow read `pending` until
+    // its first job finished.
+    #[tokio::test]
+    async fn w5_flow_workflow_is_running_once_a_job_starts() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let app = app(&db);
+        let auth = bearer(&t.key);
+
+        let (wf, ids) = create_workflow(
+            &app,
+            &auth,
+            json!([
+                {"key": "a", "queue_name": "w5-wf", "payload": {}},
+                {"key": "b", "queue_name": "w5-wf", "payload": {}, "depends_on": ["a"]},
+            ]),
+        )
+        .await;
+        // A worker claims the root job.
+        sqlx::query(
+            "UPDATE jobs SET status = 'processing', started_at = NOW(), assigned_worker_id = 'w5', \
+             lease_id = 'l5', lease_expires_at = NOW() + INTERVAL '5 minutes' WHERE id = $1",
+        )
+        .bind(&ids["a"])
+        .execute(db.pool())
+        .await
+        .unwrap();
+        // A one-job workflow that started and finished between two sweeps.
+        let (quick, quick_ids) = create_workflow(
+            &app,
+            &auth,
+            json!([{"key": "only", "queue_name": "w5-wf", "payload": {}}]),
+        )
+        .await;
+        sqlx::query(
+            "UPDATE jobs SET status = 'completed', started_at = NOW() - INTERVAL '2 seconds', \
+             completed_at = NOW() WHERE id = $1",
+        )
+        .bind(&quick_ids["only"])
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        scheduler(&db, None)
+            .update_job_dependencies()
+            .await
+            .unwrap();
+
+        let body = get_workflow(&app, &auth, &wf).await;
+        assert_eq!(body["status"], "running", "{body}");
+        assert!(body["started_at"].is_string(), "{body}");
+        let body = get_workflow(&app, &auth, &quick).await;
+        assert_eq!(body["status"], "completed", "{body}");
+        assert!(body["started_at"].is_string(), "{body}");
+    }
+
+    // BEFLOW-21: cancel overwrote a finished workflow's status and completed_at.
+    #[tokio::test]
+    async fn w5_flow_cancel_refuses_a_finished_workflow() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let app = app(&db);
+        let auth = bearer(&t.key);
+
+        let (done, ids) = create_workflow(
+            &app,
+            &auth,
+            json!([{"key": "a", "queue_name": "w5-wf", "payload": {}}]),
+        )
+        .await;
+        sqlx::query("UPDATE jobs SET status = 'completed', completed_at = NOW() WHERE id = $1")
+            .bind(&ids["a"])
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE workflows SET status = 'completed', completed_at = '2026-01-01T00:00:00Z' WHERE id = $1",
+        )
+        .bind(&done)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("/api/v1/workflows/{done}/cancel"),
+            &[("Authorization", &auth)],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        let (wf_status, completed_at): (String, chrono::DateTime<chrono::Utc>) =
+            sqlx::query_as("SELECT status, completed_at FROM workflows WHERE id = $1")
+                .bind(&done)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(wf_status, "completed");
+        assert_eq!(completed_at.to_rfc3339(), "2026-01-01T00:00:00+00:00");
+
+        // A workflow still in flight is cancelled as before.
+        let (live, _) = create_workflow(
+            &app,
+            &auth,
+            json!([{"key": "a", "queue_name": "w5-wf", "payload": {}}]),
+        )
+        .await;
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("/api/v1/workflows/{live}/cancel"),
+            &[("Authorization", &auth)],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "cancelled", "{body}");
+    }
+
+    // BEFLOW-22: self and cyclic edges were skipped with a 200, after the call
+    // had already rewritten dependency_mode (default `all`).
+    #[tokio::test]
+    async fn w5_flow_add_dependencies_rejects_self_and_cycles_and_keeps_mode() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let app = app(&db);
+        let auth = bearer(&t.key);
+
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let (status, body) = call(
+                &app,
+                "POST",
+                "/api/v1/jobs",
+                &[("Authorization", &auth)],
+                Some(json!({"queue_name": "w5-deps", "payload": {}})),
+            )
+            .await;
+            assert!(status.is_success(), "{body}");
+            ids.push(body["id"].as_str().unwrap().to_string());
+        }
+        let (a, b) = (&ids[0], &ids[1]);
+        let add = |job: String, body: Value| {
+            let app = app.clone();
+            let auth = auth.clone();
+            async move {
+                call(
+                    &app,
+                    "POST",
+                    &format!("/api/v1/jobs/{job}/dependencies"),
+                    &[("Authorization", &auth)],
+                    Some(body),
+                )
+                .await
+            }
+        };
+        let mode_and_met = |id: String| {
+            let pool = db.pool().clone();
+            async move {
+                sqlx::query_as::<_, (Option<String>, Option<bool>)>(
+                    "SELECT dependency_mode, dependencies_met FROM jobs WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+
+        let (status, body) = add(a.clone(), json!({"depends_on": [a]})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            mode_and_met(a.clone()).await.1,
+            Some(true),
+            "a stays runnable"
+        );
+
+        let (status, body) = add(
+            a.clone(),
+            json!({"depends_on": [b], "dependency_mode": "any"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["dependencies_added"], 1, "{body}");
+
+        // b -> a would close the loop a -> b -> a.
+        let before = mode_and_met(b.clone()).await;
+        let (status, body) = add(b.clone(), json!({"depends_on": [a]})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(mode_and_met(b.clone()).await, before, "b is untouched");
+
+        // Re-adding an existing edge adds nothing and keeps a's `any` mode.
+        let (status, body) = add(a.clone(), json!({"depends_on": [b]})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["dependencies_added"], 0, "{body}");
+        assert_eq!(
+            mode_and_met(a.clone()).await,
+            (Some("any".to_string()), Some(false))
+        );
+    }
+
+    // BEFLOW-09 / BEOPS-11: schedule_runs, dead_letter_queue, failed/deadletter
+    // jobs and offline workers were never garbage-collected.
+    #[tokio::test]
+    async fn w5_flow_retention_sweeps_runs_dlq_failed_jobs_and_offline_workers() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await; // starter: jobs 14 days, history 7 days
+        let pool = db.pool();
+        let org = t.org_id.as_str();
+
+        // schedule_runs follow history retention.
+        let schedule = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO schedules (id, organization_id, name, cron_expression, queue_name, payload_template) \
+             VALUES ($1, $2, 'ret', '0 0 * * *', 'w5-ret', '{}'::JSONB)",
+        )
+        .bind(&schedule)
+        .bind(org)
+        .execute(pool)
+        .await
+        .unwrap();
+        let mut runs = Vec::new();
+        for age_days in [10, 2] {
+            let id = uuid::Uuid::new_v4().to_string();
+            sqlx::query(
+                "INSERT INTO schedule_runs (id, schedule_id, status, started_at, completed_at) \
+                 VALUES ($1, $2, 'completed', NOW() - make_interval(days => $3), NOW() - make_interval(days => $3))",
+            )
+            .bind(&id)
+            .bind(&schedule)
+            .bind(age_days)
+            .execute(pool)
+            .await
+            .unwrap();
+            runs.push(id);
+        }
+
+        // dead_letter_queue rows follow job retention.
+        let mut dlq = Vec::new();
+        for age_days in [20, 2] {
+            let id = uuid::Uuid::new_v4().to_string();
+            sqlx::query(
+                "INSERT INTO dead_letter_queue (id, job_id, organization_id, queue_name, reason, original_payload, created_at) \
+                 VALUES ($1, 'gone', $2, 'w5-ret', 'boom', '{}'::JSONB, NOW() - make_interval(days => $3))",
+            )
+            .bind(&id)
+            .bind(org)
+            .bind(age_days)
+            .execute(pool)
+            .await
+            .unwrap();
+            dlq.push(id);
+        }
+
+        // Failed and dead-lettered jobs follow job retention...
+        let old_dead = seed_job(pool, org, "deadletter", 20).await;
+        let old_failed = seed_job(pool, org, "failed", 20).await;
+        let recent_dead = seed_job(pool, org, "deadletter", 2).await;
+        // ...but never while something still waits on them.
+        let gating_edge = seed_job(pool, org, "deadletter", 20).await;
+        let edge_child = seed_job(pool, org, "pending", 0).await;
+        sqlx::query("INSERT INTO job_dependencies (job_id, depends_on_job_id) VALUES ($1, $2)")
+            .bind(&edge_child)
+            .bind(&gating_edge)
+            .execute(pool)
+            .await
+            .unwrap();
+        let gating_parent = seed_job(pool, org, "failed", 20).await;
+        let parent_child = seed_job(pool, org, "pending", 0).await;
+        sqlx::query("UPDATE jobs SET parent_job_id = $2 WHERE id = $1")
+            .bind(&parent_child)
+            .bind(&gating_parent)
+            .execute(pool)
+            .await
+            .unwrap();
+        let in_running_workflow = seed_job(pool, org, "deadletter", 20).await;
+        let workflow = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO workflows (id, organization_id, name, status, total_jobs) VALUES ($1, $2, 'ret', 'running', 1)",
+        )
+        .bind(&workflow)
+        .bind(org)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE jobs SET workflow_id = $2 WHERE id = $1")
+            .bind(&in_running_workflow)
+            .bind(&workflow)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        // Offline workers go after 7 days, unless a job is still leased to them.
+        let mut workers = Vec::new();
+        for age_days in [8, 1, 8] {
+            let id = uuid::Uuid::new_v4().to_string();
+            sqlx::query(
+                "INSERT INTO workers (id, organization_id, queue_name, hostname, status, last_heartbeat) \
+                 VALUES ($1, $2, 'w5-ret', 'host', 'offline', NOW() - make_interval(days => $3))",
+            )
+            .bind(&id)
+            .bind(org)
+            .bind(age_days)
+            .execute(pool)
+            .await
+            .unwrap();
+            workers.push(id);
+        }
+        let leased = seed_job(pool, org, "processing", 0).await;
+        sqlx::query(
+            "UPDATE jobs SET assigned_worker_id = $2, lease_id = 'l', \
+             lease_expires_at = NOW() + INTERVAL '10 minutes' WHERE id = $1",
+        )
+        .bind(&leased)
+        .bind(&workers[2])
+        .execute(pool)
+        .await
+        .unwrap();
+
+        scheduler(&db, None).cleanup_stale_workers().await.unwrap();
+
+        assert!(!exists(pool, "schedule_runs", &runs[0]).await, "old run");
+        assert!(exists(pool, "schedule_runs", &runs[1]).await, "recent run");
+        assert!(
+            !exists(pool, "dead_letter_queue", &dlq[0]).await,
+            "old DLQ row"
+        );
+        assert!(
+            exists(pool, "dead_letter_queue", &dlq[1]).await,
+            "recent DLQ row"
+        );
+        assert!(!exists(pool, "jobs", &old_dead).await, "old deadletter job");
+        assert!(!exists(pool, "jobs", &old_failed).await, "old failed job");
+        assert!(
+            exists(pool, "jobs", &recent_dead).await,
+            "recent deadletter job"
+        );
+        assert!(
+            exists(pool, "jobs", &gating_edge).await,
+            "has a pending dependent"
+        );
+        assert!(
+            exists(pool, "jobs", &gating_parent).await,
+            "has a pending child"
+        );
+        assert!(
+            exists(pool, "jobs", &in_running_workflow).await,
+            "its workflow is still running"
+        );
+        assert!(
+            !exists(pool, "workers", &workers[0]).await,
+            "offline 8 days"
+        );
+        assert!(exists(pool, "workers", &workers[1]).await, "offline 1 day");
+        assert!(
+            exists(pool, "workers", &workers[2]).await,
+            "still holds a lease"
+        );
+    }
+
+    // BEFLOW-11 / QW7: dead-lettering by lease expiry sent no job.failed webhook,
+    // no realtime event and wrote no job_history row.
+    #[tokio::test]
+    async fn w5_flow_lease_expiry_dead_letter_emits_failure_events() {
+        let redis = TestRedis::new().await;
+        let cache = RedisCache::connect(&RedisSettings {
+            url: redis.url.clone(),
+            pool_size: 4,
+        })
+        .await
+        .expect("connect redis");
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        subscribe_job_failed(db.pool(), &t.org_id).await;
+        let job = seed_job(db.pool(), &t.org_id, "processing", 0).await;
+        sqlx::query(
+            "UPDATE jobs SET assigned_worker_id = 'gone', lease_id = 'l', retry_count = 3, max_retries = 3, \
+             lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1",
+        )
+        .bind(&job)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let mut pubsub = subscribe_events(&cache, &t.org_id).await;
+
+        scheduler(&db, Some(Arc::new(cache)))
+            .recover_expired_leases()
+            .await
+            .unwrap();
+
+        let status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = $1")
+            .bind(&job)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(status, "deadletter");
+        assert_eq!(deadletter_history(db.pool(), &job).await, 1);
+        let types = realtime_types(&mut pubsub, &job).await;
+        assert!(types.iter().any(|t| t == "JobStatusChange"), "{types:?}");
+        assert!(types.iter().any(|t| t == "JobFailed"), "{types:?}");
+        let data = delivered(db.pool(), &t.org_id, "job.failed", &job).await;
+        assert_eq!(data["status"], "deadletter", "{data}");
+    }
+
+    // BEFLOW-11 / QW7: the same for a job dead-lettered because its worker went
+    // offline.
+    #[tokio::test]
+    async fn w5_flow_offline_worker_dead_letter_emits_failure_events() {
+        let redis = TestRedis::new().await;
+        let cache = RedisCache::connect(&RedisSettings {
+            url: redis.url.clone(),
+            pool_size: 4,
+        })
+        .await
+        .expect("connect redis");
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        subscribe_job_failed(db.pool(), &t.org_id).await;
+        let worker = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO workers (id, organization_id, queue_name, hostname, status, last_heartbeat) \
+             VALUES ($1, $2, 'w5-ret', 'host', 'healthy', NOW() - INTERVAL '10 minutes')",
+        )
+        .bind(&worker)
+        .bind(&t.org_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let job = seed_job(db.pool(), &t.org_id, "processing", 0).await;
+        sqlx::query(
+            "UPDATE jobs SET assigned_worker_id = $2, lease_id = 'l', retry_count = 2, max_retries = 2, \
+             lease_expires_at = NULL WHERE id = $1",
+        )
+        .bind(&job)
+        .bind(&worker)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let mut pubsub = subscribe_events(&cache, &t.org_id).await;
+
+        scheduler(&db, Some(Arc::new(cache)))
+            .cleanup_stale_workers()
+            .await
+            .unwrap();
+
+        let status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = $1")
+            .bind(&job)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(status, "deadletter");
+        assert_eq!(deadletter_history(db.pool(), &job).await, 1);
+        let types = realtime_types(&mut pubsub, &job).await;
+        assert!(types.iter().any(|t| t == "JobFailed"), "{types:?}");
+        let data = delivered(db.pool(), &t.org_id, "job.failed", &job).await;
+        assert_eq!(data["status"], "deadletter", "{data}");
+    }
+}
+// ---- wave 5 / realtime ----
+mod w5_realtime {
+    use super::*;
+
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    use futures::StreamExt;
+    use spooled_backend::api::handlers::auth::Claims;
+    use spooled_backend::cache::RedisCache;
+    use spooled_backend::config::RedisSettings;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// Router on `redis_url` (and on `pool` when given, else the test database).
+    async fn realtime_app(
+        db: &TestDatabase,
+        redis_url: &str,
+        pool: Option<sqlx::PgPool>,
+    ) -> (Router, RedisCache) {
+        let cache = RedisCache::connect(&RedisSettings {
+            url: redis_url.to_string(),
+            pool_size: 4,
+        })
+        .await
+        .expect("connect redis");
+        let pool = pool.map(Arc::new).unwrap_or_else(|| Arc::clone(&db.pool));
+        let app = router(AppState::new(
+            Database::from_pool(pool),
+            Some(cache.clone()),
+            Metrics::new(),
+            Settings::load_for_testing(),
+        ));
+        (app, cache)
+    }
+
+    /// Serve `app` on a loopback port: a WebSocket upgrade needs a real connection.
+    pub(super) async fn serve(app: Router) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        addr
+    }
+
+    #[derive(Debug)]
+    pub(super) enum Frame {
+        Text(String),
+        Close(u16),
+        Other,
+    }
+
+    /// A WebSocket client written by hand: the dev-dependencies carry none.
+    pub(super) struct RawWs {
+        tcp: TcpStream,
+        buf: Vec<u8>,
+    }
+
+    /// Open `/api/v1/ws...`; `Err` is the HTTP status of a refused upgrade.
+    pub(super) async fn ws_open(
+        addr: SocketAddr,
+        target: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<RawWs, u16> {
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let mut request = format!(
+            "GET {target} HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
+        );
+        for (name, value) in headers {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str("\r\n");
+        let mut ws = RawWs {
+            tcp,
+            buf: Vec::new(),
+        };
+        ws.tcp.write_all(request.as_bytes()).await.unwrap();
+        let head_end = loop {
+            if let Some(pos) = ws.buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_secs(10), ws.read_more())
+                    .await
+                    .expect("handshake answer"),
+                "connection closed during the handshake"
+            );
+        };
+        let status: u16 = String::from_utf8_lossy(&ws.buf[..head_end])
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .expect("status line");
+        if status != 101 {
+            return Err(status);
+        }
+        ws.buf.drain(..head_end);
+        Ok(ws)
+    }
+
+    impl RawWs {
+        async fn read_more(&mut self) -> bool {
+            let mut chunk = [0u8; 8192];
+            match self.tcp.read(&mut chunk).await {
+                Ok(n) if n > 0 => {
+                    self.buf.extend_from_slice(&chunk[..n]);
+                    true
+                }
+                _ => false,
+            }
+        }
+
+        async fn fill(&mut self, n: usize) -> bool {
+            while self.buf.len() < n {
+                if !self.read_more().await {
+                    return false;
+                }
+            }
+            true
+        }
+
+        /// The next server frame (servers do not mask), `None` once the connection ends.
+        pub(super) async fn frame(&mut self) -> Option<Frame> {
+            if !self.fill(2).await {
+                return None;
+            }
+            let opcode = self.buf[0] & 0x0f;
+            let (mut len, mut header) = ((self.buf[1] & 0x7f) as usize, 2);
+            if len == 126 {
+                if !self.fill(4).await {
+                    return None;
+                }
+                len = u16::from_be_bytes([self.buf[2], self.buf[3]]) as usize;
+                header = 4;
+            } else if len == 127 {
+                if !self.fill(10).await {
+                    return None;
+                }
+                len = u64::from_be_bytes(self.buf[2..10].try_into().unwrap()) as usize;
+                header = 10;
+            }
+            if !self.fill(header + len).await {
+                return None;
+            }
+            let payload: Vec<u8> = self.buf.drain(..header + len).skip(header).collect();
+            Some(match opcode {
+                1 => Frame::Text(String::from_utf8(payload).unwrap()),
+                8 if payload.len() >= 2 => {
+                    Frame::Close(u16::from_be_bytes([payload[0], payload[1]]))
+                }
+                8 => Frame::Close(1005),
+                _ => Frame::Other,
+            })
+        }
+
+        /// Frames that arrive within `limit`, up to a close frame or the end of
+        /// the connection.
+        pub(super) async fn frames_within(&mut self, limit: Duration) -> Vec<Frame> {
+            let deadline = tokio::time::Instant::now() + limit;
+            let mut frames = Vec::new();
+            while let Ok(Some(frame)) = tokio::time::timeout_at(deadline, self.frame()).await {
+                let closed = matches!(frame, Frame::Close(_));
+                frames.push(frame);
+                if closed {
+                    break;
+                }
+            }
+            frames
+        }
+
+        async fn text_containing(&mut self, needle: &str, limit: Duration) -> bool {
+            let deadline = tokio::time::Instant::now() + limit;
+            while let Ok(Some(frame)) = tokio::time::timeout_at(deadline, self.frame()).await {
+                match frame {
+                    Frame::Text(text) if text.contains(needle) => return true,
+                    Frame::Close(_) => return false,
+                    _ => {}
+                }
+            }
+            false
+        }
+    }
+
+    /// TCP proxy in front of Redis. `cut` drops every proxied connection, as a
+    /// Redis restart or a network blip does.
+    struct RedisProxy {
+        url: String,
+        links: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    }
+
+    async fn redis_proxy(upstream: &str) -> RedisProxy {
+        let parsed = url::Url::parse(upstream).expect("redis url");
+        let target = format!(
+            "{}:{}",
+            parsed.host_str().unwrap(),
+            parsed.port().unwrap_or(6379)
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut proxied = parsed.clone();
+        proxied.set_host(Some("127.0.0.1")).unwrap();
+        proxied
+            .set_port(Some(listener.local_addr().unwrap().port()))
+            .unwrap();
+        let links = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let accepted = Arc::clone(&links);
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                let target = target.clone();
+                let link = tokio::spawn(async move {
+                    if let Ok(mut outbound) = TcpStream::connect(&target).await {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                });
+                accepted.lock().unwrap().push(link);
+            }
+        });
+        RedisProxy {
+            url: proxied.to_string(),
+            links,
+        }
+    }
+
+    impl RedisProxy {
+        fn cut(&self) {
+            for link in self.links.lock().unwrap().drain(..) {
+                link.abort();
+            }
+        }
+    }
+
+    async fn publish_job_created(cache: &RedisCache, org_id: &str, job_id: &str) {
+        let event = json!({
+            "type": "JobCreated",
+            "data": {
+                "job_id": job_id,
+                "queue_name": "w5-rt",
+                "priority": 0,
+                "timestamp": chrono::Utc::now(),
+            },
+        });
+        cache
+            .publish(&format!("org:{org_id}:events"), &event.to_string())
+            .await
+            .expect("publish");
+    }
+
+    async fn api_key_id(pool: &sqlx::PgPool, org_id: &str) -> String {
+        sqlx::query_scalar("SELECT id FROM api_keys WHERE organization_id = $1")
+            .bind(org_id)
+            .fetch_one(pool)
+            .await
+            .expect("key id")
+    }
+
+    /// An access JWT for the org's key whose acceptance (`exp` plus the 60 s
+    /// validation leeway) ends `secs` from now.
+    async fn expiring_token(pool: &sqlx::PgPool, t: &Tenant, secs: i64) -> String {
+        let api_key_id = api_key_id(pool, &t.org_id).await;
+        let now = chrono::Utc::now().timestamp();
+        let claims = Claims {
+            sub: t.org_id.clone(),
+            api_key_id,
+            org_id: t.org_id.clone(),
+            iat: now - 120,
+            exp: now - 60 + secs,
+            nbf: now - 120,
+            jti: uuid::Uuid::new_v4().to_string(),
+            queues: vec![],
+            token_type: "access".to_string(),
+            sid: Some(uuid::Uuid::new_v4().to_string()),
+        };
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(
+                Settings::load_for_testing().jwt.secret.as_bytes(),
+            ),
+        )
+        .unwrap()
+    }
+
+    async fn login(app: &Router, key: &str) -> String {
+        let (status, body) = call(
+            app,
+            "POST",
+            "/api/v1/auth/login",
+            &[],
+            Some(json!({"api_key": key})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["access_token"].as_str().unwrap().to_string()
+    }
+
+    async fn logout(app: &Router, token: &str) {
+        let (status, body) = call(
+            app,
+            "POST",
+            "/api/v1/auth/logout",
+            &[("Authorization", &bearer(token))],
+            None,
+        )
+        .await;
+        assert!(status.is_success(), "{status}: {body}");
+    }
+
+    async fn create_job(app: &Router, key: &str) -> String {
+        let (status, body) = call(
+            app,
+            "POST",
+            "/api/v1/jobs",
+            &[("Authorization", &bearer(key))],
+            Some(json!({"queue_name": "w5-rt", "payload": {}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        body["id"].as_str().unwrap().to_string()
+    }
+
+    pub(super) type SseBody = axum::body::BodyDataStream;
+
+    pub(super) async fn sse_open(
+        app: &Router,
+        uri: &str,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, SseBody) {
+        let mut req = Request::builder().uri(uri);
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        let res = app
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        (res.status(), res.into_body().into_data_stream())
+    }
+
+    /// Stream text read within `limit`, and whether the stream ended.
+    pub(super) async fn sse_read(stream: &mut SseBody, limit: Duration) -> (String, bool) {
+        let deadline = tokio::time::Instant::now() + limit;
+        let mut seen = String::new();
+        loop {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Ok(Some(Ok(chunk))) => seen.push_str(&String::from_utf8_lossy(&chunk)),
+                Ok(_) => return (seen, true),
+                Err(_) => return (seen, false),
+            }
+        }
+    }
+
+    fn conn_key(kind: &str, org_id: &str) -> String {
+        format!("realtime_connections:{kind}:{org_id}")
+    }
+
+    /// Put `n` connections with heartbeat `score` into an org's connection set.
+    async fn seed_connections(cache: &RedisCache, key: &str, n: usize, score: i64) {
+        let mut conn = cache.get_connection().await.unwrap();
+        let mut pipe = redis::pipe();
+        for _ in 0..n {
+            pipe.zadd(key, uuid::Uuid::new_v4().to_string(), score)
+                .ignore();
+        }
+        pipe.expire(key, 600).ignore();
+        let _: () = pipe.query_async(&mut conn).await.unwrap();
+    }
+
+    async fn live_connections(cache: &RedisCache, key: &str) -> i64 {
+        let mut conn = cache.get_connection().await.unwrap();
+        redis::cmd("ZCARD")
+            .arg(key)
+            .query_async(&mut conn)
+            .await
+            .unwrap()
+    }
+
+    // BEFLOW-13 / BEAUTH-19: a WebSocket ends when its access token stops being
+    // accepted, instead of streaming for as long as the key stays active.
+    #[tokio::test]
+    async fn websocket_closes_when_its_access_token_expires() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let (app, _cache, _redis) = app_with_redis(&db).await;
+        let addr = serve(app).await;
+
+        let token = expiring_token(db.pool(), &t, 3).await;
+        let mut ws = ws_open(addr, &format!("/api/v1/ws?token={token}"), &[])
+            .await
+            .expect("upgrade");
+        let frames = ws.frames_within(Duration::from_secs(10)).await;
+        assert!(
+            matches!(frames.last(), Some(Frame::Close(1008))),
+            "the socket must close (1008) once the token expires: {frames:?}"
+        );
+    }
+
+    // BEFLOW-13 / BEAUTH-19: logout (session revocation) ends an open WebSocket
+    // before it reveals another event.
+    #[tokio::test]
+    async fn websocket_stops_after_logout() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let (app, cache, _redis) = app_with_redis(&db).await;
+        let addr = serve(app.clone()).await;
+
+        let token = login(&app, &t.key).await;
+        let mut ws = ws_open(addr, &format!("/api/v1/ws?token={token}"), &[])
+            .await
+            .expect("upgrade");
+        assert!(
+            matches!(ws.frame().await, Some(Frame::Text(_))),
+            "initial ping"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        logout(&app, &token).await;
+        publish_job_created(&cache, &t.org_id, "w5-after-logout").await;
+        let frames = ws.frames_within(Duration::from_secs(6)).await;
+        assert!(
+            !frames
+                .iter()
+                .any(|f| matches!(f, Frame::Text(text) if text.contains("w5-after-logout"))),
+            "no event after logout: {frames:?}"
+        );
+        assert!(
+            matches!(frames.last(), Some(Frame::Close(1008))),
+            "{frames:?}"
+        );
+    }
+
+    // BEAUTH-19: the three SSE streams end when their access token expires.
+    #[tokio::test]
+    async fn sse_streams_end_when_their_access_token_expires() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let (app, _cache, _redis) = app_with_redis(&db).await;
+        let job_id = create_job(&app, &t.key).await;
+
+        let token = expiring_token(db.pool(), &t, 4).await;
+        let (s1, mut events) = sse_open(&app, &format!("/api/v1/events?token={token}"), &[]).await;
+        let (s2, mut job) = sse_open(
+            &app,
+            &format!("/api/v1/events/jobs/{job_id}?token={token}"),
+            &[],
+        )
+        .await;
+        let (s3, mut queue) = sse_open(
+            &app,
+            &format!("/api/v1/events/queues/w5-rt?token={token}"),
+            &[],
+        )
+        .await;
+        assert_eq!(
+            (s1, s2, s3),
+            (StatusCode::OK, StatusCode::OK, StatusCode::OK)
+        );
+
+        let limit = Duration::from_secs(12);
+        let ((_, e1), (_, e2), (_, e3)) = tokio::join!(
+            sse_read(&mut events, limit),
+            sse_read(&mut job, limit),
+            sse_read(&mut queue, limit)
+        );
+        assert!(e1, "/events must end at token expiry");
+        assert!(e2, "/events/jobs/{{id}} must end at token expiry");
+        assert!(e3, "/events/queues/{{name}} must end at token expiry");
+    }
+
+    // BEAUTH-19: logout ends the global SSE stream before it reveals another event.
+    #[tokio::test]
+    async fn sse_events_stop_after_logout() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let (app, cache, _redis) = app_with_redis(&db).await;
+
+        let token = login(&app, &t.key).await;
+        let (status, mut stream) =
+            sse_open(&app, &format!("/api/v1/events?token={token}"), &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        let (first, _) = sse_read(&mut stream, Duration::from_millis(500)).await;
+        assert!(first.contains("connected"), "{first}");
+
+        logout(&app, &token).await;
+        publish_job_created(&cache, &t.org_id, "w5-sse-after-logout").await;
+        let (seen, ended) = sse_read(&mut stream, Duration::from_secs(6)).await;
+        assert!(
+            !seen.contains("w5-sse-after-logout"),
+            "no event after logout: {seen}"
+        );
+        assert!(ended, "the stream must end after logout: {seen}");
+    }
+
+    // BEFLOW-12: when the Redis pub/sub link drops, the socket says so and
+    // closes, instead of answering pings while never delivering an event.
+    #[tokio::test]
+    async fn websocket_closes_when_its_event_channel_drops() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let redis = common::TestRedis::new().await;
+        let proxy = redis_proxy(&redis.url).await;
+        let (app, _proxied) = realtime_app(&db, &proxy.url, None).await;
+        let (_direct_app, direct) = realtime_app(&db, &redis.url, None).await;
+        let addr = serve(app).await;
+
+        let auth = bearer(&t.key);
+        let mut ws = ws_open(addr, "/api/v1/ws", &[("Authorization", &auth)])
+            .await
+            .expect("upgrade");
+        assert!(
+            matches!(ws.frame().await, Some(Frame::Text(_))),
+            "initial ping"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        publish_job_created(&direct, &t.org_id, "w5-before-cut").await;
+        assert!(
+            ws.text_containing("w5-before-cut", Duration::from_secs(5))
+                .await,
+            "events flow before the cut"
+        );
+
+        proxy.cut();
+        let frames = ws.frames_within(Duration::from_secs(8)).await;
+        assert!(
+            frames
+                .iter()
+                .any(|f| matches!(f, Frame::Text(text) if text.contains("\"type\":\"Error\""))),
+            "the client is told why: {frames:?}"
+        );
+        assert!(
+            matches!(frames.last(), Some(Frame::Close(1011))),
+            "{frames:?}"
+        );
+    }
+
+    // BEFLOW-14: the socket re-checks its key on a timer, not with one database
+    // query per forwarded event.
+    #[tokio::test]
+    async fn websocket_does_not_query_the_database_per_event() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let redis = common::TestRedis::new().await;
+        // Every query on the pool hands its connection back once: count those.
+        let released = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&released);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .after_release(move |_, _| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(true) })
+            })
+            .connect_with((*db.pool.connect_options()).clone())
+            .await
+            .unwrap();
+        let (app, cache) = realtime_app(&db, &redis.url, Some(pool)).await;
+        let addr = serve(app).await;
+
+        let auth = bearer(&t.key);
+        let mut ws = ws_open(addr, "/api/v1/ws", &[("Authorization", &auth)])
+            .await
+            .expect("upgrade");
+        assert!(
+            matches!(ws.frame().await, Some(Frame::Text(_))),
+            "initial ping"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        publish_job_created(&cache, &t.org_id, "w5-warmup").await;
+        assert!(
+            ws.text_containing("w5-warmup", Duration::from_secs(5))
+                .await
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let before = released.load(Ordering::SeqCst);
+        for i in 0..20 {
+            publish_job_created(&cache, &t.org_id, &format!("w5-burst-{i}")).await;
+        }
+        assert!(
+            ws.text_containing("w5-burst-19", Duration::from_secs(5))
+                .await
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let queries = released.load(Ordering::SeqCst) - before;
+        assert!(queries <= 2, "20 events cost {queries} database queries");
+    }
+
+    // BEAUTH-14: a counter leaked by a replica that died without cleanup (the
+    // pre-0.1.121 `ws_connections` / `sse_connections` keys) no longer locks the
+    // org out.
+    #[tokio::test]
+    async fn a_leaked_legacy_connection_counter_does_not_lock_the_org_out() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let (app, cache, _redis) = app_with_redis(&db).await;
+        cache
+            .set(&format!("ws_connections:{}", t.org_id), "100", 600)
+            .await
+            .unwrap();
+        cache
+            .set(&format!("sse_connections:{}", t.org_id), "100", 600)
+            .await
+            .unwrap();
+        let addr = serve(app.clone()).await;
+
+        let auth = bearer(&t.key);
+        assert!(ws_open(addr, "/api/v1/ws", &[("Authorization", &auth)])
+            .await
+            .is_ok());
+        let (status, _) = sse_open(&app, "/api/v1/events", &[("Authorization", &auth)]).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    // BEAUTH-14 / BEFLOW-15: every realtime stream kind is capped per org, and
+    // only connections with a recent heartbeat count toward the cap.
+    #[tokio::test]
+    async fn realtime_caps_count_only_live_connections() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let (app, cache, _redis) = app_with_redis(&db).await;
+        let addr = serve(app.clone()).await;
+        let job_id = create_job(&app, &t.key).await;
+        let auth = bearer(&t.key);
+        let headers = [("Authorization", auth.as_str())];
+        let job_uri = format!("/api/v1/events/jobs/{job_id}");
+        let streams = [
+            "/api/v1/events",
+            job_uri.as_str(),
+            "/api/v1/events/queues/w5-rt",
+        ];
+        let now = chrono::Utc::now().timestamp();
+
+        // A replica that was killed leaves members whose heartbeat stopped.
+        for kind in ["ws", "events", "job", "queue"] {
+            seed_connections(&cache, &conn_key(kind, &t.org_id), 100, now - 3600).await;
+        }
+        assert!(
+            ws_open(addr, "/api/v1/ws", &headers).await.is_ok(),
+            "stale members do not count"
+        );
+        for uri in streams {
+            let (status, _) = sse_open(&app, uri, &headers).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: stale members do not count");
+        }
+
+        for kind in ["ws", "events", "job", "queue"] {
+            seed_connections(&cache, &conn_key(kind, &t.org_id), 100, now).await;
+        }
+        assert_eq!(ws_open(addr, "/api/v1/ws", &headers).await.err(), Some(429));
+        for uri in streams {
+            let (status, _) = sse_open(&app, uri, &headers).await;
+            assert_eq!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS,
+                "{uri}: 100 live connections"
+            );
+        }
+    }
+
+    // BEAUTH-14: a closed stream leaves the live-connection set at once.
+    #[tokio::test]
+    async fn realtime_streams_leave_the_connection_set_on_disconnect() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let (app, cache, _redis) = app_with_redis(&db).await;
+        let addr = serve(app.clone()).await;
+        let job_id = create_job(&app, &t.key).await;
+        let auth = bearer(&t.key);
+
+        async fn drains(cache: &RedisCache, key: &str) -> bool {
+            for _ in 0..30 {
+                if live_connections(cache, key).await == 0 {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            false
+        }
+
+        let job_key = conn_key("job", &t.org_id);
+        let (status, stream) = sse_open(
+            &app,
+            &format!("/api/v1/events/jobs/{job_id}"),
+            &[("Authorization", &auth)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(live_connections(&cache, &job_key).await, 1);
+        drop(stream);
+        assert!(drains(&cache, &job_key).await, "job stream slot released");
+
+        let ws_key = conn_key("ws", &t.org_id);
+        let ws = ws_open(addr, "/api/v1/ws", &[("Authorization", &auth)])
+            .await
+            .expect("upgrade");
+        assert_eq!(live_connections(&cache, &ws_key).await, 1);
+        drop(ws);
+        assert!(drains(&cache, &ws_key).await, "WebSocket slot released");
+    }
+}
+// ---- wave 5 / hooks ----
+
+mod wave5_hooks {
+    use super::*;
+
+    use std::collections::HashSet;
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    use axum::extract::ConnectInfo;
+
+    use spooled_backend::outgoing_webhooks::service::{
+        spawn_completion_webhook, OutgoingWebhookService,
+    };
+
+    /// A local receiver: answers every request with `status` and `body` after
+    /// `delay`, and counts requests, peak concurrency and TCP connections.
+    pub(super) struct Endpoint {
+        pub(super) url: String,
+        stats: Arc<EndpointStats>,
+    }
+
+    #[derive(Default)]
+    struct EndpointStats {
+        hits: AtomicUsize,
+        in_flight: AtomicUsize,
+        peak: AtomicUsize,
+        peers: Mutex<HashSet<SocketAddr>>,
+    }
+
+    /// Leaves `in_flight` even when the client gives up mid-request.
+    struct InFlight(Arc<EndpointStats>);
+
+    impl Drop for InFlight {
+        fn drop(&mut self) {
+            self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Endpoint {
+        pub(super) async fn start(status: u16, delay: Duration, body: String) -> Self {
+            let stats = Arc::new(EndpointStats::default());
+            let shared = Arc::clone(&stats);
+            let app = Router::new().fallback(move |ConnectInfo(peer): ConnectInfo<SocketAddr>| {
+                let (stats, body) = (Arc::clone(&shared), body.clone());
+                async move {
+                    stats.hits.fetch_add(1, Ordering::SeqCst);
+                    stats.peers.lock().unwrap().insert(peer);
+                    let now = stats.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    stats.peak.fetch_max(now, Ordering::SeqCst);
+                    let _guard = InFlight(Arc::clone(&stats));
+                    tokio::time::sleep(delay).await;
+                    (StatusCode::from_u16(status).unwrap(), body)
+                }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .await
+                .unwrap();
+            });
+            Self {
+                url: format!("http://{addr}/hook"),
+                stats,
+            }
+        }
+
+        pub(super) fn hits(&self) -> usize {
+            self.stats.hits.load(Ordering::SeqCst)
+        }
+
+        pub(super) fn peak(&self) -> usize {
+            self.stats.peak.load(Ordering::SeqCst)
+        }
+
+        fn connections(&self) -> usize {
+            self.stats.peers.lock().unwrap().len()
+        }
+    }
+
+    pub(super) async fn insert_hook(pool: &sqlx::PgPool, org_id: &str, url: &str) -> String {
+        sqlx::query_scalar(
+            "INSERT INTO outgoing_webhooks (organization_id, name, url, events) \
+             VALUES ($1, 'w5', $2, ARRAY['job.completed']) RETURNING id",
+        )
+        .bind(org_id)
+        .bind(url)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    pub(super) fn fire(service: &Arc<OutgoingWebhookService>, org_id: &str) {
+        let job_id = uuid::Uuid::new_v4().to_string();
+        service.spawn_dispatch(
+            org_id.to_string(),
+            "job.completed".to_string(),
+            job_id.clone(),
+            json!({ "job_id": job_id, "status": "completed" }),
+        );
+    }
+
+    pub(super) async fn eventually(within: Duration, mut check: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            if check() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Poll a webhook's newest delivery row until it exists.
+    async fn await_delivery(pool: &sqlx::PgPool, hook_id: &str, within: Duration) -> DeliveryRow {
+        let deadline = Instant::now() + within;
+        loop {
+            if let Some(row) = last_delivery(pool, hook_id).await {
+                return row;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no delivery recorded for {hook_id}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// (status, status_code, response_body, error, attempts) of a webhook's
+    /// newest delivery row.
+    type DeliveryRow = (String, Option<i32>, Option<String>, Option<String>, i32);
+
+    async fn last_delivery(pool: &sqlx::PgPool, hook_id: &str) -> Option<DeliveryRow> {
+        sqlx::query_as(
+            "SELECT status, status_code, response_body, error, attempts \
+             FROM outgoing_webhook_deliveries WHERE webhook_id = $1 \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(hook_id)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+    }
+
+    // BEFLOW-10: a slow endpoint gets at most a quarter of the delivery slots,
+    // so another tenant's delivery goes straight out instead of queueing
+    // behind its backlog.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn w5_hooks_slow_endpoint_does_not_hold_every_delivery_slot() {
+        let db = TestDatabase::new().await;
+        let slow_org = seed_tenant(db.pool()).await;
+        let fast_org = seed_tenant(db.pool()).await;
+        let slow = Endpoint::start(200, Duration::from_secs(3), "ok".into()).await;
+        let fast = Endpoint::start(200, Duration::ZERO, "ok".into()).await;
+        insert_hook(db.pool(), &slow_org.org_id, &slow.url).await;
+        insert_hook(db.pool(), &fast_org.org_id, &fast.url).await;
+        let service = Arc::new(OutgoingWebhookService::new((*db.pool).clone(), 1, 4));
+
+        for _ in 0..8 {
+            fire(&service, &slow_org.org_id);
+        }
+        assert!(eventually(Duration::from_secs(5), || slow.hits() >= 1).await);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        fire(&service, &fast_org.org_id);
+        assert!(
+            eventually(Duration::from_millis(1500), || fast.hits() == 1).await,
+            "the fast tenant waited behind the slow endpoint"
+        );
+        assert_eq!(slow.peak(), 1, "4 slots / 4 = one request per webhook");
+    }
+
+    // BEFLOW-10: a delivery sleeping before its retry holds no slot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn w5_hooks_retry_backoff_does_not_hold_a_delivery_slot() {
+        let db = TestDatabase::new().await;
+        let down_org = seed_tenant(db.pool()).await;
+        let up_org = seed_tenant(db.pool()).await;
+        let down = Endpoint::start(500, Duration::ZERO, "down".into()).await;
+        let up = Endpoint::start(200, Duration::ZERO, "ok".into()).await;
+        insert_hook(db.pool(), &down_org.org_id, &down.url).await;
+        insert_hook(db.pool(), &up_org.org_id, &up.url).await;
+        // One slot, three attempts: 1 s then 2 s of backoff.
+        let service = Arc::new(OutgoingWebhookService::new((*db.pool).clone(), 3, 1));
+
+        fire(&service, &down_org.org_id);
+        assert!(eventually(Duration::from_secs(5), || down.hits() == 1).await);
+        fire(&service, &up_org.org_id);
+        assert!(
+            eventually(Duration::from_millis(800), || up.hits() == 1).await,
+            "the only slot was held through the other delivery's backoff"
+        );
+        assert!(
+            eventually(Duration::from_secs(6), || down.hits() == 3).await,
+            "the failing delivery still retries"
+        );
+    }
+
+    // BEFLOW-10: deliveries already queued stop as soon as the webhook is
+    // disabled (by the user or the breaker), instead of draining for minutes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn w5_hooks_disabling_a_webhook_stops_its_queued_retries() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let down = Endpoint::start(500, Duration::ZERO, "down".into()).await;
+        let hook = insert_hook(db.pool(), &t.org_id, &down.url).await;
+        let service = Arc::new(OutgoingWebhookService::new((*db.pool).clone(), 3, 4));
+
+        fire(&service, &t.org_id);
+        assert!(eventually(Duration::from_secs(5), || down.hits() == 1).await);
+        sqlx::query("UPDATE outgoing_webhooks SET enabled = FALSE WHERE id = $1")
+            .bind(&hook)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        // Attempt 2 was due ~1 s after attempt 1, attempt 3 ~2 s after that.
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        assert_eq!(down.hits(), 1, "a disabled webhook was still called");
+        let (status, _, _, _, attempts) = last_delivery(db.pool(), &hook).await.unwrap();
+        assert_eq!((status.as_str(), attempts), ("failed", 1));
+    }
+
+    // BEFLOW-10: past the queue bound deliveries are dropped (and counted)
+    // instead of parking one task and one payload copy each.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn w5_hooks_a_full_delivery_queue_drops_instead_of_parking() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let slow = Endpoint::start(200, Duration::from_millis(200), "ok".into()).await;
+        insert_hook(db.pool(), &t.org_id, &slow.url).await;
+        // One slot: a queue of 16, of which one webhook may hold 4.
+        let service = Arc::new(OutgoingWebhookService::new((*db.pool).clone(), 1, 1));
+
+        for _ in 0..20 {
+            fire(&service, &t.org_id);
+        }
+        assert!(eventually(Duration::from_secs(5), || slow.hits() >= 4).await);
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert_eq!(
+            slow.hits(),
+            4,
+            "only the webhook's queue share is delivered"
+        );
+        assert_eq!(
+            service.deliveries_dropped(),
+            16,
+            "4 events past the queue, then 12 deliveries past the webhook's share"
+        );
+        assert_eq!(
+            service.deliveries_queued(),
+            0,
+            "every queue slot is released"
+        );
+    }
+
+    // BEFLOW-24: the delivery log keeps the error text in `error` and the
+    // receiver's (truncated) answer in `response_body`; no response means a
+    // null status code, not 0.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn w5_hooks_delivery_log_keeps_the_error_and_the_response_body() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let body = format!("maintenance until 10:00 {}", "x".repeat(5000));
+        let busy = Endpoint::start(503, Duration::ZERO, body).await;
+        let busy_hook = insert_hook(db.pool(), &t.org_id, &busy.url).await;
+        let closed_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let dead_hook = insert_hook(
+            db.pool(),
+            &t.org_id,
+            &format!("http://127.0.0.1:{closed_port}/hook"),
+        )
+        .await;
+        let service = Arc::new(OutgoingWebhookService::new((*db.pool).clone(), 1, 4));
+
+        fire(&service, &t.org_id);
+
+        let (status, code, response_body, error, _) =
+            await_delivery(db.pool(), &busy_hook, Duration::from_secs(15)).await;
+        assert_eq!((status.as_str(), code), ("failed", Some(503)));
+        assert_eq!(error.as_deref(), Some("HTTP 503"));
+        let response_body = response_body.expect("the receiver's answer is stored");
+        assert!(
+            response_body.starts_with("maintenance until 10:00 x"),
+            "{response_body}"
+        );
+        assert!(
+            response_body.len() <= 1024,
+            "truncated: {}",
+            response_body.len()
+        );
+
+        let (status, code, response_body, error, _) =
+            await_delivery(db.pool(), &dead_hook, Duration::from_secs(15)).await;
+        assert_eq!((status.as_str(), code), ("failed", None));
+        assert_eq!(response_body, None);
+        assert!(
+            error.is_some_and(|e| !e.is_empty()),
+            "the transport error is stored"
+        );
+    }
+
+    // BEFLOW-25: re-enabling a webhook or pointing it at a new URL starts a
+    // fresh failure streak; other edits keep it.
+    #[tokio::test]
+    async fn w5_hooks_reenabling_or_repointing_a_webhook_resets_its_failure_count() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let app = app(&db);
+        let auth = bearer(&t.key);
+        let hook: String = sqlx::query_scalar(
+            "INSERT INTO outgoing_webhooks \
+               (organization_id, name, url, events, enabled, failure_count, last_status) \
+             VALUES ($1, 'w5', 'http://127.0.0.1:9/a', ARRAY['job.completed'], FALSE, 20, 'auto_disabled') \
+             RETURNING id",
+        )
+        .bind(&t.org_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let uri = format!("/api/v1/outgoing-webhooks/{hook}");
+        let headers = [("Authorization", auth.as_str())];
+        let set_failures = |n: i32| {
+            sqlx::query("UPDATE outgoing_webhooks SET failure_count = $2 WHERE id = $1")
+                .bind(&hook)
+                .bind(n)
+                .execute(db.pool())
+        };
+
+        let (status, body) = call(
+            &app,
+            "PUT",
+            &uri,
+            &headers,
+            Some(json!({ "enabled": true })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["failure_count"], 0, "{body}");
+        // The dashboard's "Re-enabled" badge reads this until the next delivery.
+        assert_eq!(body["last_status"], "auto_disabled", "{body}");
+
+        set_failures(7).await.unwrap();
+        let (_, body) = call(
+            &app,
+            "PUT",
+            &uri,
+            &headers,
+            Some(json!({ "name": "renamed" })),
+        )
+        .await;
+        assert_eq!(body["failure_count"], 7, "{body}");
+        let same_url = json!({ "url": "http://127.0.0.1:9/a" });
+        let (_, body) = call(&app, "PUT", &uri, &headers, Some(same_url)).await;
+        assert_eq!(body["failure_count"], 7, "same URL: {body}");
+        let new_url = json!({ "url": "http://127.0.0.1:9/b" });
+        let (status, body) = call(&app, "PUT", &uri, &headers, Some(new_url)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["failure_count"], 0, "new URL: {body}");
+    }
+
+    // BEFLOW-25: a stored URL that fails the SSRF check is a failed delivery,
+    // so it trips the auto-disable breaker like any other dead endpoint.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn w5_hooks_a_blocked_url_counts_toward_auto_disable() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let hook: String = sqlx::query_scalar(
+            "INSERT INTO outgoing_webhooks (organization_id, name, url, events, failure_count) \
+             VALUES ($1, 'w5', 'http://169.254.169.254/latest/meta-data', ARRAY['job.completed'], 19) \
+             RETURNING id",
+        )
+        .bind(&t.org_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let service = Arc::new(OutgoingWebhookService::new((*db.pool).clone(), 3, 4));
+
+        fire(&service, &t.org_id);
+        await_delivery(db.pool(), &hook, Duration::from_secs(5)).await;
+        // A retry would have landed 1 s after the first attempt.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let (status, _, _, error, attempts) = last_delivery(db.pool(), &hook).await.unwrap();
+        let state: (bool, i32, Option<String>) = sqlx::query_as(
+            "SELECT enabled, failure_count, last_status FROM outgoing_webhooks WHERE id = $1",
+        )
+        .bind(&hook)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(state, (false, 20, Some("auto_disabled".to_string())));
+        assert_eq!((status.as_str(), attempts), ("failed", 1), "no retries");
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|e| e.contains("Invalid webhook URL")),
+            "{error:?}"
+        );
+    }
+
+    // BEFLOW-27: completion webhooks go through the org-webhook service's
+    // client (connections are reused) and a bounded slot pool of their own
+    // (W5-R2: not the org webhooks' slots).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn w5_hooks_completion_webhooks_share_the_client_and_are_bounded() {
+        let db = TestDatabase::new().await;
+        let slow = Endpoint::start(200, Duration::from_millis(400), "ok".into()).await;
+        // The first service in the process (AppState's, in production) lends
+        // completion deliveries its client and its limits: two slots.
+        let _service = OutgoingWebhookService::new((*db.pool).clone(), 1, 2);
+
+        for i in 0..6 {
+            spawn_completion_webhook(
+                "w5-hooks-org",
+                slow.url.clone(),
+                "job.completed".to_string(),
+                json!({ "job_id": i }),
+                None,
+            );
+        }
+        assert!(eventually(Duration::from_secs(10), || slow.hits() == 6).await);
+        assert!(slow.peak() <= 2, "peak concurrency {}", slow.peak());
+        assert!(
+            slow.connections() <= 2,
+            "{} connections for 6 deliveries",
+            slow.connections()
+        );
+    }
+}
+// ---- wave 5 / keys ----
+// FEAT B2 / QW6 queue-prefix API keys, W1-14 pending billing email, BEJOB-19
+// worker registration conflicts.
+mod wave5_keys {
+    use super::*;
+
+    use tonic::{Code, Request as GrpcRequest};
+
+    use spooled_backend::config::{QueueSettings, WorkerSettings};
+    use spooled_backend::grpc::proto::queue_service_server::QueueService;
+    use spooled_backend::grpc::proto::{DequeueRequest, EnqueueRequest};
+    use spooled_backend::grpc::services::QueueServiceImpl;
+    use spooled_backend::outgoing_webhooks::service::OutgoingWebhookService;
+
+    const ADMIN_KEY: &str = "w5-keys-admin-key";
+
+    fn admin_app(db: &TestDatabase) -> Router {
+        let mut settings = Settings::load_for_testing();
+        settings.registration.admin_api_key = Some(ADMIN_KEY.to_string());
+        app_with(db, settings)
+    }
+
+    /// An API key of `org_id` limited to `queues`, inserted directly.
+    async fn seed_scoped_key(pool: &sqlx::PgPool, org_id: &str, queues: &[&str]) -> String {
+        let key = format!("sp_test_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO api_keys (id, organization_id, key_hash, key_prefix, lookup_hash, name, queues, is_active, created_at) \
+             VALUES ($1, $2, $3, $4, $5, 'w5 scoped', $6, TRUE, NOW())",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(org_id)
+        .bind(bcrypt::hash(&key, 4).expect("hash key"))
+        .bind(key.chars().take(8).collect::<String>())
+        .bind(spooled_backend::models::api_key_lookup_hash(&key))
+        .bind(queues.iter().map(|q| q.to_string()).collect::<Vec<_>>())
+        .execute(pool)
+        .await
+        .expect("seed scoped key");
+        key
+    }
+
+    async fn enqueue(app: &Router, auth: &str, queue: &str) -> (StatusCode, Value) {
+        call(
+            app,
+            "POST",
+            "/api/v1/jobs",
+            &[("Authorization", auth)],
+            Some(json!({"queue_name": queue, "payload": {"q": queue}})),
+        )
+        .await
+    }
+
+    async fn claim(app: &Router, auth: &str, queue: &str) -> (StatusCode, Value) {
+        call(
+            app,
+            "POST",
+            "/api/v1/jobs/claim",
+            &[("Authorization", auth)],
+            Some(json!({"queue_name": queue, "worker_id": "w5-prefix-worker", "limit": 1})),
+        )
+        .await
+    }
+
+    /// Id of the key named `name`.
+    async fn key_id(app: &Router, auth: &str, name: &str) -> String {
+        let (status, body) = call(
+            app,
+            "GET",
+            "/api/v1/api-keys",
+            &[("Authorization", auth)],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body.as_array()
+            .expect("key list")
+            .iter()
+            .find(|k| k["name"] == name)
+            .and_then(|k| k["id"].as_str())
+            .expect("named key")
+            .to_string()
+    }
+
+    // FEAT B2 / QW6: `orders.*` was accepted at create and then matched no queue,
+    // and `*` anywhere else in an entry was accepted too.
+    #[tokio::test]
+    async fn w5_keys_prefix_key_reaches_matching_queues_only() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let app = app(&db);
+        let admin = bearer(&t.key);
+
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/api/v1/api-keys",
+            &[("Authorization", &admin)],
+            Some(json!({"name": "orders prefix", "queues": ["orders.*"]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let prefix = bearer(body["key"].as_str().expect("key"));
+
+        for queue in ["orders.eu", "orders.eu.west"] {
+            let (status, body) = enqueue(&app, &prefix, queue).await;
+            assert_eq!(status, StatusCode::CREATED, "{queue}: {body}");
+            let (status, body) = claim(&app, &prefix, queue).await;
+            assert_eq!(status, StatusCode::OK, "{queue}: {body}");
+            assert_eq!(body["jobs"][0]["queue_name"], queue, "{body}");
+        }
+        for queue in ["orders", "ordersx", "billing"] {
+            let (status, body) = enqueue(&app, &prefix, queue).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{queue}: {body}");
+            let (status, body) = claim(&app, &prefix, queue).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{queue}: {body}");
+        }
+
+        // Any other use of `*` is refused instead of minting a key for no queue.
+        for queues in [json!(["orders*"]), json!(["*.eu"]), json!(["orders.*.eu"])] {
+            let (status, body) = call(
+                &app,
+                "POST",
+                "/api/v1/api-keys",
+                &[("Authorization", &admin)],
+                Some(json!({"name": "bad pattern", "queues": queues})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{queues}: {body}");
+        }
+        let id = key_id(&app, &admin, "orders prefix").await;
+        let (status, body) = call(
+            &app,
+            "PUT",
+            &format!("/api/v1/api-keys/{id}"),
+            &[("Authorization", &admin)],
+            Some(json!({"queues": ["restaurant.prints*"]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    fn queue_service(db: &TestDatabase) -> QueueServiceImpl {
+        QueueServiceImpl::new(
+            Arc::clone(&db.pool),
+            Arc::new(Metrics::new()),
+            None,
+            Arc::new(OutgoingWebhookService::new((*db.pool).clone(), 1, 4)),
+            QueueSettings {
+                default_max_retries: 3,
+                default_timeout_secs: 300,
+                max_payload_size_bytes: 1024 * 1024,
+            },
+            false,
+            WorkerSettings {
+                heartbeat_interval_secs: 10,
+                lease_duration_secs: 30,
+                grpc_default_lease_duration_secs: 300,
+                max_concurrency: 10,
+                fallback_poll_interval_secs: 5,
+            },
+        )
+    }
+
+    fn grpc<T>(key: &str, body: T) -> GrpcRequest<T> {
+        let mut request = GrpcRequest::new(body);
+        request
+            .metadata_mut()
+            .insert("x-api-key", key.parse().unwrap());
+        request
+    }
+
+    fn enqueue_req(queue: &str) -> EnqueueRequest {
+        EnqueueRequest {
+            queue_name: queue.to_string(),
+            payload: None,
+            priority: 0,
+            max_retries: 0,
+            timeout_seconds: 0,
+            scheduled_at: None,
+            idempotency_key: String::new(),
+            tags: Default::default(),
+        }
+    }
+
+    fn dequeue_req(queue: &str) -> DequeueRequest {
+        DequeueRequest {
+            queue_name: queue.to_string(),
+            worker_id: "w5-grpc-prefix-worker".to_string(),
+            lease_duration_secs: 60,
+            batch_size: 1,
+        }
+    }
+
+    // FEAT B2 / QW6, gRPC side: the same scope rule as REST.
+    #[tokio::test]
+    async fn w5_keys_grpc_prefix_key_reaches_matching_queues_only() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let key = seed_scoped_key(db.pool(), &t.org_id, &["restaurant.prints.*"]).await;
+        let service = queue_service(&db);
+
+        let queue = "restaurant.prints.store-12";
+        let enqueued = service
+            .enqueue(grpc(&key, enqueue_req(queue)))
+            .await
+            .expect("enqueue in a covered queue")
+            .into_inner();
+        let claimed = service
+            .dequeue(grpc(&key, dequeue_req(queue)))
+            .await
+            .expect("dequeue from a covered queue")
+            .into_inner();
+        assert_eq!(claimed.jobs.len(), 1);
+        assert_eq!(claimed.jobs[0].id, enqueued.job_id);
+
+        for queue in [
+            "restaurant.prints",
+            "restaurant.printsx",
+            "restaurant.kitchen",
+        ] {
+            let err = service
+                .enqueue(grpc(&key, enqueue_req(queue)))
+                .await
+                .expect_err(queue);
+            assert_eq!(err.code(), Code::PermissionDenied, "{queue}");
+            let err = service
+                .dequeue(grpc(&key, dequeue_req(queue)))
+                .await
+                .expect_err(queue);
+            assert_eq!(err.code(), Code::PermissionDenied, "{queue}");
+        }
+    }
+
+    // The SQL twin of the scope rule agrees with the Rust one, so the queries
+    // that filter rows by a key's scope can move to it.
+    #[tokio::test]
+    async fn w5_keys_queue_in_key_scope_sql_matches_the_rust_rule() {
+        let db = TestDatabase::new().await;
+        let scopes: &[&[&str]] = &[
+            &[],
+            &["*"],
+            &["orders.*"],
+            &["orders.*", "billing"],
+            &["restaurant.prints.*"],
+            &["a_b.*"],
+            &["a_b"],
+            &["orders*"],
+            &[".*"],
+            &["a.*.*", "x.*"],
+            &["billing", "emails"],
+        ];
+        let queues = [
+            "orders",
+            "orders.eu",
+            "orders.eu.west",
+            "ordersx",
+            "ordersx.eu",
+            "billing",
+            "billing.eu",
+            "emails",
+            "restaurant.prints",
+            "restaurant.prints.s1",
+            "a_b",
+            "axb",
+            "a_b.x",
+            "axb.x",
+            "x.foo",
+            "a.b.c",
+            "foo",
+        ];
+        for scope in scopes {
+            let scope: Vec<String> = scope.iter().map(|s| s.to_string()).collect();
+            for queue in queues {
+                let (in_sql,): (bool,) = sqlx::query_as("SELECT queue_in_key_scope($1, $2)")
+                    .bind(queue)
+                    .bind(&scope)
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    in_sql,
+                    spooled_backend::models::queue_scope_allows(&scope, queue),
+                    "scope {scope:?}, queue {queue}"
+                );
+            }
+        }
+        // NULL is what `queue_scope_filter()` binds for an unrestricted key.
+        let (all,): (bool,) = sqlx::query_as("SELECT queue_in_key_scope('anything', NULL)")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert!(all);
+    }
+
+    async fn org_row(app: &Router, auth: &str, org_id: &str) -> Value {
+        let (status, body) = call(
+            app,
+            "GET",
+            &format!("/api/v1/organizations/{org_id}"),
+            &[("Authorization", auth)],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    }
+
+    async fn email_exists(app: &Router, email: &str) -> bool {
+        let (status, body) = call(
+            app,
+            "GET",
+            &format!("/api/v1/auth/check-email?email={email}"),
+            &[],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["exists"].as_bool().expect("exists")
+    }
+
+    // W1-14: changing a verified billing email dropped email login at once; the
+    // new address now waits in `pending_billing_email` until it is verified.
+    #[tokio::test]
+    async fn w5_keys_billing_email_change_waits_until_verified() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let app = admin_app(&db);
+        let auth = bearer(&t.key);
+        let org_path = format!("/api/v1/organizations/{}", t.org_id);
+        let old = org_row(&app, &auth, &t.org_id).await["billing_email"]
+            .as_str()
+            .expect("seeded billing email")
+            .to_string();
+        let new = format!("w5-new-{}@example.com", &t.org_id[..8]);
+
+        let (status, body) = call(
+            &app,
+            "PUT",
+            &org_path,
+            &[("Authorization", &auth)],
+            Some(json!({"billing_email": new.to_uppercase()})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["billing_email"], old, "{body}");
+        assert!(!body["billing_email_verified_at"].is_null(), "{body}");
+        assert_eq!(body["pending_billing_email"], new, "{body}");
+        let row = org_row(&app, &auth, &t.org_id).await;
+        assert_eq!(row["billing_email"], old, "{row}");
+        assert_eq!(row["pending_billing_email"], new, "{row}");
+
+        // The verified address keeps working for email login; the pending one
+        // is no login identity yet.
+        assert!(email_exists(&app, &old).await);
+        assert!(!email_exists(&app, &new).await);
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/api/v1/auth/email/start",
+            &[],
+            Some(json!({"email": old})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, bound) = latest_code(db.pool(), &old).await;
+        assert_eq!(bound.as_deref(), Some(t.org_id.as_str()));
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/api/v1/auth/email/start",
+            &[],
+            Some(json!({"email": new})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, bound) = latest_code(db.pool(), &new).await;
+        assert_eq!(bound, None, "a pending address must not bind a login code");
+
+        // The confirmation code goes to the pending address.
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/api/v1/organizations/billing-email/verification",
+            &[("Authorization", &auth)],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "code_sent", "{body}");
+        let (stored, bound) = latest_code(db.pool(), &new).await;
+        assert_eq!(bound.as_deref(), Some(t.org_id.as_str()));
+        let code = stored
+            .strip_prefix("verify:")
+            .expect("verify prefix")
+            .to_string();
+
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/api/v1/organizations/billing-email/verify",
+            &[("Authorization", &auth)],
+            Some(json!({"code": code})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "verified", "{body}");
+        let row = org_row(&app, &auth, &t.org_id).await;
+        assert_eq!(row["billing_email"], new, "{row}");
+        assert!(!row["billing_email_verified_at"].is_null(), "{row}");
+        assert!(row["pending_billing_email"].is_null(), "{row}");
+        assert!(email_exists(&app, &new).await);
+        assert!(!email_exists(&app, &old).await);
+
+        // Sending the active address again withdraws a pending change.
+        let typo = format!("w5-typo-{}@example.con", &t.org_id[..8]);
+        for (address, pending) in [(&typo, json!(typo)), (&new, Value::Null)] {
+            let (status, body) = call(
+                &app,
+                "PUT",
+                &org_path,
+                &[("Authorization", &auth)],
+                Some(json!({"billing_email": address})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["billing_email"], new, "{body}");
+            assert_eq!(body["pending_billing_email"], pending, "{body}");
+        }
+
+        // An operator's address counts as verified at once and replaces any
+        // pending one.
+        let (status, body) = call(
+            &app,
+            "PUT",
+            &org_path,
+            &[("Authorization", &auth)],
+            Some(json!({"billing_email": typo})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ops = format!("w5-ops-{}@example.com", &t.org_id[..8]);
+        let (status, body) = call(
+            &app,
+            "PATCH",
+            &format!("/api/v1/admin/organizations/{}", t.org_id),
+            &[("X-Admin-Key", ADMIN_KEY)],
+            Some(json!({"billing_email": ops})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let row = org_row(&app, &auth, &t.org_id).await;
+        assert_eq!(row["billing_email"], ops, "{row}");
+        assert!(!row["billing_email_verified_at"].is_null(), "{row}");
+        assert!(row["pending_billing_email"].is_null(), "{row}");
+        assert!(email_exists(&app, &ops).await);
+
+        // Without a verified address there is nothing to keep: the change
+        // replaces it directly, unverified, as before.
+        sqlx::query("UPDATE organizations SET billing_email_verified_at = NULL WHERE id = $1")
+            .bind(&t.org_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let (status, body) = call(
+            &app,
+            "PUT",
+            &org_path,
+            &[("Authorization", &auth)],
+            Some(json!({"billing_email": new})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["billing_email"], new, "{body}");
+        assert!(body["billing_email_verified_at"].is_null(), "{body}");
+        assert!(body["pending_billing_email"].is_null(), "{body}");
+    }
+
+    async fn register_worker(
+        app: &Router,
+        auth: &str,
+        worker_id: &str,
+        queue: &str,
+    ) -> (StatusCode, Value) {
+        call(
+            app,
+            "POST",
+            "/api/v1/workers/register",
+            &[("Authorization", auth)],
+            Some(json!({"worker_id": worker_id, "queue_name": queue, "hostname": "w5-host"})),
+        )
+        .await
+    }
+
+    /// (organization_id, queue_name) of a worker row.
+    async fn worker_row(pool: &sqlx::PgPool, worker_id: &str) -> (String, String) {
+        sqlx::query_as("SELECT organization_id, queue_name FROM workers WHERE id = $1")
+            .bind(worker_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    // BEJOB-19: another org's worker id answered "Worker ID already in use"
+    // (which only ever meant another org), and a queue-scoped key could
+    // re-register a worker row of its org serving a queue outside its scope.
+    #[tokio::test]
+    async fn w5_keys_worker_register_conflicts_look_alike_and_respect_scope() {
+        let db = TestDatabase::new().await;
+        let a = seed_tenant(db.pool()).await;
+        let b = seed_tenant(db.pool()).await;
+        let app = app(&db);
+        let worker_id = format!("w5-worker-{}", &a.org_id[..8]);
+
+        let (status, body) = register_worker(&app, &bearer(&a.key), &worker_id, "payroll").await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        // Org B cannot take the id.
+        let (status, cross_org) =
+            register_worker(&app, &bearer(&b.key), &worker_id, "payroll").await;
+        assert_eq!(status, StatusCode::CONFLICT, "{cross_org}");
+
+        // A key of org A scoped to `orders.*` cannot move A's payroll worker into
+        // its own queues, and gets the very same answer.
+        let scoped = seed_scoped_key(db.pool(), &a.org_id, &["orders.*"]).await;
+        let (status, same_org) =
+            register_worker(&app, &bearer(&scoped), &worker_id, "orders.eu").await;
+        assert_eq!(status, StatusCode::CONFLICT, "{same_org}");
+        assert_eq!(
+            cross_org, same_org,
+            "the two conflicts must be indistinguishable"
+        );
+        assert_eq!(
+            worker_row(db.pool(), &worker_id).await,
+            (a.org_id.clone(), "payroll".to_string())
+        );
+
+        // Within its scope the scoped key still re-registers (upserts) its worker.
+        let own = format!("w5-own-{}", &a.org_id[..8]);
+        for queue in ["orders.eu", "orders.eu", "orders.us"] {
+            let (status, body) = register_worker(&app, &bearer(&scoped), &own, queue).await;
+            assert_eq!(status, StatusCode::CREATED, "{queue}: {body}");
+        }
+        assert_eq!(worker_row(db.pool(), &own).await.1, "orders.us");
+        // And an unrestricted key may re-register any worker of its org.
+        let (status, body) = register_worker(&app, &bearer(&a.key), &worker_id, "emails").await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(worker_row(db.pool(), &worker_id).await.1, "emails");
+    }
+}
+
+// ---- wave 5 / integration ----
+// Wave 5 integration: queue-prefix API keys on every path (KEYS-1/2), gRPC
+// Register parity (KEYS-3), the pending-billing-email login hint (KEYS-4), the
+// lease length gRPC claims record, the shared dependency-cancel reasons and the
+// webhook delivery metrics.
+mod w5_integration {
+    use super::*;
+
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    use futures::StreamExt;
+    use prost::Message;
+    use tonic::{Code, Request as GrpcRequest, Streaming};
+
+    use spooled_backend::config::{QueueSettings, WorkerSettings};
+    use spooled_backend::grpc::proto::process_request::Request as Op;
+    use spooled_backend::grpc::proto::process_response::Response as Reply;
+    use spooled_backend::grpc::proto::queue_service_server::QueueService;
+    use spooled_backend::grpc::proto::worker_service_server::WorkerService;
+    use spooled_backend::grpc::proto::{
+        CompleteRequest, DequeueRequest, EnqueueRequest, FailRequest, GetJobRequest,
+        ProcessRequest, ProcessResponse, RenewLeaseRequest, StreamJobsRequest,
+    };
+    use spooled_backend::grpc::services::QueueServiceImpl;
+    use spooled_backend::outgoing_webhooks::service::OutgoingWebhookService;
+    use spooled_backend::scheduler::Scheduler;
+
+    use super::w5_realtime::{serve, sse_open, sse_read, ws_open, Frame};
+
+    /// An API key of `org_id` limited to `queues`, inserted directly.
+    async fn seed_key(pool: &sqlx::PgPool, org_id: &str, queues: &[&str]) -> String {
+        let key = format!("sp_test_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO api_keys (id, organization_id, key_hash, key_prefix, lookup_hash, name, queues, is_active, created_at) \
+             VALUES ($1, $2, $3, $4, $5, 'w5 integration', $6, TRUE, NOW())",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(org_id)
+        .bind(bcrypt::hash(&key, 4).expect("hash key"))
+        .bind(key.chars().take(8).collect::<String>())
+        .bind(spooled_backend::models::api_key_lookup_hash(&key))
+        .bind(queues.iter().map(|q| q.to_string()).collect::<Vec<_>>())
+        .execute(pool)
+        .await
+        .expect("seed scoped key");
+        key
+    }
+
+    async fn api(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        auth: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        call(app, method, uri, &[("Authorization", auth)], body).await
+    }
+
+    /// Enqueue a job that dead-letters on its first failure; its id.
+    async fn enqueue(app: &Router, auth: &str, queue: &str) -> String {
+        let (status, body) = api(
+            app,
+            "POST",
+            "/api/v1/jobs",
+            auth,
+            Some(json!({"queue_name": queue, "payload": {"q": queue}, "max_retries": 0})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{queue}: {body}");
+        body["id"].as_str().expect("job id").to_string()
+    }
+
+    /// Claim the next job of `queue` for `worker`: (job id, lease id).
+    async fn claim(app: &Router, auth: &str, queue: &str, worker: &str) -> (String, String) {
+        let (status, body) = api(
+            app,
+            "POST",
+            "/api/v1/jobs/claim",
+            auth,
+            Some(json!({
+                "queue_name": queue,
+                "worker_id": worker,
+                "limit": 1,
+                "lease_duration_secs": 120,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{queue}: {body}");
+        let job = &body["jobs"][0];
+        (
+            job["id"].as_str().expect("claimed job").to_string(),
+            job["lease_id"].as_str().expect("lease id").to_string(),
+        )
+    }
+
+    /// POST /jobs/{id}/{action} as `worker` holding `lease`.
+    async fn settle(
+        app: &Router,
+        auth: &str,
+        action: &str,
+        job: &str,
+        worker: &str,
+        lease: &str,
+    ) -> (StatusCode, Value) {
+        let body = match action {
+            "fail" => json!({"worker_id": worker, "lease_id": lease, "error": "boom"}),
+            "complete" => json!({"worker_id": worker, "lease_id": lease, "result": {"ok": true}}),
+            _ => json!({"worker_id": worker, "lease_id": lease}),
+        };
+        api(
+            app,
+            "POST",
+            &format!("/api/v1/jobs/{job}/{action}"),
+            auth,
+            Some(body),
+        )
+        .await
+    }
+
+    async fn get_ok(app: &Router, auth: &str, uri: &str) -> Value {
+        let (status, body) = api(app, "GET", uri, auth, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        body
+    }
+
+    /// The `field` values of a JSON array of objects.
+    fn ids(body: &Value, field: &str) -> HashSet<String> {
+        body.as_array()
+            .unwrap_or_else(|| panic!("array: {body}"))
+            .iter()
+            .map(|row| row[field].as_str().expect("id field").to_string())
+            .collect()
+    }
+
+    async fn job_status(pool: &sqlx::PgPool, id: &str) -> String {
+        sqlx::query_scalar("SELECT status FROM jobs WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn create_schedule(app: &Router, auth: &str, queue: &str) -> String {
+        let (status, body) = api(
+            app,
+            "POST",
+            "/api/v1/schedules",
+            auth,
+            Some(json!({
+                "name": format!("w5i-{queue}"),
+                "cron_expression": "0 0 * * *",
+                "queue_name": queue,
+                "payload_template": {},
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{queue}: {body}");
+        body["id"].as_str().expect("schedule id").to_string()
+    }
+
+    async fn create_workflow(app: &Router, auth: &str, queue: &str) -> String {
+        let (status, body) = api(
+            app,
+            "POST",
+            "/api/v1/workflows",
+            auth,
+            Some(json!({
+                "name": format!("w5i-{queue}"),
+                "jobs": [
+                    {"key": "a", "queue_name": queue, "payload": {}},
+                    {"key": "b", "queue_name": queue, "payload": {}, "depends_on": ["a"]},
+                ],
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{queue}: {body}");
+        body["workflow_id"]
+            .as_str()
+            .expect("workflow id")
+            .to_string()
+    }
+
+    /// One REST pass for a key scoped to `scope`, working in `queue` (covered),
+    /// against rows in `outside` (not covered) that the org's unrestricted key
+    /// made, the first one leased to the scoped key's own worker id and the
+    /// second one dead-lettered.
+    async fn rest_scope_pass(db: &TestDatabase, scope: &[&str], queue: &str, outside: &[&str]) {
+        let t = seed_tenant(db.pool()).await;
+        let app = app(db);
+        let admin = bearer(&t.key);
+        let key = bearer(&seed_key(db.pool(), &t.org_id, scope).await);
+        let what = format!("scope {scope:?}");
+        let worker = format!("w5i-worker-{}", &t.org_id[..8]);
+
+        let mut hidden = HashSet::new();
+        let mut leased = None;
+        let mut dead_outside = None;
+        for (i, q) in outside.iter().enumerate() {
+            let id = enqueue(&app, &admin, q).await;
+            let (claimed, lease) = claim(&app, &admin, q, &worker).await;
+            assert_eq!(claimed, id);
+            match i {
+                0 => leased = Some((id.clone(), lease)),
+                1 => {
+                    let (status, body) = settle(&app, &admin, "fail", &id, &worker, &lease).await;
+                    assert_eq!(status, StatusCode::OK, "{body}");
+                    dead_outside = Some(id.clone());
+                }
+                _ => {}
+            }
+            hidden.insert(id);
+        }
+        let (leased, leased_lease) = leased.expect("a leased outside job");
+        let dead_outside = dead_outside.expect("a dead-lettered outside job");
+        let (status, body) = api(
+            &app,
+            "POST",
+            "/api/v1/workers/register",
+            &admin,
+            Some(json!({"worker_id": format!("{worker}-out"), "queue_name": outside[0], "hostname": "w5i"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let outside_schedule = create_schedule(&app, &admin, outside[0]).await;
+        let outside_workflow = create_workflow(&app, &admin, outside[0]).await;
+
+        // The whole worker lifecycle inside the scope.
+        let (status, body) = api(
+            &app,
+            "POST",
+            "/api/v1/workers/register",
+            &key,
+            Some(json!({"worker_id": worker, "queue_name": queue, "hostname": "w5i"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{what}: {body}");
+        let done = enqueue(&app, &key, queue).await;
+        let (claimed, lease) = claim(&app, &key, queue, &worker).await;
+        assert_eq!(claimed, done, "{what}");
+        for action in ["heartbeat", "complete"] {
+            let (status, body) = settle(&app, &key, action, &done, &worker, &lease).await;
+            assert_eq!(status, StatusCode::OK, "{what} {action}: {body}");
+        }
+        let dead = enqueue(&app, &key, queue).await;
+        let (claimed, lease) = claim(&app, &key, queue, &worker).await;
+        assert_eq!(claimed, dead, "{what}");
+        let (status, body) = settle(&app, &key, "fail", &dead, &worker, &lease).await;
+        assert_eq!(status, StatusCode::OK, "{what} fail: {body}");
+        assert_eq!(job_status(db.pool(), &done).await, "completed");
+        assert_eq!(job_status(db.pool(), &dead).await, "deadletter");
+
+        let body = get_ok(&app, &key, &format!("/api/v1/jobs/{done}")).await;
+        assert_eq!(body["status"], "completed", "{what}: {body}");
+        let listed = ids(&get_ok(&app, &key, "/api/v1/jobs?limit=100").await, "id");
+        assert_eq!(
+            listed,
+            HashSet::from([done.clone(), dead.clone()]),
+            "{what}: job list"
+        );
+        let dlq = ids(
+            &get_ok(&app, &key, "/api/v1/jobs/dlq?limit=100").await,
+            "id",
+        );
+        assert_eq!(dlq, HashSet::from([dead.clone()]), "{what}: DLQ list");
+        let stats = get_ok(&app, &key, "/api/v1/jobs/stats").await;
+        assert_eq!(
+            (stats["total"].as_i64(), stats["completed"].as_i64()),
+            (Some(2), Some(1)),
+            "{what}: {stats}"
+        );
+        assert_eq!(stats["deadletter"].as_i64(), Some(1), "{what}: {stats}");
+        assert_eq!(stats["processing"].as_i64(), Some(0), "{what}: {stats}");
+        let dashboard = get_ok(&app, &key, "/api/v1/dashboard").await;
+        assert_eq!(dashboard["jobs"]["total"], 2, "{what}: {dashboard}");
+        assert_eq!(dashboard["jobs"]["deadletter"], 1, "{what}: {dashboard}");
+        assert_eq!(dashboard["workers"]["total"], 1, "{what}: {dashboard}");
+        assert_eq!(
+            ids(&dashboard["queues"], "name"),
+            HashSet::from([queue.to_string()]),
+            "{what}: {dashboard}"
+        );
+        let workers = ids(&get_ok(&app, &key, "/api/v1/workers").await, "id");
+        assert_eq!(workers, HashSet::from([worker.clone()]), "{what}: workers");
+
+        let schedule = create_schedule(&app, &key, queue).await;
+        let schedules = ids(&get_ok(&app, &key, "/api/v1/schedules").await, "id");
+        assert_eq!(schedules, HashSet::from([schedule]), "{what}: schedules");
+        let workflow = create_workflow(&app, &key, queue).await;
+        let workflows = ids(&get_ok(&app, &key, "/api/v1/workflows").await, "id");
+        assert_eq!(
+            workflows,
+            HashSet::from([workflow.clone()]),
+            "{what}: workflows"
+        );
+        get_ok(&app, &key, &format!("/api/v1/workflows/{workflow}")).await;
+
+        // Everything outside the scope answers as it always did.
+        for q in outside {
+            let (status, body) = api(
+                &app,
+                "POST",
+                "/api/v1/jobs",
+                &key,
+                Some(json!({"queue_name": q, "payload": {}})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{what} enqueue {q}: {body}");
+            let (status, body) = api(
+                &app,
+                "POST",
+                "/api/v1/jobs/claim",
+                &key,
+                Some(json!({"queue_name": q, "worker_id": worker, "limit": 1})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{what} claim {q}: {body}");
+        }
+        for id in &hidden {
+            let (status, body) = api(&app, "GET", &format!("/api/v1/jobs/{id}"), &key, None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{what} get: {body}");
+        }
+        for action in ["heartbeat", "complete", "fail"] {
+            let (status, body) = settle(&app, &key, action, &leased, &worker, &leased_lease).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{what} {action}: {body}");
+        }
+        assert_eq!(job_status(db.pool(), &leased).await, "processing");
+        assert!(!dlq.contains(&dead_outside));
+        for uri in [
+            format!("/api/v1/workers/{worker}-out"),
+            format!("/api/v1/workflows/{outside_workflow}"),
+            format!("/api/v1/schedules/{outside_schedule}"),
+        ] {
+            let (status, body) = api(&app, "GET", &uri, &key, None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{what} {uri}: {body}");
+        }
+    }
+
+    // KEYS-1: a `prefix.*` key could enqueue and claim in its queues, then got
+    // 404 on heartbeat/complete/fail and saw none of its jobs, DLQ rows,
+    // workers, schedules, workflows or dashboard counts, because those queries
+    // compared the queue to the key's entries by exact name. Exact-name keys
+    // keep their old answers, and none of them reaches a covered child queue.
+    #[tokio::test]
+    async fn w5_int_rest_paths_follow_prefix_and_exact_key_scopes() {
+        let db = TestDatabase::new().await;
+        rest_scope_pass(
+            &db,
+            &["orders.*"],
+            "orders.eu",
+            &["ordersx", "payments", "orders"],
+        )
+        .await;
+        rest_scope_pass(
+            &db,
+            &["orders.eu"],
+            "orders.eu",
+            &["orders.us", "payments", "orders"],
+        )
+        .await;
+        rest_scope_pass(&db, &["orders"], "orders", &["orders.eu", "ordersx"]).await;
+    }
+
+    fn queue_service(db: &TestDatabase) -> QueueServiceImpl {
+        QueueServiceImpl::new(
+            Arc::clone(&db.pool),
+            Arc::new(Metrics::new()),
+            None,
+            Arc::new(OutgoingWebhookService::new((*db.pool).clone(), 1, 4)),
+            QueueSettings {
+                default_max_retries: 3,
+                default_timeout_secs: 300,
+                max_payload_size_bytes: 1024 * 1024,
+            },
+            false,
+            WorkerSettings {
+                heartbeat_interval_secs: 10,
+                lease_duration_secs: 30,
+                grpc_default_lease_duration_secs: 300,
+                max_concurrency: 10,
+                fallback_poll_interval_secs: 5,
+            },
+        )
+    }
+
+    fn grpc<T>(key: &str, body: T) -> GrpcRequest<T> {
+        let mut request = GrpcRequest::new(body);
+        request
+            .metadata_mut()
+            .insert("x-api-key", key.parse().unwrap());
+        request
+    }
+
+    fn enqueue_req(queue: &str) -> EnqueueRequest {
+        EnqueueRequest {
+            queue_name: queue.to_string(),
+            payload: None,
+            priority: 0,
+            max_retries: 0,
+            timeout_seconds: 0,
+            scheduled_at: None,
+            idempotency_key: String::new(),
+            tags: Default::default(),
+        }
+    }
+
+    fn dequeue_req(queue: &str, worker: &str, lease: i32) -> DequeueRequest {
+        DequeueRequest {
+            queue_name: queue.to_string(),
+            worker_id: worker.to_string(),
+            lease_duration_secs: lease,
+            batch_size: 1,
+        }
+    }
+
+    fn complete_req(job: &str, worker: &str, lease: &str) -> CompleteRequest {
+        CompleteRequest {
+            job_id: job.to_string(),
+            worker_id: worker.to_string(),
+            result: None,
+            lease_id: lease.to_string(),
+        }
+    }
+
+    fn fail_req(job: &str, worker: &str, lease: &str) -> FailRequest {
+        FailRequest {
+            job_id: job.to_string(),
+            worker_id: worker.to_string(),
+            error: "boom".to_string(),
+            retry: Some(false),
+            lease_id: lease.to_string(),
+        }
+    }
+
+    fn renew_req(job: &str, worker: &str, lease: &str, secs: i32) -> RenewLeaseRequest {
+        RenewLeaseRequest {
+            job_id: job.to_string(),
+            worker_id: worker.to_string(),
+            extension_secs: secs,
+            lease_id: lease.to_string(),
+        }
+    }
+
+    /// Enqueue in `queue` and lease the job to `worker` over gRPC: (id, lease).
+    async fn grpc_leased(
+        service: &QueueServiceImpl,
+        key: &str,
+        queue: &str,
+        worker: &str,
+        lease: i32,
+    ) -> (String, String) {
+        let id = service
+            .enqueue(grpc(key, enqueue_req(queue)))
+            .await
+            .unwrap_or_else(|e| panic!("enqueue {queue}: {e}"))
+            .into_inner()
+            .job_id;
+        let jobs = service
+            .dequeue(grpc(key, dequeue_req(queue, worker, lease)))
+            .await
+            .unwrap_or_else(|e| panic!("dequeue {queue}: {e}"))
+            .into_inner()
+            .jobs;
+        assert_eq!(jobs.len(), 1, "{queue}");
+        assert_eq!(jobs[0].id, id, "{queue}");
+        (id, jobs[0].lease_id.clone())
+    }
+
+    /// A ProcessJobs request stream carrying `ops`.
+    fn process_stream(key: &str, ops: Vec<Op>) -> GrpcRequest<Streaming<ProcessRequest>> {
+        let mut bytes = Vec::new();
+        for op in ops {
+            let body = ProcessRequest { request: Some(op) }.encode_to_vec();
+            bytes.push(0u8);
+            bytes.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(&body);
+        }
+        let mut codec = tonic_prost::ProstCodec::<ProcessResponse, ProcessRequest>::default();
+        let decoder = tonic::codec::Codec::decoder(&mut codec);
+        let streaming = Streaming::new_request(
+            decoder,
+            axum::body::Body::from(bytes),
+            None,
+            Some(4 * 1024 * 1024),
+        );
+        grpc(key, streaming)
+    }
+
+    async fn process(service: &QueueServiceImpl, key: &str, ops: Vec<Op>) -> Vec<Reply> {
+        let stream = service
+            .process_jobs(process_stream(key, ops))
+            .await
+            .expect("ProcessJobs")
+            .into_inner();
+        tokio::time::timeout(Duration::from_secs(20), stream.collect::<Vec<_>>())
+            .await
+            .expect("ProcessJobs ends")
+            .into_iter()
+            .map(|reply| reply.expect("reply").response.expect("response"))
+            .collect()
+    }
+
+    fn error_code(reply: &Reply) -> Option<&str> {
+        match reply {
+            Reply::Error(e) => Some(e.code.as_str()),
+            _ => None,
+        }
+    }
+
+    /// The gRPC counterpart of [`rest_scope_pass`]: unary calls, StreamJobs and
+    /// ProcessJobs inside the scope, and the same denials outside it.
+    async fn grpc_scope_pass(db: &TestDatabase, scope: &[&str], queue: &str, outside: &[&str]) {
+        let t = seed_tenant(db.pool()).await;
+        let key = seed_key(db.pool(), &t.org_id, scope).await;
+        let service = queue_service(db);
+        let what = format!("scope {scope:?}");
+        let worker = format!("w5i-grpc-{}", &t.org_id[..8]);
+        let (leased, leased_lease) = grpc_leased(&service, &t.key, outside[0], &worker, 300).await;
+
+        // Unary lifecycle.
+        let (done, lease) = grpc_leased(&service, &key, queue, &worker, 300).await;
+        service
+            .renew_lease(grpc(&key, renew_req(&done, &worker, &lease, 60)))
+            .await
+            .unwrap_or_else(|e| panic!("{what} renew: {e}"));
+        let got = service
+            .get_job(grpc(
+                &key,
+                GetJobRequest {
+                    job_id: done.clone(),
+                },
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("{what} get: {e}"))
+            .into_inner();
+        assert_eq!(got.job.expect("job").id, done);
+        service
+            .complete(grpc(&key, complete_req(&done, &worker, &lease)))
+            .await
+            .unwrap_or_else(|e| panic!("{what} complete: {e}"));
+        let (dead, lease) = grpc_leased(&service, &key, queue, &worker, 300).await;
+        service
+            .fail(grpc(&key, fail_req(&dead, &worker, &lease)))
+            .await
+            .unwrap_or_else(|e| panic!("{what} fail: {e}"));
+        assert_eq!(job_status(db.pool(), &done).await, "completed", "{what}");
+        assert_eq!(job_status(db.pool(), &dead).await, "deadletter", "{what}");
+
+        // ProcessJobs.
+        let (p_done, p_done_lease) = grpc_leased(&service, &key, queue, &worker, 300).await;
+        let (p_dead, p_dead_lease) = grpc_leased(&service, &key, queue, &worker, 300).await;
+        let p_next = service
+            .enqueue(grpc(&key, enqueue_req(queue)))
+            .await
+            .expect("enqueue")
+            .into_inner()
+            .job_id;
+        let replies = process(
+            &service,
+            &key,
+            vec![
+                Op::Dequeue(dequeue_req(queue, &worker, 0)),
+                Op::RenewLease(renew_req(&p_dead, &worker, &p_dead_lease, 60)),
+                Op::Complete(complete_req(&p_done, &worker, &p_done_lease)),
+                Op::Fail(fail_req(&p_dead, &worker, &p_dead_lease)),
+                Op::Complete(complete_req(&leased, &worker, &leased_lease)),
+                Op::Dequeue(dequeue_req(outside[0], &worker, 0)),
+            ],
+        )
+        .await;
+        assert_eq!(replies.len(), 6, "{what}: {replies:?}");
+        assert!(
+            matches!(&replies[0], Reply::Job(job) if job.id == p_next),
+            "{what}: {:?}",
+            replies[0]
+        );
+        assert!(
+            matches!(&replies[1], Reply::RenewLease(r) if r.success),
+            "{what}: {:?}",
+            replies[1]
+        );
+        assert!(
+            matches!(&replies[2], Reply::Complete(r) if r.success),
+            "{what}: {:?}",
+            replies[2]
+        );
+        assert!(
+            matches!(&replies[3], Reply::Fail(r) if r.success),
+            "{what}: {:?}",
+            replies[3]
+        );
+        assert_eq!(error_code(&replies[4]), Some("NOT_FOUND"), "{what}");
+        assert_eq!(error_code(&replies[5]), Some("PERMISSION_DENIED"), "{what}");
+        assert_eq!(job_status(db.pool(), &p_done).await, "completed", "{what}");
+        assert_eq!(job_status(db.pool(), &p_dead).await, "deadletter", "{what}");
+
+        // StreamJobs.
+        let streamed = service
+            .enqueue(grpc(&key, enqueue_req(queue)))
+            .await
+            .expect("enqueue")
+            .into_inner()
+            .job_id;
+        let mut stream = service
+            .stream_jobs(grpc(
+                &key,
+                StreamJobsRequest {
+                    queue_name: queue.to_string(),
+                    worker_id: format!("{worker}-s"),
+                    lease_duration_secs: 60,
+                },
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("{what} StreamJobs: {e}"))
+            .into_inner();
+        let job = tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("a streamed job within 10s")
+            .expect("stream open")
+            .unwrap_or_else(|e| panic!("{what} StreamJobs: {e}"));
+        assert_eq!(job.id, streamed, "{what}");
+        service
+            .complete(grpc(
+                &key,
+                complete_req(&streamed, &format!("{worker}-s"), &job.lease_id),
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("{what} complete streamed: {e}"));
+        drop(stream);
+
+        // Outside the scope: the answers from before.
+        let err = service
+            .get_job(grpc(
+                &key,
+                GetJobRequest {
+                    job_id: leased.clone(),
+                },
+            ))
+            .await
+            .expect_err("get outside");
+        assert_eq!(err.code(), Code::NotFound, "{what}");
+        let err = service
+            .renew_lease(grpc(&key, renew_req(&leased, &worker, &leased_lease, 60)))
+            .await
+            .expect_err("renew outside");
+        assert_eq!(err.code(), Code::NotFound, "{what}");
+        let err = service
+            .complete(grpc(&key, complete_req(&leased, &worker, &leased_lease)))
+            .await
+            .expect_err("complete outside");
+        assert_eq!(err.code(), Code::NotFound, "{what}");
+        let err = service
+            .fail(grpc(&key, fail_req(&leased, &worker, &leased_lease)))
+            .await
+            .expect_err("fail outside");
+        assert_eq!(err.code(), Code::NotFound, "{what}");
+        assert_eq!(job_status(db.pool(), &leased).await, "processing", "{what}");
+        for q in outside {
+            let err = service
+                .dequeue(grpc(&key, dequeue_req(q, &worker, 0)))
+                .await
+                .expect_err("dequeue outside");
+            assert_eq!(err.code(), Code::PermissionDenied, "{what} {q}");
+            let err = service
+                .stream_jobs(grpc(
+                    &key,
+                    StreamJobsRequest {
+                        queue_name: q.to_string(),
+                        worker_id: worker.clone(),
+                        lease_duration_secs: 60,
+                    },
+                ))
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{what}: StreamJobs on {q} opened"));
+            assert_eq!(err.code(), Code::PermissionDenied, "{what} {q}");
+        }
+    }
+
+    // KEYS-1 / KEYS-2, gRPC: a prefix key could Enqueue and Dequeue, then got
+    // NOT_FOUND on RenewLease/Complete/Fail/GetJob, PERMISSION_DENIED from every
+    // StreamJobs claim and ProcessJobs dequeue (the inline exact rule) and
+    // NOT_FOUND from ProcessJobs settles (the SQL exact rule).
+    #[tokio::test]
+    async fn w5_int_grpc_paths_follow_prefix_and_exact_key_scopes() {
+        let db = TestDatabase::new().await;
+        grpc_scope_pass(
+            &db,
+            &["orders.*"],
+            "orders.eu",
+            &["ordersx", "payments", "orders"],
+        )
+        .await;
+        grpc_scope_pass(&db, &["orders.eu"], "orders.eu", &["orders.us", "payments"]).await;
+        grpc_scope_pass(&db, &["orders"], "orders", &["orders.eu", "ordersx"]).await;
+    }
+
+    /// The plan of a scoped count with `scope` bound, as text.
+    async fn scoped_count_plan(conn: &mut sqlx::PgConnection, scope: &[&str]) -> String {
+        let lines: Vec<String> = sqlx::query_scalar(
+            "EXPLAIN SELECT COUNT(*) FROM jobs \
+             WHERE organization_id = $1 AND queue_in_key_scope(queue_name, $2::TEXT[])",
+        )
+        .bind("w5i-org")
+        .bind(scope.iter().map(|q| q.to_string()).collect::<Vec<_>>())
+        .fetch_all(conn)
+        .await
+        .expect("explain");
+        lines.join("\n")
+    }
+
+    // KEYS-1, plans: with a bound scope an exact-name scope must still plan as
+    // `queue_name = ANY(...)` (an index condition on idx_jobs_org_queue_status),
+    // and a prefix scope as a plain LIKE. The first queue_in_key_scope() kept a
+    // STABLE pattern rewrite in every plan, so a scoped key's counts scanned the
+    // org's whole job range and re-ran a regexp on each row.
+    #[tokio::test]
+    async fn w5_int_scoped_counts_keep_index_friendly_plans() {
+        let db = TestDatabase::new().await;
+        let mut conn = db.pool().acquire().await.unwrap();
+
+        let exact = scoped_count_plan(&mut conn, &["orders.eu", "billing"]).await;
+        assert!(
+            exact.contains("queue_name = ANY ('{orders.eu,billing}'::text[])"),
+            "{exact}"
+        );
+        for leftover in ["array_to_string", "queue_scope_like_patterns", "~~"] {
+            assert!(!exact.contains(leftover), "{leftover} left in: {exact}");
+        }
+
+        let prefix = scoped_count_plan(&mut conn, &["orders.*", "billing"]).await;
+        assert!(
+            prefix.contains("~~ ANY ('{orders.%,billing}'::text[])"),
+            "{prefix}"
+        );
+        for leftover in [
+            "array_to_string",
+            "regexp_replace",
+            "queue_scope_like_patterns",
+        ] {
+            assert!(!prefix.contains(leftover), "{leftover} left in: {prefix}");
+        }
+    }
+
+    async fn publish(cache: &spooled_backend::cache::RedisCache, org_id: &str, queue: &str) {
+        let event = json!({
+            "type": "JobCreated",
+            "data": {
+                "job_id": format!("w5i-rt-{queue}"),
+                "queue_name": queue,
+                "priority": 0,
+                "timestamp": chrono::Utc::now(),
+            },
+        });
+        cache
+            .publish(&format!("org:{org_id}:events"), &event.to_string())
+            .await
+            .expect("publish");
+    }
+
+    // KEYS-2, realtime: the WebSocket and SSE fan-out, the job stream and the
+    // queue stream compared a prefix key's entries by exact name, so its
+    // streams stayed silent or closed at the first re-check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn w5_int_prefix_key_realtime_streams_follow_the_scope() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let (app, cache, _redis) = app_with_redis(&db).await;
+        let addr = serve(app.clone()).await;
+        let key = bearer(&seed_key(db.pool(), &t.org_id, &["orders.*"]).await);
+        let headers = [("Authorization", key.as_str())];
+
+        // Streams filtered on an uncovered queue are refused, as before.
+        let (status, _) = sse_open(&app, "/api/v1/events?queue=ordersx", &headers).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            ws_open(addr, "/api/v1/ws?queue=payments", &headers)
+                .await
+                .err(),
+            Some(403)
+        );
+
+        let mut ws = ws_open(addr, "/api/v1/ws", &headers)
+            .await
+            .expect("upgrade");
+        assert!(
+            matches!(ws.frame().await, Some(Frame::Text(_))),
+            "initial ping"
+        );
+        let (status, mut events) = sse_open(&app, "/api/v1/events", &headers).await;
+        assert_eq!(status, StatusCode::OK);
+        let (first, _) = sse_read(&mut events, Duration::from_millis(500)).await;
+        assert!(first.contains("connected"), "{first}");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        for queue in ["ordersx", "payments", "orders", "orders.eu"] {
+            publish(&cache, &t.org_id, queue).await;
+        }
+        let mut seen = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+        while let Ok(Some(frame)) = tokio::time::timeout_at(deadline, ws.frame()).await {
+            match frame {
+                Frame::Text(text) => {
+                    let last = text.contains("w5i-rt-orders.eu");
+                    seen.push(text);
+                    if last {
+                        break;
+                    }
+                }
+                Frame::Close(code) => panic!("WebSocket closed ({code}): {seen:?}"),
+                Frame::Other => {}
+            }
+        }
+        assert!(
+            seen.iter().any(|text| text.contains("w5i-rt-orders.eu")),
+            "the covered queue's event reaches the WebSocket: {seen:?}"
+        );
+        for queue in ["ordersx", "payments", "orders"] {
+            let needle = format!("\"w5i-rt-{queue}\"");
+            assert!(
+                !seen.iter().any(|text| text.contains(&needle)),
+                "{queue} leaked to the WebSocket: {seen:?}"
+            );
+        }
+        let mut sse = String::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+        while !sse.contains("w5i-rt-orders.eu") && tokio::time::Instant::now() < deadline {
+            let (more, ended) = sse_read(&mut events, Duration::from_millis(500)).await;
+            sse.push_str(&more);
+            if ended {
+                break;
+            }
+        }
+        assert!(sse.contains("w5i-rt-orders.eu"), "SSE /events: {sse}");
+        for queue in ["ordersx", "payments", "orders"] {
+            assert!(
+                !sse.contains(&format!("\"w5i-rt-{queue}\"")),
+                "{queue} leaked to SSE: {sse}"
+            );
+        }
+
+        // The job and queue streams.
+        let job = enqueue(&app, &key, "orders.eu").await;
+        let hidden_job = enqueue(&app, &bearer(&t.key), "payments").await;
+        let (s1, mut job_stream) =
+            sse_open(&app, &format!("/api/v1/events/jobs/{job}"), &headers).await;
+        let (s2, mut queue_stream) =
+            sse_open(&app, "/api/v1/events/queues/orders.eu", &headers).await;
+        let (s3, mut hidden_job_stream) =
+            sse_open(&app, &format!("/api/v1/events/jobs/{hidden_job}"), &headers).await;
+        let (s4, mut hidden_queue_stream) =
+            sse_open(&app, "/api/v1/events/queues/ordersx", &headers).await;
+        assert_eq!(
+            (s1, s2, s3, s4),
+            (
+                StatusCode::OK,
+                StatusCode::OK,
+                StatusCode::OK,
+                StatusCode::OK
+            )
+        );
+        let limit = Duration::from_secs(8);
+        let ((job_seen, _), (queue_seen, _), (hidden_seen, hidden_ended), (hq_seen, hq_ended)) = tokio::join!(
+            sse_read(&mut job_stream, limit),
+            sse_read(&mut queue_stream, limit),
+            sse_read(&mut hidden_job_stream, limit),
+            sse_read(&mut hidden_queue_stream, limit)
+        );
+        assert!(job_seen.contains("job.status"), "job stream: {job_seen}");
+        assert!(
+            queue_seen.contains("queue.stats"),
+            "queue stream: {queue_seen}"
+        );
+        assert!(
+            hidden_ended && !hidden_seen.contains("job.status"),
+            "uncovered job stream: {hidden_seen}"
+        );
+        assert!(
+            hq_ended && !hq_seen.contains("queue.stats"),
+            "uncovered queue stream: {hq_seen}"
+        );
+    }
+
+    // KEYS-2: the admin key route stored any `queues` it was given, so
+    // `orders*` or `*.eu` made a key that could reach no queue.
+    #[tokio::test]
+    async fn w5_int_admin_created_keys_validate_their_queues() {
+        const ADMIN_KEY: &str = "w5-integration-admin-key";
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let mut settings = Settings::load_for_testing();
+        settings.registration.admin_api_key = Some(ADMIN_KEY.to_string());
+        let app = app_with(&db, settings);
+        let uri = format!("/api/v1/admin/organizations/{}/api-keys", t.org_id);
+
+        for queues in [
+            json!(["orders*"]),
+            json!(["*.eu"]),
+            json!(["orders.*.eu"]),
+            json!(["bad queue"]),
+            json!([""]),
+        ] {
+            let (status, body) = call(
+                &app,
+                "POST",
+                &uri,
+                &[("X-Admin-Key", ADMIN_KEY)],
+                Some(json!({"name": "w5i", "queues": queues})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{queues}: {body}");
+        }
+        for queues in [Some(json!(["orders.*", "billing"])), None] {
+            let mut request = json!({"name": "w5i"});
+            if let Some(queues) = &queues {
+                request["queues"] = queues.clone();
+            }
+            let (status, body) = call(
+                &app,
+                "POST",
+                &uri,
+                &[("X-Admin-Key", ADMIN_KEY)],
+                Some(request),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{queues:?}: {body}");
+            let key = bearer(body["key"].as_str().expect("key"));
+            enqueue(&app, &key, "orders.eu").await;
+        }
+    }
+
+    /// (organization_id, queue_name) of a worker row.
+    async fn worker_row(pool: &sqlx::PgPool, id: &str) -> (String, String) {
+        sqlx::query_as("SELECT organization_id, queue_name FROM workers WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    // KEYS-3: gRPC Register said "Worker ID already in use by another
+    // organization" (REST answers a neutral 409 since BEJOB-19), and a
+    // queue-scoped key could move a worker row of its org that serves a queue
+    // outside its scope.
+    #[tokio::test]
+    async fn w5_int_grpc_register_conflicts_match_rest() {
+        let db = TestDatabase::new().await;
+        let a = seed_tenant(db.pool()).await;
+        let b = seed_tenant(db.pool()).await;
+        let app = app(&db);
+        let (service, _) = grpcw_worker_service(&db);
+        let worker_id = format!("w5i-worker-{}", &a.org_id[..8]);
+        let (status, body) = api(
+            &app,
+            "POST",
+            "/api/v1/workers/register",
+            &bearer(&a.key),
+            Some(json!({"worker_id": worker_id, "queue_name": "payroll", "hostname": "w5i"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, rest) = api(
+            &app,
+            "POST",
+            "/api/v1/workers/register",
+            &bearer(&b.key),
+            Some(json!({"worker_id": worker_id, "queue_name": "payroll", "hostname": "w5i"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{rest}");
+        let rest_message = rest["message"].as_str().expect("message");
+
+        let err = service
+            .register(grpcw_request(
+                &b.key,
+                grpcw_register("payroll", Some(&worker_id)),
+            ))
+            .await
+            .expect_err("another org's worker id");
+        assert_eq!(err.code(), Code::AlreadyExists);
+        assert_eq!(err.message(), rest_message, "same answer as REST");
+
+        let scoped = seed_key(db.pool(), &a.org_id, &["orders.*"]).await;
+        let err = service
+            .register(grpcw_request(
+                &scoped,
+                grpcw_register("orders.eu", Some(&worker_id)),
+            ))
+            .await
+            .expect_err("an out-of-scope worker of the same org");
+        assert_eq!(err.code(), Code::AlreadyExists);
+        assert_eq!(err.message(), rest_message, "indistinguishable conflicts");
+        assert_eq!(
+            worker_row(db.pool(), &worker_id).await,
+            (a.org_id.clone(), "payroll".to_string())
+        );
+
+        // Within its scope the key still re-registers its own worker.
+        let own = format!("w5i-own-{}", &a.org_id[..8]);
+        for queue in ["orders.eu", "orders.eu", "orders.us"] {
+            service
+                .register(grpcw_request(&scoped, grpcw_register(queue, Some(&own))))
+                .await
+                .unwrap_or_else(|e| panic!("{queue}: {e}"));
+        }
+        assert_eq!(worker_row(db.pool(), &own).await.1, "orders.us");
+        // And an unrestricted key re-registers any worker of its org.
+        service
+            .register(grpcw_request(
+                &a.key,
+                grpcw_register("emails", Some(&worker_id)),
+            ))
+            .await
+            .expect("unrestricted re-register");
+        assert_eq!(worker_row(db.pool(), &worker_id).await.1, "emails");
+    }
+
+    // KEYS-4: the signup hint `unverified_org_exists` ignored a pending billing
+    // email (W1-14), the other unconfirmed address an org can hold.
+    #[tokio::test]
+    async fn w5_int_login_hint_counts_a_pending_billing_email() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let app = app(&db);
+        let pending = format!("w5i-pending-{}@example.com", &t.org_id[..8]);
+        let (status, body) = api(
+            &app,
+            "PUT",
+            &format!("/api/v1/organizations/{}", t.org_id),
+            &bearer(&t.key),
+            Some(json!({"billing_email": pending})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["pending_billing_email"], pending, "{body}");
+
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/api/v1/auth/email/start",
+            &[],
+            Some(json!({"email": pending})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (code, bound) = latest_code(db.pool(), &pending).await;
+        assert_eq!(bound, None, "a pending address is no login identity");
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/api/v1/auth/email/verify",
+            &[],
+            Some(json!({"email": pending, "code": code})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["type"], "signup", "{body}");
+        assert_eq!(body["unverified_org_exists"], true, "{body}");
+    }
+
+    async fn lease_column(pool: &sqlx::PgPool, id: &str) -> Option<i32> {
+        sqlx::query_scalar("SELECT lease_duration_secs FROM jobs WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn lease_left(pool: &sqlx::PgPool, id: &str) -> f64 {
+        sqlx::query_scalar(
+            "SELECT EXTRACT(EPOCH FROM (lease_expires_at - NOW()))::FLOAT8 FROM jobs WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// A REST heartbeat that names no length, then the seconds left on the lease.
+    async fn rest_heartbeat(
+        app: &Router,
+        db: &TestDatabase,
+        auth: &str,
+        job: &str,
+        worker: &str,
+        lease: &str,
+    ) -> f64 {
+        let (status, body) = settle(app, auth, "heartbeat", job, worker, lease).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        lease_left(db.pool(), job).await
+    }
+
+    fn assert_about(left: f64, secs: f64, what: &str) {
+        assert!(
+            left > secs - 10.0 && left <= secs + 1.0,
+            "{what}: {left}s left, expected {secs}s"
+        );
+    }
+
+    // jobsapi cross-request: gRPC claims did not record the granted lease in
+    // jobs.lease_duration_secs, so a REST heartbeat without a length cut a
+    // 600 s gRPC lease to the 30 s default.
+    #[tokio::test]
+    async fn w5_int_grpc_claims_record_the_lease_rest_heartbeats_keep() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let app = app(&db);
+        let auth = bearer(&t.key);
+        let service = queue_service(&db);
+
+        let (unary, lease) = grpc_leased(&service, &t.key, "w5i-lease", "w5i-lw", 600).await;
+        assert_eq!(lease_column(db.pool(), &unary).await, Some(600));
+        let left = rest_heartbeat(&app, &db, &auth, &unary, "w5i-lw", &lease).await;
+        assert_about(left, 600.0, "Dequeue then REST heartbeat");
+        service
+            .renew_lease(grpc(&t.key, renew_req(&unary, "w5i-lw", &lease, 90)))
+            .await
+            .expect("renew");
+        assert_eq!(lease_column(db.pool(), &unary).await, Some(90));
+        let left = rest_heartbeat(&app, &db, &auth, &unary, "w5i-lw", &lease).await;
+        assert_about(left, 90.0, "RenewLease then REST heartbeat");
+
+        let streamed = enqueue(&app, &auth, "w5i-lease-s").await;
+        let mut stream = service
+            .stream_jobs(grpc(
+                &t.key,
+                StreamJobsRequest {
+                    queue_name: "w5i-lease-s".to_string(),
+                    worker_id: "w5i-ls".to_string(),
+                    lease_duration_secs: 450,
+                },
+            ))
+            .await
+            .expect("StreamJobs")
+            .into_inner();
+        let job = tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("a streamed job within 10s")
+            .expect("stream open")
+            .expect("a job");
+        assert_eq!(job.id, streamed);
+        assert_eq!(lease_column(db.pool(), &streamed).await, Some(450));
+        let left = rest_heartbeat(&app, &db, &auth, &streamed, "w5i-ls", &job.lease_id).await;
+        assert_about(left, 450.0, "StreamJobs then REST heartbeat");
+
+        let processed = enqueue(&app, &auth, "w5i-lease-p").await;
+        let replies = process(
+            &service,
+            &t.key,
+            vec![Op::Dequeue(dequeue_req("w5i-lease-p", "w5i-lp", 500))],
+        )
+        .await;
+        let lease = match &replies[..] {
+            [Reply::Job(job)] if job.id == processed => job.lease_id.clone(),
+            other => panic!("ProcessJobs dequeue: {other:?}"),
+        };
+        assert_eq!(lease_column(db.pool(), &processed).await, Some(500));
+        let left = rest_heartbeat(&app, &db, &auth, &processed, "w5i-lp", &lease).await;
+        assert_about(left, 500.0, "ProcessJobs then REST heartbeat");
+        drop(stream);
+    }
+
+    // jobsapi/flow cross-request: the scheduler's dependency sweep and the
+    // retry re-open matched the cancel reasons through two copies of the same
+    // strings; both now use the shared consts.
+    #[tokio::test]
+    async fn w5_int_sweep_cancel_reasons_are_the_ones_retry_reopens() {
+        use spooled_backend::models::{
+            DEPENDENCY_CANCEL_REASONS, DEPENDENCY_FAILED_CANCEL_REASON, PARENT_FAILED_CANCEL_REASON,
+        };
+
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let app = app(&db);
+        let auth = bearer(&t.key);
+        let parent = enqueue(&app, &auth, "w5i-dep").await;
+        let child = uuid::Uuid::new_v4().to_string();
+        let dependent = uuid::Uuid::new_v4().to_string();
+        for (id, parent_job_id) in [(&child, Some(&parent)), (&dependent, None)] {
+            sqlx::query(
+                "INSERT INTO jobs (id, organization_id, queue_name, payload, status, max_retries, \
+                 parent_job_id, dependencies_met, created_at, updated_at) \
+                 VALUES ($1, $2, 'w5i-dep-kids', '{}'::JSONB, 'pending', 3, $3, FALSE, NOW(), NOW())",
+            )
+            .bind(id)
+            .bind(&t.org_id)
+            .bind(parent_job_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        sqlx::query("INSERT INTO job_dependencies (job_id, depends_on_job_id) VALUES ($1, $2)")
+            .bind(&dependent)
+            .bind(&parent)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let (claimed, lease) = claim(&app, &auth, "w5i-dep", "w5i-dw").await;
+        assert_eq!(claimed, parent);
+        let (status, body) = settle(&app, &auth, "fail", &parent, "w5i-dw", &lease).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        Scheduler::new(
+            Arc::clone(&db.pool),
+            None,
+            Arc::new(Metrics::new()),
+            Arc::new(OutgoingWebhookService::new((*db.pool).clone(), 3, 4)),
+        )
+        .update_job_dependencies()
+        .await
+        .expect("dependency sweep");
+        for (id, reason) in [
+            (&child, PARENT_FAILED_CANCEL_REASON),
+            (&dependent, DEPENDENCY_FAILED_CANCEL_REASON),
+        ] {
+            let (status, last_error): (String, Option<String>) =
+                sqlx::query_as("SELECT status, last_error FROM jobs WHERE id = $1")
+                    .bind(id)
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(status, "cancelled");
+            assert_eq!(last_error.as_deref(), Some(reason));
+            assert!(DEPENDENCY_CANCEL_REASONS.contains(&reason));
+        }
+
+        let (status, body) = api(
+            &app,
+            "POST",
+            &format!("/api/v1/jobs/{parent}/retry"),
+            &auth,
+            None,
+        )
+        .await;
+        assert!(status.is_success(), "{status}: {body}");
+        assert_eq!(job_status(db.pool(), &child).await, "pending");
+        assert_eq!(job_status(db.pool(), &dependent).await, "pending");
+    }
+
+    /// The value of the sample line `name` in a Prometheus text exposition.
+    fn sample(text: &str, name: &str) -> Option<f64> {
+        text.lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix(' ')?.parse().ok())
+    }
+
+    // hooks cross-request: delivery drops were only visible in logs. The
+    // outgoing-webhook counters are now sampled on every scrape, like the pool
+    // gauges.
+    #[tokio::test]
+    async fn w5_int_webhook_delivery_counters_reach_prometheus() {
+        let db = TestDatabase::new().await;
+        let mut settings = Settings::load_for_testing();
+        // One delivery slot: a queue of 16.
+        settings.outgoing_webhooks.max_concurrent_deliveries = 1;
+        let state = AppState::new(
+            Database::from_pool(Arc::clone(&db.pool)),
+            None,
+            Metrics::new(),
+            settings,
+        );
+
+        // Nothing yields here, so no consumer takes an event off the queue.
+        for _ in 0..20 {
+            state.outgoing_webhooks.spawn_dispatch(
+                "w5i-org".to_string(),
+                "job.completed".to_string(),
+                "w5i-job".to_string(),
+                json!({"job_id": "w5i-job"}),
+            );
+        }
+        for _ in 0..2 {
+            let text = state.metrics.encode();
+            assert_eq!(
+                sample(&text, "spooled_outgoing_webhook_deliveries_dropped_total"),
+                Some(4.0),
+                "{text}"
+            );
+            assert_eq!(
+                sample(&text, "spooled_outgoing_webhook_queue_depth"),
+                Some(16.0),
+                "{text}"
+            );
+            assert_eq!(
+                sample(&text, "spooled_outgoing_webhook_deliveries_in_flight"),
+                Some(0.0),
+                "{text}"
+            );
+            assert_eq!(
+                sample(&text, "spooled_completion_webhooks_dropped_total"),
+                Some(0.0),
+                "{text}"
+            );
+        }
+    }
+}
+// ---- wave 5 / review fixes ----
+// W5-R2: completion webhooks get their own request slots and per-org bounds.
+// W5-R3: a DLQ retry skips the steps of failed workflows the max_workflows cap
+// cannot revive, instead of failing whole.
+mod wave5_review {
+    use super::*;
+
+    use std::time::Duration;
+
+    use spooled_backend::outgoing_webhooks::service::{
+        completion_webhooks_dropped, spawn_completion_webhook, OutgoingWebhookService,
+    };
+
+    use super::wave5_hooks::{eventually, fire, insert_hook, Endpoint};
+
+    fn complete_to(org_id: &str, url: &str, count: usize) {
+        for i in 0..count {
+            spawn_completion_webhook(
+                org_id,
+                url.to_string(),
+                "job.completed".to_string(),
+                json!({ "job_id": i }),
+                None,
+            );
+        }
+    }
+
+    // W5-R2: completion webhooks waited on the org webhooks' request slots,
+    // and consumers wait on those inline. One tenant's backlog of completions
+    // to a URL that never answers stalled every tenant's org webhooks and
+    // every other tenant's completion webhooks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn w5_review_a_completion_backlog_does_not_stall_other_tenants_webhooks() {
+        let db = TestDatabase::new().await;
+        let busy = seed_tenant(db.pool()).await;
+        let other = seed_tenant(db.pool()).await;
+        let black_hole = Endpoint::start(200, Duration::from_secs(3), "ok".into()).await;
+        let org_hook = Endpoint::start(200, Duration::ZERO, "ok".into()).await;
+        let completion = Endpoint::start(200, Duration::ZERO, "ok".into()).await;
+        insert_hook(db.pool(), &other.org_id, &org_hook.url).await;
+        // Four slots: one org (or webhook) gets one at a time.
+        let service = Arc::new(OutgoingWebhookService::new((*db.pool).clone(), 1, 4));
+
+        complete_to(&busy.org_id, &black_hole.url, 12);
+        assert!(eventually(Duration::from_secs(5), || black_hole.hits() >= 1).await);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        fire(&service, &other.org_id);
+        complete_to(&other.org_id, &completion.url, 1);
+        assert!(
+            eventually(Duration::from_millis(1500), || org_hook.hits() == 1).await,
+            "an org webhook waited behind another tenant's completion backlog"
+        );
+        assert!(
+            eventually(Duration::from_millis(1500), || completion.hits() == 1).await,
+            "a completion webhook waited behind another tenant's backlog"
+        );
+        assert_eq!(black_hole.peak(), 1, "4 slots / 4 = one request per org");
+        assert_eq!(completion_webhooks_dropped(), 0);
+    }
+
+    // W5-R2: one org's completion backlog takes its share of the pending
+    // bound, not all of it, so another org's completion webhook still goes out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn w5_review_one_org_cannot_take_every_pending_completion_webhook() {
+        let db = TestDatabase::new().await;
+        let slow = Endpoint::start(200, Duration::from_secs(1), "ok".into()).await;
+        let fast = Endpoint::start(200, Duration::ZERO, "ok".into()).await;
+        // One slot: 16 pending, of which one org may hold 4.
+        let _service = OutgoingWebhookService::new((*db.pool).clone(), 1, 1);
+
+        complete_to("w5r-busy-org", &slow.url, 20);
+        assert_eq!(
+            completion_webhooks_dropped(),
+            16,
+            "the busy org keeps its share of 4"
+        );
+        complete_to("w5r-other-org", &fast.url, 1);
+        assert_eq!(
+            completion_webhooks_dropped(),
+            16,
+            "the other org's delivery is admitted"
+        );
+        assert!(
+            eventually(Duration::from_secs(3), || fast.hits() == 1).await,
+            "the other org's delivery waited for the busy org's backlog"
+        );
+        assert!(eventually(Duration::from_secs(6), || slow.hits() == 4).await);
+    }
+
+    const DLQ_QUEUE: &str = "w5r-dlq";
+
+    async fn post(app: &Router, auth: &str, uri: &str, body: Value) -> (StatusCode, Value) {
+        call(app, "POST", uri, &[("Authorization", auth)], Some(body)).await
+    }
+
+    /// Dead-letter `job`, dated `age_minutes` back so the DLQ order is fixed.
+    async fn dead_letter(pool: &sqlx::PgPool, job: &str, age_minutes: i32) {
+        sqlx::query(
+            "UPDATE jobs SET status = 'deadletter', last_error = 'boom', \
+             created_at = NOW() - make_interval(mins => $2), updated_at = NOW() WHERE id = $1",
+        )
+        .bind(job)
+        .bind(age_minutes)
+        .execute(pool)
+        .await
+        .expect("dead-letter job");
+    }
+
+    /// A one-step workflow left 'failed' with its step dead-lettered.
+    /// Returns (workflow id, step id).
+    async fn failed_workflow(
+        app: &Router,
+        auth: &str,
+        pool: &sqlx::PgPool,
+        name: &str,
+        age_minutes: i32,
+    ) -> (String, String) {
+        let (status, body) = post(
+            app,
+            auth,
+            "/api/v1/workflows",
+            json!({"name": name, "jobs": [{"key": "a", "queue_name": DLQ_QUEUE, "payload": {}}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let workflow = body["workflow_id"].as_str().unwrap().to_string();
+        let step = body["job_ids"][0]["job_id"].as_str().unwrap().to_string();
+        dead_letter(pool, &step, age_minutes).await;
+        sqlx::query("UPDATE workflows SET status = 'failed', completed_at = NOW() WHERE id = $1")
+            .bind(&workflow)
+            .execute(pool)
+            .await
+            .expect("fail workflow");
+        (workflow, step)
+    }
+
+    /// A plain job, dead-lettered.
+    async fn dead_job(app: &Router, auth: &str, pool: &sqlx::PgPool, age_minutes: i32) -> String {
+        let (status, body) = post(
+            app,
+            auth,
+            "/api/v1/jobs",
+            json!({"queue_name": DLQ_QUEUE, "payload": {}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let id = body["id"].as_str().unwrap().to_string();
+        dead_letter(pool, &id, age_minutes).await;
+        id
+    }
+
+    async fn status_of(pool: &sqlx::PgPool, table: &str, id: &str) -> String {
+        let sql = match table {
+            "jobs" => "SELECT status FROM jobs WHERE id = $1",
+            "workflows" => "SELECT status FROM workflows WHERE id = $1",
+            other => panic!("no status query for {other}"),
+        };
+        sqlx::query_scalar(sql)
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    fn ids(body: &Value, field: &str) -> Vec<String> {
+        let mut ids: Vec<String> = body[field]
+            .as_array()
+            .unwrap_or_else(|| panic!("{field} in {body}"))
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    fn sorted(ids: &[&String]) -> Vec<String> {
+        let mut ids: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
+        ids.sort();
+        ids
+    }
+
+    // W5-R3: a bulk DLQ retry failed whole (429, or 403 on Free) whenever the
+    // jobs it picked included a step of a failed workflow the max_workflows cap
+    // could not revive, so no dead-lettered job could be retried in bulk until
+    // a workflow slot freed up.
+    #[tokio::test]
+    async fn w5_review_dlq_retry_skips_steps_the_workflow_cap_cannot_revive() {
+        let db = TestDatabase::new().await;
+        let pool = db.pool();
+        let t = seed_tenant(pool).await;
+        sqlx::query("UPDATE organizations SET custom_limits = $2 WHERE id = $1")
+            .bind(&t.org_id)
+            .bind(json!({"max_workflows": 1}))
+            .execute(pool)
+            .await
+            .unwrap();
+        let app = app(&db);
+        let auth = bearer(&t.key);
+
+        let (failed, step) = failed_workflow(&app, &auth, pool, "w5r-failed", 60).await;
+        let (failed_2, step_2) = failed_workflow(&app, &auth, pool, "w5r-failed-2", 50).await;
+        let (status, body) = post(
+            &app,
+            &auth,
+            "/api/v1/workflows",
+            json!({"name": "w5r-running", "jobs": [{"key": "a", "queue_name": "w5r-run", "payload": {}}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let running = body["workflow_id"].as_str().unwrap().to_string();
+        let plain = [
+            dead_job(&app, &auth, pool, 30).await,
+            dead_job(&app, &auth, pool, 20).await,
+        ];
+
+        // At the cap, by queue and across queues: the plain jobs are retried,
+        // the steps stay in the DLQ and are reported.
+        for request in [json!({}), json!({"queue_name": DLQ_QUEUE})] {
+            for (job, age) in plain.iter().zip([30, 20]) {
+                dead_letter(pool, job, age).await;
+            }
+            let (status, body) = post(&app, &auth, "/api/v1/jobs/dlq/retry", request.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{request}: {body}");
+            assert_eq!(body["retried_count"], 2, "{body}");
+            assert_eq!(ids(&body, "retried_jobs"), sorted(&[&plain[0], &plain[1]]));
+            assert_eq!(
+                body["skipped_jobs"],
+                json!([step, step_2]),
+                "oldest first: {body}"
+            );
+            for job in &plain {
+                assert_eq!(status_of(pool, "jobs", job).await, "pending");
+            }
+            for (workflow, job) in [(&failed, &step), (&failed_2, &step_2)] {
+                assert_eq!(status_of(pool, "workflows", workflow).await, "failed");
+                assert_eq!(status_of(pool, "jobs", job).await, "deadletter");
+            }
+        }
+
+        // Only held steps left: the request names the cap, as a single retry does.
+        let (status, body) = post(&app, &auth, "/api/v1/jobs/dlq/retry", json!({})).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+        assert_eq!(body["error"], "limit_exceeded", "{body}");
+        assert_eq!(status_of(pool, "jobs", &step).await, "deadletter");
+
+        // Named ids follow the same rule.
+        dead_letter(pool, &plain[0], 30).await;
+        let (status, body) = post(
+            &app,
+            &auth,
+            "/api/v1/jobs/dlq/retry",
+            json!({"job_ids": [step, plain[0]]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["retried_jobs"], json!([plain[0]]), "{body}");
+        assert_eq!(body["skipped_jobs"], json!([step]), "{body}");
+
+        // One slot frees: the workflow with the oldest step is revived, the
+        // other stays held.
+        sqlx::query(
+            "UPDATE workflows SET status = 'completed', completed_at = NOW() WHERE id = $1",
+        )
+        .bind(&running)
+        .execute(pool)
+        .await
+        .unwrap();
+        let (status, body) = post(&app, &auth, "/api/v1/jobs/dlq/retry", json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["retried_jobs"], json!([step]), "{body}");
+        assert_eq!(body["skipped_jobs"], json!([step_2]), "{body}");
+        assert_eq!(status_of(pool, "workflows", &failed).await, "running");
+        assert_eq!(status_of(pool, "workflows", &failed_2).await, "failed");
+
+        // A plan without workflows still retries everything else.
+        sqlx::query(
+            "UPDATE workflows SET status = 'cancelled', completed_at = NOW() \
+             WHERE organization_id = $1 AND status IN ('pending', 'running')",
+        )
+        .bind(&t.org_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE organizations SET plan_tier = 'free', custom_limits = NULL WHERE id = $1",
+        )
+        .bind(&t.org_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        dead_letter(pool, &plain[1], 20).await;
+        let (status, body) = post(&app, &auth, "/api/v1/jobs/dlq/retry", json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["retried_jobs"], json!([plain[1]]), "{body}");
+        assert_eq!(body["skipped_jobs"], json!([step_2]), "{body}");
+        let (status, body) = post(&app, &auth, "/api/v1/jobs/dlq/retry", json!({})).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["error"], "feature_disabled", "{body}");
+        assert_eq!(status_of(pool, "jobs", &step_2).await, "deadletter");
+        assert_eq!(status_of(pool, "workflows", &failed_2).await, "failed");
+    }
+}
+
+// ---- wave 5 / retention ----
+// W5-R4: the failed/dead-letter retention deleted a job that a retry had moved
+// back to pending (or that had just failed again) after the sweep picked it.
+// W5-R5: it deleted the failed step of a failed workflow that could still be
+// retried, so the retry ran the step's dependents ungated.
+// W5-R6: schedule_runs.job_id had no index, so every deleted job scanned all of
+// schedule_runs, and the schedule_runs sweep read the whole table twice.
+mod wave5_retention {
+    use super::*;
+
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    use spooled_backend::outgoing_webhooks::service::OutgoingWebhookService;
+    use spooled_backend::scheduler::{Scheduler, SCHEDULE_RUNS_RETENTION_SQL};
+
+    const QUEUE: &str = "w5-ret";
+
+    async fn sweep(pool: Arc<sqlx::PgPool>) -> anyhow::Result<()> {
+        Scheduler::new(
+            Arc::clone(&pool),
+            None,
+            Arc::new(Metrics::new()),
+            Arc::new(OutgoingWebhookService::new((*pool).clone(), 3, 4)),
+        )
+        .cleanup_stale_workers()
+        .await
+    }
+
+    /// A job in `status`, created and last changed `age_days` ago.
+    async fn old_job(
+        pool: &sqlx::PgPool,
+        org_id: &str,
+        status: &str,
+        age_days: i32,
+        workflow_id: Option<&str>,
+    ) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO jobs (id, organization_id, queue_name, payload, status, last_error, workflow_id, \
+             created_at, updated_at, completed_at) \
+             VALUES ($1, $2, $3, '{}'::JSONB, $4, 'boom', $5, NOW() - make_interval(days => $6), \
+             NOW() - make_interval(days => $6), NOW() - make_interval(days => $6))",
+        )
+        .bind(&id)
+        .bind(org_id)
+        .bind(QUEUE)
+        .bind(status)
+        .bind(workflow_id)
+        .bind(age_days)
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    /// Put a job in `status`, finished `age_days` ago. The `jobs_updated_at`
+    /// trigger stamps every UPDATE with the current time, so it is off for
+    /// this one statement.
+    async fn finish_job(pool: &sqlx::PgPool, job: &str, status: &str, age_days: i32) {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("ALTER TABLE jobs DISABLE TRIGGER jobs_updated_at")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE jobs SET status = $2, updated_at = NOW() - make_interval(days => $3), \
+             completed_at = NOW() - make_interval(days => $3) WHERE id = $1",
+        )
+        .bind(job)
+        .bind(status)
+        .bind(age_days)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query("ALTER TABLE jobs ENABLE TRIGGER jobs_updated_at")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    /// Close a workflow as `status`, `age_days` ago.
+    async fn finish_workflow(pool: &sqlx::PgPool, workflow: &str, status: &str, age_days: i32) {
+        sqlx::query(
+            "UPDATE workflows SET status = $2, completed_at = NOW() - make_interval(days => $3) \
+             WHERE id = $1",
+        )
+        .bind(workflow)
+        .bind(status)
+        .bind(age_days)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Create a workflow through the API; returns (workflow id, key -> job id).
+    async fn create_workflow(
+        app: &Router,
+        auth: &str,
+        jobs: Value,
+    ) -> (String, HashMap<String, String>) {
+        let (status, body) = call(
+            app,
+            "POST",
+            "/api/v1/workflows",
+            &[("Authorization", auth)],
+            Some(json!({"name": "w5-ret", "jobs": jobs})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ids = body["job_ids"]
+            .as_array()
+            .expect("job_ids")
+            .iter()
+            .map(|m| {
+                (
+                    m["key"].as_str().unwrap().to_string(),
+                    m["job_id"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        (body["workflow_id"].as_str().unwrap().to_string(), ids)
+    }
+
+    /// A job's status, or None once it is deleted.
+    async fn job_status(pool: &sqlx::PgPool, id: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT status FROM jobs WHERE id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn workflow_exists(pool: &sqlx::PgPool, id: &str) -> bool {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workflows WHERE id = $1)")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    // W5-R4: the sweep picked the old failed rows in a subselect and deleted
+    // `WHERE id IN (...)` without looking at them again. A retry that moved a
+    // picked job back to pending, or a job that failed again just now, was
+    // deleted as soon as the retry's transaction let go of the row. The retry
+    // here is held open until the sweep has either finished or is waiting on
+    // its row locks, so the race is hit every run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn w5_retention_leaves_a_job_retried_while_the_sweep_runs() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await; // starter: jobs 14 days
+        let pool = db.pool();
+        let retried = old_job(pool, &t.org_id, "deadletter", 20, None).await;
+        let failed_again = old_job(pool, &t.org_id, "failed", 20, None).await;
+        let untouched = old_job(pool, &t.org_id, "deadletter", 20, None).await;
+
+        let mut retry = pool.begin().await.unwrap();
+        sqlx::query(
+            "UPDATE jobs SET status = 'pending', retry_count = 0, last_error = NULL WHERE id = $1",
+        )
+        .bind(&retried)
+        .execute(&mut *retry)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE jobs SET status = 'failed', last_error = 'again' WHERE id = $1")
+            .bind(&failed_again)
+            .execute(&mut *retry)
+            .await
+            .unwrap();
+
+        let task = tokio::spawn(sweep(Arc::clone(&db.pool)));
+        let mut blocked = false;
+        for _ in 0..600 {
+            if task.is_finished() {
+                break;
+            }
+            blocked = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                 WHERE datname = current_database() AND pid <> pg_backend_pid() \
+                   AND wait_event_type = 'Lock')",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if blocked {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            blocked || task.is_finished(),
+            "the sweep neither finished nor waited on the retry"
+        );
+        retry.commit().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(30), task)
+            .await
+            .expect("sweep finishes")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            job_status(pool, &retried).await.as_deref(),
+            Some("pending"),
+            "a job retried while the sweep ran was deleted"
+        );
+        assert_eq!(
+            job_status(pool, &failed_again).await.as_deref(),
+            Some("failed"),
+            "a job that had just failed again was deleted"
+        );
+        assert_eq!(job_status(pool, &untouched).await, None, "old dead-letter");
+    }
+
+    // W5-R5: a failed workflow can be retried until workflow retention removes
+    // it. The sweep deleted its dead-lettered step once the step itself was
+    // old, which also dropped the step's dependency edges, and the retry then
+    // re-opened the cancelled dependent as runnable before the step ran again.
+    #[tokio::test]
+    async fn w5_retention_keeps_the_failed_step_of_a_retryable_workflow() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await; // starter: jobs 14 days
+        let pool = db.pool();
+        let app = app(&db);
+        let auth = bearer(&t.key);
+
+        // a dead-lettered 20 days ago, b (waits on a) was cancelled for it, and
+        // c ran until yesterday, when the workflow ended failed.
+        let (workflow, steps) = create_workflow(
+            &app,
+            &auth,
+            json!([
+                {"key": "a", "queue_name": QUEUE, "payload": {}},
+                {"key": "b", "queue_name": QUEUE, "payload": {}, "depends_on": ["a"]},
+                {"key": "c", "queue_name": QUEUE, "payload": {}},
+            ]),
+        )
+        .await;
+        finish_job(pool, &steps["a"], "deadletter", 20).await;
+        finish_job(pool, &steps["b"], "cancelled", 1).await;
+        finish_job(pool, &steps["c"], "completed", 1).await;
+        finish_workflow(pool, &workflow, "failed", 1).await;
+
+        sweep(Arc::clone(&db.pool)).await.unwrap();
+
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("/api/v1/workflows/{workflow}/retry"),
+            &[("Authorization", &auth)],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (b_status, b_ready): (String, Option<bool>) =
+            sqlx::query_as("SELECT status, dependencies_met FROM jobs WHERE id = $1")
+                .bind(&steps["b"])
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(b_status, "pending");
+        assert_eq!(
+            b_ready,
+            Some(false),
+            "the retried workflow released b before a ran again"
+        );
+        assert_eq!(
+            job_status(pool, &steps["a"]).await.as_deref(),
+            Some("pending"),
+            "the dead-lettered step of a retryable workflow was deleted"
+        );
+    }
+
+    // W5-R5: a workflow's failed and cancelled steps go once the workflow
+    // itself is past retention, in the same pass; a step whose workflow is
+    // already gone goes as before.
+    #[tokio::test]
+    async fn w5_retention_purges_workflow_steps_with_their_workflow() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await; // starter: jobs 14 days
+        let pool = db.pool();
+        let app = app(&db);
+        let auth = bearer(&t.key);
+        let jobs = json!([
+            {"key": "a", "queue_name": QUEUE, "payload": {}},
+            {"key": "b", "queue_name": QUEUE, "payload": {}, "depends_on": ["a"]},
+        ]);
+
+        let (expired, expired_steps) = create_workflow(&app, &auth, jobs.clone()).await;
+        finish_job(pool, &expired_steps["a"], "deadletter", 20).await;
+        finish_job(pool, &expired_steps["b"], "cancelled", 20).await;
+        finish_workflow(pool, &expired, "failed", 20).await;
+
+        let (retryable, retryable_steps) = create_workflow(&app, &auth, jobs).await;
+        finish_job(pool, &retryable_steps["a"], "deadletter", 20).await;
+        finish_job(pool, &retryable_steps["b"], "cancelled", 20).await;
+        finish_workflow(pool, &retryable, "failed", 1).await;
+
+        let orphan = old_job(pool, &t.org_id, "deadletter", 20, Some("w5-ret-gone")).await;
+
+        sweep(Arc::clone(&db.pool)).await.unwrap();
+
+        assert!(!workflow_exists(pool, &expired).await, "expired workflow");
+        assert_eq!(job_status(pool, &expired_steps["a"]).await, None);
+        assert_eq!(job_status(pool, &expired_steps["b"]).await, None);
+        assert!(workflow_exists(pool, &retryable).await);
+        assert_eq!(
+            job_status(pool, &retryable_steps["a"]).await.as_deref(),
+            Some("deadletter"),
+            "failed step of a workflow that can still be retried"
+        );
+        assert_eq!(
+            job_status(pool, &retryable_steps["b"]).await.as_deref(),
+            Some("cancelled"),
+            "cancelled step of a workflow that can still be retried"
+        );
+        assert_eq!(
+            job_status(pool, &orphan).await,
+            None,
+            "its workflow is gone"
+        );
+    }
+
+    /// The generic plan (the one a foreign-key action's cached query uses) of
+    /// the ON DELETE SET NULL action of schedule_runs_job_id_fkey.
+    async fn fk_action_plan(pool: &sqlx::PgPool) -> String {
+        let mut conn = pool.acquire().await.unwrap();
+        sqlx::raw_sql(
+            "SET plan_cache_mode = force_generic_plan; \
+             PREPARE w5_ret_fk(TEXT) AS \
+             UPDATE ONLY schedule_runs SET job_id = NULL WHERE $1 OPERATOR(pg_catalog.=) job_id",
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        let plan: Vec<String> = sqlx::query_scalar("EXPLAIN EXECUTE w5_ret_fk('w5-ret-job-1')")
+            .fetch_all(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::raw_sql("DEALLOCATE w5_ret_fk; RESET plan_cache_mode")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        plan.join("\n")
+    }
+
+    async fn index_valid(pool: &sqlx::PgPool, index: &str) -> bool {
+        sqlx::query_scalar("SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass($1)")
+            .bind(index)
+            .fetch_one(pool)
+            .await
+            .unwrap_or_else(|e| panic!("{index}: {e}"))
+    }
+
+    // W5-R6: deleting a job sets schedule_runs.job_id to NULL for its runs; with
+    // no index on the column that was a scan of all of schedule_runs per job
+    // (27 ms a job at 450k runs, so 55 s for 2,000 dead-lettered jobs). The
+    // schedule_runs sweep now ranges over (schedule_id, started_at) per
+    // schedule instead of reading the table twice.
+    #[tokio::test]
+    async fn w5_retention_schedule_run_lookups_use_indexes() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let pool = db.pool();
+        sqlx::query(
+            "INSERT INTO schedules (id, organization_id, name, cron_expression, queue_name, payload_template) \
+             SELECT 'w5-ret-' || g, $1, 'ret ' || g, '* * * * *', $2, '{}'::JSONB \
+             FROM generate_series(1, 20) AS g",
+        )
+        .bind(&t.org_id)
+        .bind(QUEUE)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO jobs (id, organization_id, queue_name, payload, status) \
+             SELECT 'w5-ret-job-' || g, $1, $2, '{}'::JSONB, 'completed' \
+             FROM generate_series(1, 1000) AS g",
+        )
+        .bind(&t.org_id)
+        .bind(QUEUE)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO schedule_runs (id, schedule_id, job_id, status, started_at) \
+             SELECT 'w5-ret-run-' || g, 'w5-ret-' || (1 + g % 20), \
+                    CASE WHEN g <= 1000 THEN 'w5-ret-job-' || g END, 'completed', \
+                    NOW() - make_interval(mins => g) \
+             FROM generate_series(1, 18000) AS g",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("ANALYZE schedule_runs")
+            .execute(pool)
+            .await
+            .unwrap();
+
+        // The ON DELETE SET NULL action of schedule_runs_job_id_fkey.
+        let plan = fk_action_plan(pool).await;
+        assert!(
+            plan.contains("idx_schedule_runs_job_id"),
+            "foreign-key action plan:\n{plan}"
+        );
+
+        let plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN {SCHEDULE_RUNS_RETENTION_SQL}"
+        )))
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        let plan = plan.join("\n");
+        assert!(
+            plan.contains("idx_schedule_runs_schedule_started"),
+            "retention plan:\n{plan}"
+        );
+        assert!(
+            !plan.contains("Seq Scan on schedule_runs"),
+            "retention plan:\n{plan}"
+        );
+
+        // And the sweep still removes exactly the runs past retention
+        // (starter: 7 days of history); 18,000 minutes is 12.5 days.
+        sweep(Arc::clone(&db.pool)).await.unwrap();
+        let (left, oldest_ok): (i64, bool) = sqlx::query_as(
+            "SELECT COUNT(*), COALESCE(MIN(started_at) > NOW() - INTERVAL '7 days', TRUE) \
+             FROM schedule_runs",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(oldest_ok, "a run past retention is left");
+        assert!(
+            (10_070..=10_080).contains(&left),
+            "{left} runs left of 18,000; 7 days is 10,080 minutes"
+        );
+    }
+
+    // W5-R6: the two indexes are built CONCURRENTLY; an interrupted build
+    // leaves an INVALID index that IF NOT EXISTS skips, and the repair
+    // migrations rebuild it.
+    #[tokio::test]
+    async fn w5_retention_index_repairs_rebuild_an_invalid_index() {
+        let db = TestDatabase::new().await;
+        for (index, repair) in [
+            (
+                "idx_schedule_runs_job_id",
+                include_str!("../migrations/20261013140001_schedule_runs_job_id_index_repair.sql"),
+            ),
+            (
+                "idx_schedule_runs_schedule_started",
+                include_str!(
+                    "../migrations/20261013140101_schedule_runs_retention_index_repair.sql"
+                ),
+            ),
+        ] {
+            assert!(
+                index_valid(db.pool(), index).await,
+                "{index} after migrations"
+            );
+            sqlx::query(
+                "UPDATE pg_index SET indisvalid = FALSE WHERE indexrelid = to_regclass($1)",
+            )
+            .bind(index)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            assert!(!index_valid(db.pool(), index).await);
+
+            let mut tx = db.pool().begin().await.unwrap();
+            sqlx::raw_sql(repair).execute(&mut *tx).await.unwrap();
+            tx.commit().await.unwrap();
+            assert!(
+                index_valid(db.pool(), index).await,
+                "{index} after its repair migration"
+            );
+        }
     }
 }

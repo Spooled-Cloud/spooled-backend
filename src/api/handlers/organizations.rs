@@ -41,6 +41,20 @@ pub struct OrganizationMember {
     pub invited_by: Option<String>,
 }
 
+/// An organization as `GET`/`PUT /organizations/{id}` return it: every
+/// [`Organization`] field plus the billing-email change awaiting verification.
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct OrganizationWithPendingEmail {
+    #[serde(flatten)]
+    #[sqlx(flatten)]
+    pub organization: Organization,
+    /// A new billing email waiting for its confirmation code. The verified
+    /// `billing_email` stays the email-login identity until this one is
+    /// verified and replaces it. Null when no change is pending.
+    #[sqlx(default)]
+    pub pending_billing_email: Option<String>,
+}
+
 /// Response for organization creation - includes initial API key
 #[derive(Debug, Serialize)]
 pub struct CreateOrganizationResponse {
@@ -598,21 +612,23 @@ pub async fn get(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
     Path(id): Path<String>,
-) -> AppResult<Json<Organization>> {
+) -> AppResult<Json<OrganizationWithPendingEmail>> {
     // Verify user belongs to this organization
     if id != ctx.organization_id {
         return Err(AppError::NotFound(format!("Organization {} not found", id)));
     }
 
-    let mut org = sqlx::query_as::<_, Organization>("SELECT * FROM organizations WHERE id = $1")
-        .bind(&id)
-        .fetch_optional(state.db.pool())
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("Organization {} not found", id)))?;
+    let mut org = sqlx::query_as::<_, OrganizationWithPendingEmail>(
+        "SELECT * FROM organizations WHERE id = $1",
+    )
+    .bind(&id)
+    .fetch_optional(state.db.pool())
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("Organization {} not found", id)))?;
 
     // Queue-scoped keys must not read the inbound webhook ingestion secret.
     if !ctx.is_unrestricted() {
-        if let Some(obj) = org.settings.as_object_mut() {
+        if let Some(obj) = org.organization.settings.as_object_mut() {
             obj.remove("webhook_token");
         }
     }
@@ -695,7 +711,7 @@ pub async fn update(
     Extension(ctx): Extension<ApiKeyContext>,
     Path(id): Path<String>,
     ValidatedJson(request): ValidatedJson<UpdateOrganizationRequest>,
-) -> AppResult<Json<Organization>> {
+) -> AppResult<Json<OrganizationWithPendingEmail>> {
     require_unrestricted_key(&ctx, "update organization settings")?;
 
     // Verify user belongs to this organization
@@ -719,11 +735,11 @@ pub async fn update(
     }
 
     let name = request.name.unwrap_or(existing.name);
+    // None keeps the billing email (and any pending change) as it is.
     let billing_email = request
         .billing_email
         .as_deref()
-        .map(normalize_billing_email)
-        .or(existing.billing_email);
+        .map(normalize_billing_email);
 
     // Validate settings size to prevent large payloads
     let settings = if let Some(ref new_settings) = request.settings {
@@ -741,16 +757,35 @@ pub async fn update(
         existing.settings
     };
 
-    let org = sqlx::query_as::<_, Organization>(
+    // A new address has not been proven yet, so email login must not resolve
+    // this org by it until the verification code flow runs. An org with a
+    // verified address keeps it (and email login with it) meanwhile: the new
+    // one waits in `pending_billing_email`, and sending the active address
+    // again withdraws it. Without a verified address there is nothing to keep,
+    // and the new one replaces it, unverified. Every CASE reads the old row.
+    let org = sqlx::query_as::<_, OrganizationWithPendingEmail>(
         r#"
         UPDATE organizations
         SET name = $1,
-            billing_email = $2,
-            -- A new address has not been proven yet: email login must not
-            -- resolve this org by it until the verification code flow runs.
+            billing_email = CASE
+                WHEN $2::TEXT IS NULL OR lower(billing_email) IS NOT DISTINCT FROM $2
+                THEN billing_email
+                WHEN billing_email IS NOT NULL AND billing_email_verified_at IS NOT NULL
+                THEN billing_email
+                ELSE $2
+            END,
             billing_email_verified_at = CASE
-                WHEN lower(billing_email) IS NOT DISTINCT FROM lower($2)
+                WHEN $2::TEXT IS NULL OR lower(billing_email) IS NOT DISTINCT FROM $2
                 THEN billing_email_verified_at
+                WHEN billing_email IS NOT NULL AND billing_email_verified_at IS NOT NULL
+                THEN billing_email_verified_at
+                ELSE NULL
+            END,
+            pending_billing_email = CASE
+                WHEN $2::TEXT IS NULL THEN pending_billing_email
+                WHEN lower(billing_email) IS NOT DISTINCT FROM $2 THEN NULL
+                WHEN billing_email IS NOT NULL AND billing_email_verified_at IS NOT NULL
+                THEN $2
                 ELSE NULL
             END,
             settings = $3,

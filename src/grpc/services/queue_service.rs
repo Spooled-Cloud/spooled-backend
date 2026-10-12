@@ -511,6 +511,8 @@ impl QueueServiceImpl {
                 assigned_worker_id = $1,
                 lease_id = $2,
                 lease_expires_at = NOW() + ($3 || ' seconds')::INTERVAL,
+                -- The granted length, so a REST heartbeat that names none keeps it.
+                lease_duration_secs = $3,
                 updated_at = NOW()
             WHERE id = (
                 SELECT id FROM jobs
@@ -949,7 +951,7 @@ impl QueueService for QueueServiceImpl {
               AND lease_expires_at IS NOT NULL
               AND lease_expires_at > NOW()
               AND lease_id = $5
-              AND ($6::TEXT[] IS NULL OR queue_name = ANY($6))
+              AND queue_in_key_scope(queue_name, $6::TEXT[])
             "#,
         )
         .bind(&result_str)
@@ -1018,6 +1020,7 @@ impl QueueService for QueueServiceImpl {
         );
         if let Some(url) = completion_webhook.filter(|u| !u.is_empty()) {
             crate::outgoing_webhooks::service::spawn_completion_webhook(
+                &auth.organization_id,
                 url,
                 "job.completed".to_string(),
                 serde_json::json!({
@@ -1105,7 +1108,7 @@ impl QueueService for QueueServiceImpl {
                   AND lease_expires_at IS NOT NULL
                   AND lease_expires_at > NOW()
                   AND lease_id = $6
-                  AND ($7::TEXT[] IS NULL OR queue_name = ANY($7))
+                  AND queue_in_key_scope(queue_name, $7::TEXT[])
                 RETURNING
                     id,
                     organization_id,
@@ -1232,6 +1235,7 @@ impl QueueService for QueueServiceImpl {
             if let Some((url, secret)) = completion_meta {
                 if let Some(url) = url.filter(|u| !u.is_empty()) {
                     crate::outgoing_webhooks::service::spawn_completion_webhook(
+                        &auth.organization_id,
                         url,
                         "job.failed".to_string(),
                         serde_json::json!({
@@ -1280,7 +1284,7 @@ impl QueueService for QueueServiceImpl {
         let result = sqlx::query(
             r#"
             UPDATE jobs
-            SET lease_expires_at = $1, updated_at = NOW()
+            SET lease_expires_at = $1, lease_duration_secs = $7, updated_at = NOW()
             WHERE id = $2
               AND assigned_worker_id = $3
               AND organization_id = $4
@@ -1288,7 +1292,7 @@ impl QueueService for QueueServiceImpl {
               AND lease_expires_at IS NOT NULL
               AND lease_expires_at > NOW()
               AND lease_id = $5
-              AND ($6::TEXT[] IS NULL OR queue_name = ANY($6))
+              AND queue_in_key_scope(queue_name, $6::TEXT[])
             "#,
         )
         .bind(new_expires_at)
@@ -1297,6 +1301,7 @@ impl QueueService for QueueServiceImpl {
         .bind(&auth.organization_id)
         .bind(lease_id)
         .bind(allowed_queues)
+        .bind(extension_secs)
         .execute(self.pool.as_ref())
         .await
         .map_err(|e| {
@@ -1345,7 +1350,7 @@ impl QueueService for QueueServiceImpl {
 
         let allowed_queues = queue_scope_filter(&auth);
         let job: Option<DbJob> = sqlx::query_as(
-            "SELECT * FROM jobs WHERE id = $1 AND organization_id = $2 AND ($3::TEXT[] IS NULL OR queue_name = ANY($3))",
+            "SELECT * FROM jobs WHERE id = $1 AND organization_id = $2 AND queue_in_key_scope(queue_name, $3::TEXT[])",
         )
                 .bind(&req.job_id)
                 .bind(&auth.organization_id)
@@ -1730,6 +1735,8 @@ impl QueueServiceImpl {
                     assigned_worker_id = $1,
                     lease_id = $2,
                     lease_expires_at = NOW() + ($3 || ' seconds')::INTERVAL,
+                    -- The granted length, so a REST heartbeat that names none keeps it.
+                    lease_duration_secs = $3,
                     started_at = COALESCE(started_at, NOW()),
                     updated_at = NOW()
                 WHERE id = (
@@ -1745,11 +1752,7 @@ impl QueueServiceImpl {
                             AND k.is_active = TRUE
                             AND (k.expires_at IS NULL OR k.expires_at > NOW())
                             AND o.plan_tier <> 'deleted'
-                            AND (
-                                cardinality(k.queues) = 0
-                                OR '*' = ANY(k.queues)
-                                OR jobs.queue_name = ANY(k.queues)
-                            )
+                            AND queue_in_key_scope(jobs.queue_name, k.queues)
                       )
                       AND status IN ('pending', 'scheduled')
                       AND (scheduled_at IS NULL OR scheduled_at <= NOW())
@@ -1890,8 +1893,11 @@ fn queue_scope_filter(auth: &GrpcAuthContext) -> Option<&[String]> {
     queue_scope_filter_from_queues(&auth.queues)
 }
 
+/// The scope to bind for `queue_in_key_scope(queue_name, $n::TEXT[])`: `None`
+/// (all queues) for an unrestricted key, else the key's list, `prefix.*`
+/// entries included.
 fn queue_scope_filter_from_queues(queues: &[String]) -> Option<&[String]> {
-    if queues.is_empty() || queues.iter().any(|queue| queue == "*") {
+    if crate::models::queue_scope_is_unrestricted(queues) {
         None
     } else {
         Some(queues)
@@ -1947,11 +1953,7 @@ async fn begin_stream_operation<'a>(
     let (queues, key_rate_limit, plan_tier, custom_limits) =
         key.ok_or_else(|| Status::unauthenticated("API key revoked or expired"))?;
     if let Some(queue_name) = queue_name {
-        let allowed = queues.is_empty()
-            || queues
-                .iter()
-                .any(|allowed| allowed == "*" || allowed == queue_name);
-        if !allowed {
+        if !crate::models::queue_scope_allows(&queues, queue_name) {
             return Err(Status::permission_denied(format!(
                 "API key does not have permission for queue '{}'",
                 queue_name
@@ -2120,6 +2122,7 @@ async fn dead_letter_oversized(
     );
     if let Some(url) = job.completion_webhook.clone().filter(|u| !u.is_empty()) {
         crate::outgoing_webhooks::service::spawn_completion_webhook(
+            &job.organization_id,
             url,
             "job.failed".to_string(),
             event,
@@ -2196,6 +2199,8 @@ async fn handle_process_dequeue(
                 assigned_worker_id = $1,
                 lease_id = $2,
                 lease_expires_at = NOW() + ($3 || ' seconds')::INTERVAL,
+                -- The granted length, so a REST heartbeat that names none keeps it.
+                lease_duration_secs = $3,
                 started_at = COALESCE(started_at, NOW()),
                 updated_at = NOW()
             WHERE id = (
@@ -2311,7 +2316,7 @@ async fn classify_worker_miss_status(
         WHERE id = $1
           AND organization_id = $2
           AND assigned_worker_id = $3
-          AND ($4::TEXT[] IS NULL OR queue_name = ANY($4))
+          AND queue_in_key_scope(queue_name, $4::TEXT[])
         "#,
     )
     .bind(job_id)
@@ -2381,11 +2386,7 @@ async fn classify_worker_miss_process_response(
               SELECT 1 FROM api_keys k
               WHERE k.id = $4
                 AND k.organization_id = jobs.organization_id
-                AND (
-                    cardinality(k.queues) = 0
-                    OR '*' = ANY(k.queues)
-                    OR jobs.queue_name = ANY(k.queues)
-                )
+                AND queue_in_key_scope(jobs.queue_name, k.queues)
           )
         "#,
     )
@@ -2489,11 +2490,7 @@ async fn handle_process_complete(
               SELECT 1 FROM api_keys k
               WHERE k.id = $6
                 AND k.organization_id = jobs.organization_id
-                AND (
-                    cardinality(k.queues) = 0
-                    OR '*' = ANY(k.queues)
-                    OR jobs.queue_name = ANY(k.queues)
-                )
+                AND queue_in_key_scope(jobs.queue_name, k.queues)
           )
         "#,
     )
@@ -2545,6 +2542,7 @@ async fn handle_process_complete(
             );
             if let Some(url) = completion_webhook.filter(|u| !u.is_empty()) {
                 crate::outgoing_webhooks::service::spawn_completion_webhook(
+                    org_id,
                     url,
                     "job.completed".to_string(),
                     serde_json::json!({
@@ -2659,11 +2657,7 @@ async fn handle_process_fail(
               SELECT 1 FROM api_keys k
               WHERE k.id = $7
                 AND k.organization_id = jobs.organization_id
-                AND (
-                    cardinality(k.queues) = 0
-                    OR '*' = ANY(k.queues)
-                    OR jobs.queue_name = ANY(k.queues)
-                )
+                AND queue_in_key_scope(jobs.queue_name, k.queues)
           )
         RETURNING
             status as new_status,
@@ -2765,6 +2759,7 @@ async fn handle_process_fail(
                 );
                 if let Some(url) = completion_webhook.filter(|u| !u.is_empty()) {
                     crate::outgoing_webhooks::service::spawn_completion_webhook(
+                        org_id,
                         url,
                         "job.failed".to_string(),
                         serde_json::json!({
@@ -2846,7 +2841,7 @@ async fn handle_process_renew(
     let result = sqlx::query(
         r#"
         UPDATE jobs
-        SET lease_expires_at = $1, updated_at = NOW()
+        SET lease_expires_at = $1, lease_duration_secs = $7, updated_at = NOW()
         WHERE id = $2
           AND assigned_worker_id = $3
           AND organization_id = $4
@@ -2858,11 +2853,7 @@ async fn handle_process_renew(
               SELECT 1 FROM api_keys k
               WHERE k.id = $6
                 AND k.organization_id = jobs.organization_id
-                AND (
-                    cardinality(k.queues) = 0
-                    OR '*' = ANY(k.queues)
-                    OR jobs.queue_name = ANY(k.queues)
-                )
+                AND queue_in_key_scope(jobs.queue_name, k.queues)
           )
         "#,
     )
@@ -2872,6 +2863,7 @@ async fn handle_process_renew(
     .bind(org_id)
     .bind(QueueServiceImpl::opt_lease_id(&req.lease_id))
     .bind(api_key_id)
+    .bind(extension_secs)
     .execute(&mut *tx)
     .await;
 

@@ -407,9 +407,10 @@ pub struct AddDependenciesRequest {
     #[validate(length(min = 1, max = 100))]
     pub depends_on: Vec<String>,
 
-    /// Dependency mode
+    /// Dependency mode. Omitted keeps the job's current mode (`all` for a job
+    /// with no dependencies yet) instead of resetting an `any` job to `all`.
     #[serde(default)]
-    pub dependency_mode: DependencyMode,
+    pub dependency_mode: Option<DependencyMode>,
 }
 
 /// Response after adding dependencies

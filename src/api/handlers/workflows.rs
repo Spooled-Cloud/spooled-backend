@@ -29,7 +29,7 @@ use crate::{
         AddDependenciesRequest, AddDependenciesResponse, ApiKeyContext, CreateWorkflowRequest,
         CreateWorkflowResponse, DependencyInfo, Job, JobErrorResponse, JobWithDependencies,
         Workflow, WorkflowDependencyResponse, WorkflowDetailResponse, WorkflowJobMapping,
-        WorkflowJobResponse, WorkflowProgress, WorkflowResponse,
+        WorkflowJobResponse, WorkflowProgress, WorkflowResponse, WorkflowStatus,
     },
 };
 
@@ -50,7 +50,7 @@ where
               AND NOT EXISTS (
                   SELECT 1 FROM jobs j
                   WHERE j.workflow_id = w.id
-                    AND ($3::TEXT[] IS NOT NULL AND NOT (j.queue_name = ANY($3)))
+                    AND NOT queue_in_key_scope(j.queue_name, $3::TEXT[])
               )
         )
         "#,
@@ -88,7 +88,7 @@ pub async fn list(
               AND NOT EXISTS (
                   SELECT 1 FROM jobs j
                   WHERE j.workflow_id = workflows.id
-                    AND ($5::TEXT[] IS NOT NULL AND NOT (j.queue_name = ANY($5)))
+                    AND NOT queue_in_key_scope(j.queue_name, $5::TEXT[])
               )
             ORDER BY created_at DESC
             LIMIT $3 OFFSET $4
@@ -109,7 +109,7 @@ pub async fn list(
               AND NOT EXISTS (
                   SELECT 1 FROM jobs j
                   WHERE j.workflow_id = workflows.id
-                    AND ($4::TEXT[] IS NOT NULL AND NOT (j.queue_name = ANY($4)))
+                    AND NOT queue_in_key_scope(j.queue_name, $4::TEXT[])
               )
             ORDER BY created_at DESC
             LIMIT $2 OFFSET $3
@@ -190,41 +190,8 @@ pub async fn get(
     }
 
     // Convert jobs to response format
-    let job_responses: Vec<WorkflowJobResponse> = jobs
-        .into_iter()
-        .map(|job| {
-            let error = job.last_error.as_ref().map(|msg| JobErrorResponse {
-                error_type: "JobError".to_string(),
-                message: msg.clone(),
-                stack: None,
-            });
-
-            WorkflowJobResponse {
-                id: job.id,
-                organization_id: job.organization_id,
-                queue: job.queue_name,
-                job_type: "job".to_string(), // jobs table doesn't have job_type, use default
-                payload: job.payload,
-                status: job.status,
-                priority: job.priority,
-                attempt: job.retry_count,
-                max_retries: job.max_retries,
-                backoff_type: "exponential".to_string(), // default
-                timeout_ms: Some((job.timeout_seconds * 1000) as i64),
-                created_at: job.created_at,
-                scheduled_at: job.scheduled_at,
-                started_at: job.started_at,
-                completed_at: job.completed_at,
-                failed_at: None,     // jobs table doesn't track this separately
-                next_retry_at: None, // would need to calculate from retry logic
-                result: job.result,
-                error,
-                metadata: job.tags,
-                workflow_id: job.workflow_id,
-                parent_job_id: job.parent_job_id,
-            }
-        })
-        .collect();
+    let job_responses: Vec<WorkflowJobResponse> =
+        jobs.into_iter().map(workflow_job_response).collect();
 
     // Convert dependencies to response format
     let dependency_responses: Vec<WorkflowDependencyResponse> = dependencies
@@ -258,6 +225,55 @@ pub async fn get(
     };
 
     Ok(Json(response))
+}
+
+/// A workflow job as `GET /workflows/{id}` returns it.
+///
+/// The jobs table has no job_type column: the type is the payload's `job_type`
+/// (what the dashboard and SDKs put there, and what job lists read), falling
+/// back to the old generic `"job"` when the payload has none. A failed or
+/// dead-lettered row is not touched after it fails, so its `updated_at` is the
+/// failure time. Retries always back off exponentially.
+fn workflow_job_response(job: Job) -> WorkflowJobResponse {
+    let error = job.last_error.as_ref().map(|msg| JobErrorResponse {
+        error_type: "JobError".to_string(),
+        message: msg.clone(),
+        stack: None,
+    });
+    let job_type = job
+        .payload
+        .get("job_type")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("job")
+        .to_string();
+    let failed_at =
+        matches!(job.status.as_str(), "failed" | "deadletter").then_some(job.updated_at);
+
+    WorkflowJobResponse {
+        id: job.id,
+        organization_id: job.organization_id,
+        queue: job.queue_name,
+        job_type,
+        payload: job.payload,
+        status: job.status,
+        priority: job.priority,
+        attempt: job.retry_count,
+        max_retries: job.max_retries,
+        backoff_type: "exponential".to_string(),
+        timeout_ms: Some((job.timeout_seconds * 1000) as i64),
+        created_at: job.created_at,
+        scheduled_at: job.scheduled_at,
+        started_at: job.started_at,
+        completed_at: job.completed_at,
+        failed_at,
+        next_retry_at: None, // would need to calculate from retry logic
+        result: job.result,
+        error,
+        metadata: job.tags,
+        workflow_id: job.workflow_id,
+        parent_job_id: job.parent_job_id,
+    }
 }
 
 /// Helper struct for fetching dependencies
@@ -320,10 +336,19 @@ pub async fn create(
     let job_keys: std::collections::HashSet<&str> =
         request.jobs.iter().map(|j| j.key.as_str()).collect();
     for job_def in &request.jobs {
+        let mut seen = std::collections::HashSet::new();
         for dep_key in &job_def.depends_on {
             if !job_keys.contains(dep_key.as_str()) {
                 return Err(AppError::BadRequest(format!(
                     "Job '{}' depends on unknown job '{}'",
+                    job_def.key, dep_key
+                )));
+            }
+            // A repeated key is a second identical edge: it used to reach the
+            // unique edge constraint mid-transaction and answer 500.
+            if !seen.insert(dep_key.as_str()) {
+                return Err(AppError::BadRequest(format!(
+                    "Job '{}' lists dependency '{}' more than once",
                     job_def.key, dep_key
                 )));
             }
@@ -807,17 +832,29 @@ pub async fn cancel(
 
     // Lock the workflow row so cancellation serializes with retry and other workflow
     // state transitions. All workflow/job changes below commit or roll back together.
-    let workflow_exists: Option<String> = sqlx::query_scalar(
-        "SELECT id FROM workflows WHERE id = $1 AND organization_id = $2 FOR UPDATE",
+    let current_status: Option<String> = sqlx::query_scalar(
+        "SELECT status FROM workflows WHERE id = $1 AND organization_id = $2 FOR UPDATE",
     )
     .bind(&workflow_id)
     .bind(&ctx.organization_id)
     .fetch_optional(&mut *tx)
     .await?;
-    if workflow_exists.is_none() {
+    let Some(current_status) = current_status else {
         return Err(AppError::NotFound(format!(
             "Workflow {} not found",
             workflow_id
+        )));
+    };
+    // A finished workflow stays finished: cancelling one used to overwrite its
+    // `completed`/`failed` outcome and completed_at. Same 409 as cancelling a
+    // job that is no longer pending.
+    if !matches!(
+        WorkflowStatus::from(current_status.clone()),
+        WorkflowStatus::Pending | WorkflowStatus::Running
+    ) {
+        return Err(AppError::Conflict(format!(
+            "Workflow is already {}; only pending or running workflows can be cancelled",
+            current_status
         )));
     }
 
@@ -877,7 +914,7 @@ pub async fn get_job_dependencies(
 ) -> AppResult<Json<JobWithDependencies>> {
     // First verify the target job belongs to this organization and queue scope.
     let job_exists: Option<(String,)> = sqlx::query_as(
-        "SELECT id FROM jobs WHERE id = $1 AND organization_id = $2 AND ($3::TEXT[] IS NULL OR queue_name = ANY($3))",
+        "SELECT id FROM jobs WHERE id = $1 AND organization_id = $2 AND queue_in_key_scope(queue_name, $3::TEXT[])",
     )
             .bind(&job_id)
             .bind(&ctx.organization_id)
@@ -970,7 +1007,7 @@ pub async fn add_dependencies(
     // Authorize every involved job after acquiring the graph lock, so the checks and
     // mutation observe one serialized database state.
     let target_exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM jobs WHERE id = $1 AND organization_id = $2 AND ($3::TEXT[] IS NULL OR queue_name = ANY($3)))",
+        "SELECT EXISTS(SELECT 1 FROM jobs WHERE id = $1 AND organization_id = $2 AND queue_in_key_scope(queue_name, $3::TEXT[]))",
     )
     .bind(&job_id)
     .bind(&ctx.organization_id)
@@ -983,7 +1020,7 @@ pub async fn add_dependencies(
 
     for dep_job_id in &request.depends_on {
         let dep_exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM jobs WHERE id = $1 AND organization_id = $2 AND ($3::TEXT[] IS NULL OR queue_name = ANY($3)))",
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE id = $1 AND organization_id = $2 AND queue_in_key_scope(queue_name, $3::TEXT[]))",
         )
         .bind(dep_job_id)
         .bind(&ctx.organization_id)
@@ -998,34 +1035,42 @@ pub async fn add_dependencies(
         }
     }
 
-    // Update dependency mode
-    // SECURITY: Include organization_id for defense-in-depth
-    sqlx::query("UPDATE jobs SET dependency_mode = $1, dependencies_met = FALSE WHERE id = $2 AND organization_id = $3")
-        .bind(request.dependency_mode.to_string())
-        .bind(&job_id)
-        .bind(&ctx.organization_id)
-        .execute(&mut *tx)
-        .await?;
+    // Refuse self and cyclic edges before changing anything. They used to be
+    // skipped with a 200 (`dependencies_added: 0`) after the job's
+    // dependency_mode had already been rewritten. Checking every edge up front is
+    // enough: all new edges leave `job_id`, so none of them can be part of a path
+    // back into it.
+    for dep_job_id in &request.depends_on {
+        if dep_job_id == &job_id {
+            return Err(AppError::BadRequest(
+                "A job cannot depend on itself".to_string(),
+            ));
+        }
+        if would_create_cycle(&mut *tx, &job_id, dep_job_id).await? {
+            return Err(AppError::BadRequest(format!(
+                "Depending on job {} would create a circular dependency",
+                dep_job_id
+            )));
+        }
+    }
+
+    // Omitting the mode keeps the job's own, rather than defaulting to `all`.
+    let mode = match &request.dependency_mode {
+        Some(mode) => mode.to_string(),
+        None => {
+            sqlx::query_scalar(
+                "SELECT COALESCE(dependency_mode, 'all') FROM jobs WHERE id = $1 AND organization_id = $2",
+            )
+            .bind(&job_id)
+            .bind(&ctx.organization_id)
+            .fetch_one(&mut *tx)
+            .await?
+        }
+    };
 
     // Add dependencies
     let mut added = 0;
     for dep_job_id in &request.depends_on {
-        // Check for self-dependency
-        if dep_job_id == &job_id {
-            warn!(job_id = %job_id, "Attempted self-dependency");
-            continue;
-        }
-
-        // Check for circular dependency
-        if would_create_cycle(&mut *tx, &job_id, dep_job_id).await? {
-            warn!(
-                job_id = %job_id,
-                depends_on = %dep_job_id,
-                "Circular dependency detected, skipping"
-            );
-            continue;
-        }
-
         let result = sqlx::query(
             r#"
             INSERT INTO job_dependencies (job_id, depends_on_job_id, dependency_type)
@@ -1035,28 +1080,47 @@ pub async fn add_dependencies(
         )
         .bind(&job_id)
         .bind(dep_job_id)
-        .bind(request.dependency_mode.to_string())
+        .bind(&mode)
         .execute(&mut *tx)
         .await?;
 
         added += result.rows_affected() as i32;
     }
 
-    // Check if dependencies are met. Fail closed: a decode/SQL error must not
-    // mark the job runnable (unwrap_or(true) would enqueue it with unmet deps).
-    let dependencies_met: bool = sqlx::query_scalar("SELECT check_job_dependencies_met($1)")
-        .bind(&job_id)
-        .fetch_one(&mut *tx)
-        .await?;
+    let dependencies_met: bool = if added > 0 {
+        // SECURITY: Include organization_id for defense-in-depth
+        sqlx::query("UPDATE jobs SET dependency_mode = $1 WHERE id = $2 AND organization_id = $3")
+            .bind(&mode)
+            .bind(&job_id)
+            .bind(&ctx.organization_id)
+            .execute(&mut *tx)
+            .await?;
 
-    // Update job's dependencies_met flag
-    // SECURITY: Include organization_id for defense-in-depth
-    sqlx::query("UPDATE jobs SET dependencies_met = $1 WHERE id = $2 AND organization_id = $3")
-        .bind(dependencies_met)
+        // Check if dependencies are met. Fail closed: a decode/SQL error must not
+        // mark the job runnable (unwrap_or(true) would enqueue it with unmet deps).
+        let met: bool = sqlx::query_scalar("SELECT check_job_dependencies_met($1)")
+            .bind(&job_id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+        sqlx::query("UPDATE jobs SET dependencies_met = $1 WHERE id = $2 AND organization_id = $3")
+            .bind(met)
+            .bind(&job_id)
+            .bind(&ctx.organization_id)
+            .execute(&mut *tx)
+            .await?;
+        met
+    } else {
+        // Every edge already existed: the job is unchanged, so report its flag
+        // as it stands.
+        sqlx::query_scalar(
+            "SELECT COALESCE(dependencies_met, TRUE) FROM jobs WHERE id = $1 AND organization_id = $2",
+        )
         .bind(&job_id)
         .bind(&ctx.organization_id)
-        .execute(&mut *tx)
-        .await?;
+        .fetch_one(&mut *tx)
+        .await?
+    };
 
     tx.commit().await?;
 

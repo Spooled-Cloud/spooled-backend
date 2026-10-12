@@ -50,6 +50,15 @@ async fn require_schedule_access(
     }
 }
 
+/// 400 for a cron expression with no upcoming fire time.
+fn never_runs_response() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        "Invalid cron expression: the schedule has no upcoming run time".to_string(),
+    )
+        .into_response()
+}
+
 /// List all schedules
 ///
 /// GET /api/v1/schedules
@@ -62,21 +71,30 @@ pub async fn list(
 ) -> Result<Json<Vec<Schedule>>, (StatusCode, String)> {
     // Use authenticated org context, ignore query param
     let org_id = &ctx.organization_id;
+    let is_active = params.is_active_filter()?;
 
-    // Use safe_limit() to enforce maximum
+    // Use safe_limit() to enforce maximum. `queue_name`, `is_active` and `offset`
+    // are what the Go and Python SDKs send; they used to be ignored, so a filtered
+    // call returned every schedule and an offset loop re-read page one forever.
+    // `id` breaks created_at ties so offset pages neither repeat nor skip rows.
     let schedules: Vec<Schedule> = sqlx::query_as(
         r#"
         SELECT *
         FROM schedules
         WHERE organization_id = $1
-          AND ($3::TEXT[] IS NULL OR queue_name = ANY($3))
-        ORDER BY created_at DESC
-        LIMIT $2
+          AND queue_in_key_scope(queue_name, $3::TEXT[])
+          AND ($4::TEXT IS NULL OR queue_name = $4)
+          AND ($5::BOOLEAN IS NULL OR is_active = $5)
+        ORDER BY created_at DESC, id DESC
+        LIMIT $2 OFFSET $6
         "#,
     )
     .bind(org_id)
     .bind(params.safe_limit()) // Use bounded limit
     .bind(ctx.queue_scope_filter())
+    .bind(params.queue_name.as_deref())
+    .bind(is_active)
+    .bind(params.offset.unwrap_or(0) as i64)
     .fetch_all(state.db.pool())
     .await
     // Don't leak database error details
@@ -189,9 +207,14 @@ pub async fn create(
         crate::api::middleware::limits::check_new_queue_limit(state.db.pool(), org_id, 1).await?;
     }
 
-    // Calculate next run time in the schedule's timezone (stored as UTC)
+    // Calculate next run time in the schedule's timezone (stored as UTC). A
+    // schedule with no next run would be stored with `next_run_at: null` and never
+    // fire, so it is refused rather than reported as created.
     let next_run =
         cron.next_run_after_in_timezone(Utc::now(), req.timezone.as_deref().unwrap_or("UTC"));
+    if next_run.is_none() {
+        return Err(never_runs_response());
+    }
 
     let id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now();
@@ -332,7 +355,12 @@ pub async fn update(
             )
                 .into_response()
         })?;
-        cron.next_run_after_in_timezone(Utc::now(), timezone)
+        // Same rule as create: an update must not leave a schedule that never fires
+        // (and `COALESCE` below would otherwise keep the old next_run_at).
+        Some(
+            cron.next_run_after_in_timezone(Utc::now(), timezone)
+                .ok_or_else(never_runs_response)?,
+        )
     } else if reactivating {
         CronSchedule::parse(&current.cron_expression)
             .ok()
@@ -862,6 +890,12 @@ pub struct ListSchedulesQuery {
     #[serde(skip)]
     pub _organization_id: Option<String>,
     pub limit: Option<u32>,
+    /// Only schedules targeting this queue.
+    pub queue_name: Option<String>,
+    /// `true` / `false` (also `1` / `0`, any case); see `is_active_filter`.
+    pub is_active: Option<String>,
+    /// Rows to skip, newest first.
+    pub offset: Option<u32>,
 }
 
 impl ListSchedulesQuery {
@@ -869,6 +903,20 @@ impl ListSchedulesQuery {
     pub fn safe_limit(&self) -> i64 {
         const MAX_SCHEDULE_LIMIT: u32 = 500;
         self.limit.unwrap_or(100).min(MAX_SCHEDULE_LIMIT) as i64
+    }
+
+    /// The `is_active` filter. Anything but a boolean is a 400: silently
+    /// ignoring an unreadable filter is how every schedule came back before.
+    pub fn is_active_filter(&self) -> Result<Option<bool>, (StatusCode, String)> {
+        match self.is_active.as_deref().map(str::to_ascii_lowercase) {
+            None => Ok(None),
+            Some(v) if v == "true" || v == "1" => Ok(Some(true)),
+            Some(v) if v == "false" || v == "0" => Ok(Some(false)),
+            Some(_) => Err((
+                StatusCode::BAD_REQUEST,
+                "is_active must be true or false".to_string(),
+            )),
+        }
     }
 }
 
@@ -926,9 +974,13 @@ mod tests {
         let query = ListSchedulesQuery {
             _organization_id: None,
             limit: None,
+            queue_name: None,
+            is_active: None,
+            offset: None,
         };
         assert!(query._organization_id.is_none());
         assert!(query.limit.is_none());
+        assert_eq!(query.is_active_filter(), Ok(None));
     }
 
     #[test]

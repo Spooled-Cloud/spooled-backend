@@ -217,6 +217,26 @@ To change retention, modify `maintain_jobs_partitions()`:
 retention_months INT := 12;
 ```
 
+### Data Retention Sweeps
+
+The scheduler removes old data every 5 minutes, per organization, using the plan's retention
+(`custom_limits.job_retention_days` / `history_retention_days` override it):
+
+| Data | Retention | Notes |
+|------|-----------|-------|
+| Completed and cancelled jobs | Job retention (Free 3 days, Starter 14, Pro 30, Enterprise 90) | A cancelled step of a workflow that still exists is kept |
+| Failed and dead-lettered jobs, and their `dead_letter_queue` rows | Job retention | Kept while a pending, scheduled or processing job waits on them, and while their workflow exists (a failed workflow stays retryable until it is purged) |
+| Workflows | Job retention, after they finish | Their steps are removed in the same pass |
+| `schedule_runs`, job history, delivery history | History retention (Free 1 day, Starter 7, Pro 30, Enterprise 90) | |
+| Workers | 7 days after going `offline` | Kept while a job is still assigned to them |
+
+Each statement is a bounded batch (5,000 jobs, 10,000 rows of the other kinds), so a backlog (a
+plan downgrade, a lowered override, the first passes after upgrading to 0.1.121) is worked off over
+several passes rather than in one long statement; the scheduler loop also fires cron schedules
+and recovers leases, so no statement may hold it for long. Rows another transaction holds, or that
+a retry just changed, are skipped and picked up on a later pass. Deleted rows leave free space
+for reuse; the table files shrink only after `VACUUM FULL` or `pg_repack`.
+
 ---
 
 ## Autovacuum Tuning
@@ -270,6 +290,10 @@ VACUUM FULL jobs;
 | `spooled_jobs_deadlettered_total` | DLQ rate | > 5 in 15 min |
 | `spooled_api_request_duration_seconds` | API latency | p99 > 1s |
 | `spooled_database_connections_active` / `spooled_database_connections_max` | Pool usage | > 80% warning, > 95% critical |
+| `spooled_outgoing_webhook_deliveries_dropped_total` | Org webhook events dropped because the delivery queue (or one webhook's share) was full | Any increase |
+| `spooled_outgoing_webhook_queue_depth` | Org webhook events and deliveries queued and not resolved yet | Close to 16 x `OUTGOING_WEBHOOK_MAX_CONCURRENT_DELIVERIES` (1,024 by default) |
+| `spooled_outgoing_webhook_deliveries_in_flight` | Org webhook requests in flight | At `OUTGOING_WEBHOOK_MAX_CONCURRENT_DELIVERIES` for long |
+| `spooled_completion_webhooks_dropped_total` | Per-job completion webhooks dropped because their queue was full | Any increase |
 
 `spooled_api_requests_total{method,route,status}` and `spooled_api_request_duration_seconds{method,route}` use the matched route template (`unmatched` for 404s) and a status class (`2xx`, `4xx`, ...). There is no Redis metric.
 
@@ -495,7 +519,7 @@ Postgres connections use TLS when the URL asks for it (`sslmode=require` / `veri
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OUTGOING_WEBHOOK_MAX_ATTEMPTS` | `5` | Delivery attempts per event before giving up (exponential backoff between them) |
-| `OUTGOING_WEBHOOK_MAX_CONCURRENT_DELIVERIES` | `64` | Hard ceiling on deliveries in flight process-wide; beyond it, deliveries queue |
+| `OUTGOING_WEBHOOK_MAX_CONCURRENT_DELIVERIES` | `64` | Delivery senders and request slots process-wide. Also sizes the bounded queue (16 per sender; events past it are dropped and counted) and one webhook's share (a quarter of the senders and of the queue). Per-job completion webhooks get their own slots of the same size |
 
 Each in-flight delivery holds a copy of the job payload for up to the request timeout plus
 retry backoff, so raise the concurrency ceiling only with memory and socket headroom to

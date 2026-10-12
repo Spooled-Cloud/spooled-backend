@@ -102,7 +102,7 @@ Portainer details (Git stacks, ephemeral checkouts, recreate): [docs/guides/prod
 | `TRUSTED_CLIENT_IP_HEADER` | ❌ | - | Edge header carrying the real client IP, believed from any caller once set. Unset: `CF-Connecting-IP`, then `X-Real-IP`, believed **only** when the TCP peer is a loopback/private/link-local address (a proxy of yours on the same host or network); any other caller is keyed on its own address. Production warns at boot while unset |
 | `TRUSTED_PROXY_HOPS` | ❌ | `0` | Entries **your own** proxies append to `X-Forwarded-For`, counted from the right. `0` = never consult that header |
 | `OUTGOING_WEBHOOK_MAX_ATTEMPTS` | ❌ | `5` | Delivery attempts per outgoing webhook event |
-| `OUTGOING_WEBHOOK_MAX_CONCURRENT_DELIVERIES` | ❌ | `64` | Process-wide ceiling on webhook deliveries in flight |
+| `OUTGOING_WEBHOOK_MAX_CONCURRENT_DELIVERIES` | ❌ | `64` | Webhook delivery senders and request slots, process-wide; also sizes the bounded delivery queue (16 per sender, drops are counted) |
 | `TURNSTILE_SECRET_KEY` | ❌ | - | Cloudflare Turnstile secret. When set, `POST /auth/email/start` requires a valid `turnstile_token` (`400 CAPTCHA_FAILED` otherwise). Leave unset until the site and the dashboard both send the token |
 | `FRONTEND_URL` | ❌ | `https://spooled.cloud` | Website base URL Stripe Checkout returns to (`<FRONTEND_URL>/account/billing?checkout=success\|cancel`) |
 | `EMAIL_PROVIDER` | ✅ in production | `console` | `resend`/`sendgrid`/`postmark`/`smtp`. The backend refuses to start with `console` when `RUST_ENV=production` (login codes would only be logged) |

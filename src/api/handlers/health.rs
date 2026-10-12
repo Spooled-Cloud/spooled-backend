@@ -249,7 +249,7 @@ pub async fn dashboard_data(
             COUNT(*) FILTER (WHERE status IN ('failed', 'deadletter') AND updated_at > NOW() - INTERVAL '24 hours') as failed_24h
         FROM jobs
         WHERE organization_id = $1
-          AND ($2::TEXT[] IS NULL OR queue_name = ANY($2))
+          AND queue_in_key_scope(queue_name, $2::TEXT[])
         "#
     )
     .bind(org_id)
@@ -259,7 +259,7 @@ pub async fn dashboard_data(
     .unwrap_or((0, 0, 0, 0));
 
     let (total_jobs,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM jobs WHERE organization_id = $1 AND ($2::TEXT[] IS NULL OR queue_name = ANY($2))",
+        "SELECT COUNT(*) FROM jobs WHERE organization_id = $1 AND queue_in_key_scope(queue_name, $2::TEXT[])",
     )
     .bind(org_id)
     .bind(queue_scope)
@@ -268,7 +268,7 @@ pub async fn dashboard_data(
     .unwrap_or((0,));
 
     let (deadletter_count,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM jobs WHERE status = 'deadletter' AND organization_id = $1 AND ($2::TEXT[] IS NULL OR queue_name = ANY($2))",
+        "SELECT COUNT(*) FROM jobs WHERE status = 'deadletter' AND organization_id = $1 AND queue_in_key_scope(queue_name, $2::TEXT[])",
     )
     .bind(org_id)
     .bind(queue_scope)
@@ -285,7 +285,7 @@ pub async fn dashboard_data(
             AVG(EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000)::FLOAT8 as avg_processing_ms
         FROM jobs
         WHERE organization_id = $1
-          AND ($2::TEXT[] IS NULL OR queue_name = ANY($2))
+          AND queue_in_key_scope(queue_name, $2::TEXT[])
           AND status = 'completed'
           AND completed_at > NOW() - INTERVAL '24 hours'
           AND started_at IS NOT NULL
@@ -321,7 +321,7 @@ pub async fn dashboard_data(
         FROM jobs j
         LEFT JOIN queue_config qc ON qc.queue_name = j.queue_name AND qc.organization_id = j.organization_id
         WHERE j.organization_id = $1
-          AND ($2::TEXT[] IS NULL OR j.queue_name = ANY($2))
+          AND queue_in_key_scope(j.queue_name, $2::TEXT[])
         GROUP BY j.queue_name, qc.enabled
         ORDER BY j.queue_name
         LIMIT 20
@@ -341,7 +341,8 @@ pub async fn dashboard_data(
     })
     .collect();
 
-    // Get worker summary filtered by organization (+ queue scope)
+    // Get worker summary filtered by organization (+ queue scope: every queue a
+    // worker serves must be in the key's scope, as in the worker list)
     let worker_stats: (i64, i64) = if let Some(allowed) = queue_scope {
         sqlx::query_as(
             r#"
@@ -351,8 +352,14 @@ pub async fn dashboard_data(
             FROM workers
             WHERE last_heartbeat > NOW() - INTERVAL '1 minute'
               AND organization_id = $1
-              AND COALESCE(queue_names, ARRAY[]::TEXT[]) <@ $2::TEXT[]
-              AND (COALESCE(cardinality(queue_names), 0) > 0 OR queue_name = ANY($2::TEXT[]))
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM unnest(
+                      CASE WHEN COALESCE(cardinality(queue_names), 0) > 0
+                           THEN queue_names ELSE ARRAY[queue_name] END
+                  ) AS served(queue)
+                  WHERE NOT COALESCE(queue_in_key_scope(served.queue, $2::TEXT[]), FALSE)
+              )
             "#,
         )
         .bind(org_id)
@@ -392,7 +399,7 @@ pub async fn dashboard_data(
             COUNT(*) FILTER (WHERE updated_at > NOW() - INTERVAL '1 hour' AND status IN ('failed', 'deadletter')) as failed
         FROM jobs
         WHERE organization_id = $1
-          AND ($2::TEXT[] IS NULL OR queue_name = ANY($2))
+          AND queue_in_key_scope(queue_name, $2::TEXT[])
         "#
     )
     .bind(org_id)

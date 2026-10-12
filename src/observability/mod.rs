@@ -23,6 +23,8 @@ use prometheus::{
 use sqlx::PgPool;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+use crate::outgoing_webhooks::service::OutgoingWebhookService;
+
 // Tracing configuration re-exports for advanced usage
 #[allow(unused_imports)]
 pub use tracing_config::{init_tracing as init_tracing_with_config, TracingConfig};
@@ -71,6 +73,19 @@ pub struct Metrics {
     pub database_connections_max: IntGauge,
     /// Pool sampled on every scrape (set once by `AppState::new`).
     pool: Arc<OnceLock<PgPool>>,
+
+    // Outgoing webhook delivery, sampled on every scrape like the pool gauges.
+    /// Org webhook events and deliveries dropped because the delivery queue (or
+    /// the webhook's share of it) was full, since start.
+    pub outgoing_webhook_deliveries_dropped: IntCounter,
+    /// Org webhook events and deliveries admitted and not resolved yet.
+    pub outgoing_webhook_queue_depth: IntGauge,
+    /// Org webhook requests in flight.
+    pub outgoing_webhook_deliveries_in_flight: IntGauge,
+    /// Per-job completion webhooks dropped because their queue was full.
+    pub completion_webhooks_dropped: IntCounter,
+    /// Webhook service sampled on every scrape (set once by `AppState::new`).
+    outgoing_webhooks: Arc<OnceLock<Arc<OutgoingWebhookService>>>,
 }
 
 impl Metrics {
@@ -152,6 +167,28 @@ impl Metrics {
         )
         .expect("metric creation failed");
 
+        // Outgoing webhook delivery
+        let outgoing_webhook_deliveries_dropped = IntCounter::new(
+            "spooled_outgoing_webhook_deliveries_dropped_total",
+            "Outgoing webhook events and deliveries dropped because the delivery queue was full",
+        )
+        .expect("metric creation failed");
+        let outgoing_webhook_queue_depth = IntGauge::new(
+            "spooled_outgoing_webhook_queue_depth",
+            "Outgoing webhook events and deliveries queued and not resolved yet",
+        )
+        .expect("metric creation failed");
+        let outgoing_webhook_deliveries_in_flight = IntGauge::new(
+            "spooled_outgoing_webhook_deliveries_in_flight",
+            "Outgoing webhook requests in flight",
+        )
+        .expect("metric creation failed");
+        let completion_webhooks_dropped = IntCounter::new(
+            "spooled_completion_webhooks_dropped_total",
+            "Per-job completion webhooks dropped because their queue was full",
+        )
+        .expect("metric creation failed");
+
         // Register all metrics
         registry.register(Box::new(jobs_enqueued.clone())).unwrap();
         registry.register(Box::new(jobs_completed.clone())).unwrap();
@@ -184,6 +221,18 @@ impl Metrics {
         registry
             .register(Box::new(database_connections_max.clone()))
             .unwrap();
+        registry
+            .register(Box::new(outgoing_webhook_deliveries_dropped.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(outgoing_webhook_queue_depth.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(outgoing_webhook_deliveries_in_flight.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(completion_webhooks_dropped.clone()))
+            .unwrap();
 
         Self {
             registry: Arc::new(registry),
@@ -203,6 +252,11 @@ impl Metrics {
             database_connections,
             database_connections_max,
             pool: Arc::new(OnceLock::new()),
+            outgoing_webhook_deliveries_dropped,
+            outgoing_webhook_queue_depth,
+            outgoing_webhook_deliveries_in_flight,
+            completion_webhooks_dropped,
+            outgoing_webhooks: Arc::new(OnceLock::new()),
         }
     }
 
@@ -222,6 +276,45 @@ impl Metrics {
         }
     }
 
+    /// Attach the outgoing webhook service whose delivery counters are sampled
+    /// on every scrape. The first service wins; clones of `Metrics` share it.
+    pub fn attach_outgoing_webhooks(&self, service: Arc<OutgoingWebhookService>) {
+        let _ = self.outgoing_webhooks.set(service);
+    }
+
+    /// Refresh the webhook delivery series. The drop counts are monotonic
+    /// counts kept by the service, so each counter advances by what its count
+    /// gained since the last scrape. The completion-webhook count is
+    /// process-wide and sampled even without an attached service.
+    fn sample_outgoing_webhooks(&self) {
+        fn advance(counter: &IntCounter, total: u64) {
+            let seen = counter.get();
+            if total > seen {
+                counter.inc_by(total - seen);
+            }
+        }
+        if let Some(service) = self.outgoing_webhooks.get() {
+            advance(
+                &self.outgoing_webhook_deliveries_dropped,
+                service.deliveries_dropped(),
+            );
+            self.outgoing_webhook_queue_depth
+                .set(i64::try_from(service.deliveries_queued()).unwrap_or(i64::MAX));
+            self.outgoing_webhook_deliveries_in_flight
+                .set(i64::try_from(service.deliveries_in_flight()).unwrap_or(i64::MAX));
+        }
+        advance(
+            &self.completion_webhooks_dropped,
+            crate::outgoing_webhooks::service::completion_webhooks_dropped(),
+        );
+    }
+
+    /// Refresh every series sampled at scrape time.
+    fn sample(&self) {
+        self.sample_pool();
+        self.sample_outgoing_webhooks();
+    }
+
     /// Record one finished HTTP request.
     pub fn observe_http_request(&self, method: &str, route: &str, status: u16, elapsed_secs: f64) {
         let method = normalize_method(method);
@@ -235,7 +328,7 @@ impl Metrics {
 
     /// Encode metrics to Prometheus format
     pub fn encode(&self) -> String {
-        self.sample_pool();
+        self.sample();
         let encoder = TextEncoder::new();
         let metric_families = self.registry.gather();
         let mut buffer = Vec::new();
@@ -245,7 +338,7 @@ impl Metrics {
 
     /// Get all metric families for Prometheus scraping
     pub fn gather(&self) -> Vec<prometheus::proto::MetricFamily> {
-        self.sample_pool();
+        self.sample();
         self.registry.gather()
     }
 }

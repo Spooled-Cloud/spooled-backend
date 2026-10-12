@@ -835,11 +835,13 @@ pub async fn verify(
             let signup_token = generate_signup_token(&state, &email).await?;
 
             // Only a hint: the code proves the mailbox, but it must never link
-            // the caller to an org whose address was never confirmed.
+            // the caller to an org whose address was never confirmed. A pending
+            // billing email (a change of a verified one that waits for its code)
+            // is just as unconfirmed.
             let (unverified_org_exists,): (bool,) = sqlx::query_as(
                 "SELECT EXISTS (SELECT 1 FROM organizations \
-                 WHERE lower(billing_email) = $1 \
-                   AND billing_email_verified_at IS NULL \
+                 WHERE ((lower(billing_email) = $1 AND billing_email_verified_at IS NULL) \
+                        OR lower(pending_billing_email) = $1) \
                    AND plan_tier <> 'deleted')",
             )
             .bind(&email)
@@ -1686,25 +1688,34 @@ pub struct VerifyBillingEmailRequest {
     pub code: String,
 }
 
-/// The caller's billing email and whether it is verified, for live orgs only.
-async fn current_billing_email(
+/// The address the confirmation flow works on, for live orgs only, and whether
+/// it is verified already: a pending billing-email change when there is one
+/// (never verified: verifying it is what moves it into `billing_email`), else
+/// the billing email itself.
+async fn billing_email_to_verify(
     state: &AppState,
     org_id: &str,
 ) -> AppResult<(Option<String>, bool)> {
-    let row: Option<(Option<String>, Option<chrono::DateTime<Utc>>)> = sqlx::query_as(
-        "SELECT billing_email, billing_email_verified_at FROM organizations \
-         WHERE id = $1 AND plan_tier <> 'deleted'",
+    type Row = (
+        Option<String>,
+        Option<chrono::DateTime<Utc>>,
+        Option<String>,
+    );
+    let row: Option<Row> = sqlx::query_as(
+        "SELECT billing_email, billing_email_verified_at, pending_billing_email \
+         FROM organizations WHERE id = $1 AND plan_tier <> 'deleted'",
     )
     .bind(org_id)
     .fetch_optional(state.db.pool())
     .await?;
-    let Some((email, verified_at)) = row else {
+    let Some((email, verified_at, pending)) = row else {
         return Err(AppError::NotFound("Organization not found".to_string()));
     };
-    Ok((
-        email.map(|e| crate::api::handlers::organizations::normalize_billing_email(&e)),
-        verified_at.is_some(),
-    ))
+    let normalize = |e: String| crate::api::handlers::organizations::normalize_billing_email(&e);
+    Ok(match pending {
+        Some(pending) => (Some(normalize(pending)), false),
+        None => (email.map(normalize), verified_at.is_some()),
+    })
 }
 
 fn verified_response() -> Json<BillingEmailVerificationResponse> {
@@ -1714,19 +1725,21 @@ fn verified_response() -> Json<BillingEmailVerificationResponse> {
     })
 }
 
-/// Send a confirmation code to the organization's unverified billing email.
+/// Send a confirmation code to the organization's pending billing-email
+/// change, or else to its unverified billing email.
 ///
 /// POST /api/v1/organizations/billing-email/verification
 ///
 /// Until the address is confirmed, email login does not resolve the
-/// organization by it (see `VERIFIED_ORG_BY_EMAIL`).
+/// organization by it (see `VERIFIED_ORG_BY_EMAIL`); a pending change leaves
+/// the verified address in place meanwhile.
 pub async fn start_billing_email_verification(
     State(state): State<AppState>,
     axum::extract::Extension(ctx): axum::extract::Extension<crate::models::ApiKeyContext>,
 ) -> AppResult<Json<BillingEmailVerificationResponse>> {
     crate::api::handlers::require_unrestricted_key(&ctx, "verify the billing email")?;
 
-    let (email, verified) = current_billing_email(&state, &ctx.organization_id).await?;
+    let (email, verified) = billing_email_to_verify(&state, &ctx.organization_id).await?;
     let Some(email) = email else {
         return Err(AppError::BadRequest(
             "Set a billing email on the organization before verifying it".to_string(),
@@ -1788,7 +1801,8 @@ pub async fn start_billing_email_verification(
     }))
 }
 
-/// Confirm the organization's billing email with the code sent to it.
+/// Confirm the organization's billing email (or its pending change, which then
+/// becomes the verified billing email) with the code sent to it.
 ///
 /// POST /api/v1/organizations/billing-email/verify
 pub async fn verify_billing_email(
@@ -1798,7 +1812,7 @@ pub async fn verify_billing_email(
 ) -> AppResult<Json<BillingEmailVerificationResponse>> {
     crate::api::handlers::require_unrestricted_key(&ctx, "verify the billing email")?;
 
-    let (email, verified) = current_billing_email(&state, &ctx.organization_id).await?;
+    let (email, verified) = billing_email_to_verify(&state, &ctx.organization_id).await?;
     let Some(email) = email else {
         return Err(AppError::BadRequest(
             "The organization has no billing email to verify".to_string(),
@@ -1904,10 +1918,18 @@ pub async fn verify_billing_email(
     }
 
     // Only verify the address the code was sent to: if the email changed in the
-    // meantime, nothing is updated and the caller has to start over.
+    // meantime, nothing is updated and the caller has to start over. A verified
+    // pending change replaces the old billing email, which stops being an
+    // email-login identity only now.
     let updated = sqlx::query(
-        "UPDATE organizations SET billing_email_verified_at = NOW(), updated_at = NOW() \
-         WHERE id = $1 AND lower(billing_email) = $2 AND billing_email_verified_at IS NULL",
+        "UPDATE organizations \
+         SET billing_email = $2, billing_email_verified_at = NOW(), \
+             pending_billing_email = NULL, updated_at = NOW() \
+         WHERE id = $1 \
+           AND (lower(pending_billing_email) = $2 \
+                OR (pending_billing_email IS NULL \
+                    AND lower(billing_email) = $2 \
+                    AND billing_email_verified_at IS NULL))",
     )
     .bind(&ctx.organization_id)
     .bind(&email)

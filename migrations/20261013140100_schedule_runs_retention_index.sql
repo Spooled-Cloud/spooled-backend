@@ -1,0 +1,21 @@
+-- no-transaction
+-- An index the schedule_runs retention sweep can walk.
+--
+-- The sweep removes runs older than their organization's history retention.
+-- The cutoff differs per organization (plan tier, custom override), so the
+-- existing `started_at` index cannot bound a scan across all schedules, and
+-- the statement read all of schedule_runs twice per pass (once to pick the old
+-- runs, once to find them again for the DELETE). The sweep now picks, for each
+-- schedule, the runs older than that schedule's organization's cutoff, which
+-- is a range scan on (schedule_id, started_at), and deletes them by primary
+-- key.
+--
+-- CONCURRENTLY keeps schedule_runs writable while the index builds, which is
+-- why this file runs outside a transaction. It is a single statement on
+-- purpose: Postgres runs a multi-statement string as one implicit transaction
+-- block and refuses CREATE INDEX CONCURRENTLY inside it, so this file cannot
+-- carry the usual `SET lock_timeout` line. An interrupted build leaves an
+-- INVALID index that IF NOT EXISTS skips on the next start; 20261013140101
+-- rebuilds it then.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_schedule_runs_schedule_started
+    ON schedule_runs (schedule_id, started_at);

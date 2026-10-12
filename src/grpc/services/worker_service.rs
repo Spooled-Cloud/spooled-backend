@@ -21,6 +21,7 @@ use crate::grpc::proto::{
     worker_service_server::WorkerService, DeregisterRequest, DeregisterResponse, HeartbeatRequest,
     HeartbeatResponse, RegisterWorkerRequest, RegisterWorkerResponse,
 };
+use crate::models::WORKER_ID_UNAVAILABLE;
 use crate::observability::Metrics;
 
 /// Maximum concurrent jobs a worker can declare (REST's upper bound).
@@ -403,6 +404,31 @@ impl WorkerService for WorkerServiceImpl {
                 Status::internal("Registration failed")
             })?;
 
+        // A queue-scoped key must not take over a worker of its org that serves a
+        // queue outside its scope: the upsert would move that row into the key's
+        // queues. Same rule and answer as REST. Locked, and read under the
+        // advisory lock every registration of this org takes, so the row cannot
+        // change before the upsert.
+        if !crate::models::queue_scope_is_unrestricted(&auth.queues) {
+            let existing: Option<(String, Vec<String>)> = sqlx::query_as(
+                "SELECT queue_name, queue_names FROM workers \
+                 WHERE id = $1 AND organization_id = $2 FOR UPDATE",
+            )
+            .bind(&worker_id)
+            .bind(&auth.organization_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "Failed to look up worker registration");
+                Status::internal("Registration failed")
+            })?;
+            if existing.is_some_and(|(queue_name, queue_names)| {
+                !auth.can_access_all_queues(&Self::effective_worker_queues(queue_name, queue_names))
+            }) {
+                return Err(Status::already_exists(WORKER_ID_UNAVAILABLE));
+            }
+        }
+
         // An id this org already holds a slot for adds no worker, so it is not
         // charged against the cap; otherwise a worker at the limit could not
         // restart. Uses the same rule as the count itself.
@@ -487,9 +513,7 @@ impl WorkerService for WorkerServiceImpl {
                 org_id = %auth.organization_id,
                 "Worker ID conflict - worker belongs to different organization"
             );
-            return Err(Status::already_exists(
-                "Worker ID already in use by another organization",
-            ));
+            return Err(Status::already_exists(WORKER_ID_UNAVAILABLE));
         }
 
         tx.commit().await.map_err(|e| {

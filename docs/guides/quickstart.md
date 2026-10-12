@@ -613,6 +613,10 @@ ws.onmessage = (event) => {
 };
 ```
 
+The server closes the socket with code `1008` when the token expires or the session is logged out
+(log in again, then reconnect), and with `1000` after 1 hour or `1011` when its event channel was
+lost (reconnect). See the [API usage guide](./api-usage.md#real-time-events).
+
 ### Server-Sent Events (SSE)
 
 ```bash

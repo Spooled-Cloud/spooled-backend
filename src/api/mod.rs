@@ -65,6 +65,9 @@ impl AppState {
             settings.outgoing_webhooks.max_attempts,
             settings.outgoing_webhooks.max_concurrent_deliveries,
         ));
+        // And its delivery counters (spooled_outgoing_webhook_*,
+        // spooled_completion_webhooks_dropped_total).
+        metrics.attach_outgoing_webhooks(Arc::clone(&outgoing_webhooks));
         Self {
             db,
             cache,

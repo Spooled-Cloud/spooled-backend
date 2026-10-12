@@ -22,7 +22,8 @@ Redis is **not critical** - the system degrades gracefully:
 | Feature | Without Redis | Impact |
 |---------|--------------|--------|
 | Job notifications | Fallback to DB polling (5s interval) | Slight delay in job pickup |
-| WebSocket updates | Disabled | Dashboard not real-time |
+| WebSocket updates | Disabled: a socket whose Redis event channel cannot be opened or drops gets an `Error` event and closes with `1011` (since 0.1.121; it used to stay open and silent). Clients reconnect with backoff | Dashboard not real-time |
+| Realtime connection caps | Fail open (a Redis error or the 500 ms timeout admits the connection) | Per-organization caps are not enforced meanwhile |
 | Rate limiting | 10 req/min fallback | More restrictive |
 | Worker coordination | Direct DB queries | Higher DB load |
 | Email-login throttles (`email_start:*`, `email_verify_*`) | Start throttle fails open (429 with `RATE_LIMIT_FAIL_CLOSED`); the verify budgets are skipped and each code allows only 5 attempts | A stranger can burn an address's code again until Redis is back |

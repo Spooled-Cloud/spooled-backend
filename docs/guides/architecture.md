@@ -153,11 +153,11 @@ Background task runner for maintenance operations.
 |------|----------|---------|
 | Activate scheduled jobs | 5s | Move scheduled→pending |
 | Process cron schedules | 10s | Create jobs from cron |
-| Recover expired leases | 30s | Handle worker failures |
+| Recover expired leases | 10s | Handle worker failures; jobs out of retries are dead-lettered and announced (`job.failed` webhook, realtime events) |
 | Update metrics | 15s | Refresh Prometheus gauges |
 | Update job dependencies | 10s | Unblock child jobs when parents complete |
-| Cleanup stale workers | 5m | Mark offline workers |
-| Data retention | 5m | Delete old data |
+| Cleanup stale workers | 5m | Mark offline workers; dead-letter their exhausted jobs (announced like a reported failure) |
+| Data retention | 5m | Delete old jobs (including failed and dead-lettered ones), DLQ entries, workflows, schedule runs, history and workers offline for over 7 days, in bounded batches |
 
 ### 5. Webhook Handler (`src/webhook/`)
 

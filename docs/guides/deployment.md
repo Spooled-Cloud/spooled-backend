@@ -209,6 +209,95 @@ Run these after the rollout (all are read-only except the `UPDATE`s in 4 and 5, 
 7. **Turnstile.** Leave `TURNSTILE_SECRET_KEY` unset until the website and the dashboard both send
    `turnstile_token` to `POST /auth/email/start`.
 
+#### 0.1.121 checks
+
+Run these after the rollout. Everything is read-only; nothing here changes data.
+
+1. **The three concurrent indexes are valid.** The release builds `idx_jobs_claim`,
+   `idx_schedule_runs_job_id` and `idx_schedule_runs_schedule_started` with
+   `CREATE INDEX CONCURRENTLY`. The builds never block reads or writes, but each one waits for
+   transactions that were already open, so startup is slow while a long-lived or
+   idle-in-transaction session exists (`SELECT pid, state, xact_start FROM pg_stat_activity WHERE
+   xact_start < now() - interval '1 minute'`). With several replicas starting together, a replica
+   waiting on the migrator's advisory lock can be chosen as the deadlock victim of the build:
+   that pod fails to start once, and on its next start the repair migration (`...100001`,
+   `...140001`, `...140101`) rebuilds the `INVALID` index, blocking writes to that table for the
+   build (under a second at 130,000 jobs). Let it restart, or roll the first replica alone
+   (`kubectl scale deployment/spooled-backend --replicas=1`, wait for it, scale back). Then:
+   ```sql
+   SELECT c.relname, i.indisvalid
+   FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+   WHERE c.relname IN ('idx_jobs_claim', 'idx_schedule_runs_job_id',
+                       'idx_schedule_runs_schedule_started');
+   ```
+   Expect three rows, all `indisvalid = t`. A claim should then show `Index Scan using
+   idx_jobs_claim` in `EXPLAIN`.
+
+2. **Cron schedules whose `*/N` day field changed meaning.** A day-of-month or day-of-week field
+   that starts with `*` (`*/2` included) is now unrestricted, so a schedule with `*/N` in one day
+   field and a restricted value (or another `*/N`) in the other fires when both match instead of
+   when either matches. These are the affected schedules (5-field and 6-field expressions):
+   ```sql
+   WITH s AS (
+     SELECT id, organization_id, cron_expression, is_active, next_run_at,
+            regexp_split_to_array(btrim(cron_expression), '\s+') AS f
+     FROM schedules
+   )
+   SELECT id, organization_id, cron_expression, is_active, next_run_at
+   FROM s
+   WHERE (array_length(f, 1) = 5
+          AND ((f[3] LIKE '*/%' AND f[5] <> '*') OR (f[5] LIKE '*/%' AND f[3] <> '*')))
+      OR (array_length(f, 1) = 6
+          AND ((f[4] LIKE '*/%' AND f[6] <> '*') OR (f[6] LIKE '*/%' AND f[4] <> '*')));
+   ```
+   Each keeps its stored `next_run_at` until it fires once. To move one now, send
+   `PUT /schedules/{id}` as that organization with the same `cron_expression`, which recomputes
+   the next run.
+   Schedules stored with an impossible date (`next_run_at IS NULL` while active) never fired
+   and now answer `400` on any cron or timezone change until the expression is fixed:
+   `SELECT id, cron_expression FROM schedules WHERE is_active AND next_run_at IS NULL;`
+
+3. **API keys with a misplaced `*` in `queues`.** Only `*` alone and a trailing `prefix.*` are
+   valid now. Older keys that hold something else (`orders*`, `*.eu`) were accepted and match no
+   queue; they keep working as before (they reach nothing) and fail validation only when their
+   queues are edited:
+   ```sql
+   SELECT id, organization_id, name, queues FROM api_keys
+   WHERE EXISTS (SELECT 1 FROM unnest(queues) q
+                 WHERE q LIKE '%*%' AND q <> '*' AND q !~ '^[^*]+\.\*$');
+   ```
+
+4. **Retention backlog.** The 5-minute sweep now also removes `failed` / `deadletter` jobs,
+   `dead_letter_queue` rows, `schedule_runs` and workers offline for over 7 days. The first passes
+   work through whatever has piled up, up to 5,000 jobs and 10,000 rows of the other kinds per
+   statement per pass, so a large backlog takes hours to clear. Free organizations now keep one
+   day of schedule history, Starter seven. To see how much is waiting (lower bounds; the real
+   cutoff depends on each organization's plan):
+   ```sql
+   SELECT count(*) FROM jobs WHERE status IN ('failed', 'deadletter');
+   SELECT count(*) FROM dead_letter_queue;
+   SELECT count(*) FROM schedule_runs WHERE started_at < now() - interval '1 day';
+   SELECT count(*) FROM workers WHERE status = 'offline' AND last_heartbeat < now() - interval '7 days';
+   ```
+   Deleted rows leave free space inside the tables for reuse; the files shrink only after a
+   `VACUUM FULL` or `pg_repack` (see "Autovacuum Tuning" in the operations guide). Cleanup counts
+   are logged at `debug`. A failed step of a workflow that still exists is kept until the workflow
+   is purged, so a failed workflow stays retryable.
+
+5. **Outgoing webhook drops.** Scrape the four new series (`spooled_outgoing_webhook_deliveries_dropped_total`,
+   `spooled_outgoing_webhook_queue_depth`, `spooled_outgoing_webhook_deliveries_in_flight`,
+   `spooled_completion_webhooks_dropped_total`) and alert on any increase of a dropped counter, for
+   example `increase(spooled_outgoing_webhook_deliveries_dropped_total[15m]) > 0`. A single
+   webhook is limited to a quarter of `OUTGOING_WEBHOOK_MAX_CONCURRENT_DELIVERIES` requests in
+   flight (16 at the default 64) and a quarter of the queue (256 of 1,024); raise the setting when
+   a healthy, busy endpoint is dropping events.
+
+6. **Realtime clients.** WebSockets now close with `1000` after one hour and `1008` when the token
+   expires or the session is logged out; SSE streams end at token expiry and logout. Clients must
+   reconnect (the dashboard does). During a rolling deploy the per-organization connection caps
+   are briefly doubled, because old replicas count in the old Redis keys and new ones in sorted
+   sets; the old `ws_connections:*` and `sse_connections:*` keys expire on their own.
+
 ### 4. Start the Server
 
 ```bash
@@ -592,6 +681,12 @@ spooled_workers_healthy       # Healthy workers
 spooled_api_requests_total    # Total API requests {method,route,status}
 spooled_api_request_duration_seconds  # Request latency histogram {method,route}
 spooled_database_connections_active   # Pool connections in use (with ..._max = pool size)
+
+# Outgoing webhooks (sampled on every scrape)
+spooled_outgoing_webhook_deliveries_dropped_total  # Events dropped: delivery queue full (alert on any increase)
+spooled_outgoing_webhook_queue_depth               # Events and deliveries queued
+spooled_outgoing_webhook_deliveries_in_flight      # Requests in flight
+spooled_completion_webhooks_dropped_total          # Per-job completion webhooks dropped
 ```
 
 ### Grafana Dashboard

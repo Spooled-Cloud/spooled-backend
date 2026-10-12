@@ -427,9 +427,9 @@ pub async fn update_organization(
         .map(|tier| tier.to_lowercase())
         .unwrap_or(existing.plan_tier);
     // An operator setting the address vouches for it, so any admin write of
-    // `billing_email` (even re-sending the current one) stores it as verified.
-    // Support uses this to enable email login for an org whose address was
-    // never confirmed.
+    // `billing_email` (even re-sending the current one) stores it as verified
+    // and drops a change the org still had waiting for its code. Support uses
+    // this to enable email login for an org whose address was never confirmed.
     let billing_email_vouched = request.billing_email.is_some();
     let billing_email = request
         .billing_email
@@ -468,6 +468,10 @@ pub async fn update_organization(
             billing_email_verified_at = CASE
                 WHEN $8 THEN NOW()
                 ELSE billing_email_verified_at
+            END,
+            pending_billing_email = CASE
+                WHEN $8 THEN NULL
+                ELSE pending_billing_email
             END,
             settings = $3,
             custom_limits = $4,
@@ -1125,6 +1129,18 @@ pub async fn create_api_key(
         return Err(AppError::Validation(
             "Key name must be 1-100 characters".to_string(),
         ));
+    }
+
+    // The same rules as POST /api-keys: a queue entry that is not `*`, a name or
+    // a trailing `prefix.*` pattern was stored as given and matched no queue.
+    if let Some(queues) = &request.queues {
+        crate::models::validate_queues(queues).map_err(|e| {
+            AppError::Validation(
+                e.message
+                    .map(|m| m.into_owned())
+                    .unwrap_or_else(|| "Invalid queues".to_string()),
+            )
+        })?;
     }
 
     let now = Utc::now();

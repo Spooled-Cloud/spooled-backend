@@ -23,7 +23,7 @@ Workers are your applications that process jobs from Spooled queues. Spooled its
 
 **Key concepts:**
 - Workers claim jobs via REST or gRPC API
-- Jobs have leases (default 5 minutes) - complete before expiry
+- Jobs have leases (30 seconds by default over REST, 300 over gRPC) - complete or renew before expiry
 - Workers send heartbeats to stay registered
 - Multiple workers can process the same queue concurrently
 
@@ -51,6 +51,9 @@ Workers are your applications that process jobs from Spooled queues. Spooled its
 | `healthy` | Sending heartbeats, ready for jobs |
 | `degraded` | Missed 2+ heartbeats, may be struggling |
 | `offline` | Missed 5+ heartbeats, jobs will be recovered |
+
+A worker that stays `offline` for more than 7 days is removed. A job whose lease is still being
+renewed is never taken away from a worker that only missed worker heartbeats.
 
 ---
 
@@ -305,7 +308,11 @@ restart leaves the previous row behind, counting against your worker cap until t
 stale-worker reaper clears it about two minutes later. On a tight plan a crash-looping
 worker can therefore quota itself out of registering and start getting `429` responses.
 
-A `worker_id` already registered by a **different** organization is rejected with `409`.
+A `worker_id` already registered by a **different** organization is rejected with `409`. So is,
+for a queue-scoped API key, the `worker_id` of one of your own workers that serves a queue outside the
+key's queues (the key may not take it over). Both answer with the same message ("This worker_id
+cannot be used: register with a different worker_id, or omit it to get a generated one") over REST
+and gRPC (`ALREADY_EXISTS`), so it does not tell you which case it was: pick another id, or omit it.
 
 ### Deregister Worker
 
@@ -338,9 +345,14 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs/job_xxx/complete \
   -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
+    "worker_id": "emails-worker-1",
+    "lease_id": "lease_from_claim",
     "result": {"message_id": "msg_123", "delivered": true}
   }'
 ```
+
+`worker_id` and `lease_id` (from the claim response) are required on complete, fail and heartbeat;
+a request without `lease_id` is a `422`, and a stale one is a `409`.
 
 ### Fail Job
 
@@ -357,16 +369,23 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs/job_xxx/fail \
 
 ### Renew Lease
 
-For long-running jobs, renew the lease before it expires:
+For long-running jobs, renew the lease before it expires (a job heartbeat):
 
 ```bash
-curl -X POST https://api.spooled.cloud/api/v1/jobs/job_xxx/renew-lease \
+curl -X POST https://api.spooled.cloud/api/v1/jobs/job_xxx/heartbeat \
   -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "extension_seconds": 300
+    "worker_id": "emails-worker-1",
+    "lease_id": "lease_from_claim"
   }'
 ```
+
+Without `lease_duration_secs` the lease is renewed for the length the job was claimed with, so a job
+claimed with `lease_duration_secs: 600` is renewed for 600 seconds each time. Send
+`lease_duration_secs` (5-3600) to choose another length; later heartbeats keep it. This also holds
+for a job claimed over gRPC and renewed over REST. A successful job heartbeat also counts as a sign
+of life for the worker.
 
 ---
 

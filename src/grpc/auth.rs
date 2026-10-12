@@ -31,16 +31,17 @@ pub struct GrpcAuthContext {
 
 impl GrpcAuthContext {
     /// Whether this key is allowed to operate on the given queue.
-    /// Mirrors `ApiKeyContext::can_access_queue`: empty list or a `*`
-    /// wildcard means all queues are allowed.
+    /// Same rule as `ApiKeyContext::can_access_queue`: empty list or a `*`
+    /// wildcard means all queues, a `prefix.*` entry covers the queues whose
+    /// name starts with `prefix.`, anything else must match exactly.
     pub fn can_access_queue(&self, queue_name: &str) -> bool {
-        self.queues.is_empty() || self.queues.iter().any(|q| q == "*" || q == queue_name)
+        crate::models::queue_scope_allows(&self.queues, queue_name)
     }
 
     /// Worker lifecycle actions affect every queue a worker can process. A
     /// scoped key must be authorized for the whole worker queue set.
     pub fn can_access_all_queues(&self, queues: &[String]) -> bool {
-        if self.queues.is_empty() || self.queues.iter().any(|q| q == "*") {
+        if crate::models::queue_scope_is_unrestricted(&self.queues) {
             return true;
         }
         !queues.is_empty() && queues.iter().all(|queue| self.can_access_queue(queue))
@@ -297,6 +298,23 @@ mod tests {
         let cloned = ctx.clone();
         assert_eq!(cloned.organization_id, ctx.organization_id);
         assert_eq!(cloned.api_key_id, ctx.api_key_id);
+    }
+
+    // FEAT B2 / QW6: the gRPC helper matches `prefix.*` like REST does.
+    #[test]
+    fn test_grpc_queue_prefix_pattern_matches_like_rest() {
+        let ctx = GrpcAuthContext {
+            organization_id: "org-1".to_string(),
+            api_key_id: "key-1".to_string(),
+            queues: vec!["orders.*".to_string()],
+            rate_limit: None,
+        };
+        assert!(ctx.can_access_queue("orders.eu"));
+        assert!(ctx.can_access_queue("orders.eu.west"));
+        assert!(!ctx.can_access_queue("orders"));
+        assert!(!ctx.can_access_queue("ordersx"));
+        assert!(ctx.can_access_all_queues(&["orders.eu".to_string(), "orders.us".to_string()]));
+        assert!(!ctx.can_access_all_queues(&["orders.eu".to_string(), "orders".to_string()]));
     }
 
     #[test]

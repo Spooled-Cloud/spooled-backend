@@ -11,6 +11,422 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.121] - 2026-10-11
+
+Fixes from the 2026-10-10 bug hunt (wave 5): the jobs API, workflows and
+schedules, realtime streams, outgoing webhooks, API-key queue scopes and
+retention.
+
+### Upgrade notes
+
+- **Several requests that used to answer `200` are now refused.** Check clients
+  and scripts for these:
+  - `GET /jobs`, `GET /jobs/dlq` and `GET /jobs/stats` answer `400` for an
+    invalid `status`, `queue_name`, `tag`, `order_by` or `order_dir`. They used
+    to log it and return the unfiltered list. `order_by` takes one of
+    `created_at`, `updated_at`, `scheduled_at`, `completed_at`, `priority`,
+    `status`, `queue_name`, `retry_count`; a client that passes free-form
+    values (an SDK list helper, say) gets a `400` (BEJOB-09, BEJOB-10).
+  - `PUT /queues/{name}/config` answers `400` for `max_retries` outside 0-100,
+    `default_timeout` outside 1-86400, `rate_limit` outside 1-100000 (it was
+    clamped silently) and a queue name that is not 1-100 letters, digits, `-`,
+    `_` or `.`, or that starts with `.` or `-` (BEJOB-04).
+  - `POST /jobs/bulk` answers `400`, not `200` with every item failed, when no
+    item is valid, a batch default is out of range or the database refuses a
+    value (BEJOB-05).
+  - `POST /jobs` answers `400` for an `expires_at` that is not in the future or
+    not later than `scheduled_at` (BEJOB-23).
+  - `POST /jobs/{id}/complete`, `/fail` and `/heartbeat` without `lease_id`
+    answer `422 VALIDATION_ERROR`, not `409 LEASE_EXPIRED` (BEJOB-18).
+  - Also `400`: a repeated key in a workflow job's `depends_on` (BEFLOW-16), a
+    self or circular edge on `POST /jobs/{id}/dependencies` (BEFLOW-22), a cron
+    expression whose date never occurs such as `0 0 30 2 *` (BEFLOW-08) and an
+    `is_active` list filter that is not a boolean (BEFLOW-18). `POST
+    /workflows/{id}/cancel` on a finished workflow is `409` (BEFLOW-21).
+- **Retrying a dead-lettered workflow step can be refused by the workflow
+  cap.** A retry re-opens the dependents the scheduler cancelled because of the
+  step and puts its `failed` workflow back to `running`, which takes one of the
+  plan's `max_workflows` slots. `POST /jobs/{id}/retry` answers `429
+  QUOTA_EXCEEDED` (resource `workflows`), or `403 feature_disabled` on a plan
+  without workflows, when no slot is free, as `POST /workflows/{id}/retry`
+  does. `POST /jobs/dlq/retry` retries everything else and lists the held steps
+  in the new `skipped_jobs` field; it answers the cap's error only when nothing
+  else could be retried (BEFLOW-04, W5-R3).
+- **A workflow with a cancelled step no longer ends `completed`.** It ends
+  `failed` when a step failed or was dead-lettered, else `cancelled`, as the
+  scheduler sweep already closed such workflows (BEFLOW-04, migration
+  `20261013100300`).
+- **Cron: `*/N` in a day field now has Vixie AND semantics.** A day-of-month or
+  day-of-week field that starts with `*` (`*/2` included) counts as
+  unrestricted, so `0 0 */2 * 1` means odd days that are Mondays, not odd days
+  or Mondays. Only schedules with `*/N` in one day field and a restricted value
+  (or another `*/N`) in the other change; a stored `next_run_at` keeps its old
+  value until the schedule fires once. Find them with the query in
+  `docs/guides/deployment.md`, "0.1.121 checks" (BEFLOW-30).
+- **Retention now deletes four more kinds of data.** The 5-minute sweep also
+  removes `schedule_runs` older than the plan's history retention (Free 1 day,
+  Starter 7, Pro 30, Enterprise 90, or the `custom_limits` override),
+  `dead_letter_queue` rows and `failed` / `deadletter` jobs older than the
+  plan's job retention (Free 3 days, Starter 14, Pro 30, Enterprise 90), and
+  `offline` workers whose last heartbeat is over 7 days old. A failed,
+  dead-lettered or cancelled step of a workflow that still exists is kept until
+  the workflow itself is purged, so a failed workflow stays retryable; a failed
+  job is also kept while a pending, scheduled or processing job waits on it,
+  and a worker while a job is still assigned to it. The first passes after the
+  deploy work through the backlog gradually: up to 5,000 jobs per statement and
+  10,000 rows per statement of the other kinds, every 5 minutes (BEOPS-11,
+  BEFLOW-09, W5-R4, W5-R5).
+- **Realtime streams end with their session.** The WebSocket closes with code
+  `1008` when the access token expires or the session is logged out or revoked,
+  and with `1000` after a maximum age of 1 hour, so a dashboard or SDK client
+  reconnects about once an hour. The three SSE streams end at token expiry and
+  logout too (BEFLOW-13, BEAUTH-19, BEFLOW-12).
+- **Outgoing webhook delivery is bounded.** Past the queue bound a new event or
+  delivery is dropped and counted instead of piling up in memory, one webhook
+  may use at most a quarter of the request slots and of the queue, and per-job
+  completion webhooks have their own slots and a per-organization share. At the
+  default `OUTGOING_WEBHOOK_MAX_CONCURRENT_DELIVERIES=64` a single webhook has
+  16 requests in flight and 256 queued; raise the setting if a tenant needs
+  more. Drops show in four new Prometheus series (see Webhooks) (BEFLOW-10,
+  BEFLOW-27, W5-R2).
+- **API keys accept `prefix.*` queue patterns.** A `queues` entry can now be
+  `orders.*`. Every other use of `*` (`orders*`, `*.eu`, `a.*.b`) is `400
+  VALIDATION_ERROR` at create and update; stored keys that hold such an entry
+  keep matching nothing, and `docs/guides/deployment.md` has a query that lists
+  them (FEAT B2, QW6).
+- **A changed billing email waits for its code.** On an organization with a
+  verified billing email, `PUT /organizations/{id}` with a new address stores it
+  in the new `pending_billing_email`; the verified address keeps working for
+  email login until the code sent to the new one is confirmed. The dashboard
+  should show `pending_billing_email` and offer the confirmation while it is
+  set; until it does, a user who changes the address sees the old one as
+  confirmed and has no button for the new one, and nobody is locked out
+  (W1-14).
+- **gRPC `Register` worker-id conflicts are neutral**, as REST's are: an id held
+  by another organization, or by a worker outside a queue-scoped key's queues,
+  answers `ALREADY_EXISTS` / `409` with one message that does not say which
+  (BEJOB-19). The text "Worker ID already in use" no longer appears.
+- Twelve new migrations run at startup, three of them `CREATE INDEX
+  CONCURRENTLY` (listed below). The index builds do not block reads or writes
+  but wait for transactions that were already open, so a long-lived or idle
+  session delays startup. Run the checks in `docs/guides/deployment.md`,
+  "0.1.121 checks", after the rollout.
+
+### Jobs API
+
+- **Queue config is validated.** `PUT /queues/{name}/config` checks its body and
+  the queue name in the path (see Upgrade notes). The table enforces the same
+  ranges with two CHECK constraints, and migration `20261013100100` first
+  clamps stored out-of-range rows into range. A stored `default_timeout` of two
+  days used to make every enqueue to that queue a `500` (BEJOB-04).
+- **Bulk enqueue validates each item.** An invalid item (payload size or NUL
+  character, priority outside -100..100, idempotency key over 255 characters)
+  is listed in `failed` with its `index` and the reason, and the valid items are
+  still created. Batch defaults are range-checked: `default_priority` -100..100,
+  `default_max_retries` 0..100, `default_timeout_seconds` 1..86400. A payload or
+  tags containing the NUL character is a `400` on single and bulk enqueue
+  instead of a `500` (BEJOB-05).
+- **A blank `idempotency_key` is no key**, on `POST /jobs` and `POST
+  /jobs/bulk`. Such jobs used to collapse onto the organization's first
+  empty-key job (BEJOB-06).
+- **An idempotent replay is answered first** (`200`, `created: false`), before
+  the payload, quota and expiry checks, and charges nothing, for single and bulk
+  enqueue; a bulk batch of replays reserves no quota. At the daily cap a job is
+  now refused before it is inserted, instead of being inserted, visible to
+  workers, and deleted again (BEJOB-07, BEJOB-20 daily-cap part).
+- **Queue stats count dead-lettered jobs.** `GET /queues/{name}/stats`
+  `failed_jobs_24h` is the number of jobs dead-lettered in the last 24 hours
+  (it was always 0) and the new `deadletter_jobs` is the queue's current
+  dead-letter count (BEJOB-08, FEAT QW5).
+- **List filters and order are honoured.** `status` matches case-insensitively,
+  an empty parameter is no filter, and `tag` takes any characters up to 1,024
+  bytes (`customer:42`; it allowed only `[A-Za-z0-9_.-]` up to 64). `order_by`
+  and `order_dir` work on `GET /jobs` and `GET /jobs/dlq` (`scheduled_at` and
+  `completed_at` sort `NULLS LAST`), and every list breaks ties on the job id,
+  so `OFFSET` pages no longer repeat or skip rows of a bulk batch (BEJOB-09,
+  BEJOB-10, BEJOB-14).
+- **Retrying re-opens what the failure cancelled** (BEFLOW-04, W5-R3). A job or
+  DLQ retry, in one transaction: resets the job, removes its
+  `dead_letter_queue` row, re-opens level by level (up to 100 deep) the
+  dependents the dependency sweep cancelled because of it (gated until the job
+  completes again; skipped when another dependency would doom them again or
+  their workflow is `cancelled`), and recomputes the counters of the affected
+  workflows. Only sweep cancellations are re-opened; a job someone cancelled
+  stays cancelled. The cancel reasons are now shared constants
+  (`DEPENDENCY_CANCEL_REASONS`) used by the sweep and the retry.
+- **A heartbeat without `lease_duration_secs` keeps the claimed lease length.**
+  It renewed for 30 s, cutting a 600 s claim short. The claim records the
+  granted length in the new `jobs.lease_duration_secs` (REST claim, and gRPC
+  `Dequeue`, `StreamJobs`, `ProcessJobs` and `RenewLease`), and an explicit
+  value becomes the new length. Renewal also uses the database clock now
+  (BEJOB-15).
+- **`lease_id` is required** on complete, fail and heartbeat (BEJOB-18).
+- **DLQ retry and purge.** `POST /jobs/dlq/retry` is no longer refused at the
+  daily job cap (it creates no new daily job; the active-jobs cap applies),
+  `POST /jobs/dlq/purge` `older_than` compares the time a job was
+  dead-lettered, not when it was created, and both statements re-check the
+  status on the row they change (BEJOB-22).
+- **Documentation:** the guides no longer say idempotency keys expire after 24
+  hours (a key lives as long as its job row), no longer document a `cursor`
+  parameter that does not exist or a default list limit of 100 (it is 50), and
+  show the real queue-stats fields (BEJOB-13).
+
+### Workflows and schedules
+
+- **Workflow steps and the DAG.** `GET /workflows/{id}` jobs carry the payload's
+  `job_type` (`"job"` when it has none) and `failed_at` for failed and
+  dead-lettered jobs (BEFLOW-19). A workflow turns `running`, with `started_at`
+  set, within about 10 s of its first job being claimed (it stayed `pending`
+  with no start time until a job finished) (BEFLOW-20).
+  `POST /jobs/{id}/dependencies` rejects self and circular edges, rewrites the
+  job's `dependency_mode` and `dependencies_met` only when an edge was added,
+  and an omitted `dependency_mode` keeps the job's own instead of resetting it
+  to `all` (BEFLOW-22).
+- **Cancelling a finished workflow is a `409`.** It used to overwrite the
+  workflow's `completed` / `failed` outcome and `completed_at` (BEFLOW-21).
+- **Cron.** A date that never occurs (`0 0 30 2 *`, `0 0 31 4 *`) is a `400` at
+  create and update; such a schedule used to be stored with `next_run_at: null`
+  and never fire, after burning 525,600 loop iterations on the request thread.
+  A day that cannot match is now skipped whole, so rare but valid schedules
+  (Feb 29, Feb 29 on a Sunday) resolve in about one step per day. A cron
+  expression with no upcoming run is a `400` on update as well (BEFLOW-08). The
+  `*/N` day-field rule is in the upgrade notes (BEFLOW-30).
+- **`GET /schedules` honours `queue_name`, `is_active` and `offset`**, which the
+  Go and Python SDKs send. A filtered call returned every schedule and an offset
+  loop re-read the first page forever. Newest first, ties broken by id
+  (BEFLOW-18).
+- **Schedule history is purged** after the plan's history retention (BEFLOW-09).
+
+### Realtime
+
+- **WebSocket and SSE end with the session that opened them.** The WebSocket and
+  the three SSE streams (`/events`, `/events/jobs/{id}`,
+  `/events/queues/{name}`) read `exp`, `jti` and `sid` of the access token they
+  were opened with. They end when the API would stop accepting the token (`exp`
+  plus the validation leeway) and when a re-check, at most every 2 s, finds the
+  session or token revoked (logout), the key revoked or expired, or the
+  organization deleted. Before, only the key was re-checked, so a stream opened
+  with a dashboard token kept running after logout and past expiry (BEFLOW-13,
+  BEAUTH-19).
+- **WebSocket close codes and maximum age.** `1008` for an expired or revoked
+  token, `1000` after 1 hour, `1011` after an `Error` event when the Redis event
+  channel could not be opened or closes (or the authorization lookup failed).
+  Before, a socket whose pub/sub link dropped kept answering pings and never
+  delivered another event. Clients should reconnect on `1000` and `1011`; with
+  Redis down they now reconnect in a loop with backoff instead of holding a
+  silent socket (BEFLOW-12).
+- **No database query per event.** The WebSocket re-checks authorization at most
+  every 2 s before revealing an event, and on every ping (BEFLOW-14).
+- **Connection caps no longer leak.** Per-organization counts are Redis sorted
+  sets (`realtime_connections:{ws|events|job|queue}:{org}`) scored by a 30 s
+  heartbeat; a connection stops counting 90 s after its last heartbeat, so
+  replicas killed during a deploy no longer lock an organization out with `429`.
+  The old `ws_connections:*` and `sse_connections:*` keys are no longer read and
+  expire on their own. During a rolling deploy old replicas still use the
+  counters and new ones the sets, so the cap is briefly doubled; the heartbeat
+  check uses the application clock, so replica clocks should agree within about
+  a minute (BEAUTH-14).
+- **`/events/jobs/{id}` and `/events/queues/{name}` are capped** at 100 open
+  streams per organization each (`429 RATE_LIMIT_EXCEEDED`). Queue stream
+  statistics are computed once per (organization, queue) every 4 s and shared by
+  its streams, instead of one full aggregate per stream every 5 s (BEFLOW-15).
+
+### Webhooks
+
+- **Bounded delivery queue.** Outgoing deliveries go through a queue of 16
+  deliveries per slot (1,024 at the default) worked by a fixed set of consumers.
+  A webhook gets at most a quarter of the request slots and of the queue. Each
+  attempt re-reads the webhook, so a delivery stops once the webhook is disabled
+  (by the user or by auto-disable), deleted or unsubscribed from the event, and
+  uses the current URL and secret. A retry waits without holding a slot
+  (BEFLOW-10).
+- **New metrics**, sampled on every scrape:
+  `spooled_outgoing_webhook_deliveries_dropped_total`,
+  `spooled_outgoing_webhook_queue_depth`,
+  `spooled_outgoing_webhook_deliveries_in_flight` and
+  `spooled_completion_webhooks_dropped_total`. A non-zero drop counter means the
+  queue (or one webhook's share) was full (BEFLOW-10, BEFLOW-27).
+- **Completion webhooks.** Per-job `completion_webhook` calls share the
+  outgoing-webhook HTTP client and connections, but have their own request slots
+  and a per-organization lane (a quarter of the slots and of the pending bound),
+  so one tenant's backlog to a URL that never answers cannot stall other
+  tenants' org webhooks or completion webhooks. They are still a single attempt
+  (BEFLOW-27, W5-R2).
+- **Delivery history fields.** `error` holds the failure reason (`HTTP 503`, the
+  transport error, `Invalid webhook URL: ...`), `response_body` the first 1 KiB
+  of the receiver's answer, and `status_code` is `null` instead of `0` when no
+  response arrived (BEFLOW-24).
+- **`failure_count` resets** when `PUT /outgoing-webhooks/{id}` turns a webhook
+  on or changes its URL, so the first failed delivery after a fix no longer
+  disables it again. A stored URL that the SSRF policy rejects is a failed
+  delivery (no retries) and trips auto-disable, and a manual retry of it returns
+  `200 {"success": false}` instead of `500` (BEFLOW-25).
+- **`job.failed` also fires for sweep dead-lettering.** A job dead-lettered
+  because its lease expired or its worker went offline now writes the
+  `deadlettered` job-history row in the same statement and sends what a reported
+  failure sends: the `job.failed` outgoing webhook (`data.status: "deadletter"`),
+  the job's completion webhook and the realtime `JobStatusChange` and
+  `JobFailed` events. It was the one silent failure path (BEFLOW-11, FEAT QW7).
+
+### API keys and scopes
+
+- **`prefix.*` queue patterns.** An entry `orders.*` covers every queue whose
+  name starts with `orders.` (`orders.eu`, `orders.eu.west`), not `orders`
+  itself or `ordersx`; `*` alone still means every queue and any other use of
+  `*` is rejected (see Upgrade notes). One rule, `queue_scope_allows`, serves
+  REST and gRPC, and a queue-scoped key can grant a pattern only under one of
+  its own patterns that is at least as broad. The admin
+  `POST /admin/organizations/{id}/api-keys` route validates `queues` like
+  `POST /api-keys` (FEAT B2, QW6).
+- **Row filters understand patterns.** Every queue-scope filter now calls the
+  new SQL function `queue_in_key_scope(queue_name, scope)` instead of
+  `queue_name = ANY(scope)`: REST settle and heartbeat, job, DLQ, workflow and
+  schedule lists, dashboard and stats counts, workers lists (a worker is listed
+  only when every queue it serves is in scope), gRPC settles, `GetJob`,
+  `StreamJobs` and `ProcessJobs` claims, and the gRPC stream and realtime
+  authorization. Without this a `prefix.*` key could enqueue and claim but not
+  complete, and its jobs were hidden from every list (FEAT B2, QW6).
+- **Pending billing email.** The verification code goes to
+  `pending_billing_email` when one is set, and confirming it moves the address
+  into `billing_email` as verified in one guarded statement. Sending the active
+  address again withdraws the change, an organization without a verified address
+  is still changed directly (unverified), and an admin write of `billing_email`
+  counts as verified and clears a pending change. `GET` and `PUT
+  /organizations/{id}` return `pending_billing_email`, and the signup hint
+  `unverified_org_exists` also matches a pending address (W1-14).
+- **Worker registration conflicts.** `POST /workers/register` (and gRPC
+  `Register`) answer an id held by another organization, or by a worker of the
+  same organization that serves a queue outside a queue-scoped key's scope,
+  with one neutral `409`, and the scoped key can no longer move such a worker
+  into its queues (BEJOB-19).
+
+### Retention and performance
+
+- **Claim index.** `idx_jobs_claim` (organization, queue, `priority DESC`,
+  `created_at`; partial on `status IN ('pending', 'scheduled')`) has the claim
+  query's predicate and order, so a claim reads the first rows of its queue
+  instead of sorting its whole backlog: 252 ms became 0.4 ms at 300,000 pending
+  jobs (PostgreSQL 16). The gRPC claim paths use the same predicate. The query
+  is now the constant `queue::CLAIM_BATCH_SQL` and a test checks its plan
+  (BEJOB-03).
+- **Retention locks what it deletes.** The workflow, job and worker sweeps pick
+  their rows `FOR UPDATE ... SKIP LOCKED`: the subselect re-checks status and
+  age against the newest row version, and rows an open transaction holds are
+  skipped. A plain `DELETE ... WHERE id IN (SELECT ...)` deleted a job that a
+  retry had just moved back to `pending` (W5-R4).
+- **Retention keeps a workflow's steps while the workflow exists.** A failed,
+  dead-lettered or cancelled step of a workflow that still exists is kept,
+  whatever the workflow's status: a deleted step took its dependency edges with
+  it, so retrying the workflow ran the step's dependents ungated. Workflow
+  retention runs first in the pass, so a purged workflow's steps go in the same
+  pass (W5-R5).
+- **`schedule_runs` is indexed.** `schedule_runs.job_id` (`ON DELETE SET NULL`)
+  had no index, so every deleted job scanned all of `schedule_runs`: at 450,000
+  runs and 2,000 dead-lettered jobs the first retention pass took 55 s inside the
+  scheduler loop, which also fires cron schedules and recovers leases; now
+  0.17 s. The `schedule_runs` sweep ranges over `(schedule_id, started_at)` per
+  schedule and deletes by primary key: 84 ms became 50 ms, and 26 ms became
+  0.7 ms with nothing to delete. Job retention statements delete 5,000 rows a
+  pass (was 10,000) (W5-R6).
+- **Scope filters keep their plans.** Migration `20261013130200` moves the
+  pattern rewrite of `queue_in_key_scope()` into an `IMMUTABLE` helper, so a
+  bound exact-name scope plans as `queue_name = ANY(...)` again and a prefix
+  scope as a plain `LIKE ANY`; a scoped key's dashboard counts had dropped to a
+  scan of the organization's whole job range (1.5 ms to 43 ms at 130,000 jobs).
+
+### Migrations
+
+All twelve run at startup, in this order:
+
+- `20261013100000_job_claim_index.sql` (`CREATE INDEX CONCURRENTLY`
+  `idx_jobs_claim`; a single statement outside a transaction)
+- `20261013100001_job_claim_index_repair.sql` (rebuilds `idx_jobs_claim` if an
+  interrupted concurrent build left it `INVALID`)
+- `20261013100100_queue_config_checks.sql` (clamps stored `queue_config` rows
+  into range, then adds the `max_retries` and `default_timeout` CHECKs)
+- `20261013100200_job_lease_duration.sql` (adds nullable
+  `jobs.lease_duration_secs`)
+- `20261013100300_workflow_progress_cancelled_steps.sql` (redefines
+  `update_workflow_progress()`: `failed`, else `cancelled`, else `completed`)
+- `20261013130000_pending_billing_email.sql` (adds nullable
+  `organizations.pending_billing_email`)
+- `20261013130100_queue_in_key_scope.sql` (adds `queue_in_key_scope(text,
+  text[])`)
+- `20261013130200_queue_scope_patterns_fold.sql` (adds the `IMMUTABLE`
+  `queue_scope_like_patterns(text[])` and redefines `queue_in_key_scope`)
+- `20261013140000_schedule_runs_job_id_index.sql` (`CREATE INDEX CONCURRENTLY`
+  `idx_schedule_runs_job_id`)
+- `20261013140001_schedule_runs_job_id_index_repair.sql` (the `INVALID`-index
+  repair for the previous one)
+- `20261013140100_schedule_runs_retention_index.sql` (`CREATE INDEX
+  CONCURRENTLY` `idx_schedule_runs_schedule_started`)
+- `20261013140101_schedule_runs_retention_index_repair.sql` (the `INVALID`-index
+  repair for the previous one)
+
+The three `CREATE INDEX CONCURRENTLY` files carry no `SET lock_timeout`: sqlx
+sends a `-- no-transaction` file as one query string, which Postgres runs as an
+implicit transaction block that refuses `CREATE INDEX CONCURRENTLY`, so each is
+a single statement. They need no lock that blocks reads or writes. With several
+replicas starting together, a replica that waits on the migrator's advisory lock
+can be chosen as the deadlock victim of the index build: startup then fails once
+and the repair migration rebuilds the `INVALID` index on the next start, blocking
+writes to that table for the build (under a second at 130,000 `jobs` rows).
+Production is a single container. The other migrations start with
+`SET LOCAL lock_timeout = '5s'` and change the catalog or define functions only,
+apart from `20261013100100`, which first updates the few `queue_config` rows
+(one per configured queue) that are out of range.
+
+### Deferred / known
+
+- **QW8 (event types).** `job.deadlettered`, `job.retried`, `workflow.completed`
+  and `workflow.failed` are not subscribable yet. They need emit sites in the
+  queue and scheduler code plus a CHECK-constraint migration and
+  `VALID_WEBHOOK_EVENTS`; offering the names before anything emits them would be
+  a silent wrong answer.
+- **BEJOB-20 (P3, partly open).** The daily-cap part is fixed. The active-jobs
+  cap is still check-then-insert, so concurrent `POST /jobs` can exceed it by a
+  few; fixing it needs a per-organization lock or counter on the enqueue hot
+  path (owner decision).
+- **BEJOB-16 (P3, open).** Mixed clocks: the claim stamps lease expiry from the
+  application clock while complete, fail and reclaim compare with the database
+  `NOW()`, and the quota windows use `CURRENT_DATE` in the session time zone.
+  Only the heartbeat renewal moved to the database clock (BEJOB-15). Keep
+  replica clocks within a few seconds (the shortest lease is 5 s).
+- **BEFLOW-05 (P2, open).** A dependency that disappears counts as satisfied:
+  when a step of a workflow is deleted its dependency edges go with it, and the
+  orphan sweep releases the gated dependents one hour later, so they can run
+  without the step having run.
+- **The expiry sweep still deletes workflow steps.** `expires_at` is accepted on
+  a workflow job, and the sweep deletes expired `pending`, `scheduled`, `failed`
+  and `deadletter` jobs without looking at their workflow. That is how BEFLOW-05
+  is reached, and it also removes failed steps that retention now keeps while
+  their workflow exists (W5-R5). Fix direction: cancel the dependents first, or
+  skip workflow steps.
+- **Realtime fan-out (BEFLOW-14, second half).** Each socket still holds its own
+  Redis pub/sub connection (capped at 100 per organization). The queue stream
+  statistics cache is per process, so N replicas run the aggregate at most N
+  times per 4 s.
+- **BEFLOW-21 (P3, partly open).** Only the overwrite of a finished workflow is
+  fixed. Cancelling a workflow still sends no `job.cancelled` webhooks for the
+  jobs it cancels and does not stop jobs that are already `processing`.
+- **BEJOB-19 (P3, partly open).** Worker ids are still one global namespace (a
+  per-organization namespace is deferred), and a queue's `active_workers` counts
+  `status = 'healthy'` with no heartbeat recency. Offline rows are now purged.
+- **W5-R1 (P3, design note).** `POST /jobs/{id}/retry` and `POST /jobs/dlq/retry`
+  by a queue-scoped key re-open sweep-cancelled dependents in queues outside the
+  key's scope and revive the failed workflow, taking a workflow slot. Reviewed
+  and left as is: the key could already cause the opposite cascade by failing or
+  cancelling the step, the dependents come back gated and unchanged, and nothing
+  of them is returned to the key. An operator who wants a cancelled dependent to
+  stay cancelled cannot pin it, short of cancelling the workflow.
+- **W5-R3, single-job retry (by design).** `POST /jobs/{id}/retry` still refuses
+  a step whose failed workflow does not fit under `max_workflows`; skipping the
+  charge would reopen the W4-01 cap bypass.
+- Queue `rate_limit` is still stored and returned, not enforced (BEBILL-11,
+  BEJOB-12; see 0.1.120).
+
+---
+
 ## [0.1.120] - 2026-10-11
 
 Fixes from the 2026-10-10 bug hunt (wave 4): Stripe checkout trust, plan limits,

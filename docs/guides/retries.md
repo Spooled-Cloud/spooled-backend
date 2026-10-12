@@ -211,6 +211,10 @@ This:
 - Resets retry count to 0
 - Moves job back to `pending` status
 - Job will be processed by next available worker
+- Re-opens the workflow steps that were cancelled because this job failed (they wait again until it
+  completes; a step you cancelled yourself stays cancelled) and puts a `failed` workflow back to
+  `running`. A running workflow takes a slot of the plan's workflow limit, so the call answers
+  `429 QUOTA_EXCEEDED` when none is free (`403 feature_disabled` on a plan without workflows)
 
 ### Bulk Retry
 
@@ -236,6 +240,12 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs/dlq/retry \
     "limit": 100
   }'
 ```
+
+Retrying a dead-lettered step of a failed workflow restarts that workflow, which
+counts against your plan's workflow limit. When no workflow slot is free, such
+steps stay in the DLQ and are listed in the response's `skipped_jobs`, and the
+other jobs are still retried. If only such steps are left, the request fails
+with the workflow limit error.
 
 ### Purge DLQ
 

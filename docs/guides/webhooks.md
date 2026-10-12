@@ -163,6 +163,15 @@ When job completes, Spooled POSTs to your URL. With `completion_webhook_secret` 
 }
 ```
 
+A completion webhook is a single attempt with no delivery history. It shares the outgoing-webhook
+HTTP client but has its own limits: an organization gets a quarter of the request slots and of the
+pending queue, so one slow or unreachable callback URL does not hold up other callbacks or other
+organizations' webhooks. When the queue is full the callback is dropped (and counted in
+`spooled_completion_webhooks_dropped_total` on a self-hosted deployment) instead of waiting
+without limit. A job that is dead-lettered also sends its completion webhook, with event
+`job.failed` and `data.status` `deadletter`, however it got there (a failure the worker reported,
+a lease that expired on the last retry, or a worker that went offline).
+
 ### Event Subscriptions
 
 Subscribe to events for all jobs:
@@ -221,6 +230,12 @@ curl -X POST https://api.spooled.cloud/api/v1/outgoing-webhooks/{id}/retry/{deli
 
 > **Note:** You cannot retry successful deliveries, and each delivery has a maximum of 10 total delivery attempts across automatic and manual retries.
 
+Each delivery record explains a failure: `error` holds the reason (`HTTP 503`, a transport error such
+as a refused connection or a timeout, or `Invalid webhook URL: ...`), `response_body` the first 1 KiB
+of your endpoint's answer (for any status), and `status_code` is `null` when no response arrived at
+all. Manually retrying a delivery whose stored URL is rejected by the SSRF check answers
+`{"success": false}` and counts as a failed delivery.
+
 Delivery history is kept for your plan's history retention window, then removed:
 
 | Plan | Delivery history kept |
@@ -241,7 +256,7 @@ deliveries per webhook are returned in any case — export anything you need to 
 | `job.created` | New job enqueued |
 | `job.started` | Job claimed by worker |
 | `job.completed` | Job completed successfully |
-| `job.failed` | Job failed; `data.status` may be `failed` or `deadletter` |
+| `job.failed` | Job failed; `data.status` may be `failed` or `deadletter`. A job dead-lettered because its lease expired or its worker went offline sends it too (`data.status` `deadletter`, `data.error` the reason) |
 | `job.cancelled` | Job cancelled |
 | `queue.paused` | Queue paused |
 | `queue.resumed` | Queue resumed |
@@ -313,9 +328,19 @@ Five attempts is the default; on a self-hosted deployment the limit is
 You can also use the manual retry endpoint above; manual retry sends immediately and
 records the new result.
 
-Deliveries in flight are capped process-wide (`OUTGOING_WEBHOOK_MAX_CONCURRENT_DELIVERIES`,
-default 64), so a burst of events queues rather than firing all at once. Delivery order
-is not guaranteed — use the event `created_at` if you need ordering.
+Deliveries go through a bounded queue worked by a fixed number of senders
+(`OUTGOING_WEBHOOK_MAX_CONCURRENT_DELIVERIES`, default 64, which also sets the queue size:
+16 deliveries per sender). One webhook may have at most a quarter of the senders in flight (16 at
+the default) and a quarter of the queue (256), so a slow endpoint cannot hold up other webhooks.
+A delivery that is waiting for a retry holds no sender. Before every attempt Spooled re-reads the
+webhook: if it was disabled, deleted or unsubscribed from the event in the meantime, the queued
+delivery is dropped, and the current URL and secret are used.
+
+Under sustained overload new events are **dropped** rather than kept in memory without limit; on a
+self-hosted deployment `spooled_outgoing_webhook_deliveries_dropped_total` counts them (see the
+operations guide). Raise `OUTGOING_WEBHOOK_MAX_CONCURRENT_DELIVERIES` if a busy, healthy endpoint
+needs more than a quarter of the senders. Delivery order is not guaranteed — use the event
+`created_at` if you need ordering.
 
 ### Automatic Disabling
 
@@ -337,6 +362,10 @@ curl https://api.spooled.cloud/api/v1/outgoing-webhooks/{id} \
 per retry attempt, and any successful delivery — including a successful manual retry —
 resets it to 0.
 
+A webhook whose stored URL is rejected by the SSRF check (for example it now resolves to a private
+address) counts each event as a failed delivery, without retries, and is disabled after 20 of them
+like any other.
+
 To turn the webhook back on once your endpoint is healthy:
 
 ```bash
@@ -344,6 +373,9 @@ curl -X PUT https://api.spooled.cloud/api/v1/outgoing-webhooks/{id} \
   -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
   -d '{"enabled": true}'
 ```
+
+Turning a webhook back on, or changing its `url`, starts a fresh failure count (`failure_count`
+back to 0), so the first failed delivery after you fix the endpoint does not disable it again.
 
 > **Note:** Re-enabling counts against your plan's webhook limit. If you created other
 > webhooks while this one was disabled you may already be at the cap, and the request

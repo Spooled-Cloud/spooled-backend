@@ -14,7 +14,7 @@ use crate::api::AppState;
 use crate::error::{AppError, AppResult};
 use crate::models::{
     ApiKeyContext, RegisterWorkerRequest, RegisterWorkerResponse, Worker, WorkerHeartbeatRequest,
-    WorkerResponse, WorkerSummary,
+    WorkerResponse, WorkerSummary, WORKER_ID_UNAVAILABLE,
 };
 
 /// Maximum workers per page
@@ -55,12 +55,21 @@ pub async fn list(
         .fetch_all(state.db.pool())
         .await?
     } else {
+        // Every queue the worker serves (`queue_names`, else `queue_name`) must be
+        // in the key's scope, `prefix.*` entries included: the SQL form of
+        // `ensure_worker_in_scope`.
         sqlx::query_as::<_, Worker>(
             r#"
             SELECT * FROM workers
             WHERE organization_id = $1
-              AND COALESCE(queue_names, ARRAY[]::TEXT[]) <@ $2::TEXT[]
-              AND (COALESCE(cardinality(queue_names), 0) > 0 OR queue_name = ANY($2::TEXT[]))
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM unnest(
+                      CASE WHEN COALESCE(cardinality(queue_names), 0) > 0
+                           THEN queue_names ELSE ARRAY[queue_name] END
+                  ) AS served(queue)
+                  WHERE NOT COALESCE(queue_in_key_scope(served.queue, $2::TEXT[]), FALSE)
+              )
             ORDER BY last_heartbeat DESC
             LIMIT $3
             "#,
@@ -74,6 +83,14 @@ pub async fn list(
 
     let summaries: Vec<WorkerSummary> = workers.into_iter().map(Into::into).collect();
     Ok(Json(summaries))
+}
+
+/// The answer when a caller-supplied worker id names a worker the key cannot
+/// take (see [`WORKER_ID_UNAVAILABLE`]; gRPC `Register` gives the same text).
+/// ("Worker ID already in use" only ever meant that another organization had
+/// the id.)
+fn worker_id_unavailable() -> AppError {
+    AppError::Conflict(WORKER_ID_UNAVAILABLE.to_string())
 }
 
 /// Register a new worker
@@ -139,6 +156,23 @@ pub async fn register(
     // registrations for this org cannot overshoot the plan limit.
     let mut tx = state.db.pool().begin().await?;
     lock_resource(&mut tx, &ctx.organization_id, "workers").await?;
+
+    // A queue-scoped key must not take over a worker of its org that serves a
+    // queue outside its scope: the upsert would move that row into the key's
+    // queues. Locked, and read under the advisory lock every registration of
+    // this org takes, so the row cannot change before the upsert.
+    if !ctx.is_unrestricted() {
+        let existing = sqlx::query_as::<_, Worker>(
+            "SELECT * FROM workers WHERE id = $1 AND organization_id = $2 FOR UPDATE",
+        )
+        .bind(&worker_id)
+        .bind(&ctx.organization_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if existing.is_some_and(|w| !ctx.can_access_all_queues(&effective_worker_queues(&w))) {
+            return Err(worker_id_unavailable());
+        }
+    }
 
     // Re-registering an id this org already owns adds no worker, so it must not
     // be charged against the cap — otherwise a worker at the limit could not
@@ -209,7 +243,7 @@ pub async fn register(
 
     // Check if registration succeeded - if rows_affected is 0, worker ID exists for different org
     if result.rows_affected() == 0 {
-        return Err(AppError::Conflict("Worker ID already in use".to_string()));
+        return Err(worker_id_unavailable());
     }
 
     tx.commit().await?;

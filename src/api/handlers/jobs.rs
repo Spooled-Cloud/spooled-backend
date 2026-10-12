@@ -11,20 +11,22 @@ use sqlx::{Postgres, QueryBuilder};
 use std::sync::Arc;
 use tracing::{info, warn};
 use uuid::Uuid;
+use validator::Validate;
 
 use crate::api::handlers::require_queue_access;
 use crate::api::middleware::limits::{
-    check_job_limits, check_new_queue_limit, check_payload_size, daily_jobs_limit,
-    increment_daily_jobs, queue_job_defaults, refund_daily_jobs, try_increment_daily_jobs,
+    check_job_limits, check_new_queue_limit, check_payload_size, check_resource_limit,
+    check_resource_limit_conn, daily_jobs_limit, increment_daily_jobs, lock_resource,
+    queue_job_defaults, refund_daily_jobs, resource_room_conn, try_increment_daily_jobs,
 };
 use crate::api::middleware::ValidatedJson;
 use crate::api::AppState;
 use crate::error::{AppError, AppResult};
 use crate::models::ApiKeyContext;
 use crate::models::{
-    ClaimJobsRequest, ClaimJobsResponse, ClaimedJob, CompleteJobRequest, CreateJobRequest,
-    CreateJobResponse, FailJobRequest, HeartbeatJobRequest, Job, JobStats, JobStatsQuery,
-    JobSummary, ListJobsQuery,
+    normalize_idempotency_key, ClaimJobsRequest, ClaimJobsResponse, ClaimedJob, CompleteJobRequest,
+    CreateJobRequest, CreateJobResponse, FailJobRequest, HeartbeatJobRequest, Job, JobStats,
+    JobStatsQuery, JobSummary, ListJobsQuery, DEPENDENCY_CANCEL_REASONS,
 };
 use crate::queue::{QueueManager, WorkerOpOutcome};
 use axum::extract::Extension;
@@ -53,13 +55,76 @@ fn validate_queue_name_filter(name: &str) -> bool {
             .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
-/// Validate a single tag filter value (simple, predictable syntax).
-fn validate_tag_filter(tag: &str) -> bool {
-    !tag.is_empty()
-        && tag.len() <= 64
-        && tag
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+/// Longest tag a list filter accepts, in bytes.
+const MAX_TAG_FILTER_LEN: usize = 1024;
+
+/// A filter sent empty (`?status=`) is no filter.
+fn filter_value(value: &Option<String>) -> Option<&str> {
+    value.as_deref().filter(|v| !v.is_empty())
+}
+
+// Invalid list filters are a 400. They used to be logged and dropped, which
+// answered the UNFILTERED list with 200: `?tag=customer:42` returned every
+// customer's jobs, and a script retrying "the failed jobs" acted on all of them.
+
+fn queue_filter(value: &Option<String>) -> AppResult<Option<&str>> {
+    match filter_value(value) {
+        Some(queue) if !validate_queue_name_filter(queue) => Err(AppError::Validation(
+            "Invalid queue_name filter: use 1-255 letters, digits, '-', '_' or '.'".to_string(),
+        )),
+        queue => Ok(queue),
+    }
+}
+
+/// Status filters match case-insensitively (`Pending` = `pending`).
+fn status_filter(value: &Option<String>) -> AppResult<Option<&'static str>> {
+    let Some(status) = filter_value(value) else {
+        return Ok(None);
+    };
+    VALID_JOB_STATUSES
+        .iter()
+        .copied()
+        .find(|valid| valid.eq_ignore_ascii_case(status))
+        .map(Some)
+        .ok_or_else(|| {
+            AppError::Validation(format!(
+                "Invalid status filter '{}': expected one of {}",
+                status,
+                VALID_JOB_STATUSES.join(", ")
+            ))
+        })
+}
+
+/// Tags are stored as free-form JSON, so the filter takes any characters it
+/// could match (it is a bound parameter). It used to allow only
+/// `[A-Za-z0-9_.-]`, so `customer:42` or `env prod` could never be filtered.
+/// NUL is refused because Postgres text cannot hold it.
+fn tag_filter(value: &Option<String>) -> AppResult<Option<&str>> {
+    match filter_value(value) {
+        Some(tag) if tag.len() > MAX_TAG_FILTER_LEN || tag.contains('\0') => {
+            Err(AppError::Validation(format!(
+                "Invalid tag filter: at most {} bytes and no NUL character",
+                MAX_TAG_FILTER_LEN
+            )))
+        }
+        tag => Ok(tag),
+    }
+}
+
+/// `ORDER BY` for job lists: the requested column, then `id`, so rows that tie
+/// on it (a bulk enqueue or a cron batch shares one `created_at`) keep one
+/// order across OFFSET pages. Without the tiebreak a claim moving a row could
+/// show it on two pages and skip another. `column` and `direction` come from
+/// [`ListJobsQuery::order`], i.e. from fixed strings.
+fn push_job_order(qb: &mut QueryBuilder<Postgres>, column: &'static str, direction: &'static str) {
+    // NULL timestamps (not yet scheduled / completed) go last either way.
+    let nulls = match column {
+        "scheduled_at" | "completed_at" => " NULLS LAST",
+        _ => "",
+    };
+    qb.push(format_args!(
+        " ORDER BY {column} {direction}{nulls}, id {direction}"
+    ));
 }
 
 /// Publish a realtime event to the organization-scoped events channel (best-effort).
@@ -94,6 +159,76 @@ fn already_finished_error(status: &str) -> AppError {
     AppError::Conflict(format!("Job is already {}", status))
 }
 
+/// The job an idempotency key already names in this org, if any.
+async fn existing_idempotent_job(
+    pool: &sqlx::PgPool,
+    org_id: &str,
+    key: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar("SELECT id FROM jobs WHERE organization_id = $1 AND idempotency_key = $2")
+        .bind(org_id)
+        .bind(key)
+        .fetch_optional(pool)
+        .await
+}
+
+/// `expires_at` must lie in the future and after `scheduled_at`. Such a job
+/// was accepted (201, quota charged) but could never be claimed, and the
+/// expiry sweep deleted it a few minutes later.
+fn validate_expiry(
+    expires_at: Option<chrono::DateTime<Utc>>,
+    scheduled_at: Option<chrono::DateTime<Utc>>,
+    now: chrono::DateTime<Utc>,
+) -> AppResult<()> {
+    let Some(expires_at) = expires_at else {
+        return Ok(());
+    };
+    if expires_at <= now {
+        return Err(AppError::Validation(
+            "expires_at must be in the future".to_string(),
+        ));
+    }
+    if scheduled_at.is_some_and(|scheduled_at| expires_at <= scheduled_at) {
+        return Err(AppError::Validation(
+            "expires_at must be later than scheduled_at".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Map a failed job INSERT. The database refusing a value (a data exception,
+/// SQLSTATE class 22, or a CHECK violation) is bad input and a 400; anything
+/// else is a 500 with the SQL error kept out of the response.
+fn job_insert_error(e: sqlx::Error) -> AppError {
+    tracing::error!(error = %e, "Failed to create job");
+    let rejected_value = e
+        .as_database_error()
+        .and_then(|db| db.code())
+        .is_some_and(|code| code.starts_with("22") || code == "23514");
+    if rejected_value {
+        AppError::Validation("The database rejected a value of the job".to_string())
+    } else {
+        AppError::Database(sqlx::Error::Protocol("Failed to create job".to_string()))
+    }
+}
+
+/// Give back daily-quota credits reserved for jobs that were not created.
+async fn refund_reserved_quota(state: &AppState, org_id: &str, reserved: bool, count: i64) {
+    if !reserved || count <= 0 {
+        return;
+    }
+    // The dedicated sign-safe function: incrementing by a negative count
+    // assigned instead of adding across a reset boundary.
+    if let Err(e) = refund_daily_jobs(state.db.pool(), org_id, count as i32).await {
+        tracing::warn!(
+            error = %e,
+            org_id = %org_id,
+            refund = count,
+            "Failed to refund an unused daily job reservation"
+        );
+    }
+}
+
 /// List jobs with optional filtering
 ///
 /// Reduced max limit from 1000 to 100
@@ -106,35 +241,10 @@ pub async fn list(
     let limit = query.limit.unwrap_or(50).clamp(1, MAX_JOBS_PER_PAGE);
     let offset = query.offset.unwrap_or(0).max(0);
 
-    // Validate queue_name to prevent injection
-    let validated_queue = query.queue_name.as_ref().and_then(|q| {
-        if validate_queue_name_filter(q) {
-            Some(q.clone())
-        } else {
-            tracing::warn!(queue_name = %q, "Invalid queue_name filter ignored");
-            None
-        }
-    });
-
-    // Validate status parameter
-    let validated_status = query.status.as_ref().and_then(|s| {
-        if VALID_JOB_STATUSES.contains(&s.as_str()) {
-            Some(s.clone())
-        } else {
-            tracing::warn!(status = %s, "Invalid job status filter ignored");
-            None
-        }
-    });
-
-    // Validate tag filter (optional)
-    let validated_tag = query.tag.as_ref().and_then(|t| {
-        if validate_tag_filter(t) {
-            Some(t.clone())
-        } else {
-            tracing::warn!(tag = %t, "Invalid tag filter ignored");
-            None
-        }
-    });
+    let validated_queue = queue_filter(&query.queue_name)?;
+    let validated_status = status_filter(&query.status)?;
+    let validated_tag = tag_filter(&query.tag)?;
+    let (order_by, order_dir) = query.order().map_err(AppError::Validation)?;
     let org_id = &ctx.organization_id;
 
     // Build query dynamically to support optional filters without a combinatorial explosion.
@@ -147,9 +257,9 @@ pub async fn list(
     // RESTRICT the result set (not merely validate an optional filter), otherwise a
     // scoped key with no `queue_name` filter would see every queue's jobs.
     if let Some(allowed) = ctx.queue_scope_filter() {
-        qb.push(" AND queue_name = ANY(");
+        qb.push(" AND queue_in_key_scope(queue_name, ");
         qb.push_bind(allowed.to_vec());
-        qb.push(")");
+        qb.push("::TEXT[])");
     }
 
     if let Some(queue) = &validated_queue {
@@ -167,7 +277,8 @@ pub async fn list(
         qb.push_bind(tag);
     }
 
-    qb.push(" ORDER BY created_at DESC LIMIT ");
+    push_job_order(&mut qb, order_by, order_dir);
+    qb.push(" LIMIT ");
     qb.push_bind(limit);
     qb.push(" OFFSET ");
     qb.push_bind(offset);
@@ -196,6 +307,26 @@ pub async fn create(
     }
 
     let org_id = ctx.organization_id;
+    let idempotency_key = normalize_idempotency_key(request.idempotency_key.clone());
+
+    // A replay of a job that already exists is answered before any quota check.
+    // The retry of a request whose response was lost used to be evaluated as a
+    // new job: at a full active-jobs or daily cap it got 429 although its job
+    // existed, and the producer took it for not enqueued.
+    if let Some(ref key) = idempotency_key {
+        if let Some(existing_id) = existing_idempotent_job(state.db.pool(), &org_id, key).await? {
+            return Ok((
+                StatusCode::OK,
+                Json(CreateJobResponse {
+                    id: existing_id,
+                    created: false,
+                }),
+            ));
+        }
+    }
+
+    let now = Utc::now();
+    validate_expiry(request.expires_at, request.scheduled_at, now)?;
 
     // Check payload size against plan limits
     let payload_json = serde_json::to_string(&request.payload).unwrap_or_default();
@@ -224,7 +355,6 @@ pub async fn create(
     }
 
     let job_id = Uuid::new_v4().to_string();
-    let now = Utc::now();
 
     let priority = request.priority.unwrap_or(0);
     let max_retries = request.max_retries.unwrap_or(queue_defaults.max_retries);
@@ -274,9 +404,38 @@ pub async fn create(
         "pending"
     };
 
+    // Reserve the daily quota BEFORE inserting. Charging it after the insert
+    // meant that, at the cap, the job was briefly visible (a worker could claim
+    // it) and then deleted, and a concurrent replay of the same key could be
+    // answered 200 for a job that was about to disappear. The reservation is
+    // refunded when no row is created (insert error, or a replay that raced in).
+    let daily_limit = daily_jobs_limit(state.db.pool(), &org_id)
+        .await
+        .unwrap_or(-1);
+    let quota_reserved = match try_increment_daily_jobs(state.db.pool(), &org_id, 1, daily_limit)
+        .await
+    {
+        Ok(count) if count >= 0 => true,
+        Ok(_) => {
+            let response = check_job_limits(state.db.pool(), &org_id, 1)
+                .await
+                .err()
+                .unwrap_or_else(|| {
+                    (StatusCode::TOO_MANY_REQUESTS, "Daily job limit reached").into_response()
+                });
+            return Err(AppError::LimitExceeded(Box::new(response)));
+        }
+        Err(e) => {
+            // Counter DB error: accept the job uncounted (best-effort, as before)
+            // rather than failing an otherwise valid enqueue.
+            tracing::warn!(error = %e, org_id = %org_id, "Failed to increment daily job counter");
+            false
+        }
+    };
+
     // Use FIXED idempotency pattern: DO UPDATE SET RETURNING
     // This always returns an ID whether the job is new or existing
-    let (returned_id,): (String,) = sqlx::query_as(
+    let inserted: Result<(String,), sqlx::Error> = sqlx::query_as(
         r#"
         INSERT INTO jobs (
             id, organization_id, queue_name, status, payload, priority,
@@ -301,7 +460,7 @@ pub async fn create(
     .bind(timeout_seconds)
     .bind(now)
     .bind(request.scheduled_at)
-    .bind(&request.idempotency_key)
+    .bind(&idempotency_key)
     .bind(
         request
             .tags
@@ -314,55 +473,24 @@ pub async fn create(
     .bind(request.expires_at)
     .bind(dependencies_met)
     .fetch_one(state.db.pool())
-    .await
-    // Sanitize SQL errors
-    .map_err(|e| {
-        tracing::error!(error = %e, "Failed to create job");
-        AppError::Database(sqlx::Error::Protocol("Failed to create job".to_string()))
-    })?;
+    .await;
 
     // Check if this was a new job or existing (idempotent)
+    let returned_id = match inserted {
+        Ok((id,)) => id,
+        Err(e) => {
+            refund_reserved_quota(&state, &org_id, quota_reserved, 1).await;
+            return Err(job_insert_error(e));
+        }
+    };
     let created = returned_id == job_id;
 
     // Update metrics and usage counters
     if created {
-        // Atomically enforce + increment the daily quota. The pre-insert
-        // check_job_limits above rejects the common over-limit case; this closes
-        // the concurrency window where N simultaneous enqueues each passed that
-        // check and then all incremented, overshooting the cap.
-        let limit = daily_jobs_limit(state.db.pool(), &org_id)
-            .await
-            .unwrap_or(-1);
-        match try_increment_daily_jobs(state.db.pool(), &org_id, 1, limit).await {
-            Ok(count) if count >= 0 => {
-                state.metrics.jobs_enqueued.inc();
-                state.metrics.jobs_pending.inc();
-            }
-            Ok(_) => {
-                // Over the daily cap. The job we just created is brand new with no
-                // dependents yet, so remove it and reject with the standard limit
-                // error rather than leaving an uncounted job that exceeds quota.
-                let _ = sqlx::query("DELETE FROM jobs WHERE id = $1 AND organization_id = $2")
-                    .bind(&job_id)
-                    .bind(&org_id)
-                    .execute(state.db.pool())
-                    .await;
-                let response = check_job_limits(state.db.pool(), &org_id, 1)
-                    .await
-                    .err()
-                    .unwrap_or_else(|| {
-                        (StatusCode::TOO_MANY_REQUESTS, "Daily job limit reached").into_response()
-                    });
-                return Err(AppError::LimitExceeded(Box::new(response)));
-            }
-            Err(e) => {
-                // Counter DB error: keep the job (best-effort, as before) rather
-                // than failing an accepted enqueue.
-                tracing::warn!(error = %e, org_id = %org_id, "Failed to increment daily job counter");
-                state.metrics.jobs_enqueued.inc();
-                state.metrics.jobs_pending.inc();
-            }
-        }
+        state.metrics.jobs_enqueued.inc();
+        state.metrics.jobs_pending.inc();
+    } else {
+        refund_reserved_quota(&state, &org_id, quota_reserved, 1).await;
     }
 
     // Record the parent dependency edge so the parent's completion trigger releases
@@ -545,7 +673,7 @@ pub async fn complete(
             &id,
             &request.worker_id,
             &ctx.organization_id,
-            request.lease_id.as_deref(),
+            Some(request.lease_id.as_str()),
             ctx.queue_scope_filter(),
             request.result,
         )
@@ -641,6 +769,7 @@ pub async fn complete(
 
     if let Some(url) = completion_webhook.filter(|u| !u.is_empty()) {
         crate::outgoing_webhooks::service::spawn_completion_webhook(
+            &ctx.organization_id,
             url,
             "job.completed".to_string(),
             serde_json::json!({
@@ -678,7 +807,7 @@ pub async fn fail(
             &id,
             &request.worker_id,
             &ctx.organization_id,
-            request.lease_id.as_deref(),
+            Some(request.lease_id.as_str()),
             ctx.queue_scope_filter(),
             &crate::models::normalize_failure_message(&request.error),
         )
@@ -784,6 +913,7 @@ pub async fn fail(
 
             if let Some(url) = completion_webhook.filter(|u| !u.is_empty()) {
                 crate::outgoing_webhooks::service::spawn_completion_webhook(
+                    &ctx.organization_id,
                     url,
                     "job.failed".to_string(),
                     serde_json::json!({
@@ -815,16 +945,17 @@ pub async fn heartbeat(
         state.cache.as_ref().map(|c| Arc::new(c.clone())),
     );
 
+    // An omitted lease_duration_secs renews for the length the lease was
+    // granted with, not the 30 s default (that cut a 600 s claim to 30 s).
     let outcome = queue
-        .renew_lease(
+        .renew_lease_for(
             &id,
             &request.worker_id,
             &ctx.organization_id,
-            request.lease_id.as_deref(),
+            Some(request.lease_id.as_str()),
             ctx.queue_scope_filter(),
-            request
-                .lease_duration_secs
-                .unwrap_or(state.settings.worker.lease_duration_secs as i64),
+            request.lease_duration_secs,
+            state.settings.worker.lease_duration_secs as i64,
         )
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -983,6 +1114,176 @@ pub async fn cancel(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Deepest dependency chain re-opened by one retry.
+const MAX_REOPEN_DEPTH: usize = 100;
+
+/// After the `retried` jobs went back to pending, re-open the dependents the
+/// sweep cancelled because of them, level by level (a cancelled step's own
+/// dependents were cancelled for the same reason). Returns the re-opened ids.
+///
+/// Before, a retried step ran alone: its dependents stayed cancelled, and a
+/// workflow with another branch still running then ended 'completed' with a
+/// step that never ran. A dependent is re-opened gated
+/// (`dependencies_met = FALSE`) until the retried job completes, and only when
+/// none of its other dependencies still dooms it (the sweep would cancel it
+/// again at once). Steps of a cancelled workflow stay cancelled.
+async fn reopen_cancelled_dependents(
+    conn: &mut sqlx::PgConnection,
+    org_id: &str,
+    retried: &[String],
+) -> Result<Vec<String>, sqlx::Error> {
+    let mut reopened = Vec::new();
+    let mut frontier = retried.to_vec();
+    for _ in 0..MAX_REOPEN_DEPTH {
+        if frontier.is_empty() {
+            break;
+        }
+        let level: Vec<String> = sqlx::query_scalar(
+            r#"
+            UPDATE jobs child
+            SET
+                status = CASE WHEN child.scheduled_at > NOW() THEN 'scheduled' ELSE 'pending' END,
+                last_error = NULL,
+                completed_at = NULL,
+                dependencies_met = check_job_dependencies_met(child.id)
+                    AND NOT EXISTS (
+                        SELECT 1 FROM jobs parent
+                        WHERE parent.id = child.parent_job_id AND parent.status <> 'completed'
+                    ),
+                updated_at = NOW()
+            WHERE child.organization_id = $1
+              AND child.status = 'cancelled'
+              AND child.last_error = ANY($3)
+              AND (
+                  child.parent_job_id = ANY($2)
+                  OR EXISTS (
+                      SELECT 1 FROM job_dependencies jd
+                      WHERE jd.job_id = child.id AND jd.depends_on_job_id = ANY($2)
+                  )
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM workflows w
+                  WHERE w.id = child.workflow_id AND w.status = 'cancelled'
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM jobs parent
+                  WHERE parent.id = child.parent_job_id
+                    AND parent.status IN ('failed', 'deadletter', 'cancelled')
+              )
+              AND (
+                  (
+                      COALESCE(child.dependency_mode, 'all') <> 'any'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM job_dependencies jd
+                          JOIN jobs dep ON dep.id = jd.depends_on_job_id
+                          WHERE jd.job_id = child.id
+                            AND dep.status IN ('failed', 'deadletter', 'cancelled')
+                      )
+                  )
+                  OR (
+                      child.dependency_mode = 'any'
+                      AND EXISTS (
+                          SELECT 1 FROM job_dependencies jd
+                          JOIN jobs dep ON dep.id = jd.depends_on_job_id
+                          WHERE jd.job_id = child.id
+                            AND dep.status NOT IN ('failed', 'deadletter', 'cancelled')
+                      )
+                  )
+              )
+            RETURNING child.id
+            "#,
+        )
+        .bind(org_id)
+        .bind(&frontier)
+        // Only dependents the scheduler's sweep cancelled (shared reasons).
+        .bind(DEPENDENCY_CANCEL_REASONS)
+        .fetch_all(&mut *conn)
+        .await?;
+        reopened.extend(level.iter().cloned());
+        frontier = level;
+    }
+    if !reopened.is_empty() {
+        info!(
+            org_id = %org_id,
+            retried = ?retried,
+            reopened = reopened.len(),
+            "Re-opened dependents cancelled by a retried job's failure"
+        );
+    }
+    Ok(reopened)
+}
+
+/// Bring the workflows of retried and re-opened jobs back in line: a 'failed'
+/// workflow runs again (it would otherwise ignore its jobs settling, and keep
+/// stale counters) and pays its max_workflows slot as
+/// `POST /workflows/{id}/retry` does; the caller holds that cap's lock. Every
+/// affected workflow gets its counters recomputed.
+///
+/// `POST /jobs/{id}/retry` names one job, so a refusal here refuses it. A DLQ
+/// retry picks only the steps whose workflows fit under the cap (see
+/// [`DlqScope`]); for it this check is a backstop.
+async fn reopen_workflows(
+    conn: &mut sqlx::PgConnection,
+    org_id: &str,
+    retried: &[String],
+    reopened: &[String],
+) -> AppResult<()> {
+    let job_ids: Vec<&String> = retried.iter().chain(reopened).collect();
+    let workflows: Vec<(String, String)> = sqlx::query_as(
+        r#"
+        SELECT w.id, w.status
+        FROM workflows w
+        WHERE w.organization_id = $1
+          AND w.id IN (
+              SELECT workflow_id FROM jobs
+              WHERE organization_id = $1 AND id = ANY($2) AND workflow_id IS NOT NULL
+          )
+        FOR UPDATE OF w
+        "#,
+    )
+    .bind(org_id)
+    .bind(&job_ids)
+    .fetch_all(&mut *conn)
+    .await?;
+    if workflows.is_empty() {
+        return Ok(());
+    }
+
+    let reviving = workflows.iter().filter(|(_, s)| s == "failed").count() as u64;
+    if reviving > 0 {
+        if let Err(response) =
+            check_resource_limit_conn(&mut *conn, org_id, "workflows", reviving).await
+        {
+            return Err(AppError::LimitExceeded(Box::new(response)));
+        }
+    }
+
+    let ids: Vec<String> = workflows.into_iter().map(|(id, _)| id).collect();
+    sqlx::query(
+        r#"
+        UPDATE workflows w
+        SET
+            status = CASE WHEN w.status = 'failed' THEN 'running' ELSE w.status END,
+            completed_at = CASE WHEN w.status = 'failed' THEN NULL ELSE w.completed_at END,
+            completed_jobs = (
+                SELECT COUNT(*) FROM jobs j WHERE j.workflow_id = w.id AND j.status = 'completed'
+            ),
+            failed_jobs = (
+                SELECT COUNT(*) FROM jobs j
+                WHERE j.workflow_id = w.id AND j.status IN ('failed', 'deadletter')
+            )
+        WHERE w.organization_id = $1
+          AND w.id = ANY($2)
+          AND w.status IN ('pending', 'running', 'failed')
+        "#,
+    )
+    .bind(org_id)
+    .bind(&ids)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
 /// Retry a failed job
 ///
 pub async fn retry(
@@ -992,19 +1293,31 @@ pub async fn retry(
 ) -> AppResult<Json<Job>> {
     // Capture previous status for realtime event (failed vs deadletter) AND enforce
     // queue scope: a restricted key cannot retry jobs in queues outside its scope.
-    let before: Option<(String, String)> = sqlx::query_as(
-        "SELECT status, queue_name FROM jobs WHERE id = $1 AND organization_id = $2",
+    let before: Option<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT status, queue_name, workflow_id FROM jobs WHERE id = $1 AND organization_id = $2",
     )
     .bind(&id)
     .bind(&ctx.organization_id)
     .fetch_optional(state.db.pool())
     .await?;
-    if let Some((_, ref queue_name)) = before {
+    if let Some((_, ref queue_name, _)) = before {
         if !ctx.can_access_queue(queue_name) {
             return Err(AppError::NotFound("Job not found".to_string()));
         }
     }
-    let before_status: Option<(String,)> = before.as_ref().map(|(s, _)| (s.clone(),));
+    let before_status: Option<(String,)> = before.as_ref().map(|(s, _, _)| (s.clone(),));
+
+    // One transaction: the retry, re-opening the dependents its failure
+    // cancelled, and putting its workflow back to running apply together.
+    let mut tx = state.db.pool().begin().await?;
+    if before
+        .as_ref()
+        .is_some_and(|(_, _, workflow)| workflow.is_some())
+    {
+        // Reviving a failed workflow pays a max_workflows slot; take the cap's
+        // lock before any row lock, in the order workflow create/retry use.
+        lock_resource(&mut tx, &ctx.organization_id, "workflows").await?;
+    }
 
     let job = sqlx::query_as::<_, Job>(
         r#"
@@ -1023,7 +1336,7 @@ pub async fn retry(
     )
     .bind(&id)
     .bind(&ctx.organization_id)
-    .fetch_optional(state.db.pool())
+    .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| {
         if before.is_none() {
@@ -1035,18 +1348,19 @@ pub async fn retry(
 
     // The job is live again: drop its dead_letter_queue audit row, as the DLQ
     // retry path does, so GET /jobs/dlq stops listing it.
-    if let Err(e) =
-        sqlx::query("DELETE FROM dead_letter_queue WHERE job_id = $1 AND organization_id = $2")
-            .bind(&id)
-            .bind(&ctx.organization_id)
-            .execute(state.db.pool())
-            .await
-    {
-        warn!(error = %e, job_id = %id, "Failed to clean dead_letter_queue row after job retry");
-    }
+    sqlx::query("DELETE FROM dead_letter_queue WHERE job_id = $1 AND organization_id = $2")
+        .bind(&id)
+        .bind(&ctx.organization_id)
+        .execute(&mut *tx)
+        .await?;
+
+    let retried = [id.clone()];
+    let reopened = reopen_cancelled_dependents(&mut tx, &ctx.organization_id, &retried).await?;
+    reopen_workflows(&mut tx, &ctx.organization_id, &retried, &reopened).await?;
+    tx.commit().await?;
 
     state.metrics.jobs_retried.inc();
-    state.metrics.jobs_pending.inc();
+    state.metrics.jobs_pending.add(1 + reopened.len() as i64);
 
     // Notify Redis about job being available for workers
     if let Some(ref cache) = state.cache {
@@ -1087,14 +1401,8 @@ pub async fn stats(
     Extension(ctx): Extension<ApiKeyContext>,
     Query(query): Query<JobStatsQuery>,
 ) -> AppResult<Json<JobStats>> {
-    let validated_queue = query.queue_name.as_ref().and_then(|q| {
-        if validate_queue_name_filter(q) {
-            Some(q.as_str())
-        } else {
-            tracing::warn!(queue_name = %q, "Invalid queue_name stats filter ignored");
-            None
-        }
-    });
+    // An invalid queue filter is a 400 here too, not org-wide totals.
+    let validated_queue = queue_filter(&query.queue_name)?;
 
     if let Some(queue) = validated_queue {
         if !ctx.can_access_queue(queue) {
@@ -1114,7 +1422,7 @@ pub async fn stats(
             COUNT(*) FILTER (WHERE status = 'cancelled') as cancelled
         FROM jobs
         WHERE organization_id = $1
-          AND ($2::TEXT[] IS NULL OR queue_name = ANY($2))
+          AND queue_in_key_scope(queue_name, $2::TEXT[])
           AND ($3::TEXT IS NULL OR queue_name = $3)
         "#,
     )
@@ -1140,6 +1448,13 @@ pub async fn stats(
 ///
 /// Uses batch INSERT with UNNEST for better performance (single round-trip).
 /// SECURITY: Enforces plan limits before creating jobs
+///
+/// Items are validated one by one: an invalid item is reported in `failed`
+/// under its index with the reason, and the valid items are still created.
+/// The item validators never ran before, so one out-of-range value failed the
+/// whole INSERT and the API still answered 200 with every item in `failed` as
+/// "Failed to create job". A batch with no valid item, invalid batch defaults,
+/// or a batch the database refuses is now an error status, not a 200.
 pub async fn bulk_enqueue(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
@@ -1154,11 +1469,113 @@ pub async fn bulk_enqueue(
     }
 
     let org_id = ctx.organization_id;
-    let job_count = request.jobs.len() as u64;
+    let total = request.jobs.len();
 
-    // Check job limits (daily + active) before creating
-    if let Err(response) = check_job_limits(state.db.pool(), &org_id, job_count).await {
-        return Err(AppError::LimitExceeded(Box::new(response)));
+    let mut failed: Vec<crate::models::BulkJobError> = Vec::new();
+    // (request index, item, idempotency key with a blank key read as none)
+    let mut valid: Vec<(usize, &crate::models::BulkJobItem, Option<String>)> = Vec::new();
+    for (index, item) in request.jobs.iter().enumerate() {
+        match item.validate() {
+            Ok(()) => valid.push((
+                index,
+                item,
+                normalize_idempotency_key(item.idempotency_key.clone()),
+            )),
+            Err(errors) => failed.push(crate::models::BulkJobError {
+                index,
+                error: match AppError::from(errors) {
+                    AppError::Validation(message) => message,
+                    other => other.to_string(),
+                },
+            }),
+        }
+    }
+    if valid.is_empty() {
+        let reasons: Vec<String> = failed
+            .iter()
+            .map(|f| format!("jobs[{}]: {}", f.index, f.error))
+            .collect();
+        return Err(AppError::Validation(format!(
+            "No job in the batch is valid; {}",
+            reasons.join("; ")
+        )));
+    }
+
+    // Replays are answered from the jobs that already exist and charge no quota:
+    // only items that will create a row count against the caps (the first item
+    // of the batch carrying a key not stored yet, and every keyless item). The
+    // whole request used to be charged, so a replayed batch at a full cap was
+    // refused although every job existed.
+    let keys: Vec<&str> = valid
+        .iter()
+        .filter_map(|(_, _, key)| key.as_deref())
+        .collect();
+    let existing_keys: std::collections::HashSet<String> = if keys.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        sqlx::query_scalar::<_, String>(
+            "SELECT idempotency_key FROM jobs WHERE organization_id = $1 AND idempotency_key = ANY($2)",
+        )
+        .bind(&org_id)
+        .bind(&keys)
+        .fetch_all(state.db.pool())
+        .await?
+        .into_iter()
+        .collect()
+    };
+    let mut batch_keys = std::collections::HashSet::new();
+    let creates: Vec<bool> = valid
+        .iter()
+        .map(|(_, _, key)| match key {
+            None => true,
+            Some(key) => !existing_keys.contains(key) && batch_keys.insert(key.as_str()),
+        })
+        .collect();
+    let job_count = creates.iter().filter(|c| **c).count() as u64;
+
+    let now = Utc::now();
+    let mut job_ids: Vec<String> = Vec::with_capacity(valid.len());
+    let mut statuses: Vec<String> = Vec::with_capacity(valid.len());
+    let mut payloads: Vec<String> = Vec::with_capacity(valid.len());
+    let mut priorities: Vec<i32> = Vec::with_capacity(valid.len());
+    let mut scheduled_ats: Vec<Option<chrono::DateTime<Utc>>> = Vec::with_capacity(valid.len());
+    let mut idempotency_keys: Vec<Option<String>> = Vec::with_capacity(valid.len());
+    let mut indexes: Vec<i32> = Vec::with_capacity(valid.len());
+    let mut max_payload_size: usize = 0;
+    let default_priority = request.default_priority.unwrap_or(0);
+
+    for ((index, job_item, key), creates) in valid.iter().zip(&creates) {
+        let initial_status = if job_item.scheduled_at.is_some() && job_item.scheduled_at > Some(now)
+        {
+            "scheduled"
+        } else {
+            "pending"
+        };
+        let payload_json = serde_json::to_string(&job_item.payload).unwrap_or_default();
+        if *creates {
+            max_payload_size = max_payload_size.max(payload_json.len());
+        }
+
+        job_ids.push(Uuid::new_v4().to_string());
+        statuses.push(initial_status.to_string());
+        payloads.push(payload_json);
+        priorities.push(job_item.priority.unwrap_or(default_priority));
+        scheduled_ats.push(job_item.scheduled_at);
+        idempotency_keys.push(key.clone());
+        indexes.push(*index as i32);
+    }
+
+    // Plan checks, for the jobs this batch creates.
+    if job_count > 0 {
+        // SECURITY: Enforce per-plan payload size limit for bulk enqueue too.
+        if let Err(response) = check_payload_size(state.db.pool(), &org_id, max_payload_size).await
+        {
+            return Err(AppError::LimitExceeded(Box::new(response)));
+        }
+        // Check job limits (daily + active) before creating
+        if let Err(response) = check_job_limits(state.db.pool(), &org_id, job_count).await {
+            return Err(AppError::LimitExceeded(Box::new(response)));
+        }
     }
 
     let queue_defaults = queue_job_defaults(
@@ -1168,14 +1585,11 @@ pub async fn bulk_enqueue(
         &request.queue_name,
     )
     .await?;
-    if !queue_defaults.exists {
+    if job_count > 0 && !queue_defaults.exists {
         if let Err(response) = check_new_queue_limit(state.db.pool(), &org_id, 1).await {
             return Err(AppError::LimitExceeded(Box::new(response)));
         }
     }
-
-    let now = Utc::now();
-    let default_priority = request.default_priority.unwrap_or(0);
     let default_max_retries = request
         .default_max_retries
         .unwrap_or(queue_defaults.max_retries);
@@ -1183,79 +1597,39 @@ pub async fn bulk_enqueue(
         .default_timeout_seconds
         .unwrap_or(queue_defaults.timeout_seconds);
 
-    // Prepare arrays for batch INSERT using UNNEST
-    let mut job_ids: Vec<String> = Vec::with_capacity(request.jobs.len());
-    let mut statuses: Vec<String> = Vec::with_capacity(request.jobs.len());
-    let mut payloads: Vec<String> = Vec::with_capacity(request.jobs.len());
-    let mut priorities: Vec<i32> = Vec::with_capacity(request.jobs.len());
-    let mut scheduled_ats: Vec<Option<chrono::DateTime<Utc>>> =
-        Vec::with_capacity(request.jobs.len());
-    let mut idempotency_keys: Vec<Option<String>> = Vec::with_capacity(request.jobs.len());
-    let mut indexes: Vec<i32> = Vec::with_capacity(request.jobs.len());
-    let mut max_payload_size: usize = 0;
-
-    for (index, job_item) in request.jobs.iter().enumerate() {
-        let job_id = Uuid::new_v4().to_string();
-        let priority = job_item.priority.unwrap_or(default_priority);
-        let initial_status = if job_item.scheduled_at.is_some() && job_item.scheduled_at > Some(now)
-        {
-            "scheduled"
-        } else {
-            "pending"
-        };
-
-        job_ids.push(job_id);
-        statuses.push(initial_status.to_string());
-        let payload_json = serde_json::to_string(&job_item.payload).unwrap_or_default();
-        max_payload_size = max_payload_size.max(payload_json.len());
-        payloads.push(payload_json);
-        priorities.push(priority);
-        scheduled_ats.push(job_item.scheduled_at);
-        idempotency_keys.push(job_item.idempotency_key.clone());
-        indexes.push(index as i32);
-    }
-
-    // SECURITY: Enforce per-plan payload size limit for bulk enqueue too.
-    // Previously, /jobs created enforced plan payload limits, but /jobs/bulk only validated 1MB.
-    if let Err(response) = check_payload_size(state.db.pool(), &org_id, max_payload_size).await {
-        return Err(AppError::LimitExceeded(Box::new(response)));
-    }
-
     // Atomically reserve the daily-job quota for the WHOLE batch before inserting.
     // check_job_limits above is a fast non-atomic pre-check (and still guards the soft
     // active-jobs limit); this row-locked reservation is the authoritative daily cap,
     // closing the window where N concurrent bulk requests each passed the pre-check and
     // then all inserted, overshooting jobs_per_day (the single-enqueue path already does
     // this via try_increment_daily_jobs). All-or-nothing: a batch that would exceed the
-    // cap is rejected before any job is created. A batch containing in-batch idempotency
-    // duplicates reserves its request size, i.e. counts conservatively (never overshoots).
-    let daily_limit = daily_jobs_limit(state.db.pool(), &org_id)
-        .await
-        .unwrap_or(-1);
-    let quota_reserved = match try_increment_daily_jobs(
-        state.db.pool(),
-        &org_id,
-        job_count as i32,
-        daily_limit,
-    )
-    .await
-    {
-        Ok(count) if count >= 0 => true,
-        Ok(_) => {
-            let response = check_job_limits(state.db.pool(), &org_id, job_count)
-                .await
-                .err()
-                .unwrap_or_else(|| {
-                    (StatusCode::TOO_MANY_REQUESTS, "Daily job limit reached").into_response()
-                });
-            return Err(AppError::LimitExceeded(Box::new(response)));
-        }
-        Err(e) => {
-            // Counter DB error: proceed best-effort (matching the single-enqueue path)
-            // rather than failing an otherwise-valid batch. The post-insert block below
-            // then credits the actual creations.
-            tracing::warn!(error = %e, org_id = %org_id, "Failed to reserve daily job quota for bulk enqueue");
-            false
+    // cap is rejected before any job is created. A batch of replays only reserves nothing.
+    let quota_reserved = if job_count == 0 {
+        false
+    } else {
+        let daily_limit = daily_jobs_limit(state.db.pool(), &org_id)
+            .await
+            .unwrap_or(-1);
+        match try_increment_daily_jobs(state.db.pool(), &org_id, job_count as i32, daily_limit)
+            .await
+        {
+            Ok(count) if count >= 0 => true,
+            Ok(_) => {
+                let response = check_job_limits(state.db.pool(), &org_id, job_count)
+                    .await
+                    .err()
+                    .unwrap_or_else(|| {
+                        (StatusCode::TOO_MANY_REQUESTS, "Daily job limit reached").into_response()
+                    });
+                return Err(AppError::LimitExceeded(Box::new(response)));
+            }
+            Err(e) => {
+                // Counter DB error: proceed best-effort (matching the single-enqueue path)
+                // rather than failing an otherwise-valid batch. The post-insert block below
+                // then credits the actual creations.
+                tracing::warn!(error = %e, org_id = %org_id, "Failed to reserve daily job quota for bulk enqueue");
+                false
+            }
         }
     };
 
@@ -1344,79 +1718,66 @@ pub async fn bulk_enqueue(
     .fetch_all(state.db.pool())
     .await;
 
-    let mut succeeded = Vec::new();
-    let mut failed = Vec::new();
-    let mut successful_count: u64 = 0;
-    let total_jobs = indexes.len(); // Save count before potential move
-
-    match results {
-        Ok(rows) => {
-            for (index, returned_id, input_id) in rows {
-                let created = returned_id == input_id;
-                if created {
-                    successful_count += 1;
-                }
-                succeeded.push(crate::models::BulkJobResult {
-                    index: index as usize,
-                    job_id: returned_id,
-                    created,
-                });
-            }
-        }
+    // A failed batch INSERT created nothing: give the reservation back and say so
+    // with an error status (it was a 200 listing every item as failed).
+    let rows = match results {
+        Ok(rows) => rows,
         Err(e) => {
-            // If batch insert fails entirely, report all as failed
             tracing::error!(error = %e, "Bulk enqueue batch insert failed");
-            for index in 0..total_jobs {
-                failed.push(crate::models::BulkJobError {
-                    index,
-                    error: "Failed to create job".to_string(),
-                });
-            }
+            refund_reserved_quota(&state, &org_id, quota_reserved, job_count as i64).await;
+            return Err(job_insert_error(e));
         }
+    };
+
+    let mut succeeded = Vec::with_capacity(rows.len());
+    let mut successful_count: u64 = 0;
+    for (index, returned_id, input_id) in rows {
+        let created = returned_id == input_id;
+        if created {
+            successful_count += 1;
+        }
+        succeeded.push(crate::models::BulkJobResult {
+            index: index as usize,
+            job_id: returned_id,
+            created,
+        });
     }
 
     let success_count = succeeded.len();
     let failure_count = failed.len();
-    let total = success_count + failure_count;
 
     // Update metrics and usage counters
     if successful_count > 0 {
         state.metrics.jobs_enqueued.inc_by(successful_count);
     }
 
-    // Reconcile the daily counter so it reflects the jobs actually created.
-    if quota_reserved {
-        // The whole batch (job_count) was reserved up-front to prevent overshoot; refund
-        // the credits for rows NOT created — in-batch/idempotency duplicates, or a fully
-        // failed insert (successful_count == 0) — so the net credit equals the creations.
-        let unused = job_count as i64 - successful_count as i64;
-        if unused > 0 {
-            // Refund via the dedicated sign-safe function. Calling
-            // increment_daily_jobs with a negative count assigned instead of
-            // adding across a reset boundary (negative daily counter = free
-            // quota) and decremented the lifetime total.
-            if let Err(e) = refund_daily_jobs(state.db.pool(), &org_id, unused as i32).await {
-                tracing::warn!(
-                    error = %e,
-                    org_id = %org_id,
-                    refund = unused,
-                    "Failed to refund unused daily job reservation after bulk enqueue"
-                );
-            }
-        }
-    } else if successful_count > 0 {
-        // Reservation errored above: fall back to crediting the actual creations.
-        if let Err(e) =
-            increment_daily_jobs(state.db.pool(), &org_id, successful_count as i32).await
-        {
+    // Reconcile the daily counter so it reflects the jobs actually created: the
+    // reservation covered the items expected to create a row; refund what a racing
+    // replay took, and credit creations nothing was reserved for (the reservation
+    // errored, or a key that existed a moment ago was gone by the INSERT).
+    let reserved = if quota_reserved { job_count as i64 } else { 0 };
+    let unused = reserved - successful_count as i64;
+    if unused > 0 {
+        refund_reserved_quota(&state, &org_id, true, unused).await;
+    } else if unused < 0 {
+        if let Err(e) = increment_daily_jobs(state.db.pool(), &org_id, (-unused) as i32).await {
             tracing::warn!(
                 error = %e,
                 org_id = %org_id,
-                count = successful_count,
+                count = -unused,
                 "Failed to increment daily job counter"
             );
         }
     }
+
+    // Priority of a request item, for the job.created events below.
+    let priority_of = |index: usize| {
+        request
+            .jobs
+            .get(index)
+            .and_then(|item| item.priority)
+            .unwrap_or(default_priority)
+    };
 
     // Publish notification for new jobs with org context
     if success_count > 0 {
@@ -1432,10 +1793,6 @@ pub async fn bulk_enqueue(
             // This allows WebSocket consumers to show new jobs immediately.
             for item in &succeeded {
                 if item.created {
-                    let priority = priorities
-                        .get(item.index)
-                        .copied()
-                        .unwrap_or(default_priority);
                     publish_realtime_event(
                         cache,
                         &org_id,
@@ -1444,7 +1801,7 @@ pub async fn bulk_enqueue(
                             "data": {
                                 "job_id": item.job_id,
                                 "queue_name": request.queue_name,
-                                "priority": priority,
+                                "priority": priority_of(item.index),
                                 "timestamp": Utc::now().to_rfc3339()
                             }
                         }),
@@ -1456,10 +1813,6 @@ pub async fn bulk_enqueue(
 
         for item in &succeeded {
             if item.created {
-                let priority = priorities
-                    .get(item.index)
-                    .copied()
-                    .unwrap_or(default_priority);
                 state.outgoing_webhooks.spawn_dispatch(
                     org_id.clone(),
                     "job.created".to_string(),
@@ -1467,7 +1820,7 @@ pub async fn bulk_enqueue(
                     serde_json::json!({
                         "job_id": item.job_id,
                         "queue_name": request.queue_name,
-                        "priority": priority,
+                        "priority": priority_of(item.index),
                         "status": "pending",
                     }),
                 );
@@ -1551,24 +1904,10 @@ pub async fn list_dlq(
     let limit = query.limit.unwrap_or(50).clamp(1, MAX_JOBS_PER_PAGE);
     let offset = query.offset.unwrap_or(0).max(0);
 
-    // Validate queue_name to prevent injection (same as list())
-    let validated_queue = query.queue_name.as_ref().and_then(|q| {
-        if validate_queue_name_filter(q) {
-            Some(q.clone())
-        } else {
-            tracing::warn!(queue_name = %q, "Invalid queue_name filter ignored in list_dlq");
-            None
-        }
-    });
-
-    let validated_tag = query.tag.as_ref().and_then(|t| {
-        if validate_tag_filter(t) {
-            Some(t.clone())
-        } else {
-            tracing::warn!(tag = %t, "Invalid tag filter ignored in list_dlq");
-            None
-        }
-    });
+    // Same filter and order rules as list(); `status` is fixed to deadletter here.
+    let validated_queue = queue_filter(&query.queue_name)?;
+    let validated_tag = tag_filter(&query.tag)?;
+    let (order_by, order_dir) = query.order().map_err(AppError::Validation)?;
 
     let mut qb: QueryBuilder<Postgres> =
         QueryBuilder::new("SELECT * FROM jobs WHERE status = 'deadletter' AND organization_id = ");
@@ -1576,9 +1915,9 @@ pub async fn list_dlq(
 
     // Queue scope: restrict a scoped key's DLQ listing to its own queues.
     if let Some(allowed) = ctx.queue_scope_filter() {
-        qb.push(" AND queue_name = ANY(");
+        qb.push(" AND queue_in_key_scope(queue_name, ");
         qb.push_bind(allowed.to_vec());
-        qb.push(")");
+        qb.push("::TEXT[])");
     }
 
     if let Some(queue) = &validated_queue {
@@ -1591,7 +1930,8 @@ pub async fn list_dlq(
         qb.push_bind(tag);
     }
 
-    qb.push(" ORDER BY created_at DESC LIMIT ");
+    push_job_order(&mut qb, order_by, order_dir);
+    qb.push(" LIMIT ");
     qb.push_bind(limit);
     qb.push(" OFFSET ");
     qb.push_bind(offset);
@@ -1600,6 +1940,78 @@ pub async fn list_dlq(
 
     let summaries: Vec<JobSummary> = jobs.into_iter().map(Into::into).collect();
     Ok(Json(summaries))
+}
+
+/// The dead-lettered jobs a DLQ retry looks at: the named ids, else one
+/// queue's, else all of the org's.
+#[derive(Clone, Copy)]
+enum DlqScope<'a> {
+    Ids(&'a [String]),
+    Queue(&'a str),
+    All,
+}
+
+impl DlqScope<'_> {
+    /// ` FROM jobs j LEFT JOIN workflows w ... WHERE ...`: the org's
+    /// dead-lettered jobs in this scope, each with its workflow (`w`, all NULL
+    /// for a job outside any).
+    fn push_from(self, qb: &mut QueryBuilder<Postgres>, org_id: &str) {
+        qb.push(
+            " FROM jobs j \
+             LEFT JOIN workflows w \
+               ON w.id = j.workflow_id AND w.organization_id = j.organization_id \
+             WHERE j.status = 'deadletter' AND j.organization_id = ",
+        );
+        qb.push_bind(org_id);
+        match self {
+            DlqScope::Ids(ids) => {
+                qb.push(" AND j.id = ANY(");
+                qb.push_bind(ids);
+                qb.push(")");
+            }
+            DlqScope::Queue(queue) => {
+                qb.push(" AND j.queue_name = ");
+                qb.push_bind(queue);
+            }
+            DlqScope::All => {}
+        }
+    }
+}
+
+/// The 'failed' workflows with dead-lettered steps in `scope` that a retry
+/// may revive: at most `room`, those with the oldest step first.
+async fn revivable_dlq_workflows(
+    conn: &mut sqlx::PgConnection,
+    org_id: &str,
+    scope: DlqScope<'_>,
+    room: u64,
+) -> AppResult<Vec<String>> {
+    if room == 0 {
+        return Ok(Vec::new());
+    }
+    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new("SELECT w.id");
+    scope.push_from(&mut qb, org_id);
+    qb.push(" AND w.status = 'failed' GROUP BY w.id ORDER BY MIN(j.created_at), w.id LIMIT ");
+    qb.push_bind(i64::try_from(room).unwrap_or(i64::MAX));
+    Ok(qb.build_query_scalar().fetch_all(&mut *conn).await?)
+}
+
+/// Dead-lettered steps in `scope` of 'failed' workflows outside `revivable`:
+/// the jobs a retry leaves in the DLQ because of the max_workflows cap.
+async fn dlq_jobs_held_by_the_workflow_cap(
+    conn: &mut sqlx::PgConnection,
+    org_id: &str,
+    scope: DlqScope<'_>,
+    revivable: &[String],
+    limit: i64,
+) -> AppResult<Vec<String>> {
+    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new("SELECT j.id");
+    scope.push_from(&mut qb, org_id);
+    qb.push(" AND w.status = 'failed' AND NOT (w.id = ANY(");
+    qb.push_bind(revivable);
+    qb.push(")) ORDER BY j.created_at ASC, j.id LIMIT ");
+    qb.push_bind(limit);
+    Ok(qb.build_query_scalar().fetch_all(&mut *conn).await?)
 }
 
 /// Retry jobs from dead-letter queue
@@ -1674,106 +2086,104 @@ pub async fn retry_dlq(
         .await?
     };
 
-    // Check job limits before retrying (DLQ retry adds to active jobs count)
+    // A retry adds to the active jobs, so that cap applies. It creates no new
+    // job, so the daily cap does not: an org at its daily cap could not retry
+    // its DLQ at all.
     if job_count > 0 {
-        if let Err(response) =
-            check_job_limits(state.db.pool(), &ctx.organization_id, job_count as u64).await
+        if let Err(response) = check_resource_limit(
+            state.db.pool(),
+            &ctx.organization_id,
+            "active_jobs",
+            job_count as u64,
+        )
+        .await
         {
             return Err(AppError::LimitExceeded(Box::new(response)));
         }
     }
 
-    // Build query based on filters - ALL queries now include organization_id
-    let retried_jobs: Vec<(String,)> = if let Some(ref job_ids) = request.job_ids {
-        // Retry specific jobs - with org check
-        sqlx::query_as(
-            r#"
-            UPDATE jobs
-            SET
-                status = 'pending',
-                retry_count = 0,
-                last_error = NULL,
-                updated_at = NOW()
-            WHERE id = ANY($1) AND organization_id = $2 AND status = 'deadletter'
-            RETURNING id
-            "#,
-        )
-        .bind(job_ids)
-        .bind(&ctx.organization_id)
-        .fetch_all(state.db.pool())
-        .await?
-    } else if let Some(ref queue_name) = request.queue_name {
-        // Retry jobs from specific queue - with org check
-        sqlx::query_as(
-            r#"
-            UPDATE jobs
-            SET
-                status = 'pending',
-                retry_count = 0,
-                last_error = NULL,
-                updated_at = NOW()
-            WHERE id IN (
-                SELECT id FROM jobs
-                WHERE status = 'deadletter' AND organization_id = $1 AND queue_name = $2
-                ORDER BY created_at ASC
-                LIMIT $3
-            )
-            RETURNING id
-            "#,
-        )
-        .bind(&ctx.organization_id)
-        .bind(queue_name)
-        .bind(limit)
-        .fetch_all(state.db.pool())
-        .await?
-    } else {
-        // Retry all DLQ jobs up to limit - with org check
-        sqlx::query_as(
-            r#"
-            UPDATE jobs
-            SET
-                status = 'pending',
-                retry_count = 0,
-                last_error = NULL,
-                updated_at = NOW()
-            WHERE id IN (
-                SELECT id FROM jobs
-                WHERE status = 'deadletter' AND organization_id = $1
-                ORDER BY created_at ASC
-                LIMIT $2
-            )
-            RETURNING id
-            "#,
-        )
-        .bind(&ctx.organization_id)
-        .bind(limit)
-        .fetch_all(state.db.pool())
-        .await?
+    // One transaction for the retry and everything it re-opens (see retry()).
+    // The workflows cap lock comes first, before any row lock.
+    let mut tx = state.db.pool().begin().await?;
+    lock_resource(&mut tx, &ctx.organization_id, "workflows").await?;
+
+    // Explicit ids win over a queue name. Every pick includes organization_id.
+    let scope = match (&request.job_ids, &request.queue_name) {
+        (Some(ids), _) => DlqScope::Ids(ids),
+        (None, Some(queue)) => DlqScope::Queue(queue),
+        (None, None) => DlqScope::All,
+    };
+    let org_id = ctx.organization_id.as_str();
+
+    // A dead-lettered step of a 'failed' workflow revives that workflow, and
+    // reviving pays a max_workflows slot (see reopen_workflows). Pick only the
+    // steps of as many such workflows as fit, oldest first, and leave the rest
+    // in the DLQ, reported as skipped. Refusing the whole request instead let
+    // one such step among the oldest jobs block every bulk retry until a slot
+    // freed up. `None`: the cap is unlimited, every step can go.
+    let revivable = match resource_room_conn(&mut tx, org_id, "workflows").await {
+        Ok(None) => None,
+        Ok(Some(room)) => Some(revivable_dlq_workflows(&mut tx, org_id, scope, room).await?),
+        Err(response) => return Err(AppError::LimitExceeded(Box::new(response))),
     };
 
-    let retried_job_ids: Vec<String> = retried_jobs.into_iter().map(|(id,)| id).collect();
+    // The ids are picked in a subquery, so the outer UPDATE checks the status
+    // again: a job retried (or purged) by a concurrent request after the pick
+    // must not be reset a second time.
+    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
+        "UPDATE jobs SET status = 'pending', retry_count = 0, last_error = NULL, \
+         updated_at = NOW() WHERE id IN (SELECT j.id",
+    );
+    scope.push_from(&mut qb, org_id);
+    if let Some(revivable) = &revivable {
+        qb.push(" AND (w.status IS DISTINCT FROM 'failed' OR w.id = ANY(");
+        qb.push_bind(revivable.as_slice());
+        qb.push("))");
+    }
+    qb.push(" ORDER BY j.created_at ASC, j.id LIMIT ");
+    qb.push_bind(limit);
+    qb.push(") AND organization_id = ");
+    qb.push_bind(org_id);
+    qb.push(" AND status = 'deadletter' RETURNING id");
+    let retried_job_ids: Vec<String> = qb.build_query_scalar().fetch_all(&mut *tx).await?;
     let retried_count = retried_job_ids.len() as i64;
 
-    // Remove the corresponding dead_letter_queue audit rows — the job is live
-    // again, and nothing else ever deletes them (no FK), so they would dangle.
+    let skipped_jobs = match &revivable {
+        Some(revivable) => {
+            dlq_jobs_held_by_the_workflow_cap(&mut tx, org_id, scope, revivable, limit).await?
+        }
+        None => Vec::new(),
+    };
+    if !skipped_jobs.is_empty() {
+        if retried_job_ids.is_empty() {
+            // Nothing else to retry: answer with the cap that holds them, as
+            // POST /jobs/{id}/retry does for one such step.
+            check_resource_limit_conn(&mut tx, org_id, "workflows", 1)
+                .await
+                .map_err(|response| AppError::LimitExceeded(Box::new(response)))?;
+        }
+        info!(
+            org_id = %org_id,
+            skipped = skipped_jobs.len(),
+            "DLQ retry left steps of failed workflows the max_workflows cap cannot revive"
+        );
+    }
+
     if !retried_job_ids.is_empty() {
-        if let Err(e) = sqlx::query(
+        // Remove the corresponding dead_letter_queue audit rows — the job is live
+        // again, and nothing else ever deletes them (no FK), so they would dangle.
+        sqlx::query(
             "DELETE FROM dead_letter_queue WHERE job_id = ANY($1) AND organization_id = $2",
         )
         .bind(&retried_job_ids)
         .bind(&ctx.organization_id)
-        .execute(state.db.pool())
-        .await
-        {
-            warn!(error = %e, "Failed to clean dead_letter_queue rows after DLQ retry");
-        }
-    }
+        .execute(&mut *tx)
+        .await?;
 
-    // Reset child jobs that were blocked due to parent failure
-    // When a parent job is retried from DLQ, its child jobs (with dependencies_met = false)
-    // should have their dependencies recalculated
-    // SECURITY: Must include organization_id to prevent cross-tenant modification
-    if !retried_job_ids.is_empty() {
+        // Reset child jobs that were blocked due to parent failure
+        // When a parent job is retried from DLQ, its child jobs (with dependencies_met = false)
+        // should have their dependencies recalculated
+        // SECURITY: Must include organization_id to prevent cross-tenant modification
         let reset_children = sqlx::query(
             r#"
             UPDATE jobs
@@ -1785,25 +2195,28 @@ pub async fn retry_dlq(
         )
         .bind(&retried_job_ids)
         .bind(&ctx.organization_id)
-        .execute(state.db.pool())
-        .await;
-
-        if let Ok(result) = reset_children {
-            if result.rows_affected() > 0 {
-                info!(
-                    parent_jobs = ?retried_job_ids,
-                    reset_children = result.rows_affected(),
-                    "Reset child jobs for retried DLQ jobs"
-                );
-            }
+        .execute(&mut *tx)
+        .await?;
+        if reset_children.rows_affected() > 0 {
+            info!(
+                parent_jobs = ?retried_job_ids,
+                reset_children = reset_children.rows_affected(),
+                "Reset child jobs for retried DLQ jobs"
+            );
         }
     }
+
+    let reopened =
+        reopen_cancelled_dependents(&mut tx, &ctx.organization_id, &retried_job_ids).await?;
+    reopen_workflows(&mut tx, &ctx.organization_id, &retried_job_ids, &reopened).await?;
+    tx.commit().await?;
 
     state.metrics.jobs_retried.inc_by(retried_count as u64);
 
     Ok(Json(crate::models::RetryDlqResponse {
         retried_count,
         retried_jobs: retried_job_ids,
+        skipped_jobs,
     }))
 }
 
@@ -1843,15 +2256,20 @@ pub async fn purge_dlq(
         .unwrap_or(MAX_PURGE_LIMIT)
         .clamp(1, MAX_PURGE_LIMIT);
 
-    // ALL queries now include organization_id for tenant isolation
+    // ALL queries now include organization_id for tenant isolation.
+    // `older_than` compares the time the job was dead-lettered: `updated_at` of
+    // a dead-lettered row (any later touch only moves it forward, so a purge never
+    // removes a job dead-lettered after `older_than`). It compared `created_at`,
+    // so an old job that had just been dead-lettered was purged at once. The outer
+    // DELETE checks the status again, so a job retried after the pick survives.
     let result = match (&request.queue_name, &request.older_than) {
         (Some(queue), Some(older_than)) => {
             sqlx::query(
                 r#"DELETE FROM jobs WHERE id IN (
                     SELECT id FROM jobs
-                    WHERE status = 'deadletter' AND organization_id = $1 AND queue_name = $2 AND created_at < $3
+                    WHERE status = 'deadletter' AND organization_id = $1 AND queue_name = $2 AND updated_at < $3
                     LIMIT $4
-                )"#
+                ) AND organization_id = $1 AND status = 'deadletter'"#
             )
             .bind(&ctx.organization_id)
             .bind(queue)
@@ -1866,7 +2284,7 @@ pub async fn purge_dlq(
                     SELECT id FROM jobs
                     WHERE status = 'deadletter' AND organization_id = $1 AND queue_name = $2
                     LIMIT $3
-                )"#
+                ) AND organization_id = $1 AND status = 'deadletter'"#
             )
                 .bind(&ctx.organization_id)
                 .bind(queue)
@@ -1878,9 +2296,9 @@ pub async fn purge_dlq(
             sqlx::query(
                 r#"DELETE FROM jobs WHERE id IN (
                     SELECT id FROM jobs
-                    WHERE status = 'deadletter' AND organization_id = $1 AND created_at < $2
+                    WHERE status = 'deadletter' AND organization_id = $1 AND updated_at < $2
                     LIMIT $3
-                )"#
+                ) AND organization_id = $1 AND status = 'deadletter'"#
             )
                 .bind(&ctx.organization_id)
                 .bind(older_than)
@@ -1894,7 +2312,7 @@ pub async fn purge_dlq(
                     SELECT id FROM jobs
                     WHERE status = 'deadletter' AND organization_id = $1
                     LIMIT $2
-                )"#
+                ) AND organization_id = $1 AND status = 'deadletter'"#
             )
                 .bind(&ctx.organization_id)
                 .bind(limit)

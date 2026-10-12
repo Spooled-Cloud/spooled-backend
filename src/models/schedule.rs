@@ -308,7 +308,7 @@ impl CronSchedule {
             ));
         }
 
-        Ok(CronSchedule {
+        let schedule = CronSchedule {
             second: Self::parse_field(parts[0], 0, 59)?,
             minute: Self::parse_field(parts[1], 0, 59)?,
             hour: Self::parse_field(parts[2], 0, 23)?,
@@ -316,7 +316,51 @@ impl CronSchedule {
             month: Self::parse_field(parts[4], 1, 12)?,
             // Day-of-week accepts 0-7 where both 0 and 7 mean Sunday (standard cron).
             day_of_week: Self::parse_field(parts[5], 0, 7)?,
-        })
+        };
+        // Every field is in bounds on its own, but `0 0 30 2 *` (Feb 30) or
+        // `0 0 31 4 *` (Apr 31) still name a day that never exists. Such a
+        // schedule used to be accepted with `next_run_at: null` and never fire.
+        if !schedule.has_reachable_date() {
+            return Err(
+                "day-of-month never occurs in the selected month(s) (e.g. February 30), so the schedule would never run"
+                    .to_string(),
+            );
+        }
+        Ok(schedule)
+    }
+
+    /// Whether the day-of-month and day-of-week fields are restricted, in Vixie
+    /// cron's sense: a field starting with `*` (`*` itself, or a step such as
+    /// `*/2`) is unrestricted.
+    fn day_fields_restricted(&self) -> (bool, bool) {
+        let restricted =
+            |field: &CronField| !matches!(field, CronField::Any | CronField::Step { .. });
+        (
+            restricted(&self.day_of_month),
+            restricted(&self.day_of_week),
+        )
+    }
+
+    /// Cheap check that some calendar date can ever match, so an impossible
+    /// date is caught without scanning a year of candidate instants.
+    ///
+    /// Only a restricted day-of-month ANDed with an unrestricted day-of-week can
+    /// be impossible: an unrestricted day-of-month always includes the 1st, a
+    /// restricted day-of-week (OR) matches some day of every month, and an
+    /// unrestricted day-of-week always includes Sunday, which every date
+    /// (Feb 29 too) eventually is.
+    pub fn has_reachable_date(&self) -> bool {
+        const DAYS_IN_MONTH: [u8; 12] = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        let (dom_restricted, dow_restricted) = self.day_fields_restricted();
+        if !dom_restricted || dow_restricted {
+            return true;
+        }
+        (1..=12u8)
+            .filter(|month| Self::field_matches(&self.month, *month))
+            .any(|month| {
+                (1..=DAYS_IN_MONTH[month as usize - 1])
+                    .any(|day| Self::field_matches(&self.day_of_month, day))
+            })
     }
 
     fn parse_field(field: &str, min: u8, max: u8) -> Result<CronField, String> {
@@ -447,6 +491,10 @@ impl CronSchedule {
     ) -> Option<DateTime<Utc>> {
         use chrono::{Datelike, Duration, Timelike};
 
+        if !self.has_reachable_date() {
+            return None;
+        }
+
         let after_local = after.with_timezone(tz);
         // Wall-clock of the reference instant. During a DST fall-back the same wall
         // clock occurs at two instants; without this guard next_run computed from a
@@ -498,29 +546,39 @@ impl CronSchedule {
             let weekday = current.weekday().num_days_from_sunday() as u8;
 
             // Day-of-month vs day-of-week follow standard (Vixie) cron semantics:
-            // when BOTH fields are restricted (neither is `*`), the day matches if
-            // EITHER matches (OR); if either field is `*`, they combine with AND
-            // (the restricted field gates, the `*` is always true). Previously this
+            // when BOTH fields are restricted, the day matches if EITHER matches
+            // (OR); if either field is unrestricted, they combine with AND (the
+            // restricted field gates, the other is always true). Previously this
             // was an unconditional AND, so e.g. `0 0 0 15 * 1` fired only on a 15th
-            // that is also a Monday instead of "the 15th OR any Monday".
+            // that is also a Monday instead of "the 15th OR any Monday". A field
+            // starting with `*` is unrestricted, `*/2` included, so `0 0 */2 * 1`
+            // means odd days that are Mondays, as in Vixie cron.
             let dom_match = Self::field_matches(&self.day_of_month, day);
             // Sunday is both 0 and 7 in cron; chrono reports it as 0, so also
             // match a literal 7 in the day-of-week field.
             let dow_match = Self::field_matches(&self.day_of_week, weekday)
                 || (weekday == 0 && Self::field_matches(&self.day_of_week, 7));
-            let dom_restricted = !matches!(self.day_of_month, CronField::Any);
-            let dow_restricted = !matches!(self.day_of_week, CronField::Any);
+            let (dom_restricted, dow_restricted) = self.day_fields_restricted();
             let day_matches = if dom_restricted && dow_restricted {
                 dom_match || dow_match
             } else {
                 dom_match && dow_match
             };
 
+            if !(day_matches && Self::field_matches(&self.month, month)) {
+                // A DATE field (day-of-month/month/day-of-week) does not match, so
+                // nothing before the next local midnight can: skip the whole day.
+                // Sparse schedules (once a year, a weekday-and-date pair) then cost
+                // about one iteration per day instead of crawling through every
+                // non-matching day minute by minute until the iteration cap.
+                current += Self::until_next_local_midnight(&current, tz).max(Duration::seconds(1));
+                iterations += 1;
+                continue;
+            }
+
             if Self::field_matches(&self.second, second)
                 && Self::field_matches(&self.minute, minute)
                 && Self::field_matches(&self.hour, hour)
-                && Self::field_matches(&self.month, month)
-                && day_matches
             {
                 return Some(current.with_timezone(&Utc));
             }
@@ -538,16 +596,10 @@ impl CronSchedule {
             } else if !Self::field_matches(&self.second, second) {
                 // Just step by 1 second if only second doesn't match
                 Duration::seconds(1)
-            } else if !Self::field_matches(&self.hour, hour) {
+            } else {
                 // Second and minute match but the hour does not: jump to the next
                 // hour boundary rather than crawling minute by minute.
                 Duration::seconds(3600 - (minute as i64 * 60) - second as i64)
-            } else {
-                // Time-of-day (sec/min/hour) fully matches but a DATE field
-                // (day-of-month/month/day-of-week) does not: jump to the start of the
-                // next day, so sparse schedules (e.g. once a year) resolve in ~365
-                // iterations instead of exhausting the iteration cap and stalling.
-                Self::until_next_local_midnight(&current, tz)
             };
 
             current += step.max(Duration::seconds(1));
@@ -595,7 +647,7 @@ impl CronSchedule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{TimeZone, Timelike};
+    use chrono::{Datelike, TimeZone, Timelike};
 
     #[test]
     fn test_parse_every_minute() {
@@ -995,6 +1047,75 @@ mod tests {
         let start = Utc.with_ymd_and_hms(2026, 3, 15, 0, 0, 0).unwrap();
         let next = schedule.next_run_after(start).unwrap();
         assert_eq!(next, Utc.with_ymd_and_hms(2027, 1, 1, 0, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn test_impossible_calendar_dates_are_rejected_at_parse() {
+        // BEFLOW-08: Feb 30 / Apr 31 used to parse, store next_run_at = NULL and
+        // never fire, after burning the full iteration cap on the request thread.
+        for expr in [
+            "0 0 0 30 2 *",
+            "0 0 31 4 *",
+            "0 0 31 2,4,6,9,11 *",
+            "0 0 30-31 2 *",
+            "0 0 31 4 */2", // `*/2` day-of-week is unrestricted: AND, so still Apr 31
+        ] {
+            let err = CronSchedule::parse(expr).expect_err(expr);
+            assert!(err.contains("never"), "{expr}: {err}");
+        }
+        // Reachable: leap day, a 31st in some listed month, and Feb 30 OR Mondays.
+        for expr in ["0 0 29 2 *", "0 0 31 2,3 *", "0 0 30 2 1", "0 0 */2 2 *"] {
+            assert!(CronSchedule::parse(expr).is_ok(), "{expr}");
+        }
+    }
+
+    #[test]
+    fn test_unreachable_date_short_circuits_next_run() {
+        // A schedule built without parse() still answers None, not a year-long scan.
+        let schedule = CronSchedule {
+            second: CronField::Value(0),
+            minute: CronField::Value(0),
+            hour: CronField::Value(0),
+            day_of_month: CronField::Value(31),
+            month: CronField::Value(4),
+            day_of_week: CronField::Any,
+        };
+        assert!(!schedule.has_reachable_date());
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        assert_eq!(schedule.next_run_after(now), None);
+    }
+
+    #[test]
+    fn test_step_day_field_counts_as_unrestricted() {
+        // BEFLOW-30: Vixie cron treats a day field starting with `*` (so `*/N`
+        // too) as unrestricted, which makes day-of-month and day-of-week AND.
+        // From Thursday 2026-07-09. Odd days AND Mondays: Sat 07-11 is odd but
+        // not a Monday; Mon 07-13 is both.
+        let now = Utc.with_ymd_and_hms(2026, 7, 9, 0, 0, 0).unwrap();
+        let odd_mondays = CronSchedule::parse("0 0 */2 * 1").unwrap();
+        assert_eq!(
+            odd_mondays.next_run_after(now),
+            Some(Utc.with_ymd_and_hms(2026, 7, 13, 0, 0, 0).unwrap())
+        );
+        // The 1st AND Sun/Tue/Thu/Sat: Aug 1 2026 is a Saturday.
+        let first_on_even_weekday = CronSchedule::parse("0 0 1 * */2").unwrap();
+        assert_eq!(
+            first_on_even_weekday.next_run_after(now),
+            Some(Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_sparse_leap_day_weekday_schedule_resolves() {
+        // Feb 29 that is also a Sunday (`*/7` = Sunday, ANDed) recurs only every
+        // 28 years. Stepping minute by minute through every non-matching day ran
+        // out of iterations long before reaching it; non-matching days are now
+        // skipped whole.
+        let schedule = CronSchedule::parse("59 59 23 29 2 */7").unwrap();
+        let start = Utc.with_ymd_and_hms(2033, 1, 1, 0, 0, 0).unwrap();
+        let next = schedule.next_run_after(start).expect("resolves");
+        assert_eq!(next, Utc.with_ymd_and_hms(2060, 2, 29, 23, 59, 59).unwrap());
+        assert_eq!(next.weekday(), chrono::Weekday::Sun);
     }
 
     #[test]

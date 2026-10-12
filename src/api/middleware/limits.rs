@@ -208,17 +208,7 @@ pub async fn check_resource_limit_conn(
     resource: &str,
     adding: u64,
 ) -> Result<(), Response> {
-    let (plan_tier, custom_limits): (String, Option<serde_json::Value>) =
-        sqlx::query_as("SELECT plan_tier, custom_limits FROM organizations WHERE id = $1")
-            .bind(org_id)
-            .fetch_one(&mut *conn)
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "Failed to get org plan tier");
-                (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
-            })?;
-
-    let limits = PlanLimits::for_tier_with_overrides(&plan_tier, custom_limits.as_ref());
+    let limits = plan_limits_conn(&mut *conn, org_id).await?;
 
     if limits.is_disabled(resource) {
         return Err(FeatureDisabledResponse {
@@ -234,6 +224,62 @@ pub async fn check_resource_limit_conn(
         .into_response());
     }
 
+    let Some(current) = resource_count_conn(&mut *conn, org_id, resource).await? else {
+        return Ok(()); // Unknown resource, allow
+    };
+
+    limits
+        .check_limit(resource, current, adding)
+        .map_err(|e| LimitExceededResponse::from(e).into_response())
+}
+
+/// How many more of `resource` fit under the org's plan right now: `None`
+/// when it is unlimited, `Some(0)` when it is disabled or at its cap. Reads on
+/// `conn` like [`check_resource_limit_conn`], so a caller holding
+/// [`lock_resource`] gets an answer that stays true until it commits.
+pub async fn resource_room_conn(
+    conn: &mut sqlx::PgConnection,
+    org_id: &str,
+    resource: &str,
+) -> Result<Option<u64>, Response> {
+    let limits = plan_limits_conn(&mut *conn, org_id).await?;
+    if limits.is_disabled(resource) {
+        return Ok(Some(0));
+    }
+    let Some(max) = limits.limit_for(resource) else {
+        return Ok(None);
+    };
+    let current = resource_count_conn(&mut *conn, org_id, resource)
+        .await?
+        .unwrap_or(0);
+    Ok(Some(max.saturating_sub(current)))
+}
+
+async fn plan_limits_conn(
+    conn: &mut sqlx::PgConnection,
+    org_id: &str,
+) -> Result<PlanLimits, Response> {
+    let (plan_tier, custom_limits): (String, Option<serde_json::Value>) =
+        sqlx::query_as("SELECT plan_tier, custom_limits FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "Failed to get org plan tier");
+                (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
+            })?;
+    Ok(PlanLimits::for_tier_with_overrides(
+        &plan_tier,
+        custom_limits.as_ref(),
+    ))
+}
+
+/// The org's current count of `resource`, or `None` for an unknown resource.
+async fn resource_count_conn(
+    conn: &mut sqlx::PgConnection,
+    org_id: &str,
+    resource: &str,
+) -> Result<Option<u64>, Response> {
     let row: (i64, i64, i64, i64, i64, i64, i64, i64) =
         sqlx::query_as("SELECT * FROM get_org_resource_counts($1)")
             .bind(org_id)
@@ -244,21 +290,17 @@ pub async fn check_resource_limit_conn(
                 (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
             })?;
 
-    let current = match resource {
-        "jobs_per_day" => row.7 as u64,
-        "active_jobs" => row.0 as u64,
-        "queues" => row.1 as u64,
-        "workers" => row.2 as u64,
-        "api_keys" => row.3 as u64,
-        "schedules" => row.4 as u64,
-        "workflows" => row.5 as u64,
-        "webhooks" => row.6 as u64,
-        _ => return Ok(()), // Unknown resource, allow
-    };
-
-    limits
-        .check_limit(resource, current, adding)
-        .map_err(|e| LimitExceededResponse::from(e).into_response())
+    Ok(match resource {
+        "jobs_per_day" => Some(row.7 as u64),
+        "active_jobs" => Some(row.0 as u64),
+        "queues" => Some(row.1 as u64),
+        "workers" => Some(row.2 as u64),
+        "api_keys" => Some(row.3 as u64),
+        "schedules" => Some(row.4 as u64),
+        "workflows" => Some(row.5 as u64),
+        "webhooks" => Some(row.6 as u64),
+        _ => None,
+    })
 }
 
 /// Error type for limit check failures (usable by HTTP, gRPC, etc.)

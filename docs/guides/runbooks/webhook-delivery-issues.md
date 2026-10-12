@@ -65,6 +65,7 @@ SELECT
   d.status,
   d.status_code,
   d.error,
+  left(d.response_body, 200) AS response_start,
   d.attempts,
   d.created_at,
   d.delivered_at
@@ -76,10 +77,33 @@ ORDER BY created_at DESC
 LIMIT 50;
 ```
 
+Since 0.1.121 `error` holds the failure reason (`HTTP 503`, the transport error such as a refused
+connection or a timeout, or `Invalid webhook URL: ...`), `response_body` the first 1 KiB of the
+endpoint's answer, and `status_code` is NULL when no response arrived (it was 0, and `error`
+was always NULL). Rows written by older versions keep the old values.
+
 Widen the interval and you will eventually hit the retention floor: delivery rows are
 deleted by the per-organization retention sweep at the plan's history retention window
 (free 1 day, starter 7, pro 30, enterprise 90). An empty result for a free-tier
 organization's "yesterday" is expected, not evidence that nothing was sent.
+
+### 2b. Check whether events were dropped
+
+Delivery goes through a bounded queue. When it (or one webhook's share of it) is full, new events are
+**dropped, not delivered late**, and no delivery row exists for them. Look at the metrics:
+
+```
+increase(spooled_outgoing_webhook_deliveries_dropped_total[15m])  # org webhooks
+increase(spooled_completion_webhooks_dropped_total[15m])          # per-job completion webhooks
+spooled_outgoing_webhook_queue_depth                              # queued now (capacity 16 x slots)
+spooled_outgoing_webhook_deliveries_in_flight                     # requests in flight (cap = slots)
+```
+
+and the warn-level logs `Outgoing webhook delivery dropped` / `completion_webhook dropped` (written for the first drop and every 100th; the reason says whether the whole queue or one webhook's share was full).
+One webhook can use at most a quarter of the slots (16 at the default 64) and of the queue (256), so a
+busy healthy endpoint can drop events while the totals look low: raise
+`OUTGOING_WEBHOOK_MAX_CONCURRENT_DELIVERIES`, or reduce that webhook's event subscriptions. A slow or
+black-holing endpoint fills only its own share.
 
 ### 3. Identify failure patterns (status codes + error messages)
 
@@ -174,9 +198,11 @@ docker exec spooled-backend nslookup customer-endpoint.com
    # Hard ceiling on deliveries in flight process-wide (requires restart)
    OUTGOING_WEBHOOK_MAX_CONCURRENT_DELIVERIES=64
    ```
-   Lowering this queues deliveries instead of firing them concurrently, which spreads the
-   load a rate-limited endpoint sees. It is a process-wide ceiling, so it affects every
-   organization on the deployment — do not tune it for one noisy customer.
+   Lowering this reduces the senders and shrinks the queue (16 deliveries per sender), which
+   spreads the load a rate-limited endpoint sees but also makes the process drop events sooner
+   under a burst. It is a process-wide setting, so it affects every organization on the
+   deployment — do not tune it for one noisy customer. One webhook already gets at most a quarter
+   of the senders.
 
 3. **Batch webhooks**: Contact customer to discuss webhook batching
 

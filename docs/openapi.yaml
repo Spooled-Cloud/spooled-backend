@@ -858,8 +858,11 @@ paths:
       summary: Send a billing email confirmation code
       description: |
         Email login only resolves an organization by a **confirmed** billing
-        email. Setting or changing `billing_email` through the API leaves it
-        unconfirmed; this sends a 6-digit code to the address. Shares the
+        email. Setting a `billing_email` through the API leaves it
+        unconfirmed; changing a confirmed one stores the new address in
+        `pending_billing_email` instead. This sends a 6-digit code to the
+        pending address when there is one, otherwise to the unconfirmed
+        `billing_email`. Shares the
         per-address hourly code budget with email login. Requires an
         unrestricted API key or session.
       operationId: startBillingEmailVerification
@@ -886,9 +889,11 @@ paths:
       summary: Confirm the billing email
       description: |
         Confirms the billing email with the code sent by
-        `POST /api/v1/organizations/billing-email/verification`. A code is bound
-        to the address it was sent to; changing the billing email again
-        invalidates it. Five wrong attempts burn a code.
+        `POST /api/v1/organizations/billing-email/verification`. Confirming a
+        pending address makes it the confirmed `billing_email` and clears
+        `pending_billing_email`. A code is bound to the address it was sent to;
+        changing the billing email again invalidates it. Five wrong attempts
+        burn a code.
       operationId: verifyBillingEmail
       requestBody:
         required: true
@@ -1173,7 +1178,9 @@ paths:
     post:
       tags: [Admin]
       summary: Create API key for organization
-      description: Create an API key for a specific organization
+      description: >-
+        Create an API key for a specific organization. `queues` follows the same rules as
+        `POST /api-keys` (an invalid entry is a 400).
       operationId: adminCreateApiKey
       security:
         - AdminKeyAuth: []
@@ -1222,26 +1229,41 @@ paths:
     get:
       tags: [Jobs]
       summary: List jobs
-      description: List jobs with optional filtering
+      description: |
+        List jobs with optional filtering and ordering.
+
+        Filters are strict: an invalid `status`, `queue_name`, `tag`, `order_by` or `order_dir`
+        is a `400 VALIDATION_ERROR`. Before 0.1.121 it was ignored and the unfiltered list came
+        back with `200`. An empty parameter (`?status=`) is no filter.
+
+        Jobs are ordered by `order_by` / `order_dir` and then by job id in the same direction,
+        so rows that tie on the column (a bulk batch shares one `created_at`) keep one order
+        across `offset` pages. `scheduled_at` and `completed_at` sort `NULLS LAST`. Pagination
+        is by `limit` and `offset` only; there is no cursor.
       operationId: listJobs
       parameters:
         - name: queue_name
           in: query
           schema:
             type: string
-          description: Filter by queue name
+            maxLength: 255
+          description: >-
+            Filter by queue name (the alias `queue` is also accepted). Letters, digits, `-`,
+            `_` and `.` only; anything else is a 400.
         - name: status
           in: query
           schema:
             type: string
             enum: [pending, scheduled, processing, completed, failed, deadletter, cancelled]
-          description: Filter by status
+          description: Filter by status. Matched case-insensitively (`Pending` = `pending`).
         - name: tag
           in: query
           schema:
             type: string
-            maxLength: 64
-          description: Filter jobs by a single tag (matches Postgres `tags ? tag` semantics)
+            maxLength: 1024
+          description: >-
+            Filter jobs by a single tag (matches Postgres `tags ? tag` semantics). Any
+            characters (`customer:42`), at most 1024 bytes and no NUL character.
         - name: limit
           in: query
           schema:
@@ -1255,6 +1277,21 @@ paths:
             type: integer
             default: 0
           description: Offset for pagination
+        - name: order_by
+          in: query
+          schema:
+            type: string
+            enum:
+              [created_at, updated_at, scheduled_at, completed_at, priority, status, queue_name, retry_count]
+            default: created_at
+          description: Column to sort by (case-insensitive). Any other value is a 400.
+        - name: order_dir
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: desc
+          description: Sort direction (case-insensitive). Any other value is a 400.
       responses:
         '200':
           description: List of jobs
@@ -1264,6 +1301,12 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/JobSummary'
+        '400':
+          description: Invalid `status`, `queue_name`, `tag`, `order_by` or `order_dir`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
     post:
       tags: [Jobs]
       summary: Create job
@@ -1271,7 +1314,17 @@ paths:
         Create a new job in the specified queue.
 
         If an `idempotency_key` is provided and a job with the same key exists,
-        the existing job ID is returned (idempotent behavior).
+        the existing job ID is returned (idempotent behavior, `200` with `created: false`).
+        The replay is answered before the payload, quota and expiry checks and consumes no
+        quota, so retrying a request whose response was lost never fails with `429` because the
+        organization is at a limit. A key lives as long as its job row: there is no time-to-live,
+        and a finished job (cancelled and dead-lettered ones included) keeps answering for its key
+        until the plan's job retention removes it. An empty or
+        whitespace-only `idempotency_key` is treated as no key.
+
+        `expires_at` must be in the future and later than `scheduled_at`, otherwise the request
+        is a `400`. A payload or tags containing the NUL character (`\u0000`) is also a `400`.
+        At the daily job limit the job is refused before it is created.
       operationId: createJob
       requestBody:
         required: true
@@ -1292,6 +1345,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CreateJobResponse'
+        '400':
+          description: >-
+            Invalid request: `expires_at` not in the future or not later than `scheduled_at`, a
+            payload or tags containing the NUL character, or a value the database refuses
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /api/v1/jobs/{id}:
     parameters:
@@ -1337,7 +1398,18 @@ paths:
     post:
       tags: [Jobs]
       summary: Retry job
-      description: Retry a failed or dead-lettered job
+      description: |
+        Retry a failed or dead-lettered job. The retry resets the job (fresh retry budget) and
+        removes its dead-letter entry. In the same transaction it re-opens the dependents the
+        scheduler cancelled because of this job ("Dependency job failed or was deadlettered",
+        "Parent job failed or was deadlettered"), which wait again until the job completes, and
+        puts the job's `failed` workflow back to `running`. A job someone cancelled stays
+        cancelled.
+
+        Putting a failed workflow back to `running` takes one of the plan's `max_workflows`
+        slots (only pending and running workflows count), like `POST /workflows/{id}/retry`: the
+        call is refused with `429 QUOTA_EXCEEDED` (resource `workflows`) when the organization is
+        at its limit, and with `403` (`feature_disabled`) on a plan without workflows.
       operationId: retryJob
       responses:
         '200':
@@ -1346,8 +1418,24 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Job'
+        '403':
+          description: >-
+            `feature_disabled`: the job belongs to a failed workflow and the plan has no
+            workflows
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '409':
           description: Job cannot be retried
+        '429':
+          description: >-
+            `QUOTA_EXCEEDED` (resource `workflows`): the job belongs to a failed workflow and
+            reviving it would exceed the plan's limit of pending and running workflows
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /api/v1/jobs/claim:
     post:
@@ -1355,8 +1443,10 @@ paths:
       summary: Claim jobs for processing
       description: |
         Claim one or more jobs from a queue for processing.
-        Jobs are leased to the worker for a configurable duration (default 5 minutes).
-        If not completed before lease expiry, jobs are released for other workers.
+        Jobs are leased to the worker for `lease_duration_secs` (default 30 s,
+        `WORKER_LEASE_DURATION_SECS`). The granted length is remembered: a heartbeat that omits
+        `lease_duration_secs` renews for it. If not completed before lease expiry, jobs are
+        released for other workers.
       operationId: claimJobs
       requestBody:
         required: true
@@ -1407,6 +1497,14 @@ paths:
           description: Job not found
         '409':
           description: Job not in processing state or lease expired
+        '422':
+          description: >-
+            `VALIDATION_ERROR`: `worker_id` or `lease_id` is missing (a missing `lease_id` used to
+            be a `409 LEASE_EXPIRED`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /api/v1/jobs/{id}/fail:
     parameters:
@@ -1441,6 +1539,13 @@ paths:
                     type: boolean
         '404':
           description: Job not found
+        '422':
+          description: >-
+            `VALIDATION_ERROR`: `worker_id`, `error` or `lease_id` is missing
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /api/v1/jobs/{id}/heartbeat:
     parameters:
@@ -1452,7 +1557,13 @@ paths:
     post:
       tags: [Jobs]
       summary: Renew job lease
-      description: Extend the lease on a processing job to prevent it being reclaimed
+      description: |
+        Extend the lease on a processing job to prevent it being reclaimed.
+
+        Without `lease_duration_secs` the lease is renewed for the length it was granted with
+        (the claim's `lease_duration_secs`, or the last heartbeat that named one); only a job
+        with no recorded length falls back to the server default (30 s). It used to renew for
+        30 s, which cut a longer lease short. `lease_id` is required (`422` when missing).
       operationId: jobHeartbeat
       requestBody:
         required: true
@@ -1475,6 +1586,14 @@ paths:
           description: Job not found
         '409':
           description: Job not in processing state
+        '422':
+          description: >-
+            `VALIDATION_ERROR`: `worker_id` or `lease_id` is missing, or `lease_duration_secs` is
+            outside 5-3600
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /api/v1/jobs/stats:
     get:
@@ -1485,7 +1604,9 @@ paths:
         - name: queue_name
           in: query
           required: false
-          description: Optional queue filter (alias `queue` also accepted)
+          description: >-
+            Optional queue filter (alias `queue` also accepted). An invalid name (letters,
+            digits, `-`, `_` and `.` only) is a 400; it used to return the organization totals.
           schema:
             type: string
           example: emails
@@ -1496,6 +1617,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/JobStats'
+        '400':
+          description: Invalid `queue_name`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /api/v1/jobs/status:
     get:
@@ -1530,9 +1657,22 @@ paths:
       tags: [Jobs]
       summary: Bulk enqueue jobs
       description: |
-        Enqueue multiple jobs in a single request. 
+        Enqueue multiple jobs in a single request.
         Maximum 100 jobs per request.
-        Jobs are processed atomically where possible.
+
+        Items are validated one by one. An invalid item (payload over the plan limit or
+        containing the NUL character, `priority` outside -100..100, `idempotency_key` over 255
+        characters) is listed in `failed` with its `index` and the reason, and the valid items
+        are still created. The batch defaults are range-checked too (`default_priority`
+        -100..100, `default_max_retries` 0..100, `default_timeout_seconds` 1..86400).
+
+        The request is a `400` instead of a `200` with every item failed when no item is valid
+        (the message lists `jobs[i]: reason` for each), a batch default is out of range, or the
+        database refuses a value; any other database failure is a `500`.
+
+        An empty or whitespace-only `idempotency_key` is no key. Items whose key already exists
+        come back with `created: false` and charge no quota; only the jobs a batch creates count
+        against the payload, active-job, daily and new-queue limits.
 
         The request body may be up to 100 jobs at the largest plan payload cap (plus 4 KiB
         per job for the envelope), capped at 32 MiB, which is the current limit. A larger
@@ -1562,6 +1702,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/BulkEnqueueResponse'
+        '400':
+          description: >-
+            No valid item in the batch, an out-of-range batch default, or a value the database
+            refuses
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '413':
           description: The request body is over the bulk limit
           content:
@@ -1601,20 +1749,25 @@ paths:
     get:
       tags: [Jobs]
       summary: List dead-letter queue
-      description: List jobs in the dead-letter queue
+      description: |
+        List jobs in the dead-letter queue. Filters and ordering follow `GET /jobs`: an invalid
+        `queue_name`, `tag`, `order_by` or `order_dir` is a `400`, and ties are broken by job id.
       operationId: listDeadLetterQueue
       parameters:
         - name: queue_name
           in: query
           schema:
             type: string
-          description: Filter by queue name
+            maxLength: 255
+          description: Filter by queue name (letters, digits, `-`, `_` and `.` only)
         - name: tag
           in: query
           schema:
             type: string
-            maxLength: 64
-          description: Filter jobs by a single tag (matches Postgres `tags ? tag` semantics)
+            maxLength: 1024
+          description: >-
+            Filter jobs by a single tag (matches Postgres `tags ? tag` semantics). Any
+            characters, at most 1024 bytes and no NUL character.
         - name: limit
           in: query
           schema:
@@ -1626,6 +1779,19 @@ paths:
           schema:
             type: integer
             default: 0
+        - name: order_by
+          in: query
+          schema:
+            type: string
+            enum:
+              [created_at, updated_at, scheduled_at, completed_at, priority, status, queue_name, retry_count]
+            default: created_at
+        - name: order_dir
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: desc
       responses:
         '200':
           description: List of dead-letter jobs
@@ -1635,12 +1801,29 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/JobSummary'
+        '400':
+          description: Invalid `queue_name`, `tag`, `order_by` or `order_dir`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /api/v1/jobs/dlq/retry:
     post:
       tags: [Jobs]
       summary: Retry dead-letter jobs
-      description: Move jobs from dead-letter queue back to pending
+      description: |
+        Move jobs from dead-letter queue back to pending, oldest first. Only the plan's
+        active-jobs limit applies; the daily job limit does not, because a retry creates no new
+        job. Each retried job resets its retry budget, removes its dead-letter entry and, as
+        `POST /jobs/{id}/retry` does, re-opens the dependents the scheduler cancelled because of
+        it and puts its `failed` workflow back to `running`.
+
+        Reviving a failed workflow takes one `max_workflows` slot. This call retries the
+        dead-lettered steps of as many failed workflows as fit under the limit (the workflow with
+        the oldest step first) and leaves the other steps in the dead-letter queue, listed in
+        `skipped_jobs`. Only when nothing else could be retried does it fail with the limit's
+        error (`429`, or `403` on a plan without workflows).
       operationId: retryDeadLetterJobs
       requestBody:
         required: true
@@ -1655,12 +1838,31 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RetryDlqResponse'
+        '403':
+          description: >-
+            `feature_disabled`: nothing could be retried because every selected job is a step of
+            a failed workflow and the plan has no workflows
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          description: >-
+            `QUOTA_EXCEEDED`: the active-jobs limit would be exceeded (resource `active_jobs`), or
+            nothing could be retried because every selected job is a step of a failed workflow
+            that does not fit under `max_workflows` (resource `workflows`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /api/v1/jobs/dlq/purge:
     post:
       tags: [Jobs]
       summary: Purge dead-letter queue
-      description: Permanently delete jobs from dead-letter queue
+      description: |
+        Permanently delete jobs from dead-letter queue. `older_than` selects jobs dead-lettered
+        before that time (not jobs created before it).
       operationId: purgeDeadLetterQueue
       requestBody:
         required: true
@@ -1750,6 +1952,13 @@ paths:
     put:
       tags: [Queues]
       summary: Update queue configuration
+      description: |
+        Creates or updates the configuration of a queue. The body is validated (`max_retries`
+        0-100, `default_timeout` 1-86400, `rate_limit` 1-100000) and so is the `{name}` in the
+        path: 1-100 letters, digits, `-`, `_` or `.`, not starting with `.` or `-`, the rules a
+        job's `queue_name` follows. Values outside the ranges are a `400`; they used to be stored
+        (a `default_timeout` of two days then made every enqueue to the queue fail) or, for
+        `rate_limit`, clamped silently. Omitted fields keep their stored value.
       operationId: updateQueueConfig
       requestBody:
         required: true
@@ -1764,6 +1973,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/QueueConfig'
+        '400':
+          description: A field outside its range, or an invalid queue name
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /api/v1/queues/{name}/stats:
     parameters:
@@ -1775,6 +1990,9 @@ paths:
     get:
       tags: [Queues]
       summary: Get queue statistics
+      description: |
+        `failed_jobs_24h` counts jobs dead-lettered in the last 24 hours and `deadletter_jobs`
+        is the queue's current dead-letter count. `failed_jobs_24h` was always 0 before 0.1.121.
       operationId: getQueueStats
       responses:
         '200':
@@ -1872,7 +2090,11 @@ paths:
               schema:
                 $ref: '#/components/schemas/RegisterWorkerResponse'
         '409':
-          description: The `worker_id` belongs to another organization
+          description: >-
+            "This worker_id cannot be used: register with a different worker_id, or omit it to get
+            a generated one". The `worker_id` belongs to another organization, or, for a
+            queue-scoped key, to a worker of this organization that serves a queue outside the
+            key's scope. Both cases answer the same text, so it does not say which one it was.
           content:
             application/json:
               schema:
@@ -1979,6 +2201,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CreateApiKeyResponse'
+        '400':
+          description: >-
+            `VALIDATION_ERROR`: an invalid `queues` entry (for example `orders*`, `*.eu`;
+            `invalid_queue_pattern`), `permissions` sent, or another invalid field
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /api/v1/api-keys/{id}:
     parameters:
@@ -2017,6 +2247,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ApiKeySummary'
+        '400':
+          description: >-
+            `VALIDATION_ERROR`: an invalid `queues` entry (`invalid_queue_pattern`), `permissions`
+            sent, or another invalid field
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '404':
           description: API key not found
         '429':
@@ -2203,13 +2441,21 @@ paths:
               schema:
                 $ref: '#/components/schemas/CreateWorkflowResponse'
         '400':
-          description: Invalid workflow definition (e.g., circular dependency)
+          description: >-
+            Invalid workflow definition: a circular dependency, an unknown key in `depends_on`, or
+            a job that lists the same key twice in `depends_on` (it used to be a 500)
 
   /api/v1/workflows/{id}:
     get:
       tags: [Workflows]
       summary: Get workflow
-      description: Get workflow details including progress
+      description: |
+        Get workflow details including progress.
+
+        In the returned `jobs`, `job_type` is the payload's `job_type` (`"job"` when the payload
+        has none), `failed_at` is the failure time of a `failed` or `deadletter` job (null
+        otherwise) and `backoff_type` is always `exponential`. A workflow turns `running`, with
+        `started_at` set, within about 10 s of its first job being claimed.
       operationId: getWorkflow
       parameters:
         - name: id
@@ -2232,7 +2478,10 @@ paths:
     post:
       tags: [Workflows]
       summary: Cancel workflow
-      description: Cancel a workflow and all its pending jobs
+      description: |
+        Cancel a workflow and all its pending jobs. Only a `pending` or `running` workflow can be
+        cancelled; a `completed`, `failed` or `cancelled` one is a `409` and keeps its outcome and
+        `completed_at` (cancelling used to overwrite them).
       operationId: cancelWorkflow
       parameters:
         - name: id
@@ -2248,6 +2497,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/WorkflowResponse'
+        '404':
+          description: Workflow not found
+        '409':
+          description: The workflow is already completed, failed or cancelled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /api/v1/workflows/{id}/retry:
     post:
@@ -2316,7 +2573,12 @@ paths:
     post:
       tags: [Workflows]
       summary: Add job dependencies
-      description: Add dependencies to an existing job
+      description: |
+        Add dependencies to an existing job. Every requested edge is checked before anything
+        changes: a dependency on the job itself, or an edge that would close a cycle, is a `400`
+        (it used to be skipped with `dependencies_added: 0`). The job's `dependency_mode` and
+        `dependencies_met` change only when at least one edge was added; when every edge already
+        existed the job is unchanged and `dependencies_added` is 0.
       operationId: addJobDependencies
       parameters:
         - name: id
@@ -2337,6 +2599,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AddDependenciesResponse'
+        '400':
+          description: A dependency on the job itself, or one that would create a cycle
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   # Real-time Endpoints
   /api/v1/ws:
@@ -2377,6 +2645,21 @@ paths:
         {"cmd": "Unsubscribe", "queue": "emails", "job_id": null}
         {"cmd": "Ping"}
         ```
+
+        ## Lifetime and close codes
+        The socket lives as long as the credential it was opened with. The server re-checks
+        the access token's session (logout), the API key (revoked, expired, organization
+        deleted) and the key's queue scope at most every 2 s before it reveals an event, and on
+        every ping. It closes the socket with:
+
+        - `1008` when the access token expires (`exp` plus a 60 s validation leeway) or the
+          token, session or key is revoked. The server sends an `Error` event first; do not
+          reconnect with the same token.
+        - `1000` after a maximum age of 1 hour. Reconnect.
+        - `1011`, after an `Error` event, when the Redis event channel could not be opened or
+          closed, or the authorization lookup failed. Reconnect.
+
+        At most 100 WebSockets per organization are open at once; the next gets `429`.
       operationId: websocketHandler
       parameters:
         - name: token
@@ -2401,6 +2684,10 @@ paths:
       responses:
         '101':
           description: Switching to WebSocket protocol
+        '401':
+          description: Invalid token, or it expired between authentication and the upgrade
+        '429':
+          description: Too many WebSocket connections for the organization (100)
 
   /api/v1/events:
     get:
@@ -2412,6 +2699,12 @@ paths:
         plus `system.health` every 10 s). Each `data:` is the
         `{"type": "<Variant>", "data": {...}}` envelope. The key's queue scope
         always applies. Before 0.1.114 this stream only emitted `system.health`.
+
+        All four realtime endpoints end when the access JWT they were opened with expires
+        (`exp` plus a 60 s validation leeway) or its session is logged out, and when the key is
+        revoked or expired or the organization is deleted (re-checked at most every 2 s). SSE
+        streams also end after 30 minutes; reconnect. At most 100 `/events` streams per
+        organization are open at once.
       operationId: sseEventsHandler
       parameters:
         - name: queue
@@ -2436,12 +2729,19 @@ paths:
             text/event-stream:
               schema:
                 $ref: '#/components/schemas/RealtimeEvent'
+        '401':
+          description: Invalid token, or it expired between authentication and the start of the stream
+        '429':
+          description: Too many SSE connections for the organization (100 `/events` streams)
 
   /api/v1/events/jobs/{id}:
     get:
       tags: [Real-time]
       summary: Job status SSE stream
-      description: Subscribe to status updates for a specific job
+      description: |
+        Subscribe to status updates for a specific job. The stream ends when the job reaches a
+        terminal status, when the access token expires or its session is logged out, and after
+        30 minutes. At most 100 job streams per organization are open at once.
       operationId: sseJobHandler
       parameters:
         - name: id
@@ -2456,12 +2756,24 @@ paths:
             text/event-stream:
               schema:
                 $ref: '#/components/schemas/RealtimeEvent'
+        '401':
+          description: Invalid token, or it expired between authentication and the start of the stream
+        '429':
+          description: Too many SSE connections for the organization (100 job streams)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /api/v1/events/queues/{name}:
     get:
       tags: [Real-time]
       summary: Queue stats SSE stream
-      description: Subscribe to statistics updates for a specific queue
+      description: |
+        Subscribe to statistics updates for a specific queue. The counts are computed once per
+        queue every few seconds and shared by all streams of that queue. The stream ends when
+        the access token expires or its session is logged out, and after 30 minutes. At most 100
+        queue streams per organization are open at once.
       operationId: sseQueueHandler
       parameters:
         - name: name
@@ -2476,24 +2788,55 @@ paths:
             text/event-stream:
               schema:
                 $ref: '#/components/schemas/RealtimeEvent'
+        '401':
+          description: Invalid token, or it expired between authentication and the start of the stream
+        '429':
+          description: Too many SSE connections for the organization (100 queue streams)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   # Schedule (Cron) Endpoints
   /api/v1/schedules:
     get:
       tags: [Schedules]
       summary: List schedules
-      description: List all cron-based job schedules
+      description: |
+        List cron-based job schedules, newest first (ties broken by id so `offset` pages are
+        stable). `queue_name`, `is_active` and `offset` were ignored before 0.1.121, so a
+        filtered call returned every schedule.
       operationId: listSchedules
       parameters:
         - name: organization_id
           in: query
           schema:
             type: string
+        - name: queue_name
+          in: query
+          schema:
+            type: string
+          description: Only schedules that target this queue
+        - name: is_active
+          in: query
+          schema:
+            type: boolean
+          description: >-
+            Only active (`true`) or paused (`false`) schedules. `true`, `false`, `1` and `0` are
+            accepted in any case; anything else is a 400.
         - name: limit
           in: query
           schema:
             type: integer
             default: 100
+            maximum: 500
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+          description: Number of schedules to skip
       responses:
         '200':
           description: List of schedules
@@ -2503,6 +2846,12 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/Schedule'
+        '400':
+          description: '`is_active` is not a boolean'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
     post:
       tags: [Schedules]
       summary: Create schedule
@@ -2522,7 +2871,10 @@ paths:
               schema:
                 $ref: '#/components/schemas/CreateScheduleResponse'
         '400':
-          description: Invalid cron expression or validation error
+          description: >-
+            Invalid cron expression or validation error. A cron expression whose date never occurs
+            (`0 0 30 2 *`, `0 0 31 4 *`) or that has no upcoming run time is refused; such a
+            schedule used to be stored with `next_run_at: null` and never fire.
           content:
             application/json:
               schema:
@@ -2553,7 +2905,9 @@ paths:
       tags: [Schedules]
       summary: Update schedule
       description: |
-        Update an existing schedule.
+        Update an existing schedule. A new `cron_expression` or `timezone` recomputes the next
+        run and is a `400` when the expression names a date that never occurs or has no upcoming
+        run.
 
         `is_active: true` on a paused schedule re-activates it like `POST /schedules/{id}/resume`:
         it is checked against the plan's schedule limit (429 `QUOTA_EXCEEDED`) and the next run is
@@ -2579,6 +2933,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Schedule'
+        '400':
+          description: Invalid cron expression (including a date that never occurs) or timezone
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '404':
           description: Schedule not found
         '429':
@@ -2772,6 +3132,10 @@ paths:
         Setting `"enabled": true` on a webhook that was auto-disabled counts
         against the plan webhook cap, so it can be rejected with
         429 QUOTA_EXCEEDED.
+
+        Turning a webhook on (false to true) or changing its `url` resets `failure_count` to 0,
+        so the first failed delivery after a fix does not disable it again. `last_status` is
+        left as it is.
       operationId: updateOutgoingWebhook
       requestBody:
         required: true
@@ -2872,7 +3236,9 @@ paths:
       description: |
         Trigger a retry for a specific outgoing webhook delivery attempt.
         
-        A successful retry resets the webhook's failure_count to 0.
+        A successful retry resets the webhook's failure_count to 0. If the webhook's stored URL is
+        rejected by the SSRF policy, the answer is `200` with `success: false` (it used to be a
+        `500`) and the rejection counts as a failed delivery.
 
         **Limitations:**
         - Cannot retry successful deliveries (returns 400)
@@ -3110,7 +3476,12 @@ components:
           maxLength: 1000
         cron_expression:
           type: string
-          description: Cron expression (5-field, or 6-field with leading seconds)
+          description: >-
+            Cron expression (5-field, or 6-field with leading seconds). When both day fields
+            (day-of-month and day-of-week) are restricted, a day matches if either does; a field
+            that starts with `*` (`*` or `*/N`) is unrestricted, so the day fields then combine
+            with AND (`0 0 */2 * 1` = odd days that are Mondays), as in Vixie cron. A date that
+            never occurs (`0 0 30 2 *`) is a 400.
         timezone:
           type: string
           default: UTC
@@ -3255,7 +3626,19 @@ components:
           description: |
             When the billing email was confirmed (email signup, the confirmation
             code flow, or an operator). Null means email login does not resolve
-            this organization by the address. Changing `billing_email` clears it.
+            this organization by the address. Changing `billing_email` on an
+            organization whose address is not confirmed clears it; on one whose
+            address is confirmed the new address waits in `pending_billing_email`
+            and this stays set.
+        pending_billing_email:
+          type: string
+          format: email
+          nullable: true
+          description: |
+            A new billing email waiting for its confirmation code. The confirmed
+            `billing_email` keeps resolving email login (and stays the Stripe
+            address) until the pending one is confirmed and replaces it. Null
+            when no change is pending.
         settings:
           type: object
         created_at:
@@ -3319,6 +3702,12 @@ components:
         billing_email:
           type: string
           format: email
+          description: |
+            On an organization with a confirmed billing email, a different address is stored in
+            `pending_billing_email` and the confirmed one stays active until the new address is
+            confirmed; sending the active address again withdraws a pending change. On an
+            organization without a confirmed address the new one replaces `billing_email`,
+            unconfirmed.
         settings:
           type: object
 
@@ -3467,6 +3856,7 @@ components:
         expires_at:
           type: string
           format: date-time
+          description: Must be in the future and later than `scheduled_at` (otherwise a 400)
         tags:
           type: object
         parent_job_id:
@@ -3480,6 +3870,9 @@ components:
         idempotency_key:
           type: string
           maxLength: 255
+          description: >-
+            Deduplicates jobs per organization for as long as the job row exists (no time-to-live).
+            An empty or whitespace-only value is treated as no key.
 
     CreateJobResponse:
       type: object
@@ -3570,25 +3963,27 @@ components:
 
     UpsertQueueConfigRequest:
       type: object
-      required: [queue_name]
       properties:
         queue_name:
           type: string
+          description: 'Optional and ignored; the queue is named by the `{name}` path parameter'
         max_retries:
           type: integer
           minimum: 0
           maximum: 100
+          description: Values outside 0-100 are a 400
         default_timeout:
           type: integer
           minimum: 1
           maximum: 86400
+          description: Seconds. Values outside 1-86400 are a 400
         rate_limit:
           type: integer
           minimum: 1
           maximum: 100000
           description: >-
-            Stored and returned; not enforced yet (planned). Workers are not throttled to this
-            many jobs per second.
+            Values outside 1-100000 are a 400 (they were clamped). Stored and returned; not
+            enforced yet (planned). Workers are not throttled to this many jobs per second.
         enabled:
           type: boolean
         settings:
@@ -3603,6 +3998,7 @@ components:
           processing_jobs,
           completed_jobs_24h,
           failed_jobs_24h,
+          deadletter_jobs,
           active_workers,
         ]
       properties:
@@ -3616,6 +4012,10 @@ components:
           type: integer
         failed_jobs_24h:
           type: integer
+          description: Jobs dead-lettered in the last 24 hours (it counted a status no job has and was always 0)
+        deadletter_jobs:
+          type: integer
+          description: Jobs in the queue's dead-letter queue now
         avg_processing_time_ms:
           type: number
         max_job_age_seconds:
@@ -3712,7 +4112,9 @@ components:
             worker cap until the stale-worker reaper clears it (about two
             minutes). Omit it and the server mints a UUID, which is the previous
             behaviour. An id already owned by a different organization is
-            rejected with 409.
+            rejected with 409, and so is, for a queue-scoped key, an id of a
+            worker of this organization that serves a queue outside the key's
+            scope (one neutral message for both).
         queue_name:
           type: string
           minLength: 1
@@ -3771,6 +4173,9 @@ components:
           type: array
           items:
             type: string
+          description: >-
+            Queues the key may use. Empty or `*` means every queue; otherwise exact queue names
+            and `prefix.*` patterns (see `CreateApiKeyRequest`).
         rate_limit:
           type: integer
           description: >-
@@ -3810,6 +4215,14 @@ components:
           type: array
           items:
             type: string
+          description: >-
+            Queues the key may use. Each entry is an exact queue name, `*` (every queue) or
+            `prefix.*`, which covers every queue whose name starts with `prefix.` (`orders.*`
+            covers `orders.eu` and `orders.eu.west`, not `orders` or `ordersx`; list `orders` too
+            to reach it). Any other use of `*` (`orders*`, `*.eu`, `a.*.b`) is a 400
+            VALIDATION_ERROR (`invalid_queue_pattern`). A queue-scoped key can grant only queues
+            it can use itself, and a `prefix.*` pattern only under one of its own patterns that is
+            at least as broad. Names are case-sensitive.
         rate_limit:
           type: integer
           minimum: 1
@@ -3854,6 +4267,9 @@ components:
           type: array
           items:
             type: string
+          description: >-
+            Same rules as `CreateApiKeyRequest.queues`: exact names, `*` and `prefix.*`; any
+            other use of `*` is a 400.
         rate_limit:
           type: integer
           minimum: 1
@@ -3919,13 +4335,21 @@ components:
             $ref: '#/components/schemas/BulkJobItem'
         default_priority:
           type: integer
+          minimum: -100
+          maximum: 100
           default: 0
         default_max_retries:
           type: integer
+          minimum: 0
+          maximum: 100
           default: 3
+          description: Omitted → the queue's `max_retries`, else the server default (3)
         default_timeout_seconds:
           type: integer
+          minimum: 1
+          maximum: 86400
           default: 300
+          description: Omitted → the queue's `default_timeout`, else the server default (300)
 
     BulkJobItem:
       type: object
@@ -3935,9 +4359,12 @@ components:
           type: object
         priority:
           type: integer
+          minimum: -100
+          maximum: 100
         idempotency_key:
           type: string
           maxLength: 255
+          description: An empty or whitespace-only value is treated as no key
         scheduled_at:
           type: string
           format: date-time
@@ -3978,8 +4405,10 @@ components:
       properties:
         index:
           type: integer
+          description: Position of the invalid item in the request's `jobs`
         error:
           type: string
+          description: Why the item was refused (validation message)
 
     # Priority Boost
     BoostPriorityRequest:
@@ -4029,6 +4458,15 @@ components:
           type: array
           items:
             type: string
+        skipped_jobs:
+          type: array
+          description: >-
+            Dead-lettered steps of failed workflows left in the DLQ because
+            reviving their workflow would exceed the plan's max_workflows
+            (oldest first, at most `limit`). When nothing else could be
+            retried the request fails with that limit's error instead.
+          items:
+            type: string
 
     PurgeDlqRequest:
       type: object
@@ -4040,6 +4478,7 @@ components:
         older_than:
           type: string
           format: date-time
+          description: Only jobs dead-lettered before this time (not created before it)
         confirm:
           type: boolean
           description: Must be true to execute purge
@@ -4206,7 +4645,9 @@ components:
         dependency_mode:
           type: string
           enum: [all, any]
-          default: all
+          description: >-
+            Omitted keeps the job's current mode (`all` for a job with no dependencies yet); it no
+            longer resets an `any` job to `all`.
 
     AddDependenciesResponse:
       type: object
@@ -4540,10 +4981,18 @@ components:
           enum: [pending, success, failed]
         status_code:
           type: integer
+          nullable: true
+          description: HTTP status of the receiver's answer; null when no response arrived (it was 0)
         response_body:
           type: string
+          nullable: true
+          description: First 1024 bytes of the receiver's answer, for any status; null when empty or no response arrived
         error:
           type: string
+          nullable: true
+          description: >-
+            Why the delivery failed (`HTTP 503`, a transport error such as a refused connection or
+            timeout, or `Invalid webhook URL: ...`); null on success
         attempts:
           type: integer
         created_at:
@@ -4790,6 +5239,9 @@ components:
         billing_email:
           type: string
           format: email
+          description: >-
+            An operator write counts as confirmed (even re-sending the current address) and
+            clears a change the organization still had pending.
         settings:
           type: object
         custom_limits:
@@ -4931,7 +5383,7 @@ components:
           description: >-
             Required lease fencing token from the claim response. Completion
             succeeds only if it matches the job's current lease (409
-            LEASE_EXPIRED otherwise).
+            LEASE_EXPIRED otherwise). A missing value is a 422 VALIDATION_ERROR.
 
     FailJobRequest:
       type: object
@@ -4949,7 +5401,7 @@ components:
           description: >-
             Required lease fencing token from the claim response. Failure
             succeeds only if it matches the job's current lease (409
-            LEASE_EXPIRED otherwise).
+            LEASE_EXPIRED otherwise). A missing value is a 422 VALIDATION_ERROR.
 
     HeartbeatJobRequest:
       type: object
@@ -4959,8 +5411,11 @@ components:
           type: integer
           minimum: 5
           maximum: 3600
-          default: 30
-          description: New lease duration from now, in seconds. Omitted → `WORKER_LEASE_DURATION_SECS` (30); required before 0.1.115.
+          description: >-
+            New lease duration from now, in seconds. Omitted → the length the lease was granted
+            with (the claim's `lease_duration_secs`, or the last heartbeat that named one), else
+            `WORKER_LEASE_DURATION_SECS` (30). An explicit value becomes the length later
+            heartbeats keep.
         worker_id:
           type: string
         lease_id:
@@ -4968,7 +5423,7 @@ components:
           description: >-
             Required lease fencing token from the claim response. Renewal
             succeeds only if it matches the job's current lease (409
-            LEASE_EXPIRED otherwise).
+            LEASE_EXPIRED otherwise). A missing value is a 422 VALIDATION_ERROR.
 
     # Email Authentication Schemas
     CheckEmailRequest:

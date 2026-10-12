@@ -76,6 +76,7 @@ pub struct UpsertQueueConfigRequest {
     pub default_timeout: Option<i32>,
 
     /// Rate limit (jobs per second). Stored and returned; not enforced yet.
+    /// Out-of-range values are a 400 (they used to be clamped silently).
     #[validate(range(
         min = 1,
         max = 100000,
@@ -139,7 +140,11 @@ pub struct QueueStats {
     pub pending_jobs: i64,
     pub processing_jobs: i64,
     pub completed_jobs_24h: i64,
+    /// Jobs that failed for good (dead-lettered) in the last 24 hours. It
+    /// counted `status = 'failed'`, which no job ever gets, so it was always 0.
     pub failed_jobs_24h: i64,
+    /// Jobs in the queue's dead-letter queue now.
+    pub deadletter_jobs: i64,
     pub avg_processing_time_ms: Option<f64>,
     pub max_job_age_seconds: Option<i64>,
     pub active_workers: i64,

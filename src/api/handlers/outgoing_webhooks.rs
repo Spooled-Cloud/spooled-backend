@@ -244,6 +244,7 @@ pub async fn update(
 
     // Build update query dynamically
     let name = request.name.unwrap_or(existing.name);
+    let url_changed = request.url.as_ref().is_some_and(|url| *url != existing.url);
     let url = request.url.unwrap_or(existing.url);
     let events = request.events.unwrap_or(existing.events);
     // Three-state: absent → keep, null → clear, value → replace.
@@ -260,6 +261,13 @@ pub async fn update(
     // webhook OFF must never fail on quota, hence the narrow condition.
     let is_enabling = enabled && !existing.enabled;
 
+    // A re-enabled or repointed webhook starts a fresh failure streak.
+    // Otherwise the streak that tripped the breaker (or that the old URL
+    // earned) carries over, and the first failed delivery after the fix
+    // disables it again. `last_status` is left alone: the dashboard reads
+    // `auto_disabled` there as "re-enabled" until the next delivery.
+    let reset_failures = is_enabling || url_changed;
+
     let mut tx = state.db.pool().begin().await?;
     if is_enabling {
         lock_resource(&mut tx, &ctx.organization_id, "webhooks").await?;
@@ -273,7 +281,9 @@ pub async fn update(
     let webhook: OutgoingWebhook = sqlx::query_as(
         r#"
         UPDATE outgoing_webhooks
-        SET name = $1, url = $2, events = $3, secret = $4, enabled = $5, updated_at = NOW()
+        SET name = $1, url = $2, events = $3, secret = $4, enabled = $5,
+            failure_count = CASE WHEN $8 THEN 0 ELSE failure_count END,
+            updated_at = NOW()
         WHERE id = $6 AND organization_id = $7
         RETURNING id, organization_id, name, url, secret, events, enabled,
                   failure_count, last_triggered_at, last_status, created_at, updated_at
@@ -286,6 +296,7 @@ pub async fn update(
     .bind(enabled)
     .bind(&id)
     .bind(&ctx.organization_id)
+    .bind(reset_failures)
     .fetch_one(&mut *tx)
     .await?;
 

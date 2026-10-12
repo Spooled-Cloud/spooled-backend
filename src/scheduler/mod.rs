@@ -23,9 +23,54 @@ use crate::api::middleware::limits::{
     try_increment_daily_jobs,
 };
 use crate::cache::RedisCache;
-use crate::models::CronSchedule;
+use crate::models::{CronSchedule, DEPENDENCY_FAILED_CANCEL_REASON, PARENT_FAILED_CANCEL_REASON};
 use crate::observability::Metrics;
 use crate::outgoing_webhooks::service::OutgoingWebhookService;
+
+/// Jobs one retention statement deletes per pass (completed/cancelled, and
+/// failed/dead-lettered, each). Every deleted job also runs its foreign-key
+/// actions and the dependents trigger, about 0.06-0.09 ms a job with every
+/// referencing column indexed (measured at 130k jobs / 450k schedule_runs), so
+/// a full batch holds the scheduler loop for well under half a second. A
+/// backlog (a plan downgrade, a lowered retention override) is worked off over
+/// several passes, 1.4M jobs a day per statement.
+const RETENTION_JOB_BATCH: i64 = 5_000;
+
+/// The schedule_runs retention sweep: up to 10,000 runs older than their
+/// organization's `history_retention_days`.
+///
+/// The cutoff is per organization, so it cannot bound one scan of the
+/// `started_at` index, and the previous `id IN (SELECT ... JOIN ...)` form read
+/// all of schedule_runs twice per pass. The old runs are picked per schedule,
+/// a range scan of `idx_schedule_runs_schedule_started` (migration
+/// 20261013140100) each, and deleted by primary key. 450k runs: first pass
+/// 84 ms -> 50 ms; a pass with nothing to delete 26 ms -> 0.7 ms.
+pub const SCHEDULE_RUNS_RETENTION_SQL: &str = r#"
+    DELETE FROM schedule_runs
+    WHERE id = ANY(ARRAY(
+        SELECT old.id
+        FROM schedules s
+        JOIN organizations o ON s.organization_id = o.id
+        CROSS JOIN LATERAL (
+            SELECT sr.id
+            FROM schedule_runs sr
+            WHERE sr.schedule_id = s.id
+              AND sr.started_at < NOW() - (
+                COALESCE(
+                    custom_retention_days(o.custom_limits, 'history_retention_days'),
+                    CASE o.plan_tier
+                        WHEN 'enterprise' THEN 90
+                        WHEN 'pro' THEN 30
+                        WHEN 'starter' THEN 7
+                        ELSE 1  -- free tier default
+                    END
+                ) || ' days'
+              )::INTERVAL
+            LIMIT 10000
+        ) old
+        LIMIT 10000
+    ))
+"#;
 
 /// Background scheduler that runs periodic maintenance tasks
 pub struct Scheduler {
@@ -45,6 +90,17 @@ impl Drop for MarkStoppedOnDrop {
     fn drop(&mut self) {
         self.0.scheduler_stopped();
     }
+}
+
+/// A job a scheduler sweep has just moved to `deadletter`.
+#[derive(sqlx::FromRow)]
+struct DeadletteredJob {
+    id: String,
+    organization_id: String,
+    queue_name: String,
+    retry_count: i32,
+    completion_webhook: Option<String>,
+    completion_webhook_secret: Option<String>,
 }
 
 impl Scheduler {
@@ -199,7 +255,7 @@ impl Scheduler {
     }
 
     /// Recover jobs with expired leases (worker crashed or timed out)
-    async fn recover_expired_leases(&self) -> Result<()> {
+    pub async fn recover_expired_leases(&self) -> Result<()> {
         // Only retry jobs that haven't exceeded max_retries
         // Jobs that have exceeded max_retries should go to deadletter
 
@@ -237,8 +293,9 @@ impl Scheduler {
         // Move jobs that have exceeded max_retries to deadletter. Also insert a
         // dead_letter_queue row, matching the explicit-fail path in queue/mod.rs —
         // otherwise jobs that die via worker timeout are missing from the DLQ
-        // audit table.
-        let result = sqlx::query(
+        // audit table — and the `deadlettered` job_history row that path writes.
+        // The moved rows come back so the failure is announced like a reported one.
+        let deadlettered: Vec<DeadletteredJob> = sqlx::query_as(
             r#"
             WITH deadlettered AS (
                 UPDATE jobs
@@ -257,38 +314,134 @@ impl Scheduler {
                     -- `<`) deadletterable — a one-tick stuck window.
                     AND lease_expires_at <= NOW()
                     AND retry_count >= max_retries
-                RETURNING id, organization_id, queue_name, payload, retry_count
+                RETURNING id, organization_id, queue_name, payload, retry_count,
+                          completion_webhook, completion_webhook_secret
+            ),
+            dlq AS (
+                INSERT INTO dead_letter_queue
+                    (id, job_id, organization_id, queue_name, reason, original_payload, error_details, created_at)
+                SELECT
+                    gen_random_uuid()::TEXT,
+                    id,
+                    organization_id,
+                    queue_name,
+                    'Max retries exceeded after lease expiration',
+                    payload,
+                    jsonb_build_object(
+                        'final_error', 'Max retries exceeded after lease expiration',
+                        'total_retries', retry_count
+                    ),
+                    NOW()
+                FROM deadlettered
+            ),
+            history AS (
+                INSERT INTO job_history (id, job_id, event_type, details, created_at)
+                SELECT
+                    gen_random_uuid()::TEXT,
+                    id,
+                    'deadlettered',
+                    jsonb_build_object(
+                        'error', 'Max retries exceeded after lease expiration',
+                        'total_retries', retry_count,
+                        'organization_id', organization_id
+                    ),
+                    NOW()
+                FROM deadlettered
             )
-            INSERT INTO dead_letter_queue
-                (id, job_id, organization_id, queue_name, reason, original_payload, error_details, created_at)
-            SELECT
-                gen_random_uuid()::TEXT,
-                id,
-                organization_id,
-                queue_name,
-                'Max retries exceeded after lease expiration',
-                payload,
-                jsonb_build_object(
-                    'final_error', 'Max retries exceeded after lease expiration',
-                    'total_retries', retry_count
-                ),
-                NOW()
+            SELECT id, organization_id, queue_name, retry_count,
+                   completion_webhook, completion_webhook_secret
             FROM deadlettered
             "#,
         )
-        .execute(&*self.db)
+        .fetch_all(&*self.db)
         .await?;
 
-        let deadlettered = result.rows_affected();
-        if deadlettered > 0 {
+        if !deadlettered.is_empty() {
             warn!(
-                count = deadlettered,
+                count = deadlettered.len(),
                 "Moved expired jobs to deadletter queue"
             );
-            self.metrics.jobs_deadlettered.inc_by(deadlettered);
+            self.metrics
+                .jobs_deadlettered
+                .inc_by(deadlettered.len() as u64);
+            self.announce_deadlettered(
+                &deadlettered,
+                "Max retries exceeded after lease expiration",
+            )
+            .await;
         }
 
         Ok(())
+    }
+
+    /// Announce jobs a sweep moved to `deadletter` the way the REST/gRPC fail path
+    /// announces a reported failure: realtime `JobStatusChange` + `JobFailed`, the
+    /// `job.failed` outgoing webhook and the job's completion webhook. Without
+    /// this, the most common production failure (a worker dying on the last
+    /// attempt) was the only silent one.
+    async fn announce_deadlettered(&self, jobs: &[DeadletteredJob], error: &str) {
+        // Realtime is best effort. Each publish to a hung Redis waits out its
+        // command timeout, and this runs on the one scheduler loop, so the first
+        // failure ends realtime for the rest of the batch.
+        let mut realtime = self.cache.as_deref();
+        for job in jobs {
+            if let Some(cache) = realtime {
+                let now = Utc::now().to_rfc3339();
+                let channel = format!("org:{}:events", job.organization_id);
+                for event in [
+                    serde_json::json!({
+                        "type": "JobStatusChange",
+                        "data": {
+                            "job_id": job.id,
+                            "queue_name": job.queue_name,
+                            "old_status": "processing",
+                            "new_status": "deadletter",
+                            "timestamp": now,
+                        }
+                    }),
+                    serde_json::json!({
+                        "type": "JobFailed",
+                        "data": {
+                            "job_id": job.id,
+                            "queue_name": job.queue_name,
+                            "error": error,
+                            "retry_count": job.retry_count,
+                            "timestamp": now,
+                        }
+                    }),
+                ] {
+                    if let Err(e) = cache.publish(&channel, &event.to_string()).await {
+                        warn!(error = %e, "Realtime publish failed; skipping it for the rest of this sweep");
+                        realtime = None;
+                        break;
+                    }
+                }
+            }
+
+            let event = serde_json::json!({
+                "job_id": job.id,
+                "queue_name": job.queue_name,
+                "status": "deadletter",
+                "error": error,
+            });
+            self.outgoing_webhooks.spawn_dispatch(
+                job.organization_id.clone(),
+                "job.failed".to_string(),
+                job.id.clone(),
+                event.clone(),
+            );
+            if let Some(url) = job.completion_webhook.clone().filter(|u| !u.is_empty()) {
+                crate::outgoing_webhooks::service::spawn_completion_webhook(
+                    &job.organization_id,
+                    url,
+                    "job.failed".to_string(),
+                    event,
+                    job.completion_webhook_secret
+                        .clone()
+                        .filter(|s| !s.is_empty()),
+                );
+            }
+        }
     }
 
     /// Update Prometheus metrics from database
@@ -786,7 +939,7 @@ impl Scheduler {
     ///
     /// This is a safety net to catch any jobs that weren't updated
     /// during parent completion (e.g., race conditions, server restarts)
-    async fn update_job_dependencies(&self) -> Result<()> {
+    pub async fn update_job_dependencies(&self) -> Result<()> {
         // Find jobs with dependencies_met = FALSE whose parent jobs are completed
         // SECURITY: Include organization_id filter to ensure cross-tenant isolation
         let result = sqlx::query(
@@ -826,7 +979,7 @@ impl Scheduler {
             UPDATE jobs child
             SET
                 status = 'cancelled',
-                last_error = 'Parent job failed or was deadlettered',
+                last_error = $1,
                 completed_at = NOW(),
                 updated_at = NOW()
             WHERE
@@ -842,6 +995,7 @@ impl Scheduler {
             RETURNING child.id, child.organization_id, child.queue_name
             "#,
         )
+        .bind(PARENT_FAILED_CANCEL_REASON)
         .fetch_all(&*self.db)
         .await?;
 
@@ -887,7 +1041,7 @@ impl Scheduler {
                 UPDATE jobs child
                 SET
                     status = 'cancelled',
-                    last_error = 'Dependency job failed or was deadlettered',
+                    last_error = $1,
                     completed_at = NOW(),
                     updated_at = NOW()
                 WHERE
@@ -924,6 +1078,7 @@ impl Scheduler {
                 RETURNING child.id, child.organization_id, child.queue_name
                 "#,
             )
+            .bind(DEPENDENCY_FAILED_CANCEL_REASON)
             .fetch_all(&*self.db)
             .await?;
 
@@ -996,6 +1151,47 @@ impl Scheduler {
             warn!(
                 count = unblocked_orphans.rows_affected(),
                 "Unblocked jobs whose dependency rows no longer exist (dependency job was deleted)"
+            );
+        }
+
+        // A workflow starts when its first job is claimed. Nothing ever set
+        // `started_at`, and `status` read `pending` until the progress trigger saw
+        // a job finish. This is done here rather than in that trigger, whose
+        // status write already races on concurrent completions (BEFLOW-03): this
+        // statement only moves `pending` to `running` and fills a NULL
+        // started_at, so it never overwrites an outcome the trigger computed.
+        // Workflows that finished within the last hour are included so one that
+        // started and finished between two sweeps still gets its start time.
+        let started = sqlx::query(
+            r#"
+            UPDATE workflows w
+            SET
+                status = CASE WHEN w.status = 'pending' THEN 'running' ELSE w.status END,
+                started_at = COALESCE(
+                    w.started_at,
+                    (SELECT MIN(j.started_at) FROM jobs j WHERE j.workflow_id = w.id)
+                )
+            WHERE
+                (
+                    w.status = 'pending'
+                    OR (
+                        w.started_at IS NULL
+                        AND (w.status = 'running' OR w.completed_at > NOW() - INTERVAL '1 hour')
+                    )
+                )
+                AND EXISTS (
+                    SELECT 1 FROM jobs j
+                    WHERE j.workflow_id = w.id AND j.started_at IS NOT NULL
+                )
+            "#,
+        )
+        .execute(&*self.db)
+        .await?;
+
+        if started.rows_affected() > 0 {
+            debug!(
+                count = started.rows_affected(),
+                "Marked workflows started by their first claimed job"
             );
         }
 
@@ -1147,8 +1343,9 @@ impl Scheduler {
         // deleted the job row, while jobs that failed through the normal path in
         // the same incident stayed fully documented. Same single-statement CTE
         // shape as the expired-lease sweep above, so status and audit row cannot
-        // half-apply.
-        let result = sqlx::query(
+        // half-apply. The job_history row and the announcement follow the
+        // expired-lease sweep too.
+        let deadlettered: Vec<DeadletteredJob> = sqlx::query_as(
             r#"
             WITH deadlettered AS (
                 UPDATE jobs
@@ -1171,37 +1368,63 @@ impl Scheduler {
                           AND w.status = 'offline'
                           AND w.organization_id = jobs.organization_id
                     )
-                RETURNING id, organization_id, queue_name, payload, retry_count
+                RETURNING id, organization_id, queue_name, payload, retry_count,
+                          completion_webhook, completion_webhook_secret
+            ),
+            dlq AS (
+                INSERT INTO dead_letter_queue (
+                    id, job_id, organization_id, queue_name, reason,
+                    original_payload, error_details, created_at
+                )
+                SELECT
+                    gen_random_uuid()::TEXT,
+                    d.id,
+                    d.organization_id,
+                    d.queue_name,
+                    'Max retries exceeded after worker went offline',
+                    d.payload,
+                    jsonb_build_object(
+                        'final_error', 'Max retries exceeded after worker went offline',
+                        'total_retries', d.retry_count
+                    ),
+                    NOW()
+                FROM deadlettered d
+            ),
+            history AS (
+                INSERT INTO job_history (id, job_id, event_type, details, created_at)
+                SELECT
+                    gen_random_uuid()::TEXT,
+                    d.id,
+                    'deadlettered',
+                    jsonb_build_object(
+                        'error', 'Max retries exceeded after worker went offline',
+                        'total_retries', d.retry_count,
+                        'organization_id', d.organization_id
+                    ),
+                    NOW()
+                FROM deadlettered d
             )
-            INSERT INTO dead_letter_queue (
-                id, job_id, organization_id, queue_name, reason,
-                original_payload, error_details, created_at
-            )
-            SELECT
-                gen_random_uuid()::TEXT,
-                d.id,
-                d.organization_id,
-                d.queue_name,
-                'Max retries exceeded after worker went offline',
-                d.payload,
-                jsonb_build_object(
-                    'final_error', 'Max retries exceeded after worker went offline',
-                    'total_retries', d.retry_count
-                ),
-                NOW()
-            FROM deadlettered d
+            SELECT id, organization_id, queue_name, retry_count,
+                   completion_webhook, completion_webhook_secret
+            FROM deadlettered
             "#,
         )
-        .execute(&*self.db)
+        .fetch_all(&*self.db)
         .await?;
 
-        let deadlettered = result.rows_affected();
-        if deadlettered > 0 {
+        if !deadlettered.is_empty() {
             warn!(
-                count = deadlettered,
+                count = deadlettered.len(),
                 "Moved offline worker jobs to deadletter (max retries exceeded)"
             );
-            self.metrics.jobs_deadlettered.inc_by(deadlettered);
+            self.metrics
+                .jobs_deadlettered
+                .inc_by(deadlettered.len() as u64);
+            self.announce_deadlettered(
+                &deadlettered,
+                "Max retries exceeded after worker went offline",
+            )
+            .await;
         }
 
         // Cleanup old data based on each organization's plan tier + custom overrides
@@ -1230,12 +1453,70 @@ impl Scheduler {
     async fn cleanup_old_data_by_org(&self) -> Result<u64> {
         let mut total_cleaned: u64 = 0;
 
+        // The sweeps below run inside the scheduler loop, which also fires cron
+        // schedules and recovers leases, so each one is a bounded batch: what
+        // is left over goes on the next pass, five minutes later.
+        //
+        // Every DELETE that removes rows another request can still change picks
+        // them with FOR UPDATE ... SKIP LOCKED. A plain `DELETE ... WHERE id IN
+        // (SELECT ...)` checks the status and age only in the subselect: a job
+        // a retry moved back to `pending` (or that failed again just now) after
+        // the subselect read it was deleted all the same, because the DELETE
+        // only waited for the retry's row lock and then re-checked `id IN`
+        // against the list it already had. Locking in the subselect re-checks
+        // the row's own conditions (status, age) against its newest version, so
+        // a row that changed is left out; a row an open transaction is changing
+        // right now is skipped, and the sweep never waits on it.
+
+        // Old completed/failed/cancelled workflows go first, so the failed and
+        // cancelled steps they kept (below) go in the same pass. A workflow
+        // retry flips `failed` back to `running` while holding the row's lock,
+        // so a workflow being retried is skipped or re-checked, not deleted.
+        let result = sqlx::query(
+            r#"
+            DELETE FROM workflows
+            WHERE id IN (
+                SELECT w.id
+                FROM workflows w
+                JOIN organizations o ON w.organization_id = o.id
+                WHERE w.status IN ('completed', 'failed', 'cancelled')
+                  AND w.completed_at < NOW() - (
+                    COALESCE(
+                        custom_retention_days(o.custom_limits, 'job_retention_days'),
+                        CASE o.plan_tier
+                            WHEN 'enterprise' THEN 90
+                            WHEN 'pro' THEN 30
+                            WHEN 'starter' THEN 14
+                            ELSE 3  -- free tier default
+                        END
+                    ) || ' days'
+                  )::INTERVAL
+                LIMIT 5000
+                FOR UPDATE OF w SKIP LOCKED
+            )
+            "#,
+        )
+        .execute(&*self.db)
+        .await?;
+
+        let workflows_cleaned = result.rows_affected();
+        if workflows_cleaned > 0 {
+            debug!(
+                count = workflows_cleaned,
+                "Cleaned up old workflows (tier-based retention)"
+            );
+            total_cleaned += workflows_cleaned;
+        }
+
         // Cleanup old completed/cancelled jobs using JOIN with organizations table
         // Uses CASE to determine retention based on plan_tier, with custom_limits override
+        //
+        // A cancelled workflow step stays while its workflow exists: a workflow
+        // retry sets it back to pending, and the workflow's outcome counts it.
         let result = sqlx::query(
             r#"
             DELETE FROM jobs
-            WHERE id IN (
+            WHERE id = ANY(ARRAY(
                 SELECT j.id
                 FROM jobs j
                 JOIN organizations o ON j.organization_id = o.id
@@ -1251,10 +1532,16 @@ impl Scheduler {
                         END
                     ) || ' days'
                   )::INTERVAL
-                LIMIT 10000  -- Batch limit to prevent long-running transactions
-            )
+                  AND (
+                    j.status = 'completed'
+                    OR NOT EXISTS (SELECT 1 FROM workflows w WHERE w.id = j.workflow_id)
+                  )
+                LIMIT $1
+                FOR UPDATE OF j SKIP LOCKED
+            ))
             "#,
         )
+        .bind(RETENTION_JOB_BATCH)
         .execute(&*self.db)
         .await?;
 
@@ -1265,6 +1552,157 @@ impl Scheduler {
                 "Cleaned up old jobs (tier-based retention)"
             );
             total_cleaned += jobs_cleaned;
+        }
+
+        // Failed and dead-lettered jobs follow the same job retention. They were
+        // kept forever, full payload included, although the plan promises N days.
+        // `updated_at` is when they failed: a terminal row is not touched again.
+        //
+        // Never while something still waits on one: deleting a job drops its
+        // dependency edges and clears its children's parent_job_id, and a pending
+        // dependent left without either is released as if its blocker had
+        // completed. Nor while its workflow still exists, whatever its status: a
+        // failed workflow can be retried until workflow retention removes it, and
+        // the retry resets its failed steps and gates their dependents on them
+        // again. A step deleted before that took its dependency edges with it,
+        // so the retry ran the dependents straight away. The steps go once the
+        // workflow is gone (the workflow sweep above runs first).
+        let result = sqlx::query(
+            r#"
+            DELETE FROM jobs
+            WHERE id = ANY(ARRAY(
+                SELECT j.id
+                FROM jobs j
+                JOIN organizations o ON j.organization_id = o.id
+                WHERE j.status IN ('failed', 'deadletter')
+                  AND j.updated_at < NOW() - (
+                    COALESCE(
+                        custom_retention_days(o.custom_limits, 'job_retention_days'),
+                        CASE o.plan_tier
+                            WHEN 'enterprise' THEN 90
+                            WHEN 'pro' THEN 30
+                            WHEN 'starter' THEN 14
+                            ELSE 3  -- free tier default
+                        END
+                    ) || ' days'
+                  )::INTERVAL
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM job_dependencies jd
+                    JOIN jobs c ON c.id = jd.job_id
+                    WHERE jd.depends_on_job_id = j.id
+                      AND c.status IN ('pending', 'scheduled', 'processing')
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM jobs c
+                    WHERE c.parent_job_id = j.id
+                      AND c.status IN ('pending', 'scheduled', 'processing')
+                  )
+                  AND NOT EXISTS (SELECT 1 FROM workflows w WHERE w.id = j.workflow_id)
+                LIMIT $1
+                FOR UPDATE OF j SKIP LOCKED
+            ))
+            "#,
+        )
+        .bind(RETENTION_JOB_BATCH)
+        .execute(&*self.db)
+        .await?;
+
+        let failed_cleaned = result.rows_affected();
+        if failed_cleaned > 0 {
+            debug!(
+                count = failed_cleaned,
+                "Cleaned up old failed/dead-lettered jobs (tier-based retention)"
+            );
+            total_cleaned += failed_cleaned;
+        }
+
+        // The dead_letter_queue keeps a copy of each dead-lettered job's payload;
+        // it is job data, so it follows job retention too. It was only ever
+        // emptied by an explicit purge.
+        let result = sqlx::query(
+            r#"
+            DELETE FROM dead_letter_queue
+            WHERE id IN (
+                SELECT d.id
+                FROM dead_letter_queue d
+                JOIN organizations o ON d.organization_id = o.id
+                WHERE d.created_at < NOW() - (
+                    COALESCE(
+                        custom_retention_days(o.custom_limits, 'job_retention_days'),
+                        CASE o.plan_tier
+                            WHEN 'enterprise' THEN 90
+                            WHEN 'pro' THEN 30
+                            WHEN 'starter' THEN 14
+                            ELSE 3  -- free tier default
+                        END
+                    ) || ' days'
+                )::INTERVAL
+                LIMIT 10000
+            )
+            "#,
+        )
+        .execute(&*self.db)
+        .await?;
+
+        let dlq_cleaned = result.rows_affected();
+        if dlq_cleaned > 0 {
+            debug!(
+                count = dlq_cleaned,
+                "Cleaned up old dead letter queue rows (tier-based retention)"
+            );
+            total_cleaned += dlq_cleaned;
+        }
+
+        // schedule_runs gained one row per cron fire (and per quota-blocked fire)
+        // forever: 1,440 rows a day for a `* * * * *` schedule. A run record is
+        // history, so it follows `history_retention_days`.
+        let result = sqlx::query(SCHEDULE_RUNS_RETENTION_SQL)
+            .execute(&*self.db)
+            .await?;
+
+        let runs_cleaned = result.rows_affected();
+        if runs_cleaned > 0 {
+            debug!(
+                count = runs_cleaned,
+                "Cleaned up old schedule runs (tier-based retention)"
+            );
+            total_cleaned += runs_cleaned;
+        }
+
+        // Workers that have been offline for a week are gone for good; their rows
+        // only grew the table (a restart without a fixed worker id registers a new
+        // row, and one with a fixed id simply registers again). One that still
+        // holds a processing job is kept until the lease sweeps settle it, and
+        // one that is registering again right now is skipped (the row lock).
+        let result = sqlx::query(
+            r#"
+            DELETE FROM workers
+            WHERE id IN (
+                SELECT w.id
+                FROM workers w
+                WHERE w.status = 'offline'
+                  AND w.last_heartbeat < NOW() - INTERVAL '7 days'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM jobs j
+                    WHERE j.assigned_worker_id = w.id
+                      AND j.status = 'processing'
+                  )
+                LIMIT 10000
+                FOR UPDATE OF w SKIP LOCKED
+            )
+            "#,
+        )
+        .execute(&*self.db)
+        .await?;
+
+        let workers_cleaned = result.rows_affected();
+        if workers_cleaned > 0 {
+            debug!(
+                count = workers_cleaned,
+                "Cleaned up workers offline for over 7 days"
+            );
+            total_cleaned += workers_cleaned;
         }
 
         // Cleanup old job history using JOIN
@@ -1482,43 +1920,6 @@ impl Scheduler {
                 "Cleaned up expired jobs (expires_at passed)"
             );
             total_cleaned += expired_cleaned;
-        }
-
-        // Cleanup old completed/failed/cancelled workflows based on plan tier
-        // Workflows accumulate over time (e.g., demo apps create one per request)
-        let result = sqlx::query(
-            r#"
-            DELETE FROM workflows
-            WHERE id IN (
-                SELECT w.id
-                FROM workflows w
-                JOIN organizations o ON w.organization_id = o.id
-                WHERE w.status IN ('completed', 'failed', 'cancelled')
-                  AND w.completed_at < NOW() - (
-                    COALESCE(
-                        custom_retention_days(o.custom_limits, 'job_retention_days'),
-                        CASE o.plan_tier
-                            WHEN 'enterprise' THEN 90
-                            WHEN 'pro' THEN 30
-                            WHEN 'starter' THEN 14
-                            ELSE 3  -- free tier default
-                        END
-                    ) || ' days'
-                  )::INTERVAL
-                LIMIT 5000
-            )
-            "#,
-        )
-        .execute(&*self.db)
-        .await?;
-
-        let workflows_cleaned = result.rows_affected();
-        if workflows_cleaned > 0 {
-            debug!(
-                count = workflows_cleaned,
-                "Cleaned up old workflows (tier-based retention)"
-            );
-            total_cleaned += workflows_cleaned;
         }
 
         Ok(total_cleaned)

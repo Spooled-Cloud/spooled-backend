@@ -10,6 +10,7 @@ use serde::Deserialize;
 
 use crate::api::handlers::require_queue_access;
 use crate::api::middleware::limits::{check_resource_limit_conn, lock_resource};
+use crate::api::middleware::ValidatedJson;
 use crate::api::AppState;
 use crate::error::{AppError, AppResult};
 use crate::models::{
@@ -19,9 +20,6 @@ use crate::models::{
 
 /// Maximum queues per page
 const MAX_QUEUES_PER_PAGE: i64 = 100;
-
-/// Maximum allowed rate limit value
-const MAX_RATE_LIMIT: i32 = 100000;
 
 /// List all queues with their configurations.
 ///
@@ -103,6 +101,21 @@ fn validate_queue_name_param(name: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+/// A queue name `PUT /queues/{name}/config` may create: the rules a job's
+/// `queue_name` follows, so a configured queue can also be enqueued into. The
+/// path name was not validated at all, so names with spaces, unicode
+/// punctuation or 100+ characters created unusable queues that still counted
+/// against the plan's queue cap.
+fn validate_configurable_queue_name(name: &str) -> Result<(), AppError> {
+    validate_queue_name_param(name)?;
+    if name.starts_with('.') || name.starts_with('-') {
+        return Err(AppError::BadRequest(
+            "Queue name cannot start with a dot or a dash".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Get queue configuration by name.
 ///
 /// Falls back to a synthesized default config if the queue exists implicitly
@@ -159,14 +172,19 @@ pub async fn get(
 /// Update or create queue configuration
 ///
 /// Now uses authenticated organization context.
-/// Now validates rate_limit bounds.
 /// SECURITY: Enforces plan limits before creating NEW queues.
+///
+/// The body is validated (`max_retries` 0-100, `default_timeout` 1-86400,
+/// `rate_limit` 1-100000) and so is the path's queue name. Neither was: a
+/// stored `default_timeout` of 172800 made every later enqueue to the queue a
+/// 500, because jobs inherit it and the jobs table refuses it.
 pub async fn update_config(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
     Path(name): Path<String>,
-    Json(request): Json<UpsertQueueConfigRequest>,
+    ValidatedJson(request): ValidatedJson<UpsertQueueConfigRequest>,
 ) -> AppResult<Json<QueueConfig>> {
+    validate_configurable_queue_name(&name)?;
     require_queue_access(&ctx, &name)?;
     // Enforce the queues cap atomically: an advisory lock serializes concurrent
     // config-creates for this org, so two requests can't both see "not existing"
@@ -211,19 +229,10 @@ pub async fn update_config(
         .enabled
         .unwrap_or_else(|| existing.as_ref().map(|e| e.enabled).unwrap_or(true));
 
-    // Validate rate_limit if provided; omit keeps the existing override.
-    let rate_limit = match request.rate_limit {
-        Some(rl) => Some(if rl < 0 {
-            tracing::warn!(rate_limit = rl, queue = %name, "Invalid negative rate limit, using 0");
-            0
-        } else if rl > MAX_RATE_LIMIT {
-            tracing::warn!(rate_limit = rl, max = MAX_RATE_LIMIT, queue = %name, "Rate limit exceeds maximum, capping");
-            MAX_RATE_LIMIT
-        } else {
-            rl
-        }),
-        None => existing.as_ref().and_then(|e| e.rate_limit),
-    };
+    // rate_limit is range-checked by the validator; omit keeps the existing override.
+    let rate_limit = request
+        .rate_limit
+        .or_else(|| existing.as_ref().and_then(|e| e.rate_limit));
 
     let settings = merge_queue_settings(
         existing.as_ref().map(|e| &e.settings),
@@ -295,14 +304,18 @@ pub async fn stats(
     validate_queue_name_param(&name)?;
     require_queue_access(&ctx, &name)?;
 
-    // Check both legacy queue_name AND queue_names array for accurate worker count
-    let stats = sqlx::query_as::<_, (i64, i64, i64, i64, Option<f64>, Option<i64>, i64)>(
+    // Check both legacy queue_name AND queue_names array for accurate worker count.
+    // Jobs that fail for good are dead-lettered (no job is ever 'failed', so the
+    // old count was always 0) and dead-lettering sets no completed_at: a
+    // dead-lettered row's updated_at is when it was dead-lettered.
+    let stats = sqlx::query_as::<_, (i64, i64, i64, i64, i64, Option<f64>, Option<i64>, i64)>(
         r#"
         SELECT 
             COUNT(*) FILTER (WHERE status = 'pending') as pending_jobs,
             COUNT(*) FILTER (WHERE status = 'processing') as processing_jobs,
             COUNT(*) FILTER (WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '24 hours') as completed_24h,
-            COUNT(*) FILTER (WHERE status = 'failed' AND completed_at > NOW() - INTERVAL '24 hours') as failed_24h,
+            COUNT(*) FILTER (WHERE status IN ('failed', 'deadletter') AND updated_at > NOW() - INTERVAL '24 hours') as failed_24h,
+            COUNT(*) FILTER (WHERE status = 'deadletter') as deadletter_jobs,
             AVG(EXTRACT(EPOCH FROM (completed_at - started_at))::FLOAT8 * 1000) FILTER (WHERE status = 'completed' AND completed_at IS NOT NULL AND started_at IS NOT NULL) as avg_processing_time_ms,
             EXTRACT(EPOCH FROM (NOW() - MIN(created_at) FILTER (WHERE status IN ('pending', 'scheduled'))))::BIGINT as max_job_age_seconds,
             (SELECT COUNT(*) FROM workers WHERE (queue_name = $1 OR $1 = ANY(queue_names)) AND organization_id = $2 AND status = 'healthy') as active_workers
@@ -321,9 +334,10 @@ pub async fn stats(
         processing_jobs: stats.1,
         completed_jobs_24h: stats.2,
         failed_jobs_24h: stats.3,
-        avg_processing_time_ms: stats.4,
-        max_job_age_seconds: stats.5,
-        active_workers: stats.6,
+        deadletter_jobs: stats.4,
+        avg_processing_time_ms: stats.5,
+        max_job_age_seconds: stats.6,
+        active_workers: stats.7,
     }))
 }
 
@@ -631,6 +645,7 @@ mod tests {
             processing_jobs: 5,
             completed_jobs_24h: 100,
             failed_jobs_24h: 2,
+            deadletter_jobs: 4,
             avg_processing_time_ms: Some(150.5),
             max_job_age_seconds: Some(30),
             active_workers: 3,

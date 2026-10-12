@@ -688,19 +688,8 @@ impl PlanLimits {
     ///
     /// Returns Ok(()) if within limit, Err with message if exceeded
     pub fn check_limit(&self, resource: &str, current: u64, adding: u64) -> Result<(), LimitError> {
-        let limit = match resource {
-            "jobs_per_day" => self.max_jobs_per_day,
-            "active_jobs" => self.max_active_jobs,
-            "queues" => self.max_queues.map(|v| v as u64),
-            "workers" => self.max_workers.map(|v| v as u64),
-            "api_keys" => self.max_api_keys.map(|v| v as u64),
-            "schedules" => self.max_schedules.map(|v| v as u64),
-            "workflows" => self.max_workflows.map(|v| v as u64),
-            "webhooks" => self.max_webhooks.map(|v| v as u64),
-            _ => return Ok(()), // Unknown resource, allow
-        };
-
-        if let Some(max) = limit {
+        // An unknown resource has no limit: allow.
+        if let Some(max) = self.limit_for(resource) {
             let new_total = current + adding;
             if new_total > max {
                 return Err(LimitError {
@@ -714,6 +703,21 @@ impl PlanLimits {
         }
 
         Ok(())
+    }
+
+    /// The cap on `resource`, or `None` when it is unlimited (or unknown).
+    pub fn limit_for(&self, resource: &str) -> Option<u64> {
+        match resource {
+            "jobs_per_day" => self.max_jobs_per_day,
+            "active_jobs" => self.max_active_jobs,
+            "queues" => self.max_queues.map(|v| v as u64),
+            "workers" => self.max_workers.map(|v| v as u64),
+            "api_keys" => self.max_api_keys.map(|v| v as u64),
+            "schedules" => self.max_schedules.map(|v| v as u64),
+            "workflows" => self.max_workflows.map(|v| v as u64),
+            "webhooks" => self.max_webhooks.map(|v| v as u64),
+            _ => None,
+        }
     }
 
     /// Check if a resource is disabled on this plan
@@ -736,19 +740,7 @@ impl PlanLimits {
 
     /// Calculate usage percentage for a resource
     pub fn usage_percentage(&self, resource: &str, current: u64) -> Option<f64> {
-        let limit = match resource {
-            "jobs_per_day" => self.max_jobs_per_day,
-            "active_jobs" => self.max_active_jobs,
-            "queues" => self.max_queues.map(|v| v as u64),
-            "workers" => self.max_workers.map(|v| v as u64),
-            "api_keys" => self.max_api_keys.map(|v| v as u64),
-            "schedules" => self.max_schedules.map(|v| v as u64),
-            "workflows" => self.max_workflows.map(|v| v as u64),
-            "webhooks" => self.max_webhooks.map(|v| v as u64),
-            _ => return None,
-        };
-
-        match limit {
+        match self.limit_for(resource) {
             Some(max) if max > 0 => Some((current as f64 / max as f64) * 100.0),
             _ => None,
         }
