@@ -205,9 +205,37 @@ appendfsync everysec
 
 ## Queue Partitioning
 
+> **Warning: the live `jobs` table is not partitioned, and nothing in Spooled reads or writes
+> `jobs_partitioned`.** Migration `20241209000009_partitioned_jobs.sql` creates that second,
+> empty table as scaffolding, and the helpers below manage only it. Do **not** follow the
+> "swap tables" notes at the end of that migration (`ALTER TABLE jobs RENAME TO jobs_legacy;
+> ALTER TABLE jobs_partitioned RENAME TO jobs;`) on a deployment you care about:
+>
+> - **Idempotency breaks.** PostgreSQL requires a unique index on a partitioned table to
+>   contain the partition key, so the index on `jobs_partitioned` is
+>   `(organization_id, idempotency_key, created_at)`: unique per key *and* creation time, which
+>   no two jobs share, so a repeated key is no longer caught. Spooled's enqueue statements use
+>   `ON CONFLICT (organization_id, idempotency_key) WHERE idempotency_key IS NOT NULL`, which
+>   needs a unique index on exactly those columns (`idx_jobs_idempotency` on the real `jobs`
+>   table); on the swapped table there is none to infer, and enqueueing fails.
+> - **The copy fails.** `jobs_partitioned` lacks columns that `jobs` has gained
+>   (`completion_webhook`, `workflow_id`, `workflow_step`, `dependency_mode`,
+>   `completion_webhook_secret`, `lease_duration_secs`), so `INSERT INTO jobs_partitioned
+>   SELECT * FROM jobs` does not run.
+> - **Integrity is lost.** It has none of the foreign keys to `jobs(id)` (job history,
+>   dependencies, schedule runs, `parent_job_id`; a primary key of `(id, created_at)` cannot be
+>   referenced by `id` alone), none of the CHECK constraints and none of the triggers that
+>   workflow progress, dependent-job release and the worker counters rely on.
+>
+> Partitioning the live table would need a purpose-built migration, planned and tested against a
+> copy of production data; it is deferred (BEJOB-17 in `docs/ai/knowledge/bugs`). The functions
+> below are safe to leave alone: `maintain_jobs_partitions()` only drops partitions of the
+> unused table.
+
 ### Monthly Partitioning
 
-The jobs table can be partitioned by `created_at` for better performance:
+These helpers create and maintain monthly partitions of `jobs_partitioned` (by `created_at`),
+the unused table described above:
 
 ```sql
 -- View partition health

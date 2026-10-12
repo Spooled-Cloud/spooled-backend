@@ -22,6 +22,7 @@ Update the KB in the **same change** when you touch these areas.
 | Triggers on `jobs`/`workers` (`trigger_count_worker_job_outcome`, `update_workflow_progress`, `update_dependent_jobs`), `models/worker.rs` counters, `dead_letter_oversized` | `dataflows/jobs-queue.md` (Worker counters), `dataflows/grpc-rest.md`, `contracts/invariants.md` #40, chesterton fences |
 | Routes in `src/api/mod.rs`, `docs/openapi.yaml`, `scripts/check_openapi_drift.py` | `contracts/invariants.md` #8 (the CI `openapi-drift` job fails a route without its documented path) |
 | New env setting | `docker-compose.prod.yml` forward, `.env.example`, README env table, `docs/guides/operations.md`, `contracts/invariants.md` #20 |
+| Statements the docs make about code: gRPC payload/result limits (`docs/guides/grpc-server.md`), documented response codes (`docs/openapi.yaml`), the `jobs_partitioned` warning (`docs/guides/operations.md`), finding statuses | `tests/docs_contract_tests.rs` pins them to the code; change both together |
 | Security-relevant behavior | `bugs/findings.jsonl` + `findings.md` |
 
 ## Rules

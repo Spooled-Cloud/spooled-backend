@@ -529,6 +529,11 @@ For high-volume queues, consider partitioning by:
 - Organization (separate tables)
 - Queue name (sharding)
 
+None of this is in place: the live `jobs` table is a single table. The empty `jobs_partitioned`
+table that migration `20241209000009` creates is not a ready-made path to it, and swapping it in
+for `jobs` would break idempotency (see the warning under "Queue Partitioning" in
+[operations.md](operations.md)).
+
 ---
 
 ## Performance Characteristics

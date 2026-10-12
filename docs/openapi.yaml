@@ -2702,8 +2702,10 @@ paths:
             schema:
               $ref: '#/components/schemas/CreateWorkflowRequest'
       responses:
-        '201':
-          description: Workflow created
+        '200':
+          description: >-
+            Workflow created. The status is `200`, not `201`. The body maps each job `key` to its
+            job id (`job_ids`); the jobs in `GET /workflows/{id}` carry no `key`.
           content:
             application/json:
               schema:

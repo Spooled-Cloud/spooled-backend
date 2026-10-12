@@ -14,6 +14,16 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Test fixtures no longer carry literals that secret scanners report as leaked keys: the production-config test builds its JWT secret at runtime, and so does the inbound-webhook log test for its token. Neither value was ever a real credential (the production JWT secret was checked to differ).
 - The development gRPC TLS pair `certs/grpc-key.pem` / `certs/grpc-cert.pem` is removed from the tree. Production never used it (its Compose stack generates its own keypair in the `grpc_tls` volume, confirmed different on the host); `certs/README.md` shows how to generate a throwaway local pair.
 
+### Documentation
+
+Wave 9, from the final production verification of waves 3-8 (2026-10-12). Documentation, knowledge base and tests only: no code, no migration, no version change.
+
+- **gRPC payloads and results are `google.protobuf.Struct`** (BEGRPC-05, remainder, now `open (documented)`). `docs/guides/grpc-server.md` says that a payload or result that is not a JSON object (an array, a string, a number, a boolean or `null`) reaches a gRPC worker with the field absent, that an integer of 2^53 or more comes back rounded as a float, and that REST keeps both; use REST or wrap the value. The fix needs new proto fields and is not made here.
+- **`POST /workflows` is documented as `200`** (BEFLOW-23, status half). `docs/openapi.yaml` said `201`; the handler answers `200`, so the document now matches what callers see today. The documented `GET /workflows/{id}` shape (`WorkflowResponse`) still differs from the real body (`progress`, `jobs`, `dependencies`) and stays open in the knowledge base. The OpenAPI drift check is unchanged and passes (105 operations).
+- **`jobs_partitioned` is fenced off** (BEJOB-17, deferred). A warning in the operations guide, the architecture guide and the knowledge base: the table is empty scaffolding, and the "swap tables" notes in migration `20241209000009` would break idempotency (its index is unique per key *and* `created_at`, so `ON CONFLICT (organization_id, idempotency_key)` has no index to use), and the copy would fail on missing columns and drop the foreign keys, CHECKs and triggers. The migration is untouched.
+- **Scale costs are recorded as deferred** (BEJOB-21). Measured at 320k `jobs` rows: three sweep `UPDATE` scans of about 47 ms each every 10 s, one history `INSERT` per job in a 100-job `dequeue_batch`, and whole-organization scans in `GET /queues` and `GET /jobs/stats`. Production holds about 130k jobs, so nothing is user-visible; the work is scheduled after the SDK wave.
+- **`tests/docs_contract_tests.rs`** (no Docker needed) pins these statements to the code, so a later change to the behaviour has to update the documents with it.
+
 ---
 
 ## [0.1.122] - 2026-10-12

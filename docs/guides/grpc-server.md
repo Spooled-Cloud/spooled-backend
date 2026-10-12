@@ -121,6 +121,28 @@ characters, `priority` -100..100, `idempotency_key` up to 255 characters, `tags`
 as JSON, `scheduled_at` between years 1 and 9999 (an all-zero Timestamp means unset).
 Struct numbers that are whole and below 2^53 come back as integers (`42`, not `42.0`).
 
+**Payloads and results are `google.protobuf.Struct`.** `Job.payload`, `Job.result`,
+`EnqueueRequest.payload` and `CompleteRequest.result` are Struct fields, and the proto has no
+JSON string or bytes field for them. REST accepts any JSON value; over gRPC two things differ:
+
+- **Only a JSON object arrives.** A job whose payload (or result) is an array, a string, a
+  number, a boolean or `null` reaches a gRPC worker (`Dequeue`, `StreamJobs`, `ProcessJobs`,
+  `GetJob`) with the `payload` (or `result`) field **absent**, and no error. A job enqueued
+  over gRPC without a payload is stored as `{}` and arrives as an empty Struct, so an absent
+  field means the value was not an object; `GET /api/v1/jobs/{id}` over REST returns it. An
+  object is delivered whole, with anything nested inside it (arrays, strings, nulls).
+- **Numbers are doubles.** An integer below 2^53 (2^53 = 9007199254740992) comes back as an
+  integer. An integer of 2^53 or more cannot be held exactly in a Struct: it comes back as a
+  float, rounded (`9007199254740993` arrives as `9007199254740992.0`). A Struct number is a
+  double on the wire, so a client cannot send such an integer exactly either.
+  REST keeps such integers exactly.
+
+Jobs that carry non-object payloads or integers of 2^53 or more (snowflake ids, 64-bit
+counters) belong on REST, or the value has to be wrapped: put the array in an object
+(`{"items": [1, 2]}`) and send a large integer as a string. Lifting the limit needs new proto
+fields (for example `bytes payload_json`) and matching changes in every SDK, so it is
+documented here rather than changed (tracked as BEGRPC-05 in `docs/ai/knowledge`).
+
 **Responses and messages**: a `Dequeue` batch stops at about 3 MiB so it fits the 4 MiB
 message limit (it always returns at least one job; the rest stay pending). A job too large for
 one message is dead-lettered with the reason `Job too large for a gRPC message`.

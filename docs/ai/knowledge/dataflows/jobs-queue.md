@@ -106,12 +106,21 @@ Before 0.1.119 a bulk of 100 jobs of 25 KB was refused (BEOPS-16).
 - The daily quota is reserved (`try_increment_daily_jobs`) BEFORE the insert and refunded when no row is
   created, so a job over the cap is never inserted, claimable and deleted again. The active-jobs cap is
   still check-then-insert (BEJOB-20 remainder, open).
+- The unique index is `idx_jobs_idempotency` on the unpartitioned `jobs` table
+  (`migrations/20241209000001_initial_schema.sql:86`). The unused `jobs_partitioned` table of migration
+  `20241209000009` has `(organization_id, idempotency_key, created_at)`, which is not unique per key (a
+  unique index on a partitioned table must contain the partition key). Swapping that table in as `jobs`, as
+  the migration's own notes suggest, leaves the `ON CONFLICT` statements above without an index to infer
+  and stops duplicate keys from being detected; it also lacks columns, foreign keys, CHECKs and triggers.
+  Deferred (BEJOB-17); see chesterton fence #33 and the warning in `docs/guides/operations.md`.
 
 ## Scheduler loops (in-process)
 
 Activated scheduled jobs (~5s), cron (~10s), lease recovery (~10s), metrics (~15s), stale workers (~300s), dependency/workflow progress (~10s). See `scheduler/mod.rs`. Since 0.1.121 the dependency pass (`update_job_dependencies` `:942`) also moves a `pending` workflow to `running` and fills `started_at` once one of its jobs has started (`:1155`, BEFLOW-20; no trigger change, it never overwrites an outcome the progress trigger wrote), and both dead-lettering sweeps (`recover_expired_leases` `:258`, `cleanup_stale_workers` `:1251`) write the `deadlettered` job_history row and the DLQ row in one CTE and announce the failure through `announce_deadlettered` (`:382`): realtime `JobStatusChange` + `JobFailed`, the `job.failed` outgoing webhook (`data.status` `deadletter`) and the job's completion webhook, like the REST fail path (BEFLOW-11, QW7). Realtime publishing stops after its first failure in a batch so a hung Redis cannot stall the one scheduler loop. Since 0.1.122 the dependency pass ends with `announce_workflow_outcomes` (`scheduler/mod.rs:1249`, QW8): one claiming `UPDATE` announces the `completed`/`failed` workflows whose `completed_at` it has not sent yet, **at most once** (see `dataflows/webhooks.md`, invariants #41). Every loop pass reports to `RuntimeHealth::scheduler_tick` (`scheduler/mod.rs:95`) and a drop guard marks it stopped however `run` ends (`:42`, `:76`); `/health` reports the scheduler down after 120 s without a pass.
 
 Cron catch-up (`scheduler/mod.rs` ~395–418): if `next_run_at` is far in the past after downtime, **skip missed fires, run once now**, advance `next_run_at` via `next_run_after_in_timezone` (DST-aware). Live re-verified 2026-07-15 on `0.1.107`.
+
+Known costs at scale (BEJOB-21, **deferred**, measured at 320k `jobs` rows; production held about 130k on 2026-10-12): the dependency pass `update_job_dependencies` (`scheduler/mod.rs:942`) runs three `UPDATE jobs child ... AND (child.dependencies_met = FALSE OR child.dependencies_met IS NULL)` statements (`:954`, `:988`, `:1049`) every 10 s, about 47 ms each, because the `IS NULL` arm cannot use the partial index `idx_jobs_dependencies_met` (`WHERE dependencies_met = FALSE`); `dequeue_batch` (`queue/mod.rs:277`) awaits one `record_history` INSERT per claimed job, 100 for a full batch; the implicit-queue backfill of `GET /queues` (`handlers/queues.rs:50`) and `GET /jobs/stats` (`handlers/jobs.rs:1845`) read the whole job range of the organization. Nothing is user-visible at today's size; the fix is scheduled after the SDK wave (findings entry has the directions). Do not "optimise" these statements casually: the workflow sweep's loop invariants (stated in the code comments of `update_job_dependencies`) and the claim order are load-bearing.
 
 ## Chesterton fence
 

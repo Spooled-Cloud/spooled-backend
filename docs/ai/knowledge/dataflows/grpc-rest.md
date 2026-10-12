@@ -199,8 +199,19 @@ Dead-letter keeps `retry_count` (the statements at `:958-966` and `:2417-2424`),
 
 `google.protobuf.Struct` numbers are doubles. Whole values with |n| < 2^53 come back as JSON
 integers (`src/grpc/convert.rs:144-149` `number_to_json`): `42` stays `42`, `1.5` stays a
-float, `2^53` and above stay floats, NaN/infinity become null. Non-object payloads are
-still dropped; fixing that needs a proto field (`bytes payload_json`).
+float, `2^53` and above stay floats, NaN/infinity become null.
+
+Only a JSON object is a Struct. `json_to_struct` (`src/grpc/convert.rs:68`) returns `None` for
+any other top-level value, so `job_to_proto` sends `Job.payload` / `Job.result` **absent** for
+an array, string, number, boolean or null, in `Dequeue`, `StreamJobs`, `ProcessJobs` and
+`GetJob`. A gRPC client cannot send one either (`EnqueueRequest.payload` and
+`CompleteRequest.result` are Structs), and an integer of 2^53 or more is already a rounded
+double in the client's Struct. REST keeps all of it (`payload` is a `serde_json::Value`).
+BEGRPC-05 therefore stays **open (documented)**: the fix is new proto fields (for example
+`bytes payload_json`) read by the four SDKs, a cross-repo contract change. The public
+statement is `docs/guides/grpc-server.md` ("Payloads and results are `google.protobuf.Struct`");
+`tests/docs_contract_tests.rs` pins the behaviour and the statement together, so adding the
+fields means updating the guide, this section, the findings entry and that test in one change.
 
 ## Health and shutdown (0.1.119)
 
