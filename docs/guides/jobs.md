@@ -205,7 +205,7 @@ Response:
 }
 ```
 
-The lease lasts `lease_duration_secs` (default 30 seconds). Keep `lease_id`: complete, fail and
+The lease lasts `lease_duration_secs` (5-3600 seconds, default 30; one hour is the maximum, so a longer job must heartbeat to extend it). Keep `lease_id`: complete, fail and
 heartbeat requests must send it (a missing `lease_id` is a `422`).
 
 ### Complete Job

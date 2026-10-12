@@ -37,7 +37,7 @@ The easiest way to get started is with the managed service at [spooled.cloud](ht
 **Benefits:**
 - ✓ No infrastructure to manage
 - ✓ Automatic scaling and updates
-- ✓ Built-in monitoring and alerting
+- ✓ Platform monitoring and alerting run by Spooled (there is no tenant-facing Prometheus endpoint or alert-rule feature; the metrics below are for operators who self-host)
 - ✓ 99.9% SLA (Pro and Enterprise plans)
 - ✓ Security-focused architecture and operational monitoring
 

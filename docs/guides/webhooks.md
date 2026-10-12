@@ -100,7 +100,7 @@ Response:
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `queue_name` | string | Yes | Target queue (1-255 chars) |
-| `payload` | object | Yes | Job data (max 5MB) |
+| `payload` | object | Yes | Job data (request body is capped at 2 MiB; the plan's job payload cap also applies) |
 | `event_type` | string | No | Event type for logging |
 | `priority` | integer | No | -100 to 100 (default: 0) |
 | `idempotency_key` | string | No | Prevent duplicates |

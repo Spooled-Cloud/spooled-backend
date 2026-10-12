@@ -35,22 +35,25 @@ info:
     - **Multi-tenant isolation**: All operations are scoped to your organization
     - **API key verification**: Keys verified using bcrypt with caching
     - **Webhook signatures**: HMAC-SHA256 with constant-time comparison
-    - **Rate limiting**: Per-key limits with graceful degradation
+    - **Rate limiting**: Per-organization token bucket by plan, plus an optional per-key limit, with graceful degradation
     - **Input validation**: All inputs sanitized and size-limited
     - **SSRF protection**: Webhook URLs validated in production
 
     ## Rate Limiting
 
-    Rate limits are applied per API key based on plan tier:
+    Authenticated requests share one token bucket per organization, sized by plan tier:
     - Free tier: 5 requests/second (burst: 10)
     - Starter tier: 25 requests/second (burst: 50)
     - Pro tier: 100 requests/second (burst: 200)
     - Enterprise: 500 requests/second (burst: 1000)
 
-    Rate limit headers included in all responses:
-    - `X-RateLimit-Limit`: Maximum requests per window
-    - `X-RateLimit-Remaining`: Remaining requests in current window
-    - `X-RateLimit-Reset`: Unix timestamp when the window resets
+    An API key may also carry its own `rate_limit` in requests per **minute**; it is checked after
+    the organization limit, so it can only lower what that key may do.
+
+    A rejected request answers `429` with code `RATE_LIMIT_EXCEEDED`, a `Retry-After` header (seconds)
+    and a JSON body with `retry_after_secs`, `limit`, `remaining` and `reset_at`. `Retry-After` is the
+    only rate-limit header: the API does not send `X-RateLimit-Limit`, `X-RateLimit-Remaining` or
+    `X-RateLimit-Reset`.
 
     ## Plan Limits
 
@@ -59,7 +62,7 @@ info:
     - Active jobs: Free (10), Starter (500), Pro (5,000), Enterprise (unlimited)
     - Queues: Free (2), Starter (10), Pro (50), Enterprise (unlimited)
     - Workers: Free (1), Starter (5), Pro (25), Enterprise (unlimited)
-    - Workflows: Free (disabled), Starter (5), Pro (50), Enterprise (unlimited). Only
+    - Workflows: Free (disabled), Starter (5), Pro (25), Enterprise (unlimited). Only
       workflows that are pending or running count toward the limit.
 
   version: 1.0.0

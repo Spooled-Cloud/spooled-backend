@@ -798,7 +798,7 @@ SPOOLED_BASE_URL=https://api.spooled.cloud
 try {
   const job = await client.jobs.create({ ... });
 } catch (error) {
-  if (error.code === 'rate_limited') {
+  if (error.code === 'RATE_LIMIT_EXCEEDED') {
     await delay(error.retryAfter);
     // Retry
   } else if (error.code === 'validation_error') {

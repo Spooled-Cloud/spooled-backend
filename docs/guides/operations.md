@@ -63,7 +63,10 @@ Configure via environment variables:
 ### Per-Client Rate Limiting
 
 Rate limits are tracked per client:
-- **API Key**: Hash of the API key
+- **Organization**: authenticated routes share one token bucket per organization, sized by the plan
+  (requests per second and burst; see [API Reference > Rate Limits](./api-usage.md#rate-limits))
+- **API Key**: an optional per-key `rate_limit` in requests per **minute**, checked after the
+  organization bucket (so it can only lower it)
 - **IP Address**: See [Client IP Resolution](#client-ip-resolution) below. It also keys the
   failed-auth budget, `check-email`, `check-slug` and the email-login throttles
   (`POST /auth/email/start`: 3 per minute and 10 per hour per client; `POST /auth/email/verify`:
@@ -117,7 +120,7 @@ unauthenticated traffic shares one bucket. Set one of the two variables.
 | Request body | `2 MiB` | Default body limit of every route (axum) |
 | `POST /api/v1/jobs/bulk` body | up to `32 MiB` | 100 jobs x the largest plan payload cap (+ 4 KiB each), clamped between 2 and 32 MiB; split bigger batches |
 | `MAX_PAYLOAD_SIZE` | `1 MB` | Maximum job payload size |
-| `MAX_WEBHOOK_PAYLOAD_SIZE` | `5 MB` | Maximum webhook payload |
+| `MAX_WEBHOOK_PAYLOAD_SIZE` | `5 MB` | Webhook payload check in the handler; the 2 MiB request body limit above is reached first, so 5 MB is not reachable |
 
 ### Queue-Level Controls
 

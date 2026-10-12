@@ -23,7 +23,7 @@ Workers are your applications that process jobs from Spooled queues. Spooled its
 
 **Key concepts:**
 - Workers claim jobs via REST or gRPC API
-- Jobs have leases (30 seconds by default over REST, 300 over gRPC) - complete or renew before expiry
+- Jobs have leases (30 seconds by default over REST, 300 over gRPC) - complete or renew before expiry. A lease is at most 3600 seconds (1 hour); longer jobs renew it with a heartbeat. The server does not enforce a job `timeout_seconds` or cancel running handlers: that is up to your worker
 - Workers send heartbeats to stay registered
 - Multiple workers can process the same queue concurrently
 

@@ -105,50 +105,35 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs \
 
 Spooled uses exponential backoff with jitter to prevent thundering herd problems.
 
-### Default Backoff
+### Backoff Formula
+
+The backoff is fixed for every job and queue. It is not configurable:
 
 ```
-delay = min(base_delay * 2^attempt + random_jitter, max_delay)
+delay = min(2^retry_count seconds, 60 seconds) + random jitter (0-499 ms)
 ```
 
-| Attempt | Base Delay | With Jitter (approx) |
-|---------|------------|---------------------|
+`retry_count` is the number of retries already used when the failure happens, so the first failure waits about 1 second.
+
+| Failure # | Base delay | With jitter (approx) |
+|-----------|------------|----------------------|
 | 1 | 1s | 1-1.5s |
 | 2 | 2s | 2-2.5s |
 | 3 | 4s | 4-4.5s |
 | 4 | 8s | 8-8.5s |
 | 5 | 16s | 16-16.5s |
 | 6 | 32s | 32-32.5s |
-| 7 | 64s | 64-64.5s |
-| 8 | 128s | 128-128.5s |
+| 7 and later | 60s (cap; 2^6 = 64 is clamped) | 60-60.5s |
 
 **Parameters:**
-- `base_delay` = 1 second
-- `max_delay` = 1 hour (3600 seconds)
-- `random_jitter` = 0-500ms
+- base = 1 second, doubling per retry
+- maximum delay = 60 seconds
+- jitter = 0-499 ms
+- A job that lost its worker (lease expired) goes through the same retry or dead-letter decision as a reported failure.
 
-### Custom Backoff (Per Queue)
+### What you can and cannot tune
 
-```bash
-curl -X PUT https://api.spooled.cloud/api/v1/queues/emails/config \
-  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "backoff_base_seconds": 5,
-    "backoff_multiplier": 2.0,
-    "backoff_max_seconds": 3600
-  }'
-```
-
-### Backoff Examples
-
-| Use Case | Base | Max | Result |
-|----------|------|-----|--------|
-| Fast retry (API calls) | 1s | 60s | 1s, 2s, 4s, 8s, 16s, 32s, 60s |
-| Slow retry (external services) | 30s | 3600s | 30s, 60s, 120s, 240s... |
-| Aggressive retry (transient errors) | 0.5s | 30s | 0.5s, 1s, 2s, 4s, 8s, 16s, 30s |
-
----
+Retry **count** is configurable, per job (`max_retries`) and per queue (`PUT /queues/{name}/config` with `max_retries`). The delay curve is not: there is no per-queue or per-job backoff base, multiplier or maximum. To space retries further apart, fail the job and re-enqueue it yourself with `scheduled_at` set to the time you want.
 
 ## Dead Letter Queue
 

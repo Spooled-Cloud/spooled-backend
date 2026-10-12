@@ -15,7 +15,7 @@ Spooled is a high-performance, multi-tenant job queue system designed for reliab
 - **High Performance**: Built on Rust + Tokio + PostgreSQL with Redis-backed caching
 - **Optimized gRPC**: HTTP/2 keepalive, TCP optimizations, connection pooling, and streaming
 - **Multi-Tenant**: explicit per-organization scoping on every query
-- **Observable**: Prometheus metrics, Grafana dashboards, optional OpenTelemetry export (`--features otel`)
+- **Observable**: operator-level Prometheus metrics and Grafana dashboards for self-hosters, optional OpenTelemetry export (`--features otel`). There is no tenant-facing Prometheus endpoint or alerting feature
 - **Reliable**: At-least-once processing with leases + retries (use idempotency keys for exactly-once effects)
 - **Real-Time**: WebSocket + SSE for live job/queue updates
 - **Secure**: Bcrypt API keys with Redis caching, JWT auth, HMAC webhook verification
@@ -644,7 +644,7 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317 ./target/release/spooled-backend
 - **Authentication**: API keys (bcrypt hashed) or JWT tokens
 - **Least privilege**: queue-scoped keys are enforced across REST, realtime, and gRPC operations; active streams revalidate current key state
 - **Multi-tenancy**: explicit per-organization scoping on every query
-- **Rate Limiting**: Per-key limits with Redis (fails closed when configured)
+- **Rate Limiting**: Per-organization token bucket by plan, plus an optional per-key limit in requests per minute, with Redis (fails closed when configured). Rejected requests get `429` with `Retry-After`; there are no `X-RateLimit-*` headers
 - **Webhooks**: HMAC-SHA256 signature verification
 - **Input Validation**: All inputs sanitized and size-limited
 - **SSRF Protection**: Webhook URLs validated in production

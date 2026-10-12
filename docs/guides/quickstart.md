@@ -548,7 +548,7 @@ curl -X POST http://localhost:8080/api/v1/jobs/job_m1n2o3p4/retry \
 ### Cancel a Job
 
 ```bash
-curl -X POST http://localhost:8080/api/v1/jobs/job_m1n2o3p4/cancel \
+curl -X DELETE http://localhost:8080/api/v1/jobs/job_m1n2o3p4 \
   -H "Authorization: Bearer sp_live_..."
 ```
 
@@ -698,22 +698,21 @@ If a job with the same key exists, the request returns the existing job instead 
 
 ### Automatic Retries
 
-Failed jobs retry automatically with exponential backoff:
+Failed jobs retry automatically with exponential backoff: `2^n` seconds (n = retries already used),
+capped at 60 seconds, plus up to 0.5 s of jitter. The curve is fixed and cannot be configured.
 
 ```
-Attempt 1: immediate
-Attempt 2: 1 second delay
-Attempt 3: 2 seconds delay
-Attempt 4: 4 seconds delay
+1st failure: retried after ~1 second
+2nd failure: retried after ~2 seconds
+3rd failure: retried after ~4 seconds
 ...
+7th failure and later: retried after ~60 seconds (cap)
 ```
 
-Configure per job:
+Configure the number of retries per job (or as a queue default):
 ```json
 {
-  "max_retries": 5,
-  "backoff_multiplier": 2.0,
-  "backoff_max_delay": 3600
+  "max_retries": 5
 }
 ```
 
@@ -831,6 +830,7 @@ Per-second rate limiting returns HTTP `429 Too Many Requests`:
 }
 ```
 
+- The response carries a `Retry-After` header (seconds); it is the only rate-limit header, there are no `X-RateLimit-*` headers. The same wait is in `retry_after_secs`
 - Check your plan's rate limits
 - Implement exponential backoff in clients
 - Use bulk operations where possible

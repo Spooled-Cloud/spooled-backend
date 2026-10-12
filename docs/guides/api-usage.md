@@ -1644,19 +1644,32 @@ grpcurl -plaintext localhost:50051 describe spooled.v1.EnqueueRequest
 | 403 | `forbidden` | Insufficient permissions |
 | 404 | `not_found` | Resource not found |
 | 409 | `conflict` | Resource conflict (e.g., duplicate) |
-| 429 | `rate_limited` | Too many requests |
+| 429 | `RATE_LIMIT_EXCEEDED` | Too many requests (also `QUOTA_EXCEEDED` for plan caps) |
 | 500 | `internal_error` | Server error |
 
 ### Rate Limiting
 
-When rate limited, check these headers:
+A rate-limited request answers `429` with a `Retry-After` header (whole seconds). It is the only
+rate-limit header: the API does not send `X-RateLimit-Limit`, `X-RateLimit-Remaining` or
+`X-RateLimit-Reset`. The JSON body carries the same information:
 
 ```
-X-RateLimit-Limit: 1000
-X-RateLimit-Remaining: 0
-X-RateLimit-Reset: 1704067200
 Retry-After: 60
+
+{
+  "error": "Rate limit exceeded",
+  "code": "RATE_LIMIT_EXCEEDED",
+  "retry_after_secs": 60,
+  "limit": 100,
+  "remaining": 0,
+  "reset_at": 1704067200
+}
 ```
+
+The main limit is a token bucket **per organization** (requests per second and burst, by plan; see
+[Rate Limits](#rate-limits)). An API key can also carry its own `rate_limit` in **requests per
+minute**; it is checked after the organization limit, so it can only lower what that key may do,
+and it is counted per key. Unauthenticated routes are limited per client IP.
 
 ---
 

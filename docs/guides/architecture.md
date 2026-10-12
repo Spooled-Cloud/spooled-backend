@@ -421,7 +421,7 @@ Response includes next cursor:
 │   (TLS, Firewall, Network Policies)     │
 ├─────────────────────────────────────────┤
 │        2. Rate Limiting                 │
-│   (Per-IP, Per-API-Key, Per-Queue)     │
+│   (Per-IP, Per-Org, Per-API-Key)       │
 ├─────────────────────────────────────────┤
 │        3. Authentication                │
 │   (API Keys, JWT, bcrypt hashing)      │
@@ -441,7 +441,7 @@ Response includes next cursor:
 
 - Keys are hashed with bcrypt (cost=12)
 - Prefix-based lookup for efficient validation
-- Keys can have expiration dates, queue restrictions, and rate limit overrides
+- Keys can have expiration dates, queue restrictions, and a per-key rate limit (requests per minute) that can only lower the organization limit
 - Key cache invalidated immediately on revoke
 
 ### JWT Tokens
@@ -469,10 +469,10 @@ above.)
 
 | Resource | Limit |
 |----------|-------|
-| Request body | 5MB |
-| Job payload | 1MB |
+| Request body | 2 MiB (bulk enqueue: up to 32 MiB) |
+| Job payload | by plan: 64 KB Free, 256 KB Starter, 1 MB Pro and Enterprise |
 | gRPC payload | 1MB |
-| Webhook payload | 5MB |
+| Webhook payload | 5MB limit in code, but the 2 MiB request body limit applies first |
 | List page size | 100 |
 | Bulk enqueue | 100 jobs |
 
@@ -572,10 +572,10 @@ For high-volume queues, consider partitioning by:
 
 | Resource | Limit |
 |----------|-------|
-| Request body | 5MB |
-| Job payload | 1MB |
+| Request body | 2 MiB (bulk enqueue: up to 32 MiB) |
+| Job payload | by plan: 64 KB Free, 256 KB Starter, 1 MB Pro and Enterprise |
 | gRPC payload | 1MB |
-| Webhook payload | 5MB |
+| Webhook payload | 5MB limit in code, but the 2 MiB request body limit applies first |
 | List page size | 100 |
 | Bulk enqueue | 100 jobs |
 
