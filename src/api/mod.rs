@@ -80,6 +80,23 @@ impl AppState {
     }
 }
 
+/// Response headers exposed to cross-origin callers (rate limit state, retry
+/// hint, request id, list pagination hint).
+pub(crate) fn cors_exposed_headers() -> Vec<axum::http::header::HeaderName> {
+    [
+        "x-ratelimit-limit",
+        "x-ratelimit-remaining",
+        "x-ratelimit-reset",
+        "x-ratelimit-scope",
+        "retry-after",
+        "x-request-id",
+        "x-has-more",
+    ]
+    .into_iter()
+    .map(axum::http::header::HeaderName::from_static)
+    .collect()
+}
+
 /// Build the main application router
 ///
 /// CORS is now configurable based on environment
@@ -87,6 +104,9 @@ impl AppState {
 /// - Production: Restrict to configured origins only
 pub fn router(state: AppState) -> Router {
     use crate::config::Environment;
+
+    // Response headers a cross-origin dashboard must be able to read.
+    let exposed_headers = cors_exposed_headers();
 
     // Only allow Any origin in development
     // In production, CORS should be restricted to prevent CSRF attacks
@@ -129,6 +149,7 @@ pub fn router(state: AppState) -> Router {
                 axum::http::header::HeaderName::from_static("x-admin-key"),
                 axum::http::header::HeaderName::from_static("x-organization-id"),
             ])
+            .expose_headers(exposed_headers.clone())
     } else {
         // Development mode: allow any origin for easier testing
         tracing::info!("Development mode: Using permissive CORS policy");
@@ -136,6 +157,7 @@ pub fn router(state: AppState) -> Router {
             .allow_origin(Any)
             .allow_methods(Any)
             .allow_headers(Any)
+            .expose_headers(exposed_headers)
     };
 
     #[allow(deprecated)] // TimeoutLayer::new is deprecated but with_status_code is not yet stable
@@ -314,6 +336,7 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
         .route("/jobs/{id}/complete", post(handlers::jobs::complete))
         .route("/jobs/{id}/fail", post(handlers::jobs::fail))
         .route("/jobs/{id}/heartbeat", post(handlers::jobs::heartbeat))
+        .route("/jobs/{id}/history", get(handlers::jobs::history))
         // Dead Letter Queue Management
         .route("/jobs/dlq", get(handlers::jobs::list_dlq))
         .route("/jobs/dlq/retry", post(handlers::jobs::retry_dlq))
@@ -375,6 +398,11 @@ fn api_v1_router(state: AppState) -> Router<AppState> {
             post(handlers::schedules::trigger),
         )
         .route("/schedules/{id}/history", get(handlers::schedules::history))
+        // Inbound webhook request log
+        .route(
+            "/webhooks/deliveries",
+            get(handlers::webhooks::list_deliveries),
+        )
         // Outgoing Webhooks (notification configuration)
         .route("/outgoing-webhooks", get(handlers::outgoing_webhooks::list))
         .route(

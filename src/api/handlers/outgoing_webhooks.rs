@@ -25,9 +25,9 @@ use crate::api::middleware::limits::{check_resource_limit_conn, lock_resource};
 use crate::api::AppState;
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    ApiKeyContext, CreateOutgoingWebhookRequest, OutgoingWebhook, OutgoingWebhookDelivery,
-    OutgoingWebhookSummary, TestWebhookResponse, UpdateOutgoingWebhookRequest,
-    VALID_WEBHOOK_EVENTS,
+    validate_webhook_format, ApiKeyContext, CreateOutgoingWebhookRequest, OutgoingWebhook,
+    OutgoingWebhookDelivery, OutgoingWebhookSummary, TestWebhookResponse,
+    UpdateOutgoingWebhookRequest, WebhookFormat, VALID_WEBHOOK_EVENTS,
 };
 use crate::security::{build_outbound_http_client, validate_webhook_url, UrlValidationOptions};
 
@@ -55,7 +55,7 @@ pub async fn list(
 
     let webhooks: Vec<OutgoingWebhook> = sqlx::query_as(
         r#"
-        SELECT id, organization_id, name, url, secret, events, enabled,
+        SELECT id, organization_id, name, url, secret, events, format, enabled,
                failure_count, last_triggered_at, last_status, created_at, updated_at
         FROM outgoing_webhooks
         WHERE organization_id = $1
@@ -93,6 +93,9 @@ pub async fn create(
 
     // Validate event types
     validate_events(&request.events)?;
+    let format = validate_webhook_format(request.format.as_deref())
+        .map_err(AppError::Validation)?
+        .unwrap_or(WebhookFormat::Json.as_str());
 
     // SECURITY: Validate URL against SSRF attacks
     let url_options = UrlValidationOptions::default();
@@ -124,10 +127,10 @@ pub async fn create(
         r#"
         INSERT INTO outgoing_webhooks (
             id, organization_id, name, url, secret, events, enabled,
-            failure_count, created_at, updated_at
+            failure_count, created_at, updated_at, format
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, $8)
-        RETURNING id, organization_id, name, url, secret, events, enabled,
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, $8, $9)
+        RETURNING id, organization_id, name, url, secret, events, format, enabled,
                   failure_count, last_triggered_at, last_status, created_at, updated_at
         "#,
     )
@@ -139,6 +142,7 @@ pub async fn create(
     .bind(&request.events)
     .bind(request.enabled)
     .bind(now)
+    .bind(format)
     .fetch_one(&mut *tx)
     .await?;
 
@@ -167,7 +171,7 @@ pub async fn get(
 
     let webhook: Option<OutgoingWebhook> = sqlx::query_as(
         r#"
-        SELECT id, organization_id, name, url, secret, events, enabled,
+        SELECT id, organization_id, name, url, secret, events, format, enabled,
                failure_count, last_triggered_at, last_status, created_at, updated_at
         FROM outgoing_webhooks
         WHERE id = $1 AND organization_id = $2
@@ -209,6 +213,8 @@ pub async fn update(
     if let Some(ref events) = request.events {
         validate_events(events)?;
     }
+    let new_format =
+        validate_webhook_format(request.format.as_deref()).map_err(AppError::Validation)?;
 
     // SECURITY: Validate URL against SSRF attacks if being updated
     if let Some(ref url) = request.url {
@@ -228,7 +234,7 @@ pub async fn update(
     // Check if webhook exists
     let existing: Option<OutgoingWebhook> = sqlx::query_as(
         r#"
-        SELECT id, organization_id, name, url, secret, events, enabled,
+        SELECT id, organization_id, name, url, secret, events, format, enabled,
                failure_count, last_triggered_at, last_status, created_at, updated_at
         FROM outgoing_webhooks
         WHERE id = $1 AND organization_id = $2
@@ -253,6 +259,7 @@ pub async fn update(
         Some(new_secret) => new_secret,
     };
     let enabled = request.enabled.unwrap_or(existing.enabled);
+    let format = new_format.map_or(existing.format, str::to_string);
 
     // The plan cap counts ENABLED webhooks (see get_org_resource_counts), and
     // create() charges 0 for a disabled one. Without this check an org could
@@ -283,9 +290,10 @@ pub async fn update(
         UPDATE outgoing_webhooks
         SET name = $1, url = $2, events = $3, secret = $4, enabled = $5,
             failure_count = CASE WHEN $8 THEN 0 ELSE failure_count END,
+            format = $9,
             updated_at = NOW()
         WHERE id = $6 AND organization_id = $7
-        RETURNING id, organization_id, name, url, secret, events, enabled,
+        RETURNING id, organization_id, name, url, secret, events, format, enabled,
                   failure_count, last_triggered_at, last_status, created_at, updated_at
         "#,
     )
@@ -297,6 +305,7 @@ pub async fn update(
     .bind(&id)
     .bind(&ctx.organization_id)
     .bind(reset_failures)
+    .bind(&format)
     .fetch_one(&mut *tx)
     .await?;
 
@@ -363,7 +372,7 @@ pub async fn test(
     // Get the webhook
     let webhook: Option<OutgoingWebhook> = sqlx::query_as(
         r#"
-        SELECT id, organization_id, name, url, secret, events, enabled,
+        SELECT id, organization_id, name, url, secret, events, format, enabled,
                failure_count, last_triggered_at, last_status, created_at, updated_at
         FROM outgoing_webhooks
         WHERE id = $1 AND organization_id = $2
@@ -409,9 +418,14 @@ pub async fn test(
 
     let start = std::time::Instant::now();
 
-    // Generate signature if secret is configured
+    // Generate signature if secret is configured. A chat-format webhook gets
+    // the test as a chat message too: Slack and Discord reject the raw JSON
+    // (400), so the test would always fail for them.
     let timestamp = Utc::now().timestamp();
-    let payload_json = serde_json::to_string(&test_payload).unwrap_or_default();
+    let payload_json = crate::outgoing_webhooks::format::body_for(
+        WebhookFormat::from_stored(&webhook.format),
+        &test_payload,
+    );
 
     let mut request_builder = client
         .post(&webhook.url)

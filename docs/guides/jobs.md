@@ -284,22 +284,45 @@ plan's workflow limit, so the retry answers `429 QUOTA_EXCEEDED` when no slot is
 ### List Jobs
 
 ```bash
-curl "https://api.spooled.cloud/api/v1/jobs?queue_name=emails&status=pending&order_by=priority&order_dir=desc&limit=50" \
+curl "https://api.spooled.cloud/api/v1/jobs?queue_name=emails&status=failed,deadletter&order_by=priority&order_dir=desc&limit=50" \
   -H "Authorization: Bearer sp_live_YOUR_API_KEY"
 ```
 
 | Parameter | Description |
 |-----------|-------------|
 | `queue_name` | Only this queue (letters, digits, `-`, `_`, `.`) |
-| `status` | `pending`, `scheduled`, `processing`, `completed`, `failed`, `deadletter` or `cancelled` (any case) |
+| `status` | One status or a comma-separated list: `pending`, `scheduled`, `processing`, `completed`, `failed`, `deadletter` or `cancelled` (any case) |
+| `q` | Search text (at most 255 bytes, case-insensitive): a job whose id starts with it, or whose queue name or `payload.job_type` contains it |
+| `job_type` | Exact `payload.job_type` (at most 255 bytes) |
+| `created_after`, `created_before` | RFC 3339 times: created at or after / before. Percent-encode a `+` offset as `%2B` |
 | `tag` | One tag, any characters up to 1024 bytes (`customer:42`) |
 | `order_by` | `created_at` (default), `updated_at`, `scheduled_at`, `completed_at`, `priority`, `status`, `queue_name`, `retry_count` |
 | `order_dir` | `desc` (default) or `asc` |
 | `limit`, `offset` | Page size (default 50, at most 100) and rows to skip. There is no cursor |
 
-An invalid `status`, `queue_name`, `tag`, `order_by` or `order_dir` is a `400`; it is not ignored.
-Rows that tie on the sort column are ordered by job id, so `offset` pages do not repeat or skip
-jobs. `GET /api/v1/jobs/dlq` takes the same parameters (without `status`).
+The filters combine with AND. An invalid `status` (any entry of the list), `queue_name`, `tag`,
+`q`, `job_type`, `created_after`, `created_before`, `order_by` or `order_dir` is a `400`; it is not
+ignored. Rows that tie on the sort column are ordered by job id, so `offset` pages do not repeat
+or skip jobs. `GET /api/v1/jobs/dlq` takes the same parameters (without `status`).
+
+The response is a plain array. Its `X-Has-More` header is `true` when another page follows, so a
+client can page until it reads `false`. A list runs under a 5 second statement timeout and a list
+that cannot be answered in time is a `400` with code `QUERY_TIMEOUT`: add `queue_name`, `status`,
+`job_type`, a created window or a longer `q` instead of retrying it. `q` looks at the first 1,000
+distinct job types of the organization; `job_type` (exact) finds the rest. See the
+[API usage guide](./api-usage.md#list-jobs).
+
+### Job History
+
+```bash
+curl "https://api.spooled.cloud/api/v1/jobs/job_xxx/history?order_dir=desc" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY"
+```
+
+The recorded lifecycle events of one job (`processing`, `completed`, `retry_scheduled`,
+`deadlettered`), oldest first unless `order_dir=desc`, `limit` 1 to 500 (default 100), `offset` and
+an `X-Has-More` header. Jobs handled over gRPC record few events, and a job has no `created` event.
+See the [API usage guide](./api-usage.md#job-history).
 
 ---
 

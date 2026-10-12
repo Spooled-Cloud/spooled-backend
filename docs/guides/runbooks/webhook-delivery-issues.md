@@ -15,6 +15,17 @@
 - Logs showing `webhook delivery failed: connection refused/timeout`
 - A webhook that has gone completely silent: 20 consecutive failed deliveries auto-disable
   it (`enabled = FALSE`, `last_status = 'auto_disabled'`)
+- A Slack, Discord or Teams URL answering `400` to every delivery: the webhook's `format` is still
+  `json` (the default), and those services reject the raw event envelope. `PUT` it with
+  `"format": "slack"`, `"discord"` or `"teams"` (a Teams *Workflows* / Power Automate URL expects an
+  Adaptive Card and rejects the `teams` MessageCard too). Check with
+  `SELECT id, url, format FROM outgoing_webhooks WHERE id = '<webhook id>';`
+- A `workflow.completed` / `workflow.failed` that never arrived: these are announced at most once by
+  a scheduler pass (see the [webhooks guide](../webhooks.md#workflow-outcomes-are-announced-at-most-once)).
+  A restart at that moment, a full delivery queue (`spooled_outgoing_webhook_deliveries_dropped_total`),
+  a scheduler that was down for over an hour, or a workflow retried within about 10 seconds of
+  failing loses the event, and nothing re-sends it. Read the state with `GET /api/v1/workflows/{id}`
+  instead.
 
 ---
 

@@ -130,6 +130,35 @@ empty `X-Admin-Key` header pass closed registration and signup, and an empty
 `STRIPE_BILLING_WEBHOOK_SECRET` verified forged webhooks (BE-43). The gates also
 refuse an empty configured key explicitly.
 
+## Plan rate limiter and `X-RateLimit-*` headers (0.1.122, QW9, W8-R1)
+
+`plan_rate_limit_middleware` (`api/middleware/plan_rate_limit.rs:291`) runs on the protected and realtime routers (JWT requests of the
+dashboard too). Per request it checks (1) the organization's token bucket (`cache::check_token_bucket`, key `rate_limit:org:{org}`,
+size = plan burst, refill = plan rps, or the `custom_limits` overrides) and then (2) the API key's own `rate_limit` (requests per
+**minute**, fixed one-minute window, `cache::check_rate_limit`, key `rate_limit:api_key:{id}`), so a key limit can only lower the plan
+limit (invariants #31). Public routes use a per-client limiter and admin routes their own; both answer `429` with `Retry-After` only.
+
+- **Headers** (`RateLimitHeaders` `:92`, constants `HEADER_LIMIT` ... `HEADER_SCOPE` `:49-57`): `X-RateLimit-Limit`,
+  `X-RateLimit-Remaining`, `X-RateLimit-Reset`, `X-RateLimit-Scope` (`organization` | `api_key`) on every authenticated response
+  that passed the limiter and on its `429`. Organization scope: `Limit` = burst, `Remaining` = whole tokens left after this request
+  (`from_token_bucket` `:101`), `reset_secs` = `ceil(next_token_ms / 1000)` (0 when the bucket is full). Key scope: `Limit` = the key's
+  `rate_limit`, `reset_secs` = seconds to the window's `reset_at` (`from_window` `:111`). With both, `tighter` (`:137`) keeps the one
+  with fewer remaining, ties to the later reset.
+- **`X-RateLimit-Reset` is a Unix time in seconds** (`reset_at(now) = now + reset_secs`, `:149`; the current time while the bucket is
+  full), not the wait. W8-R1: the first design sent the wait; all four SDKs parse the header as an epoch (a delta reads as January
+  1970). `Retry-After` stays the wait. On a `429`, `rate_limit_exceeded_response` (`:170`) takes ONE clock reading for the body's
+  `reset_at` and the header, so they are equal; `Remaining` is 0 and `Reset` is `now + Retry-After`.
+- **No headers** when no check ran or one was skipped: public and admin routes, no Redis, a Redis error in fail-open mode
+  (`bypassed`, because the numbers would be wrong), and the fail-closed `Rate limit unavailable` 429 (`Retry-After: 5` only).
+  Clients must treat the headers as optional.
+- **Token-bucket script** returns a 4th value, `next_token_ms` (`cache/mod.rs:762`, `TokenBucketResult::next_token_ms` `:790`): the
+  time until `floor(tokens) + 1` accrues, 0 when full, equal to `retry_after_ms` on refusal. The hash layout is unchanged, so old and
+  new replicas share buckets in a rolling deploy; the script has a new SHA (`EVALSHA` falls back to `EVAL` on `NOSCRIPT`). gRPC callers
+  ignore the new field.
+- **CORS** (`cors_exposed_headers` `api/mod.rs:85`, applied to the production and the development `CorsLayer`): `Access-Control-Expose-Headers`
+  lists `x-ratelimit-limit`, `-remaining`, `-reset`, `-scope`, `retry-after`, `x-request-id`, `x-has-more`. None of them is CORS-safelisted,
+  so without it the cross-origin dashboard (`PUBLIC_API_URL`) reads none. A new response header a browser client needs must be added there.
+
 ## Client IP: TCP peer, edge headers, IPv6 /64 (0.1.120, BEAUTH-10, BEBILL-24)
 
 `main.rs` serves with `into_make_service_with_connect_info::<SocketAddr>()`, so each request carries its TCP

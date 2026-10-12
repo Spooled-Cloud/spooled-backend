@@ -11,7 +11,9 @@ use std::time::Duration;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, warn};
 
-use crate::models::OutgoingWebhook;
+use super::events;
+use super::format::body_for;
+use crate::models::{OutgoingWebhook, WebhookFormat};
 use crate::security::{
     build_outbound_http_client, validate_webhook_url as validate_url_ssrf, UrlValidationOptions,
 };
@@ -147,7 +149,7 @@ enum Work {
         admission: OwnedSemaphorePermit,
     },
     /// One event for one webhook.
-    Delivery(Delivery),
+    Delivery(Box<Delivery>),
 }
 
 struct Delivery {
@@ -246,8 +248,33 @@ impl OutgoingWebhookService {
     /// Best-effort fire-and-forget dispatch used by REST/gRPC handlers.
     ///
     /// Never blocks and never spawns: the event is queued for the consumers,
-    /// or dropped (and counted) when the queue is full.
+    /// or dropped (and counted) when the queue is full. An event that implies
+    /// another ([`events::implied_event`]: a dead-lettering `job.failed` is
+    /// also a `job.deadlettered`) queues that one too, with the same data.
     pub fn spawn_dispatch(
+        self: &Arc<Self>,
+        organization_id: String,
+        event: String,
+        resource_id: String,
+        payload: serde_json::Value,
+    ) {
+        // The event itself first: with the queue nearly full, the one callers
+        // always had wins the last slot.
+        let implied = events::implied_event(&event, &payload).map(|implied| {
+            (
+                implied.to_string(),
+                organization_id.clone(),
+                resource_id.clone(),
+                payload.clone(),
+            )
+        });
+        self.queue_event(organization_id, event, resource_id, payload);
+        if let Some((implied, organization_id, resource_id, payload)) = implied {
+            self.queue_event(organization_id, implied, resource_id, payload);
+        }
+    }
+
+    fn queue_event(
         self: &Arc<Self>,
         organization_id: String,
         event: String,
@@ -268,8 +295,9 @@ impl OutgoingWebhookService {
         });
     }
 
-    /// Queue one delivery per matching webhook. Returns once they are queued,
-    /// not delivered.
+    /// Queue one delivery per matching webhook (and per webhook matching the
+    /// event it implies, as in [`Self::spawn_dispatch`]). Returns once they are
+    /// queued, not delivered.
     pub async fn dispatch_event(
         &self,
         event: String,
@@ -277,9 +305,16 @@ impl OutgoingWebhookService {
         payload: serde_json::Value,
         organization_id: &str,
     ) -> Result<()> {
+        let implied = events::implied_event(&event, &payload).map(|i| (i, payload.clone()));
         self.inner
             .fan_out(&event, resource_id, payload, organization_id, None)
-            .await
+            .await?;
+        if let Some((implied, payload)) = implied {
+            self.inner
+                .fan_out(implied, resource_id, payload, organization_id, None)
+                .await?;
+        }
+        Ok(())
     }
 
     pub async fn retry_delivery(&self, delivery_id: uuid::Uuid) -> Result<bool> {
@@ -287,7 +322,7 @@ impl OutgoingWebhookService {
         let row = sqlx::query(
             r#"
             SELECT d.webhook_id, d.event, d.status, d.payload, d.attempts, d.created_at,
-                   w.url, w.secret
+                   w.url, w.secret, w.format
             FROM outgoing_webhook_deliveries d
             JOIN outgoing_webhooks w ON d.webhook_id = w.id
             WHERE d.id = $1
@@ -310,6 +345,9 @@ impl OutgoingWebhookService {
             url: row.get("url"),
             secret: row.get("secret"),
             events: vec![], // Not needed
+            // The webhook's current format: the stored payload is the
+            // envelope, rendered again for this attempt.
+            format: row.get("format"),
             enabled: true,
             failure_count: 0,
             last_triggered_at: None,
@@ -538,7 +576,7 @@ impl Inner {
                 "created_at": Utc::now(),
                 "data": payload.clone(),
             });
-            self.enqueue(Work::Delivery(Delivery {
+            self.enqueue(Work::Delivery(Box::new(Delivery {
                 webhook,
                 body,
                 attempt: 1,
@@ -546,7 +584,7 @@ impl Inner {
                 lane_slot: None,
                 _share: share,
                 _admission: admission,
-            }));
+            })));
         }
 
         Ok(())
@@ -570,7 +608,7 @@ impl Inner {
     }
 
     /// Run one attempt of `delivery`, then retry it, resolve it or drop it.
-    async fn work(self: &Arc<Self>, mut delivery: Delivery) {
+    async fn work(self: &Arc<Self>, mut delivery: Box<Delivery>) {
         if delivery.lane_slot.is_none() {
             match Arc::clone(&delivery.lane.slots).try_acquire_owned() {
                 Ok(slot) => delivery.lane_slot = Some(slot),
@@ -653,7 +691,7 @@ impl Inner {
 
     /// Re-queue `delivery` after its backoff. While it sleeps it keeps its
     /// queue permit (memory stays bounded) but holds no request slot.
-    fn schedule_retry(self: &Arc<Self>, mut delivery: Delivery) {
+    fn schedule_retry(self: &Arc<Self>, mut delivery: Box<Delivery>) {
         let backoff = Duration::from_secs(2_u64.pow((delivery.attempt - 1).clamp(0, 5) as u32));
         warn!(
             webhook_id = %delivery.webhook.id,
@@ -747,7 +785,10 @@ impl Inner {
             return Attempt::Rejected;
         }
 
-        let payload_json = serde_json::to_string(body).unwrap_or_default();
+        // `body` is the envelope, and it is what the delivery log keeps; the
+        // webhook's format decides what goes on the wire (the envelope itself
+        // for `json`). The signature covers the bytes sent.
+        let payload_json = body_for(WebhookFormat::from_stored(&webhook.format), body);
         let timestamp = Utc::now().timestamp();
         let event = body["event"].as_str().unwrap_or_default();
 

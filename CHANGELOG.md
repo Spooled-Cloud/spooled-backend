@@ -11,6 +11,393 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.122] - 2026-10-12
+
+Wave 8 of the 2026-10-10 bug hunt, the feature quick wins QW8-QW16 of the
+features review (QW13 is dashboard-only): rate-limit headers, server-side job
+list filters, the job history route, worker job counters, four new
+outgoing-webhook events with Slack, Discord and Teams formats, the inbound
+webhook log, and a CI check that the router and `docs/openapi.yaml` list the
+same endpoints. Review found three problems before release, all fixed here: the
+unit of the rate-limit reset header (W8-R1), the cost of the job-type search
+(W8-R2) and a lock-order deadlock in the worker counter trigger (W8-R3).
+
+### Upgrade notes
+
+- **The API change is additive.** Two new routes (`GET /jobs/{id}/history`,
+  `GET /webhooks/deliveries`), new optional list parameters, new response
+  fields and headers, four new event names. Response bodies keep their shape
+  (the job lists are still a bare array) and existing outgoing webhooks keep
+  sending the signed JSON envelope byte for byte. Three existing calls behave
+  differently:
+  - `GET /jobs?status=failed,deadletter` was a `400`; it is a status list now.
+  - `q`, `job_type`, `created_after` and `created_before` on `GET /jobs` and
+    `GET /jobs/dlq` were ignored, like any unknown parameter; they filter now,
+    and an invalid value is a `400` (QW12).
+  - A job list the database cannot answer within 5 s is stopped and answers
+    `400 QUERY_TIMEOUT`, where it used to run until the 30 s request timeout cut
+    it off (the statement kept running in the database). Set
+    `DATABASE_LIST_STATEMENT_TIMEOUT_MS` to change the 5000 ms default (W8-R2).
+- **`X-RateLimit-*` response headers exist now** (QW9). Authenticated responses
+  that went through the plan rate limiter carry `X-RateLimit-Limit`,
+  `X-RateLimit-Remaining`, `X-RateLimit-Reset` and `X-RateLimit-Scope`.
+  **`X-RateLimit-Reset` is a Unix time in seconds**, the moment
+  `X-RateLimit-Remaining` next goes up (the current time while the bucket is
+  full); on a `429` it equals the body's `reset_at`, and `Retry-After` is still
+  the wait in seconds. The first draft sent the wait in seconds, which all four
+  SDKs parse as an epoch and would have shown as January 1970; that was caught
+  in review and never released (W8-R1). The headers are left out when no
+  rate-limit check ran or it was skipped (public and admin routes, Redis not
+  configured, Redis failing with `RATE_LIMIT_FAIL_CLOSED` off, the fail-closed
+  `Rate limit unavailable` answer), so clients must treat them as optional.
+- **A browser can read them now.** The CORS layers expose
+  `X-RateLimit-Limit`, `-Remaining`, `-Reset`, `-Scope`, `Retry-After`,
+  `X-Request-Id` and `X-Has-More`; before, no response header was exposed and a
+  cross-origin dashboard could not read `Retry-After` either.
+- **New webhook events.** `job.deadlettered`, `job.retried`,
+  `workflow.completed` and `workflow.failed` can be subscribed to with the
+  existing create and update calls (QW8). `job.deadlettered` is sent next to
+  every `job.failed` whose `data.status` is `deadletter`; `job.retried` once per
+  job that `POST /jobs/{id}/retry`, `POST /jobs/dlq/retry` or `POST
+  /workflows/{id}/retry` puts back to `pending`. **`workflow.completed` and
+  `workflow.failed` are announced at most once**: a scheduler pass every 10 s
+  claims the workflows that ended, marks them announced, commits, and only then
+  hands the events to the in-memory delivery queue. No outcome is sent twice,
+  whichever instance runs the pass, but an outcome is lost when
+  - the process stops between that commit and the delivery being recorded;
+  - the delivery queue (or the webhook's share of it) is full, so the event is
+    dropped and counted in `spooled_outgoing_webhook_deliveries_dropped_total`,
+    or recording the delivery fails;
+  - the workflow is retried (`POST /workflows/{id}/retry` clears
+    `completed_at`) before the next pass sees it, so a workflow that fails and
+    is retried within about 10 s never announces that `workflow.failed`, only
+    the outcome it reaches afterwards;
+  - the outcome is more than an hour old when a pass first sees it (no
+    scheduler ran for that long); everything that ended before this release is
+    never announced either.
+
+  A pass announces at most 500 outcomes, the rest follow on the next pass. A
+  cancelled workflow sends neither event. Treat the event as a prompt and
+  confirm with `GET /workflows/{id}`; making it at-least-once needs a durable
+  outbox (W8-R4).
+- **Outgoing webhooks take a `format`** (QW14): `json` (the default, and every
+  existing webhook), `slack`, `discord` or `teams`. A chat format sends one
+  short message built from the event, so the incoming-webhook URL of the chat
+  service can be used as it is; `X-Spooled-Signature` signs the bytes actually
+  sent. The Teams format is the legacy `MessageCard` of Office 365 connector
+  webhooks; Teams Workflows (Power Automate) URLs expect an Adaptive Card and
+  reject it.
+- **`GET /webhooks/deliveries` is the inbound webhook log** (QW11): the accepted
+  requests to `POST /webhooks/{org_id}/custom`, newest first. Unrestricted API
+  keys only, a queue-scoped key gets `403 ACCESS_DENIED`. Entries older than
+  this release have `null` `job_id` and `status`.
+- **Workers report `jobs_processed` and `jobs_failed`** (QW15). They start at 0
+  with this release: past failures cannot be attributed. They are kept by a
+  database trigger and only count outcomes a worker reported while it held the
+  lease; sweep releases and the server-side dead-letter of a job too large for
+  a gRPC message are not counted (details under Workers).
+- Eight new migrations run at startup, two of them `CREATE INDEX CONCURRENTLY`
+  (listed below). The index builds do not block reads or writes but wait for
+  transactions that were already open, so a long-lived or idle session delays
+  startup; `20261014110000` takes a short lock on `jobs` and `workers`. Run the
+  checks in `docs/guides/deployment.md`, "0.1.122 checks", after the rollout.
+- No new Prometheus series. The new events share the delivery queue, its bounds
+  and its drop counter with the existing ones.
+
+### Rate limiting
+
+- **Headers from the limiter the request was counted against** (QW9). With the
+  organization's token bucket, `Limit` is the plan burst (Free 10, Starter 50,
+  Pro 200, Enterprise 1000, or `custom_limits.rate_limit_burst`), `Remaining` the
+  whole tokens left after this request, `Reset` the time the next whole token
+  arrives (now, when the bucket is full), `Scope` `organization`. With an API
+  key's own `rate_limit` (requests per minute, a fixed window), `Limit` is that
+  value, `Reset` the start of the next window and `Scope` `api_key`. When both
+  apply, the one that runs out first is reported: fewer requests remaining, and
+  on a tie the later reset.
+- **A `429` carries the same headers** with `Remaining` 0, `Retry-After` as
+  before, and `X-RateLimit-Reset` and the body's `reset_at` taken from one clock
+  reading, so they are equal (W8-R1). The public and admin limiters still answer
+  with `Retry-After` only; their `429` bodies are unchanged. All the `429`
+  builders in `plan_rate_limit.rs` now share one helper.
+- **Token bucket script.** The Lua script behind `check_token_bucket` also
+  returns the milliseconds until the next whole token (`TokenBucketResult::next_token_ms`).
+  The script has a new SHA (`EVALSHA` falls back to `EVAL` on `NOSCRIPT`), and
+  the bucket's hash fields are unchanged, so old and new replicas share buckets
+  during a rolling deploy. gRPC callers ignore the new field.
+- **CORS exposes the headers** listed in the upgrade notes, on both the
+  production and the development layer (`cors_exposed_headers` in
+  `src/api/mod.rs`).
+
+### Jobs API
+
+- **Server-side list filters** (QW12). `GET /jobs` takes `status` as one status
+  or a comma list (case-insensitive, blanks and repeats ignored, an unknown
+  entry a `400` that names it), `q`, `job_type`, `created_after` (inclusive) and
+  `created_before` (exclusive), the last two as RFC 3339 (a `+` offset that
+  arrived as a space is read as `+`; `created_after` not before `created_before`
+  is a `400`). `q` is trimmed, at most 255 bytes, free of NUL, and matches
+  case-insensitively a job whose **id starts with it**, whose `queue_name`
+  contains it or whose `payload.job_type` contains it; `%` and `_` match
+  themselves. `job_type` is an exact match of at most 255 bytes. All filters
+  combine with AND and with `queue_name`, `tag` and the key's queue scope.
+  `GET /jobs/dlq` takes the same filters except `status`, which it still
+  ignores. The order is unchanged (`created_at DESC`, then id).
+- **`X-Has-More`** on `GET /jobs`, `GET /jobs/dlq` and `GET /jobs/{id}/history`:
+  `true` when another page follows. The list fetches one row past the page, the
+  body stays a bare array, and `limit` is still capped at 100.
+- **The job-type search is bounded and indexed** (W8-R2). The first version of
+  `q` and `job_type` walked `idx_jobs_org_created` through every job of the
+  organization and read each payload from TOAST: on 130,000 jobs of ~3 KB
+  payloads, `job_type=X` took 381 ms and a `q` search 466 ms, with no timeout.
+  - New index `idx_jobs_org_job_type` (organization, `payload->>'job_type'`,
+    `created_at DESC`), partial on `octet_length(payload->>'job_type') <= 255`
+    so a long free-text type can neither fail the build nor the insert of such
+    a job. `job_type=X` reads it: 0.12 ms. A job without a job type is not in
+    it.
+  - `q` never reads a payload. Its job-type part first resolves, by a skip scan
+    of that index, the organization's matching job types, then probes each type
+    through the index and unions the result with the id / queue part: 54 ms.
+    **That part sees only the first 1,000 distinct job types** of the
+    organization in sort order, each at most 255 bytes. A job whose type is
+    beyond that, or longer, is still found by `job_type` (exact, up to 255
+    bytes), by its id prefix and by its queue.
+  - The queries repeat the index predicate verbatim; the planner only uses a
+    partial index whose predicate the query implies.
+- **List statement timeout** (W8-R2). `GET /jobs` and `GET /jobs/dlq` run in a
+  read-only transaction with `SET LOCAL statement_timeout`
+  (`DATABASE_LIST_STATEMENT_TIMEOUT_MS`, default 5000; `0` is refused at
+  startup because Postgres reads it as no timeout). Postgres cancels the
+  statement itself, which also bounds a request whose client went away. A list
+  it stopped is `400 QUERY_TIMEOUT` ("narrow it with `queue_name`, `status`,
+  `job_type`, `created_after` or `created_before`, or a longer `q`"), not a
+  5xx: the same list would only time out again, and the SDKs retry 5xx and count
+  them toward their circuit breaker. `LOCAL` ends with the transaction, so the
+  setting never reaches the next user of the pooled connection or a
+  transaction-mode PgBouncer client. Any other database failure stays a `500`
+  without SQL text.
+- **`GET /jobs/{id}/history`** (QW10). The recorded `job_history` events of a
+  job, oldest first (`order_dir=desc`, alias `order`, for newest first), with
+  `limit` (default 100, 1 to 500), `offset` and `X-Has-More`. Another
+  organization's job, an unknown id and a queue outside the key's scope are all
+  `404`, as for `GET /jobs/{id}`. `worker_id` is the column or else the
+  `worker_id` the claim wrote into `details`. Events exist only where code
+  writes them: REST claim (`processing`), REST complete (`completed`), REST
+  fail (`retry_scheduled`, `deadlettered`) and the scheduler's dead-letter
+  sweeps (`deadlettered`). `QueueManager::enqueue` would write `created`, but
+  no REST or gRPC handler calls it. **The history is sparse for jobs that go
+  through gRPC, and no job has a `created` event** (F12, Phase 2).
+- **The status of `job.failed` comes from the transition.** `POST
+  /jobs/{id}/fail` used to read the job's status back after the commit; by then
+  a retry may have been claimed again or a dead-lettered job retried, and the
+  `job.failed` event (and the `job.deadlettered` it implies), the realtime
+  events and the metrics were skipped or carried the wrong status. They use the
+  status the fail transaction set.
+- **`job.retried` on every manual retry.** `POST /jobs/{id}/retry`, `POST
+  /jobs/dlq/retry` (one event per job that left the DLQ) and `POST
+  /workflows/{id}/retry` send it after the commit, with `old_status` and a
+  `source` of `job_retry`, `dlq_retry` or `workflow_retry`. The workflow retry
+  statement is now `UPDATE ... FROM` so it can return each job's previous
+  status; its predicate is unchanged.
+
+### Workers
+
+- **`jobs_processed` and `jobs_failed`** on `GET /workers` and `GET /workers/{id}`
+  (QW15; the backend half of FEAT B7, the dashboard's `Processed 0 / Failed 0`).
+  `workers.jobs_processed` and `workers.jobs_failed` are `BIGINT NOT NULL
+  DEFAULT 0`, written only by the trigger `trigger_count_worker_job_outcome` on
+  `jobs`, never by application code, so REST, gRPC and any path added later
+  count alike. A move out of `processing` counts for `OLD.assigned_worker_id`
+  when the lease was still live (`OLD.lease_expires_at > now()`): to `completed`
+  adds to `jobs_processed`; to `failed`, `deadletter`, or back to `pending` /
+  `scheduled` with a raised `retry_count` (a scheduled retry) adds to
+  `jobs_failed`. The counters are disjoint: a job that fails twice and then
+  completes adds 2 and 1.
+- **What is not counted.** Every worker call needs a live lease and every sweep
+  an expired one, so lease-expiry recovery and the offline-worker release and
+  dead-letter never count as the worker's failure. A release that keeps
+  `retry_count` (deregistration, an undelivered gRPC claim) counts nothing, and
+  neither does the gRPC dead-letter of a job too large for a gRPC message: that
+  is the server's decision, so its transaction first expires the lease
+  (`lease_expires_at = now()`) and then dead-letters the job. Counts survive a
+  re-registration of the same worker id; workers that existed before the
+  release start at 0.
+- **Deadlock found before release (W8-R3).** The first version was an ordinary
+  AFTER trigger. AFTER triggers run in name order, so it fired before
+  `trigger_update_dependent_jobs` and `trigger_update_workflow_progress` and a
+  settling transaction locked the job row, then the worker row, then the job's
+  dependents. With `dependency_mode` `any`, a worker completing a job at the
+  same moment as a dependent it was already running deadlocked: 225 of 300
+  rounds of a two-session race. The trigger is now a **constraint trigger,
+  `DEFERRABLE INITIALLY DEFERRED`**: its `WHEN` clause is still checked at the
+  row update, on that update's old and new rows, but the counting `UPDATE` runs
+  at `COMMIT`, so the worker row is the last lock a transaction takes (0 of 300
+  rounds). A failure in the counting update now fails the `COMMIT` instead of
+  the statement. Never make the trigger immediate again.
+- **Cost.** An `UPDATE` that does not set `status` never fires it, and for one
+  that does the `WHEN` clause is checked without calling the function (20,000
+  lease renewals: 1,048 ms with and without it). A counted transition adds one
+  primary-key update of the worker row at commit: one completion per
+  transaction on PostgreSQL 16, 8 clients over 200 workers, 8,963 vs 10,094 tps
+  (about 11%). Completions of one worker id serialize on its row for the length
+  of the commit: 8 clients on one worker, 8,797 vs 10,217 tps.
+
+### Webhooks
+
+- **New events** (QW8). The `outgoing_webhook_events_check` constraint is
+  replaced by a superset (a webhook still cannot subscribe to an unknown
+  event) and `VALID_WEBHOOK_EVENTS` has the four names; see the upgrade notes
+  for what each sends. `data` of `job.deadlettered` is that of the
+  `job.failed` it follows (`job_id`, `queue_name`, `status: "deadletter"`,
+  `error`); `job.retried` has `job_id`, `queue_name`, `status: "pending"`,
+  `old_status` (`failed`, `deadletter` or `cancelled`), `source` and, for a
+  workflow job, `workflow_id`; `workflow.completed` / `workflow.failed` have
+  `workflow_id`, `name`, `status`, `total_jobs`, `completed_jobs`, `failed_jobs`,
+  `created_at`, `started_at`, `completed_at` and `metadata`.
+- **`job.deadlettered` is derived, not emitted.** The dispatcher
+  (`OutgoingWebhookService::spawn_dispatch` and `dispatch_event`) queues it for
+  any `job.failed` whose `data.status` is `deadletter`, so REST fail, gRPC
+  `Fail` and `ProcessJobs`, gRPC lease expiry, the oversized-job dead-letter and
+  both scheduler sweeps send it once per transition, and so does any path added
+  later. **No caller may send `job.deadlettered` itself** (it would arrive
+  twice), and a path that retries a job must not use `status: "deadletter"`. It
+  queues after the `job.failed` it follows, so with the delivery queue almost
+  full the original wins the last slot.
+- **Workflow outcomes** are announced by the scheduler at the end of the
+  10-second dependency pass (`announce_workflow_outcomes`), one statement that
+  claims the `completed` / `failed` workflows whose `completed_at` differs from
+  the new `workflows.announced_completed_at`, copies the one into the other and
+  returns them, `FOR UPDATE SKIP LOCKED`. It covers both ways a workflow ends,
+  the progress trigger on `jobs` (which runs inside the settling transaction,
+  where no webhook can be sent) and the terminate sweep, and a retry clears
+  `completed_at`, so the next outcome is announced again. The partial index
+  `idx_workflows_unannounced_outcome` has the statement's predicate verbatim.
+- **Formats** (QW14). `slack` sends `{"text"}` in mrkdwn with `&`, `<` and `>`
+  escaped, so a value cannot form a link or an `<!channel>`; `discord` sends
+  `{"content"}` of at most 2,000 characters with markdown escaped and
+  `allowed_mentions: {"parse": []}`, so an `@everyone` in an error text pings
+  nobody; `teams` sends a `MessageCard` with the title, the event as `text` and
+  the fields as facts (green, red or blue by event). The message shows these
+  `data` fields when present, in this order: `name`, `workflow_id`, `job_id`,
+  `queue_name`, `schedule_id`, `worker_id`, `hostname`, `status`, `old_status`,
+  `source`, `completed_jobs`, `failed_jobs`, `total_jobs`, `error`, `reason`,
+  `message`; a value is cut at 300 characters. The body is rendered at delivery
+  from the stored envelope, headers are unchanged, the delivery history keeps the
+  envelope, a manual retry renders with the webhook's current format, and
+  `POST /outgoing-webhooks/{id}/test` sends the chat format too (Slack and
+  Discord answer `400` to raw JSON). `format` is validated case-insensitively on
+  create and update (`400` otherwise) and returned by create, get, list and
+  update; on update, omitting it keeps the current one.
+- **Inbound webhook log** (QW11). `GET /webhooks/deliveries` returns `id`,
+  `provider`, `event_type` (`custom` when the request had none), `matched_queue`,
+  `job_id`, `status` (`created` or `duplicate`) and `created_at`, newest first
+  (`created_at DESC`, id), with `limit` (default 50, 1 to 100) and `offset`
+  and the filters `status`, `since` (RFC 3339, inclusive) and `queue_name`
+  (alias `queue`, exact match, at most 255 characters). An invalid filter is a
+  `400`. It never returns the payload, a signature or the organization id, and
+  only accepted requests are logged (a bad token or an over-limit request
+  writes nothing, so unauthenticated traffic cannot grow the table).
+  `matched_queue` is now the queue of the job the request resolved to, which
+  differs from the request's `queue_name` only for an idempotent replay.
+  The existing retention sweep applies.
+
+### Tooling and docs
+
+- **Router vs OpenAPI check** (QW16). `scripts/check_openapi_drift.py` (Python 3,
+  standard library only) reads every `.route(...)` in `src/api/mod.rs`, with the
+  prefix of the `.nest` that mounts its builder, and every operation under
+  `paths:` in `docs/openapi.yaml`, and fails when a routed endpoint is
+  undocumented, a documented one is not routed or a path parameter is named
+  differently. A construct it cannot read (`any()`, `on()`, `route_service`, a
+  nest of a non-local router, `$ref` path items) fails the check instead of
+  being skipped. Exceptions live in `scripts/openapi-drift-allowlist.json`, each
+  with a reason (empty today). CI has a new `openapi-drift` job (the script's
+  self-test, then the check) and the Docker build job waits for it. 105 routed
+  and 105 documented operations are in sync. **A new route now needs its
+  `docs/openapi.yaml` path in the same change.**
+- **OpenAPI** documents `GET /organizations/{id}/members` (the one real gap the
+  check found), `GET /jobs/{id}/history`, `GET /webhooks/deliveries`, the list
+  filters, `X-Has-More`, `QUERY_TIMEOUT`, the rate-limit headers, the worker
+  counters, the four events and `format`.
+- **Documentation:** the API usage, jobs, workers, webhooks, operations and
+  deployment guides and the README describe all of the above; the guides no
+  longer say there are no `X-RateLimit-*` headers.
+
+### Migrations
+
+All eight run at startup, in this order:
+
+- `20261014100000_outgoing_webhook_events_and_format.sql` (replaces the events
+  CHECK by a superset, adds `outgoing_webhooks.format` `NOT NULL DEFAULT 'json'`
+  with its CHECK)
+- `20261014100100_inbound_webhook_delivery_outcome.sql` (adds nullable
+  `webhook_deliveries.job_id` and `status`, the status CHECK `NOT VALID`)
+- `20261014100200_workflow_outcome_announcement.sql` (adds nullable
+  `workflows.announced_completed_at`)
+- `20261014100201_workflow_outcome_index.sql` (`CREATE INDEX CONCURRENTLY`
+  `idx_workflows_unannounced_outcome`; a single statement outside a
+  transaction)
+- `20261014100202_workflow_outcome_index_repair.sql` (the `INVALID`-index repair
+  for the previous one)
+- `20261014110000_worker_job_counters.sql` (`count_worker_job_outcome()`, the
+  deferred constraint trigger `trigger_count_worker_job_outcome` on `jobs`, and
+  `workers.jobs_processed` / `jobs_failed`)
+- `20261014120000_job_type_index.sql` (`CREATE INDEX CONCURRENTLY`
+  `idx_jobs_org_job_type`)
+- `20261014120001_job_type_index_repair.sql` (the `INVALID`-index repair for the
+  previous one)
+
+The two `CREATE INDEX CONCURRENTLY` files carry no `SET lock_timeout`, for the
+reason given under 0.1.121: sqlx sends a `-- no-transaction` file as one query
+string, which Postgres runs as an implicit transaction block that refuses
+`CREATE INDEX CONCURRENTLY`. Both need no lock that blocks reads or writes. A
+replica that waits on the migrator's advisory lock can be chosen as the deadlock
+victim of an index build: startup then fails once and the repair migration
+rebuilds the `INVALID` index on the next start, blocking writes to that table
+for the build (about half a second at 130,000 `jobs` rows of ~3 KB payloads).
+Production is a single container. The other migrations start with `SET LOCAL
+lock_timeout = '5s'`; the ones that add a column take `ACCESS EXCLUSIVE` on the
+table for an instant (`webhook_deliveries`, `workflows`, `outgoing_webhooks`,
+`workers`; catalog-only, no rewrite), and `20261014110000` first creates the
+trigger, which takes `SHARE ROW EXCLUSIVE` on `jobs` (it waits for writers in
+flight and blocks new ones while held). On a busy `jobs` table a start can fail
+on the `lock_timeout` once and succeed on the next. `20261014110000` is
+idempotent: a constraint trigger has no `CREATE OR REPLACE`, so a re-run drops
+the trigger first. Rolling back to 0.1.121 is safe: the new columns are unused
+there and the widened CHECK is a superset.
+
+### Deferred / known
+
+- **QW8 is done** (the 0.1.121 "Deferred / known" entry is superseded), with the
+  at-most-once limits of the workflow events above (W8-R4).
+- **Job history is incomplete (F12).** gRPC complete, fail and dequeue write no
+  `job_history` rows and no handler writes a `created` row, so
+  `GET /jobs/{id}/history` covers REST worker calls and scheduler dead-letters.
+- **`q` is not index-backed for its id and queue parts.** The job-type part is
+  bounded (first 1,000 types) and the statement timeout bounds the whole list,
+  but an organization with a very large `jobs` table can still make a broad `q`
+  without a created window answer `400 QUERY_TIMEOUT`. A trigram index would
+  need `pg_trgm` and a write cost on every insert.
+- **Hot worker row (QW15).** Completions of one worker id serialize on its row
+  for the commit, about 8,800 completions a second on a local SSD. If that ever
+  binds, move the counters to a sharded side table summed on read; the API
+  fields would not change.
+- **Counting rules are a product choice**: the counters are disjoint, every
+  sweep outcome is excluded (including a dead-letter after a worker crash) and
+  there is no backfill.
+- **Teams** is the legacy `MessageCard` format; an Adaptive Card format for
+  Teams Workflows is not offered yet.
+- **`src/webhook/mod.rs` is dead code** (an unused public module whose `INSERT`
+  into `webhook_deliveries` names columns that do not exist). Delete or fix it.
+- **Clients are cross-repo.** This release is the backend half: using the new
+  list filters and `X-Has-More`, the history route, the worker counters, the
+  event names and `format` in the dashboard and the SDKs is tracked in those
+  repositories, and the backend works without them.
+- The 0.1.121 open items (BEJOB-16, BEJOB-19, BEJOB-20, BEFLOW-05, BEFLOW-21 and
+  the others) are unchanged.
+
+---
+
 ## [0.1.121] - 2026-10-11
 
 Fixes from the 2026-10-10 bug hunt (wave 5): the jobs API, workflows and

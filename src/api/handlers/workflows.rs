@@ -31,6 +31,7 @@ use crate::{
         Workflow, WorkflowDependencyResponse, WorkflowDetailResponse, WorkflowJobMapping,
         WorkflowJobResponse, WorkflowProgress, WorkflowResponse, WorkflowStatus,
     },
+    outgoing_webhooks::events,
 };
 
 async fn require_workflow_access<'e, E>(
@@ -708,7 +709,9 @@ pub async fn retry(
     // reset dependent whose parent is also being reset re-gates (FALSE) and is
     // released by the completion trigger when the parent re-completes; one whose
     // parent already completed is runnable immediately (TRUE).
-    let updated = sqlx::query(
+    // RETURNING carries each job's status before the reset (from the FROM
+    // list, read in the same statement) for its job.retried event.
+    let retried: Vec<(String, String, String)> = sqlx::query_as(
         r#"
         UPDATE jobs
         SET status = 'pending',
@@ -716,19 +719,27 @@ pub async fn retry(
             last_error = NULL,
             started_at = NULL,
             completed_at = NULL,
-            dependencies_met = check_job_dependencies_met(id),
+            dependencies_met = check_job_dependencies_met(jobs.id),
             updated_at = NOW()
-        WHERE workflow_id = $1
-          AND organization_id = $2
-          AND status IN ('failed', 'deadletter', 'cancelled')
+        FROM (
+            SELECT id, status FROM jobs
+            WHERE workflow_id = $1
+              AND organization_id = $2
+              AND status IN ('failed', 'deadletter', 'cancelled')
+        ) AS prev
+        WHERE jobs.id = prev.id
+          AND jobs.workflow_id = $1
+          AND jobs.organization_id = $2
+          AND jobs.status IN ('failed', 'deadletter', 'cancelled')
+        RETURNING jobs.id, jobs.queue_name, prev.status
         "#,
     )
     .bind(&workflow_id)
     .bind(&ctx.organization_id)
-    .execute(&mut *tx)
+    .fetch_all(&mut *tx)
     .await?;
 
-    let jobs_retried = updated.rows_affected();
+    let jobs_retried = retried.len() as u64;
 
     // Update workflow status back to running. NOTE: the workflows table has no
     // `updated_at` column — referencing it here raised 42703 (undefined_column)
@@ -775,6 +786,21 @@ pub async fn retry(
         jobs_retried = jobs_retried,
         "Retried workflow"
     );
+
+    for (job_id, queue_name, old_status) in &retried {
+        state.outgoing_webhooks.spawn_dispatch(
+            ctx.organization_id.clone(),
+            events::JOB_RETRIED.to_string(),
+            job_id.clone(),
+            events::job_retried_payload(
+                job_id,
+                queue_name,
+                old_status,
+                events::RETRY_SOURCE_WORKFLOW,
+                Some(&workflow_id),
+            ),
+        );
+    }
 
     // Notify Redis that workflow was retried
     if let Some(ref cache) = state.cache {

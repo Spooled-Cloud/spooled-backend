@@ -45,6 +45,8 @@ new names can overshoot by a few.
 with a "does not match" message); job already terminal → `AlreadyFinished` → 409
 `CONFLICT` "Job is already completed" (was 404); not this worker's → 404.
 
+REST `fail` (`handlers/jobs.rs:1162`) takes the status of its `job.failed` event (and so of the implied `job.deadlettered`), of the realtime events and of the metrics from the transition itself (`outcome.new_status`, `:1211`), not from a SELECT after the commit (0.1.122): by then a scheduled retry may have been claimed again or a dead-lettered job retried, and the event was skipped or carried the wrong status.
+
 Manual `POST /jobs/{id}/retry` resets `retry_count` to 0 and removes the job's
 `dead_letter_queue` row, like `POST /jobs/dlq/retry` (it used to increment, leaving
 `retry_count > max_retries`).
@@ -107,7 +109,7 @@ Before 0.1.119 a bulk of 100 jobs of 25 KB was refused (BEOPS-16).
 
 ## Scheduler loops (in-process)
 
-Activated scheduled jobs (~5s), cron (~10s), lease recovery (~10s), metrics (~15s), stale workers (~300s), dependency/workflow progress (~10s). See `scheduler/mod.rs`. Since 0.1.121 the dependency pass (`update_job_dependencies` `:942`) also moves a `pending` workflow to `running` and fills `started_at` once one of its jobs has started (`:1155`, BEFLOW-20; no trigger change, it never overwrites an outcome the progress trigger wrote), and both dead-lettering sweeps (`recover_expired_leases` `:258`, `cleanup_stale_workers` `:1251`) write the `deadlettered` job_history row and the DLQ row in one CTE and announce the failure through `announce_deadlettered` (`:382`): realtime `JobStatusChange` + `JobFailed`, the `job.failed` outgoing webhook (`data.status` `deadletter`) and the job's completion webhook, like the REST fail path (BEFLOW-11, QW7). Realtime publishing stops after its first failure in a batch so a hung Redis cannot stall the one scheduler loop. Every loop pass reports to `RuntimeHealth::scheduler_tick` (`scheduler/mod.rs:95`) and a drop guard marks it stopped however `run` ends (`:42`, `:76`); `/health` reports the scheduler down after 120 s without a pass.
+Activated scheduled jobs (~5s), cron (~10s), lease recovery (~10s), metrics (~15s), stale workers (~300s), dependency/workflow progress (~10s). See `scheduler/mod.rs`. Since 0.1.121 the dependency pass (`update_job_dependencies` `:942`) also moves a `pending` workflow to `running` and fills `started_at` once one of its jobs has started (`:1155`, BEFLOW-20; no trigger change, it never overwrites an outcome the progress trigger wrote), and both dead-lettering sweeps (`recover_expired_leases` `:258`, `cleanup_stale_workers` `:1251`) write the `deadlettered` job_history row and the DLQ row in one CTE and announce the failure through `announce_deadlettered` (`:382`): realtime `JobStatusChange` + `JobFailed`, the `job.failed` outgoing webhook (`data.status` `deadletter`) and the job's completion webhook, like the REST fail path (BEFLOW-11, QW7). Realtime publishing stops after its first failure in a batch so a hung Redis cannot stall the one scheduler loop. Since 0.1.122 the dependency pass ends with `announce_workflow_outcomes` (`scheduler/mod.rs:1249`, QW8): one claiming `UPDATE` announces the `completed`/`failed` workflows whose `completed_at` it has not sent yet, **at most once** (see `dataflows/webhooks.md`, invariants #41). Every loop pass reports to `RuntimeHealth::scheduler_tick` (`scheduler/mod.rs:95`) and a drop guard marks it stopped however `run` ends (`:42`, `:76`); `/health` reports the scheduler down after 120 s without a pass.
 
 Cron catch-up (`scheduler/mod.rs` ~395–418): if `next_run_at` is far in the past after downtime, **skip missed fires, run once now**, advance `next_run_at` via `next_run_after_in_timezone` (DST-aware). Live re-verified 2026-07-15 on `0.1.107`.
 
@@ -267,28 +269,28 @@ so every statement is a bounded batch (`RETENTION_JOB_BATCH` = 5,000 jobs per st
 
 ## Jobs API semantics (0.1.121)
 
-- **List filters are strict** (`handlers/jobs.rs`): `queue_filter` `:70`, `status_filter` `:80` (case-insensitive),
-  `tag_filter` `:102` (any characters, at most 1,024 bytes, no NUL; it used to be `[A-Za-z0-9_.-]` up to 64)
-  turn an invalid value into a 400 `VALIDATION_ERROR` for `GET /jobs`, `GET /jobs/dlq` and `GET /jobs/stats`
+- **List filters are strict** (`handlers/jobs.rs`): `queue_filter` `:70`, `status_filter` `:82` (case-insensitive),
+  `tag_filter` `:503` (any characters, at most 1,024 bytes, no NUL; it used to be `[A-Za-z0-9_.-]` up to 64)
+  turn an invalid value into a 400 `VALIDATION_ERROR` for `GET /jobs`, `GET /jobs/dlq` and `GET /jobs/stats` (0.1.122: `status` is a comma list now, `status_filter` `:82` returns `Vec<&str>`; see "Job lists" below)
   (`queue_name`); they used to log and return the unfiltered list. An empty parameter is no filter (BEJOB-09).
-- **Order** is `ListJobsQuery::order()` (`models/job.rs:571`): `order_by` from `ALLOWED_ORDER_BY_FIELDS`
+- **Order** is `ListJobsQuery::order()` (`models/job.rs:585`): `order_by` from `ALLOWED_ORDER_BY_FIELDS`
   (`created_at`, `updated_at`, `scheduled_at`, `completed_at`, `priority`, `status`, `queue_name`,
   `retry_count`), `order_dir` `asc|desc`, both case-insensitive, an unknown value a 400; `push_job_order`
-  (`jobs.rs:119`) appends `id` in the same direction so OFFSET pages are stable, `NULLS LAST` for the two
+  (`jobs.rs:520`) appends `id` in the same direction so OFFSET pages are stable, `NULLS LAST` for the two
   nullable timestamps (BEJOB-10, BEJOB-14). Pagination is `limit` (default 50, max 100) + `offset`; there is no
   cursor (BEJOB-13).
-- **Bulk** (`bulk_enqueue` `:1458`): each item is validated with `BulkJobItem::validate()` (not `nested`); invalid
+- **Bulk** (`bulk_enqueue` `:1904`): each item is validated with `BulkJobItem::validate()` (not `nested`); invalid
   items go to `failed[]` as `{index, error}` and the valid ones are created. A 400 (not 200) when no item is
   valid (message lists `jobs[i]: reason`), a batch default is out of range (`default_priority` -100..100,
   `default_max_retries` 0..100, `default_timeout_seconds` 1..86400) or the database refuses a value
   (`job_insert_error`: SQLSTATE class 22 or 23514); other insert errors are 500 after the quota reservation is
   refunded. A payload or tags containing U+0000 is refused up front (`contains_nul`), because `jsonb` rejects it
   (BEJOB-05).
-- **`expires_at`** must be in the future and later than `scheduled_at` (`validate_expiry` `:178`); such a job used
+- **`expires_at`** must be in the future and later than `scheduled_at` (`validate_expiry` `:579`); such a job used
   to be accepted, charged and never claimable (BEJOB-23).
 - **Queue stats** (`queues.rs:298`): `failed_jobs_24h` counts `failed|deadletter` rows by `updated_at` (dead-lettering
   sets no `completed_at`; no job is ever `failed`), `deadletter_jobs` is the current DLQ count (BEJOB-08, QW5).
-- **DLQ** (`retry_dlq` `:2021`, `purge_dlq` `:2228`): retry checks only the `active_jobs` cap (a retry creates no
+- **DLQ** (`retry_dlq` `:2445`, `purge_dlq` `:2670`): retry checks only the `active_jobs` cap (a retry creates no
   daily job); purge `older_than` compares `updated_at`, the dead-letter time; both outer statements re-check
   `status = 'deadletter'` and the organization (BEJOB-22).
 - **Claim predicate vs `idx_jobs_claim`** (migration `20261013100000`): `(organization_id, queue_name, priority DESC,
@@ -303,22 +305,97 @@ so every statement is a bounded batch (`RETENTION_JOB_BATCH` = 5,000 jobs per st
   must disable it, and anything that reads `updated_at` as "when it failed" (stats, purge, retention) relies on a
   terminal row not being touched again.
 
+## Job lists, search, history and timeouts (0.1.122, QW10, QW12, W8-R2)
+
+- **Filters** (`JobListFilters` `handlers/jobs.rs:165`, built by `JobListFilters::parse`; all values bound, only fixed SQL pushed):
+  `queue_name`, `status` (comma list, case-insensitive, blanks and repeats dropped, an unknown entry a 400 naming it; one
+  status keeps `status = $n`, several `status = ANY($n::TEXT[])`), `tag`, `q` (trimmed, at most 255 bytes, no NUL,
+  `escape_like` `:111` so `\ % _` match themselves), `job_type` (exact, at most 255 bytes), `created_after` (`>=`) and
+  `created_before` (`<`) as RFC 3339 (`parse_rfc3339` `:138` also accepts the `+` offset that arrives as a space;
+  `after >= before` is a 400). `GET /jobs/dlq` uses the same parser with `with_status = false` (its `status` stays
+  ignored). The default order is `created_at DESC, id DESC` and `idx_jobs_org_created` still answers it.
+- **`q` = id prefix OR queue_name substring OR payload job_type substring.** The job-type part never compares text with a
+  payload (W8-R2: on 130k jobs of ~3 KB payloads the first version read every payload from TOAST, 466 ms; `job_type=X`
+  381 ms). `list_job_page` (`:412`) first runs `SEARCH_JOB_TYPES_SQL` (`:277`), a recursive skip scan of
+  `idx_jobs_org_job_type` that returns the organization's job types matching `ILIKE %q%` among its **first
+  `MAX_SEARCH_JOB_TYPES` = 1000 distinct types** (sort order, types of at most 255 bytes). `job_list_query` (`:357`) then
+  builds a single SELECT (no `q`, or no matching type) or a UNION ALL of two disjoint parts, each cut to
+  `offset + limit + 1` rows: the id/queue match from the row's own columns, and a LATERAL probe per matching type through
+  the index. 54 ms; `job_type=X` 0.12 ms. A type beyond the 1000th or longer than 255 bytes is therefore invisible to `q`'s
+  job-type part and still found by `job_type` (up to 255 bytes), id prefix and queue.
+- **Index `idx_jobs_org_job_type`** (`20261014120000`, CIC; repair `20261014120001`): `(organization_id,
+  (payload->>'job_type'), created_at DESC) WHERE octet_length(payload->>'job_type') <= 255`. The partial predicate bounds
+  the btree entry size (2704 bytes) so a long free-text type cannot fail the build or an insert. **Every query that should use
+  it repeats the predicate verbatim** (`JOB_TYPE_INDEXED` `:260`, appended next to every `payload->>'job_type' =`),
+  or the planner cannot imply it (invariants #39). Jobs without a job type are not indexed.
+- **Paging hint.** `list_job_page` fetches `limit + 1` rows; `split_page` (`:481`) drops the extra and `paged` (`:489`) sets
+  `X-Has-More: true|false` (`HAS_MORE_HEADER`). The body stays a bare `JobSummary[]`; `limit` is still capped at 100. The
+  header is invisible to browsers without CORS `expose_headers` (`api/mod.rs:85`).
+- **Statement timeout.** Each list runs `BEGIN READ ONLY; SET LOCAL statement_timeout = <ms>` (`begin_with` + `AssertSqlSafe`:
+  the only text written into the SQL is a `u64` from `DATABASE_LIST_STATEMENT_TIMEOUT_MS`, default 5000; `0` is refused by
+  `Settings::validate`, `config/mod.rs:699`, because Postgres reads 0 as no timeout). Postgres cancels the statement itself,
+  which also stops the work of a request whose client left (dropping the future does not cancel a running statement); `LOCAL`
+  ends with the transaction so it never reaches the next pooled user or a transaction-mode PgBouncer client.
+  `list_query_error` (`:460`) maps SQLSTATE 57014 to `AppError::QueryTimeout` (`error/mod.rs:78`): **400 `QUERY_TIMEOUT`**,
+  not a 5xx, because the SDKs retry 5xx and count them toward their circuit breaker and the same list would time out again.
+  Any other database error stays a 500 without SQL text (invariants #38). The settle/claim paths have no such timeout.
+- **History** (`history` `:1389`): `GET /jobs/{id}/history` reads `job_history` through `idx_job_history_job_created`
+  in either direction (`order_dir` asc default, alias `order`; `limit` 1-500, default 100; `offset`; `limit + 1` for
+  `X-Has-More`). Access is `GET /jobs/{id}`'s: unknown id, other organization and a queue outside the key's scope are all 404.
+  `worker_id = COALESCE(worker_id, details->>'worker_id')`, because `record_history` (`queue/mod.rs:1303`) never fills the
+  column. Writers today: REST claim (`processing`), complete (`completed`), fail (`retry_scheduled`, `deadlettered`) and the
+  scheduler's dead-letter CTEs (`deadlettered`); `QueueManager::enqueue` would write `created` but no handler calls it, and
+  gRPC settlements write nothing (F12, open).
+
+## Worker counters (0.1.122, QW15, W8-R3)
+
+`workers.jobs_processed` / `jobs_failed` (`BIGINT NOT NULL DEFAULT 0`, `models/worker.rs:167,172`, returned in
+`WorkerSummary` and `WorkerResponse`) are written **only** by the trigger `trigger_count_worker_job_outcome` on `jobs`
+(migration `20261014110000`); never increment them in Rust, that would double count.
+- **Rule.** `AFTER UPDATE OF status ON jobs ... WHEN (OLD.status = 'processing' AND OLD.assigned_worker_id IS NOT NULL AND
+  OLD.lease_expires_at > now() AND (NEW.status IN ('completed','failed','deadletter') OR (NEW.status IN ('pending',
+  'scheduled') AND NEW.retry_count > OLD.retry_count)))`. `completed` adds to `jobs_processed`, everything else matched to
+  `jobs_failed`, for `OLD.assigned_worker_id` in `OLD.organization_id`. The counters are disjoint (fail twice then complete
+  = 2 and 1).
+- **Why the live-lease test.** Every worker call requires `lease_expires_at > NOW()` and every sweep an expired or NULL
+  lease, and `now()` is the transaction start for both, so the lease-expiry sweep and the offline-worker release /
+  dead-letter never count; a release that keeps `retry_count` (deregistration, an undelivered gRPC claim) counts nothing.
+  A new path that settles a job for a worker must keep that convention; a server-side settle that is not the worker's
+  outcome must expire the lease first, as `dead_letter_oversized` does (`grpc/services/queue_service.rs:2049`:
+  `UPDATE ... SET lease_expires_at = NOW()` fenced on `lease_id`, then the dead-letter, in one transaction), and a release
+  must not raise `retry_count` unless it is a failure.
+- **The trigger is a DEFERRED constraint trigger** (`CREATE CONSTRAINT TRIGGER ... DEFERRABLE INITIALLY DEFERRED`): the
+  `WHEN` clause is evaluated at the row update on that update's OLD/NEW rows, the counting `UPDATE workers` runs at COMMIT.
+  As an ordinary AFTER trigger it fired (name order) before `trigger_update_dependent_jobs` and
+  `trigger_update_workflow_progress`, so a settling transaction locked the job row, then the worker row, then the
+  dependents; with `dependency_mode = 'any'` a worker completing a job and a dependent it was already running at the same
+  instant deadlocked (225 of 300 rounds of a two-session race; 0 deferred). **Never make it immediate** (invariants #40). A
+  failure in the counting UPDATE fails the COMMIT, not the statement. A constraint trigger has no `CREATE OR REPLACE`, so the
+  migration drops and recreates it.
+- **Cost.** `UPDATE`s that do not set `status` never fire it; others evaluate `WHEN` without calling the function (20k lease
+  renewals: 1048 ms with and without). A counted transition adds one primary-key UPDATE of the worker row at commit: about
+  11% on completions (PG16, 8 clients over 200 workers 8963 vs 10094 tps); completions of ONE worker id serialize on its row
+  for the commit only (8797 vs 10217 tps). If that ever binds, move to a sharded side table summed on read (the API fields
+  would not change). Counters start at 0 at deploy (no backfill) and survive a re-registration of the same id.
+
 ## Retry re-opens what the failure cancelled (0.1.121)
 
-`POST /jobs/{id}/retry` (`:1289`) and `POST /jobs/dlq/retry` (`:2021`) run in one transaction (BEFLOW-04):
+`POST /jobs/{id}/retry` (`:1719`) and `POST /jobs/dlq/retry` (`:2445`) run in one transaction (BEFLOW-04):
 1. `lock_resource(org, 'workflows')` first (single retry: only for a job that belongs to a workflow; DLQ retry: always), then row locks, the order `POST /workflows` and `/workflows/{id}/retry` use;
 2. reset the job(s) to `pending`, `retry_count = 0`, delete their DLQ rows;
-3. `reopen_cancelled_dependents` (`:1130`) re-opens, level by level (`MAX_REOPEN_DEPTH` 100), children cancelled with
+3. `reopen_cancelled_dependents` (`:1560`) re-opens, level by level (`MAX_REOPEN_DEPTH` 100), children cancelled with
    `last_error` in `DEPENDENCY_CANCEL_REASONS` (`models/job.rs:141`: `DEPENDENCY_FAILED_CANCEL_REASON` and
    `PARENT_FAILED_CANCEL_REASON`, the constants the scheduler sweep writes - one definition for both sides, never
    a duplicated string), gated (`dependencies_met` recomputed), skipping a cancelled workflow's steps and any
    dependent another dependency still dooms; a job someone cancelled is not touched;
-4. `reopen_workflows` (`:1225`) puts a `failed` workflow back to `running` and recomputes its counters; reviving pays a
+4. `reopen_workflows` (`:1655`) puts a `failed` workflow back to `running` and recomputes its counters; reviving pays a
    `max_workflows` slot (`check_resource_limit_conn`), so a single-job retry answers 429 `QUOTA_EXCEEDED` /
    403 `feature_disabled` when no slot is free (by design, W5-R3: skipping the charge reopens the W4-01 bypass).
    `retry_dlq` instead reads the room (`resource_room_conn`), revives the oldest failed workflows that fit, leaves the
    other steps in the DLQ and lists them in `skipped_jobs`; it answers the cap's error only when nothing else could be
    retried.
+
+After the commit all three retry endpoints send `job.retried` per job through `spawn_dispatch` (single `jobs.rs:1797` with `source` `job_retry`, DLQ `:2646` `dlq_retry`, `workflows.rs:793` `workflow_retry`; the workflow retry statement is `UPDATE ... FROM` so `RETURNING` carries each job's previous status) (0.1.122, QW8). The single retry reads `old_status` before its transaction.
 
 Design note (W5-R1, P3, reviewed, no change): a queue-scoped key's retry re-opens sweep-cancelled dependents in queues
 outside its scope and revives the workflow; the key could already trigger the opposite cascade, the dependents return
@@ -331,12 +408,12 @@ gated and unchanged, and none of their data is returned.
   is `failed|deadletter`, else `cancelled` if any is `cancelled`, else `completed`. A cancelled step no longer lets a
   workflow end `completed` (BEFLOW-04). BEFLOW-03 (concurrent last completions can leave the workflow `running`) is
   untouched.
-- `POST /workflows/{id}/cancel` (`workflows.rs:825`) reads the status under the row lock and answers 409 for a
+- `POST /workflows/{id}/cancel` (`workflows.rs:851`) reads the status under the row lock and answers 409 for a
   `completed|failed|cancelled` workflow (BEFLOW-21; still open: no `job.cancelled` webhooks for the jobs it cancels, and
   `processing` jobs keep running). `POST /workflows` rejects a repeated key in one job's `depends_on` with 400 before the quota
-  reservation (BEFLOW-16). `GET /workflows/{id}` jobs come from `workflow_job_response` (`:237`): `job_type` is
+  reservation (BEFLOW-16). `GET /workflows/{id}` jobs come from `workflow_job_response` (`:238`): `job_type` is
   `payload.job_type` else `"job"`, `failed_at` is `updated_at` for `failed|deadletter` jobs, `backoff_type` is always
   `exponential` (BEFLOW-19).
-- `POST /jobs/{id}/dependencies` (`:989`) checks every edge before writing (self edge and cycles are 400), writes
+- `POST /jobs/{id}/dependencies` (`:1015`) checks every edge before writing (self edge and cycles are 400), writes
   `dependency_mode` / `dependencies_met` only when an edge was inserted, and an omitted mode keeps the job's own
   (`AddDependenciesRequest.dependency_mode` is an `Option`) (BEFLOW-22).

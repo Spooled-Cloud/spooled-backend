@@ -1244,6 +1244,17 @@ impl Scheduler {
             );
         }
 
+        // workflow.completed / workflow.failed for every workflow that ended
+        // since the last pass: just above, or in the progress trigger.
+        if let Err(e) = crate::outgoing_webhooks::events::announce_workflow_outcomes(
+            &self.db,
+            &self.outgoing_webhooks,
+        )
+        .await
+        {
+            warn!(error = %e, "Failed to announce workflow outcomes");
+        }
+
         Ok(())
     }
 

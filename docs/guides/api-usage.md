@@ -251,7 +251,7 @@ Response:
 ### List Jobs
 
 ```bash
-GET /api/v1/jobs?queue_name=emails&status=pending&limit=50
+GET /api/v1/jobs?queue_name=emails&status=failed,deadletter&created_after=2026-10-11T00:00:00Z&limit=50
 Authorization: Bearer <token>
 ```
 
@@ -260,17 +260,34 @@ Authorization: Bearer <token>
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `queue_name` | string | Filter by queue (letters, digits, `-`, `_`, `.`) |
-| `status` | string | pending, scheduled, processing, completed, failed, deadletter, cancelled (any case) |
+| `status` | string | One status or a comma-separated list (`failed,deadletter`): pending, scheduled, processing, completed, failed, deadletter, cancelled (any case) |
+| `q` | string | Search text, at most 255 bytes, case-insensitive: matches a job whose id **starts with** it, or whose `queue_name` or `payload.job_type` contains it. `%` and `_` match themselves |
+| `job_type` | string | Exact `payload.job_type`, at most 255 bytes |
+| `created_after` | RFC 3339 | Only jobs created at or after this instant |
+| `created_before` | RFC 3339 | Only jobs created before this instant (must be later than `created_after`) |
 | `tag` | string | One tag, any characters up to 1024 bytes |
 | `limit` | integer | Max results (default: 50, at most 100) |
 | `offset` | integer | Rows to skip (default: 0). There is no cursor |
 | `order_by` | string | created_at (default), updated_at, scheduled_at, completed_at, priority, status, queue_name, retry_count |
 | `order_dir` | string | desc (default), asc |
 
-An invalid `status`, `queue_name`, `tag`, `order_by` or `order_dir` is a `400`; it is not
+The filters combine with AND. An invalid `status` (any entry of the list), `queue_name`, `tag`,
+`q`, `job_type`, `created_after`, `created_before`, `order_by` or `order_dir` is a `400`; it is not
 ignored (before 0.1.121 it was, and the unfiltered list came back). An empty parameter is no
-filter. Rows that tie on the sort column are ordered by job id, so `offset` pages do not repeat
-or skip jobs.
+filter. Percent-encode a `+` offset in a timestamp as `%2B`. Rows that tie on the sort column are
+ordered by job id, so `offset` pages do not repeat or skip jobs.
+
+The body is a plain JSON array of job summaries. The `X-Has-More` response header says whether
+another page follows (`true` or `false`), so a client can page until it reads `false` without
+asking for one row too many; the dashboard can read it cross-origin.
+
+Two limits on `q`: its job-type part compares the text with the organization's distinct job
+types, not with every job, and looks at the first 1,000 of them (in sort order, each at most 255
+bytes). A job whose type is beyond that is still found by `job_type`, by its id prefix or by its
+queue. And the list runs under a statement timeout (5 seconds, `DATABASE_LIST_STATEMENT_TIMEOUT_MS`
+on a self-hosted deployment): a list the database cannot answer in time is stopped and answers
+`400` with code `QUERY_TIMEOUT`. Retrying it would time out again; narrow it with `queue_name`,
+`status`, `job_type`, a created window or a longer `q`.
 
 ### Get Job
 
@@ -278,6 +295,37 @@ or skip jobs.
 GET /api/v1/jobs/{job_id}
 Authorization: Bearer <token>
 ```
+
+### Job History
+
+```bash
+GET /api/v1/jobs/{job_id}/history?order_dir=desc&limit=100
+Authorization: Bearer <token>
+```
+
+The lifecycle events recorded for the job, oldest first (`order_dir=desc` for newest first; the
+alias `order` works too). `limit` is 1 to 500 (default 100), `offset` skips events, and the
+`X-Has-More` header says whether more follow.
+
+```json
+[
+  {
+    "id": "6f0c1a52-...",
+    "job_id": "job_550e8400e29b41d4",
+    "event_type": "processing",
+    "worker_id": "emails-worker-1",
+    "details": {"worker_id": "emails-worker-1", "lease_id": "...", "organization_id": "org_xxxxx"},
+    "created_at": "2026-10-12T09:00:01Z"
+  }
+]
+```
+
+`event_type` is `processing`, `completed`, `retry_scheduled` or `deadlettered` (`created` exists,
+but only the internal queue manager's enqueue writes it and no REST or gRPC handler calls that).
+Events exist only where the server records them: REST claim, complete and fail, and the scheduler's
+dead-letter sweeps. **The history is sparse for jobs handled over gRPC, and a job has no `created`
+event.** Another organization's job, an unknown id and a job in a queue outside the key's scope all
+answer `404`.
 
 ### Cancel Job
 
@@ -385,24 +433,31 @@ Jobs that have exhausted all retries are moved to the Dead Letter Queue (DLQ).
 ### List DLQ Jobs
 
 ```bash
-GET /api/v1/jobs/dlq?queue_name=emails&limit=100
+GET /api/v1/jobs/dlq?queue_name=emails&q=invoice&created_after=2026-10-01T00:00:00Z&limit=100
 Authorization: Bearer <token>
 ```
 
-Response:
+Takes the filters, ordering, paging, `X-Has-More` header and statement timeout of
+[List Jobs](#list-jobs), without `status` (the list is always `deadletter`).
+
+Response, a plain array of job summaries:
 ```json
-{
-  "jobs": [
-    {
-      "id": "job_xxxxx",
-      "queue_name": "emails",
-      "status": "deadletter",
-      "error_message": "Failed after 3 retries",
-      "last_error_at": "2024-01-01T00:00:00Z"
-    }
-  ],
-  "total": 1
-}
+[
+  {
+    "id": "job_xxxxx",
+    "queue_name": "emails",
+    "status": "deadletter",
+    "priority": 0,
+    "attempt": 3,
+    "max_retries": 3,
+    "job_type": "send_welcome_email",
+    "last_error": "Failed after 3 retries",
+    "created_at": "2026-10-11T00:00:00Z",
+    "scheduled_at": null,
+    "started_at": "2026-10-11T00:00:05Z",
+    "completed_at": null
+  }
+]
 ```
 
 ### Retry DLQ Jobs
@@ -631,6 +686,14 @@ Authorization: Bearer <token>
 GET /api/v1/workers/{worker_id}
 Authorization: Bearer <token>
 ```
+
+Both return `jobs_processed` and `jobs_failed`, counted by the server since 0.1.122 (they start
+at 0 and survive a re-registration of the same `worker_id`). `jobs_processed` is the jobs the
+worker completed, `jobs_failed` the failures it reported (each retry scheduled and each
+dead-letter); a job that fails twice and then completes adds 2 and 1. Only outcomes reported while
+the worker held the job's lease count: a job released because its lease expired or the worker
+went offline, a release on deregistration and a job the server dead-letters because it is too
+large for a gRPC message do not. Success rate is `jobs_processed / (jobs_processed + jobs_failed)`.
 
 ### Deregister Worker
 
@@ -1074,6 +1137,46 @@ curl -X POST https://api.spooled.cloud/api/v1/webhooks/org_abc123/custom \
 | 400 | Invalid request (missing queue_name, invalid JSON, etc.) |
 | 401 | Invalid or missing `X-Webhook-Token` |
 | 404 | Organization not found |
+
+### Inbound Webhook Log
+
+```bash
+GET /api/v1/webhooks/deliveries?status=duplicate&since=2026-10-12T00:00:00Z&limit=50
+Authorization: Bearer <token>
+```
+
+The requests `POST /api/v1/webhooks/{org_id}/custom` accepted for your organization, newest first.
+Use it to answer "did the provider call us, and what did we do with it". A request with a wrong
+token, or one refused by a limit, is not logged.
+
+| Parameter | Description |
+|-----------|-------------|
+| `status` | `created` (the request made a new job) or `duplicate` (its idempotency key matched an existing job) |
+| `since` | RFC 3339 instant; only requests received at or after it |
+| `queue_name` | Only requests whose job is in this queue (exact match, at most 255 characters; alias `queue`) |
+| `limit`, `offset` | Page size (default 50, 1 to 100) and entries to skip |
+
+```json
+[
+  {
+    "id": "d3a1c0f2-...",
+    "provider": "custom",
+    "event_type": "order.created",
+    "matched_queue": "my-events",
+    "job_id": "job_550e8400e29b41d4",
+    "status": "created",
+    "created_at": "2026-10-12T09:15:00Z"
+  }
+]
+```
+
+`event_type` is `custom` when the request sent none. `matched_queue` is the queue of the job the
+request resolved to, which is not the request's `queue_name` when an idempotent replay matched a job
+in another queue. `job_id` and `status` are `null` for entries recorded before 0.1.122. The log
+never returns the payload, a signature or the webhook token. It needs an unrestricted API key: a
+queue-scoped key gets `403 ACCESS_DENIED`. An unknown `status`, a `since` that is not RFC 3339 or a
+`queue_name` over 255 characters is a `400`. Entries are removed by the same retention sweep as the
+other delivery history.
 
 ### Security Best Practices
 
@@ -1644,17 +1747,21 @@ grpcurl -plaintext localhost:50051 describe spooled.v1.EnqueueRequest
 | 403 | `forbidden` | Insufficient permissions |
 | 404 | `not_found` | Resource not found |
 | 409 | `conflict` | Resource conflict (e.g., duplicate) |
+| 400 | `QUERY_TIMEOUT` | A job list ran into its statement timeout; narrow the filters (retrying the same request times out again) |
 | 429 | `RATE_LIMIT_EXCEEDED` | Too many requests (also `QUOTA_EXCEEDED` for plan caps) |
 | 500 | `internal_error` | Server error |
 
 ### Rate Limiting
 
-A rate-limited request answers `429` with a `Retry-After` header (whole seconds). It is the only
-rate-limit header: the API does not send `X-RateLimit-Limit`, `X-RateLimit-Remaining` or
-`X-RateLimit-Reset`. The JSON body carries the same information:
+A rate-limited request answers `429` with a `Retry-After` header (the wait in whole seconds) and
+a JSON body with the same information:
 
 ```
 Retry-After: 60
+X-RateLimit-Limit: 100
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 1704067200
+X-RateLimit-Scope: api_key
 
 {
   "error": "Rate limit exceeded",
@@ -1665,6 +1772,31 @@ Retry-After: 60
   "reset_at": 1704067200
 }
 ```
+
+Authenticated responses, allowed or refused, carry the state of the limit that answered:
+
+| Header | Meaning |
+|--------|---------|
+| `X-RateLimit-Limit` | The plan burst (the bucket size: Free 10, Starter 50, Pro 200, Enterprise 1000, or the organization's override), or the key's own per-minute limit |
+| `X-RateLimit-Remaining` | Requests that may still be made right now, after this one |
+| `X-RateLimit-Reset` | The **Unix time** in seconds at which `X-RateLimit-Remaining` next goes up (the next whole token of the bucket, or the start of the key's next minute); the current time while the bucket is full. On a `429` it equals the body's `reset_at` |
+| `X-RateLimit-Scope` | `organization` or `api_key`: which limit the other three describe |
+
+`X-RateLimit-Reset` is an absolute time, not a wait; `Retry-After` is the wait. When an API key has its
+own `rate_limit` as well, the numbers are those of whichever limit runs out first (fewer requests
+remaining, and on a tie the later reset).
+
+```
+X-RateLimit-Limit: 200
+X-RateLimit-Remaining: 187
+X-RateLimit-Reset: 1704067201
+X-RateLimit-Scope: organization
+```
+
+Unauthenticated routes, admin routes, deployments without Redis and requests whose limit check could
+not run (Redis failing while `RATE_LIMIT_FAIL_CLOSED` is off) carry no `X-RateLimit-*` headers, so
+treat them as optional; a refusal there still has `Retry-After`. Browsers can read these headers,
+`Retry-After`, `X-Request-Id` and `X-Has-More` on cross-origin calls (`Access-Control-Expose-Headers`).
 
 The main limit is a token bucket **per organization** (requests per second and burst, by plan; see
 [Rate Limits](#rate-limits)). An API key can also carry its own `rate_limit` in **requests per

@@ -9,7 +9,7 @@
 use axum::{
     body::Body,
     extract::State,
-    http::{Request, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -43,6 +43,151 @@ fn current_timestamp() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// `X-RateLimit-Limit`: the size of the limit that answered (see [`RateLimitHeaders`]).
+pub const HEADER_LIMIT: &str = "x-ratelimit-limit";
+/// `X-RateLimit-Remaining`: requests that may still be made right now.
+pub const HEADER_REMAINING: &str = "x-ratelimit-remaining";
+/// `X-RateLimit-Reset`: Unix time in seconds at which `X-RateLimit-Remaining`
+/// next goes up (the current time when nothing is spent). It is the same
+/// instant as `reset_at` in a `429` body, and the SDKs read it as an epoch.
+pub const HEADER_RESET: &str = "x-ratelimit-reset";
+/// `X-RateLimit-Scope`: which limit the other three describe.
+pub const HEADER_SCOPE: &str = "x-ratelimit-scope";
+
+/// Which limiter the `X-RateLimit-*` headers describe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitScope {
+    /// The organization's plan token bucket: `limit` is the burst (bucket
+    /// size), `reset_secs` the time until the next whole token.
+    Organization,
+    /// The API key's own `rate_limit` (requests per minute, fixed one-minute
+    /// window): `reset_secs` is the time until the window starts again.
+    ApiKey,
+}
+
+impl RateLimitScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            RateLimitScope::Organization => "organization",
+            RateLimitScope::ApiKey => "api_key",
+        }
+    }
+}
+
+/// `X-RateLimit-*` values for one authenticated request, taken from the
+/// limiter result that request was counted against.
+///
+/// `reset_secs` is the wait until `X-RateLimit-Remaining` next goes up, rounded
+/// up: for the organization bucket that is the next whole token (`0` when the
+/// bucket is full), for an API key's per-minute limit it is the start of the
+/// next window. On a `429` it equals `Retry-After`.
+///
+/// `X-RateLimit-Reset` carries that moment as a Unix time in seconds (the
+/// current time plus `reset_secs`), not the wait itself: every Spooled SDK
+/// parses the header as an epoch, and a `429` body's `reset_at` is the same
+/// value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimitHeaders {
+    pub scope: RateLimitScope,
+    pub limit: u32,
+    pub remaining: u32,
+    pub reset_secs: u64,
+}
+
+impl RateLimitHeaders {
+    /// From the organization token bucket of size `capacity`.
+    pub fn from_token_bucket(capacity: u32, result: &crate::cache::TokenBucketResult) -> Self {
+        Self {
+            scope: RateLimitScope::Organization,
+            limit: capacity,
+            remaining: result.remaining.min(capacity),
+            reset_secs: result.next_token_ms.div_ceil(1000),
+        }
+    }
+
+    /// From an API key's fixed-window counter of `limit` requests, at `now`.
+    pub fn from_window(
+        limit: u32,
+        result: &crate::cache::RateLimitResult,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        let until_reset_ms = (result.reset_at - now).num_milliseconds().max(0) as u64;
+        Self {
+            scope: RateLimitScope::ApiKey,
+            limit,
+            remaining: result.remaining.min(limit),
+            reset_secs: until_reset_ms.div_ceil(1000),
+        }
+    }
+
+    /// The values sent with a refused request: nothing remains, and the reset
+    /// is the same wait as `Retry-After`.
+    pub fn refused(self, retry_after_secs: u64) -> Self {
+        Self {
+            remaining: 0,
+            reset_secs: retry_after_secs,
+            ..self
+        }
+    }
+
+    /// The limit that runs out first: fewer requests remaining, and on a tie
+    /// the one that takes longer to come back.
+    pub fn tighter(self, other: Self) -> Self {
+        if (other.remaining, std::cmp::Reverse(other.reset_secs))
+            < (self.remaining, std::cmp::Reverse(self.reset_secs))
+        {
+            other
+        } else {
+            self
+        }
+    }
+
+    /// The `X-RateLimit-Reset` value at Unix time `now` (seconds): when
+    /// `X-RateLimit-Remaining` next goes up, `now` itself for a full bucket.
+    pub fn reset_at(&self, now: u64) -> u64 {
+        now.saturating_add(self.reset_secs)
+    }
+
+    /// Set the four headers on `headers`, as of the current time.
+    pub fn apply(&self, headers: &mut HeaderMap) {
+        self.apply_at(headers, current_timestamp());
+    }
+
+    /// Set the four headers on `headers`, as of Unix time `now` (seconds).
+    pub fn apply_at(&self, headers: &mut HeaderMap, now: u64) {
+        headers.insert(HEADER_LIMIT, HeaderValue::from(self.limit));
+        headers.insert(HEADER_REMAINING, HeaderValue::from(self.remaining));
+        headers.insert(HEADER_RESET, HeaderValue::from(self.reset_at(now)));
+        headers.insert(HEADER_SCOPE, HeaderValue::from_static(self.scope.as_str()));
+    }
+}
+
+/// `429 RATE_LIMIT_EXCEEDED` with `Retry-After`, plus the `X-RateLimit-*`
+/// headers when the refusing limiter is known. The body's `reset_at` and
+/// `X-RateLimit-Reset` are taken from one clock reading, so they match.
+fn rate_limit_exceeded_response(
+    retry_after_secs: u64,
+    limit: u32,
+    headers: Option<RateLimitHeaders>,
+) -> Response {
+    let now = current_timestamp();
+    let body = RateLimitExceededResponse {
+        error: "Rate limit exceeded".to_string(),
+        code: "RATE_LIMIT_EXCEEDED".to_string(),
+        retry_after_secs,
+        limit,
+        remaining: 0,
+        reset_at: now + retry_after_secs,
+    };
+    let mut res = (StatusCode::TOO_MANY_REQUESTS, axum::Json(body)).into_response();
+    res.headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from(retry_after_secs));
+    if let Some(headers) = headers {
+        headers.apply_at(res.headers_mut(), now);
+    }
+    res
 }
 
 fn rate_limit_unavailable_response(retry_after_secs: u64) -> Response {
@@ -169,6 +314,12 @@ pub async fn plan_rate_limit_middleware(
             }
         };
 
+        // What the X-RateLimit-* headers report: the limit that runs out
+        // first. Nothing is sent once a check was skipped on a Redis error
+        // (fail-open): the numbers would be wrong.
+        let mut reported: Option<RateLimitHeaders> = None;
+        let mut bypassed = false;
+
         // 1) Org-level token bucket (plan rps/burst)
         let org_key = format!("rate_limit:org:{}", ctx.organization_id);
         match cache
@@ -176,23 +327,16 @@ pub async fn plan_rate_limit_middleware(
             .await
         {
             Ok(result) => {
+                let headers = RateLimitHeaders::from_token_bucket(org_limits.burst, &result);
                 if !result.allowed {
                     let retry_after_secs = result.retry_after_ms.div_ceil(1000);
-                    let reset_at = current_timestamp() + retry_after_secs;
-                    let body = RateLimitExceededResponse {
-                        error: "Rate limit exceeded".to_string(),
-                        code: "RATE_LIMIT_EXCEEDED".to_string(),
+                    return rate_limit_exceeded_response(
                         retry_after_secs,
-                        limit: org_limits.burst,
-                        remaining: 0,
-                        reset_at,
-                    };
-                    let mut res = (StatusCode::TOO_MANY_REQUESTS, axum::Json(body)).into_response();
-                    if let Ok(v) = retry_after_secs.to_string().parse() {
-                        res.headers_mut().insert("Retry-After", v);
-                    }
-                    return res;
+                        org_limits.burst,
+                        Some(headers.refused(retry_after_secs)),
+                    );
                 }
+                reported = Some(headers);
             }
             Err(e) => {
                 if fail_closed {
@@ -204,6 +348,7 @@ pub async fn plan_rate_limit_middleware(
                     return rate_limit_unavailable_response(5);
                 }
                 warn!(error = %e, org_id = %ctx.organization_id, "Redis error during org rate limit check; allowing");
+                bypassed = true;
             }
         }
 
@@ -213,25 +358,21 @@ pub async fn plan_rate_limit_middleware(
             let key = format!("rate_limit:api_key:{}", ctx.api_key_id);
             match cache.check_rate_limit(&key, key_limit, 60).await {
                 Ok(result) => {
+                    let headers =
+                        RateLimitHeaders::from_window(key_limit, &result, chrono::Utc::now());
                     if !result.allowed {
                         let retry_after_secs =
                             (result.reset_at - chrono::Utc::now()).num_seconds().max(1) as u64;
-                        let reset_at = current_timestamp() + retry_after_secs;
-                        let body = RateLimitExceededResponse {
-                            error: "Rate limit exceeded".to_string(),
-                            code: "RATE_LIMIT_EXCEEDED".to_string(),
+                        return rate_limit_exceeded_response(
                             retry_after_secs,
-                            limit: key_limit,
-                            remaining: 0,
-                            reset_at,
-                        };
-                        let mut res =
-                            (StatusCode::TOO_MANY_REQUESTS, axum::Json(body)).into_response();
-                        if let Ok(v) = retry_after_secs.to_string().parse() {
-                            res.headers_mut().insert("Retry-After", v);
-                        }
-                        return res;
+                            key_limit,
+                            Some(headers.refused(retry_after_secs)),
+                        );
                     }
+                    reported = Some(match reported {
+                        Some(org) => org.tighter(headers),
+                        None => headers,
+                    });
                 }
                 Err(e) => {
                     if fail_closed {
@@ -247,12 +388,17 @@ pub async fn plan_rate_limit_middleware(
                         api_key_id = %ctx.api_key_id,
                         "Redis error during api-key rate limit check; allowing"
                     );
+                    bypassed = true;
                 }
             }
         }
 
         // Allowed -> proceed
-        return next.run(request).await;
+        let mut response = next.run(request).await;
+        if let Some(headers) = reported.filter(|_| !bypassed) {
+            headers.apply(response.headers_mut());
+        }
+        return response;
     }
 
     // Public routes: apply a simple global rate limit (settings-based) keyed by IP/UA.
@@ -264,20 +410,7 @@ pub async fn plan_rate_limit_middleware(
         Ok(result) => {
             if !result.allowed {
                 let retry_after_secs = result.retry_after_ms.div_ceil(1000);
-                let reset_at = current_timestamp() + retry_after_secs;
-                let body = RateLimitExceededResponse {
-                    error: "Rate limit exceeded".to_string(),
-                    code: "RATE_LIMIT_EXCEEDED".to_string(),
-                    retry_after_secs,
-                    limit: burst,
-                    remaining: 0,
-                    reset_at,
-                };
-                let mut res = (StatusCode::TOO_MANY_REQUESTS, axum::Json(body)).into_response();
-                if let Ok(v) = retry_after_secs.to_string().parse() {
-                    res.headers_mut().insert("Retry-After", v);
-                }
-                return res;
+                return rate_limit_exceeded_response(retry_after_secs, burst, None);
             }
         }
         Err(e) => {
@@ -322,19 +455,7 @@ pub async fn admin_rate_limit_middleware(
             if !result.allowed {
                 let retry_after_secs =
                     (result.reset_at - chrono::Utc::now()).num_seconds().max(1) as u64;
-                let body = RateLimitExceededResponse {
-                    error: "Rate limit exceeded".to_string(),
-                    code: "RATE_LIMIT_EXCEEDED".to_string(),
-                    retry_after_secs,
-                    limit: MAX_REQUESTS,
-                    remaining: 0,
-                    reset_at: current_timestamp() + retry_after_secs,
-                };
-                let mut res = (StatusCode::TOO_MANY_REQUESTS, axum::Json(body)).into_response();
-                if let Ok(v) = retry_after_secs.to_string().parse() {
-                    res.headers_mut().insert("Retry-After", v);
-                }
-                return res;
+                return rate_limit_exceeded_response(retry_after_secs, MAX_REQUESTS, None);
             }
         }
         Err(e) => {
@@ -347,4 +468,215 @@ pub async fn admin_rate_limit_middleware(
     }
 
     next.run(request).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::{RateLimitResult, TokenBucketResult};
+
+    fn bucket(allowed: bool, remaining: u32, retry_ms: u64, next_ms: u64) -> TokenBucketResult {
+        TokenBucketResult {
+            allowed,
+            remaining,
+            retry_after_ms: retry_ms,
+            next_token_ms: next_ms,
+        }
+    }
+
+    fn header(headers: &HeaderMap, name: &str) -> Option<String> {
+        headers
+            .get(name)
+            .map(|v| v.to_str().expect("ascii header").to_string())
+    }
+
+    #[test]
+    fn token_bucket_headers_report_burst_whole_tokens_and_seconds_to_the_next_token() {
+        // Free plan: 5 rps, burst 10; 9.4 tokens left -> 9, next token in 120 ms.
+        let h = RateLimitHeaders::from_token_bucket(10, &bucket(true, 9, 0, 120));
+        assert_eq!(h.scope, RateLimitScope::Organization);
+        assert_eq!(h.limit, 10);
+        assert_eq!(h.remaining, 9);
+        assert_eq!(h.reset_secs, 1, "rounded up, never 0 while refilling");
+
+        // A full bucket has nothing to wait for.
+        assert_eq!(
+            RateLimitHeaders::from_token_bucket(10, &bucket(true, 10, 0, 0)).reset_secs,
+            0
+        );
+        // 1.5 s to the next token at a slow refill rounds up to 2.
+        assert_eq!(
+            RateLimitHeaders::from_token_bucket(10, &bucket(true, 3, 0, 1_500)).reset_secs,
+            2
+        );
+        // Remaining never exceeds the advertised limit.
+        assert_eq!(
+            RateLimitHeaders::from_token_bucket(10, &bucket(true, 50, 0, 0)).remaining,
+            10
+        );
+    }
+
+    #[test]
+    fn window_headers_report_seconds_until_the_window_starts_again() {
+        let now = chrono::Utc::now();
+        let result = RateLimitResult {
+            allowed: true,
+            remaining: 41,
+            reset_at: now + chrono::Duration::milliseconds(59_500),
+        };
+        let h = RateLimitHeaders::from_window(60, &result, now);
+        assert_eq!(h.scope, RateLimitScope::ApiKey);
+        assert_eq!((h.limit, h.remaining, h.reset_secs), (60, 41, 60));
+
+        // A window that already ended (clock skew) reports 0, not a wrap-around.
+        let past = RateLimitResult {
+            allowed: true,
+            remaining: 0,
+            reset_at: now - chrono::Duration::seconds(3),
+        };
+        assert_eq!(RateLimitHeaders::from_window(60, &past, now).reset_secs, 0);
+    }
+
+    #[tokio::test]
+    async fn refused_headers_match_retry_after() {
+        let h = RateLimitHeaders::from_token_bucket(10, &bucket(false, 0, 1_200, 1_200));
+        let refused = h.refused(2);
+        assert_eq!(
+            (refused.limit, refused.remaining, refused.reset_secs),
+            (10, 0, 2)
+        );
+
+        let before = current_timestamp();
+        let res = rate_limit_exceeded_response(2, 10, Some(refused));
+        let after = current_timestamp();
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+        let headers = res.headers().clone();
+        assert_eq!(header(&headers, "retry-after").as_deref(), Some("2"));
+        assert_eq!(header(&headers, HEADER_LIMIT).as_deref(), Some("10"));
+        assert_eq!(header(&headers, HEADER_REMAINING).as_deref(), Some("0"));
+        assert_eq!(
+            header(&headers, HEADER_SCOPE).as_deref(),
+            Some("organization")
+        );
+        // X-RateLimit-Reset is the Unix time of the reset (what the SDKs
+        // parse), the very value of the body's reset_at; Retry-After is the wait.
+        let reset: u64 = header(&headers, HEADER_RESET)
+            .expect("reset header")
+            .parse()
+            .expect("numeric reset");
+        assert!(
+            (before + 2..=after + 2).contains(&reset),
+            "{reset} is not now + Retry-After ({before}..={after} + 2)"
+        );
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(body["reset_at"].as_u64(), Some(reset), "{body}");
+        assert_eq!(body["retry_after_secs"], 2);
+
+        // Public and admin refusals keep Retry-After only.
+        let res = rate_limit_exceeded_response(3, 100, None);
+        assert_eq!(header(res.headers(), "retry-after").as_deref(), Some("3"));
+        assert!(res.headers().get(HEADER_LIMIT).is_none());
+        assert!(res.headers().get(HEADER_REMAINING).is_none());
+        assert!(res.headers().get(HEADER_RESET).is_none());
+    }
+
+    #[test]
+    fn the_limit_that_runs_out_first_is_reported() {
+        let org = RateLimitHeaders {
+            scope: RateLimitScope::Organization,
+            limit: 200,
+            remaining: 150,
+            reset_secs: 1,
+        };
+        let key = RateLimitHeaders {
+            scope: RateLimitScope::ApiKey,
+            limit: 30,
+            remaining: 4,
+            reset_secs: 40,
+        };
+        assert_eq!(org.tighter(key), key);
+        assert_eq!(key.tighter(org), key);
+
+        // A per-key limit with more room than the org bucket: the org bucket.
+        let roomy = RateLimitHeaders {
+            remaining: 170,
+            ..key
+        };
+        assert_eq!(org.tighter(roomy), org);
+
+        // Tie on remaining: the one that takes longer to come back.
+        let tie = RateLimitHeaders {
+            remaining: 150,
+            ..key
+        };
+        assert_eq!(org.tighter(tie), tie);
+        assert_eq!(tie.tighter(org), tie);
+    }
+
+    #[test]
+    fn apply_sets_the_four_headers() {
+        let mut headers = HeaderMap::new();
+        RateLimitHeaders {
+            scope: RateLimitScope::ApiKey,
+            limit: 60,
+            remaining: 12,
+            reset_secs: 33,
+        }
+        .apply_at(&mut headers, 1_700_000_000);
+        assert_eq!(header(&headers, "X-RateLimit-Limit").as_deref(), Some("60"));
+        assert_eq!(
+            header(&headers, "X-RateLimit-Remaining").as_deref(),
+            Some("12")
+        );
+        assert_eq!(
+            header(&headers, "X-RateLimit-Reset").as_deref(),
+            Some("1700000033"),
+            "a Unix time, not the 33 s wait"
+        );
+        assert_eq!(
+            header(&headers, "X-RateLimit-Scope").as_deref(),
+            Some("api_key")
+        );
+    }
+
+    #[test]
+    fn reset_header_is_a_unix_time_the_sdks_can_parse() {
+        // Every SDK turns X-RateLimit-Reset into a date with the value as Unix
+        // seconds (Go time.Unix, Node new Date(v * 1000), Python fromtimestamp,
+        // PHP $reset - time()). A wait of a few seconds there reads as 1970.
+        let now = 1_760_000_000;
+        let spent = RateLimitHeaders::from_token_bucket(10, &bucket(true, 9, 0, 120));
+        assert_eq!(spent.reset_at(now), now + 1);
+
+        // A full bucket has nothing to wait for: the reset is now, not 0.
+        let full = RateLimitHeaders::from_token_bucket(10, &bucket(true, 10, 0, 0));
+        assert_eq!(full.reset_at(now), now);
+
+        // An API key window ending in 59.5 s.
+        let wall = chrono::Utc::now();
+        let window = RateLimitHeaders::from_window(
+            60,
+            &RateLimitResult {
+                allowed: true,
+                remaining: 41,
+                reset_at: wall + chrono::Duration::milliseconds(59_500),
+            },
+            wall,
+        );
+        assert_eq!(window.reset_at(now), now + 60);
+
+        // apply() stamps the current time.
+        let before = current_timestamp();
+        let mut headers = HeaderMap::new();
+        spent.apply(&mut headers);
+        let after = current_timestamp();
+        let reset: u64 = header(&headers, HEADER_RESET).unwrap().parse().unwrap();
+        assert!(
+            (before + 1..=after + 1).contains(&reset),
+            "{reset} not in {before}..={after} + 1"
+        );
+    }
 }

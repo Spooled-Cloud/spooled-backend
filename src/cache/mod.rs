@@ -728,14 +728,22 @@ impl RedisCache {
               retry_ms = math.ceil((1.0 - tokens) * 1000.0 / rate)
             end
 
+            -- Time until the next whole token, i.e. until the integer
+            -- `remaining` goes up by one; 0 when the bucket is already full.
+            local whole = math.floor(tokens)
+            local next_ms = 0
+            if whole < capacity then
+              next_ms = math.ceil((whole + 1.0 - tokens) * 1000.0 / rate)
+            end
+
             redis.call('HMSET', key, 'tokens', tokens, 'ts', now_ms)
             redis.call('PEXPIRE', key, ttl_ms)
 
-            return {allowed, math.floor(tokens), retry_ms}
+            return {allowed, whole, retry_ms, next_ms}
             "#,
         );
 
-        let (allowed, remaining, retry_ms): (i64, i64, i64) = self
+        let (allowed, remaining, retry_ms, next_ms): (i64, i64, i64, i64) = self
             .bounded(
                 script
                     .key(key)
@@ -751,6 +759,7 @@ impl RedisCache {
             allowed: allowed == 1,
             remaining: remaining.max(0) as u32,
             retry_after_ms: retry_ms.max(0) as u64,
+            next_token_ms: next_ms.max(0) as u64,
         })
     }
 }
@@ -775,6 +784,10 @@ pub struct TokenBucketResult {
     pub remaining: u32,
     /// Suggested retry-after in milliseconds (0 if allowed)
     pub retry_after_ms: u64,
+    /// Milliseconds until the next whole token, i.e. until `remaining` goes
+    /// up by one (0 when the bucket is full). Equals `retry_after_ms` when the
+    /// request was refused.
+    pub next_token_ms: u64,
 }
 
 #[cfg(test)]

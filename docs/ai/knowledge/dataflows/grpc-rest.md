@@ -65,6 +65,13 @@ An API key's `queues` entry may be `*`, an exact name or `prefix.*`. `GrpcAuthCo
 locked key row), and stream authorization uses `queue_scope_allows` / `queue_scope_is_unrestricted`
 (`begin_stream_operation` `queue_service.rs:1919`, `queue_scope_filter_from_queues` `:1899`). See `dataflows/auth.md`.
 
+## Worker counters are database-side (0.1.122, QW15)
+
+`workers.jobs_processed` / `jobs_failed` come from the deferred trigger on `jobs`, so gRPC `Complete`, `Fail`, `ProcessJobs` and
+`StreamJobs` settlements count with no code of their own, exactly like REST. The proto `Worker` / `ListWorkers` messages do not
+carry the counters (REST only; adding them is an additive proto change, not done). Keep the lease convention when adding a gRPC
+settle path (`dataflows/jobs-queue.md`, invariants #40).
+
 ## Worker field names
 
 The database uses `max_concurrent_jobs`, `current_job_count`, and `created_at`; REST public JSON keeps `max_concurrency`, `current_jobs`, and `registered_at`. Keep handlers and OpenAPI mapped at the boundary so SDKs do not see DB-only column names.
@@ -166,9 +173,12 @@ Message size: `MAX_GRPC_MESSAGE_SIZE` = 4 MiB (`src/grpc/mod.rs:50`, also the to
 encode/decode limit in `server.rs`). A `Dequeue` batch stops at 3 MiB encoded
 (`MAX_BATCH_RESPONSE_BYTES` `:68`, checked at `:735`) but always returns one job; the job
 that does not fit is released to pending, no retry spent. A job over 4 MiB is
-dead-lettered by `dead_letter_oversized` (`:1823`) with "Job too large for a gRPC
-message", a `job.failed` webhook and its completion webhook, on Dequeue, StreamJobs and
-ProcessJobs alike. This includes a REST-created job whose Struct form is over 4 MiB: any
+dead-lettered by `dead_letter_oversized` (`:2049`; called at `:850`, `:1816`, `:2279`) with "Job too large for a gRPC
+message", a `job.failed` webhook (which also sends the implied `job.deadlettered`, 0.1.122) and its completion webhook, on Dequeue, StreamJobs and
+ProcessJobs alike. Since 0.1.122 that is one transaction: it first expires the lease (`lease_expires_at = NOW()`, fenced on
+`lease_id` and `status = 'processing'`; a miss rolls back) and then dead-letters the job and writes the DLQ row, because the
+dead-letter is the server's decision and must not count as the claiming worker's failure on `workers.jobs_failed`: the counter
+trigger only counts a move out of `processing` under a live lease (`dataflows/jobs-queue.md`, "Worker counters"). This includes a REST-created job whose Struct form is over 4 MiB: any
 gRPC consumer on that queue dead-letters it, though a REST worker could process it (product
 policy). A claim error part-way through a unary Dequeue batch returns the jobs claimed so
 far (`:711-720`, BEGRPC-24).

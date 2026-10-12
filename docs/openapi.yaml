@@ -51,9 +51,18 @@ info:
     the organization limit, so it can only lower what that key may do.
 
     A rejected request answers `429` with code `RATE_LIMIT_EXCEEDED`, a `Retry-After` header (seconds)
-    and a JSON body with `retry_after_secs`, `limit`, `remaining` and `reset_at`. `Retry-After` is the
-    only rate-limit header: the API does not send `X-RateLimit-Limit`, `X-RateLimit-Remaining` or
-    `X-RateLimit-Reset`.
+    and a JSON body with `retry_after_secs`, `limit`, `remaining` and `reset_at`.
+
+    Authenticated responses also carry the state of the limit that answered the request:
+    `X-RateLimit-Limit` (the plan burst for the organization bucket, or the key's per-minute
+    limit), `X-RateLimit-Remaining` (requests that may still be made right now),
+    `X-RateLimit-Reset` (the Unix time in seconds at which `X-RateLimit-Remaining` next goes up;
+    the current time for a full bucket) and `X-RateLimit-Scope` (`organization` or `api_key`).
+    On a `429`, `X-RateLimit-Reset` is the current time plus `Retry-After` and equals the body's
+    `reset_at`; `Retry-After` is the wait in seconds. A request that bypasses the limiter carries
+    none of these headers.
+    The headers are exposed to cross-origin browsers (`Access-Control-Expose-Headers`), as are
+    `Retry-After`, `X-Request-Id` and `X-Has-More`.
 
     ## Plan Limits
 
@@ -837,6 +846,47 @@ paths:
         '404':
           description: Organization not found
 
+  /api/v1/organizations/{id}/members:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Organization ID (must be the caller's own organization)
+    get:
+      tags: [Organizations]
+      summary: List organization members
+      description: |
+        The organization's active API keys, oldest first, as members. An organization has no
+        user accounts: each key is one member, `role` is `owner` for a key whose `queues`
+        include `*` and `member` otherwise, and `email` is the organization's billing email.
+        Requires an unrestricted key. Another organization's id answers `404`.
+      operationId: listOrganizationMembers
+      responses:
+        '200':
+          description: Members
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/OrganizationMember'
+        '401':
+          description: Missing or invalid API key
+        '403':
+          description: The API key is restricted to queues (`ACCESS_DENIED`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Organization not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
   /api/v1/organizations/usage:
     get:
       tags: [Organizations]
@@ -1242,7 +1292,17 @@ paths:
         Jobs are ordered by `order_by` / `order_dir` and then by job id in the same direction,
         so rows that tie on the column (a bulk batch shares one `created_at`) keep one order
         across `offset` pages. `scheduled_at` and `completed_at` sort `NULLS LAST`. Pagination
-        is by `limit` and `offset` only; there is no cursor.
+        is by `limit` and `offset` only; there is no cursor. The `X-Has-More` response header
+        (`true` or `false`) says whether another page follows.
+
+        `status` may be a comma-separated list (`status=failed,deadletter`). `q` searches id
+        prefixes, queue names and job types; `job_type`, `created_after` and `created_before`
+        filter on the job type and the creation time. An invalid value is a 400.
+
+        The list runs under a statement timeout (5 s by default, `DATABASE_LIST_STATEMENT_TIMEOUT_MS`).
+        A list the database cannot answer in time is stopped and answered
+        `400 QUERY_TIMEOUT`; the same request would time out again, so narrow it (`queue_name`,
+        `status`, `job_type`, a created window, a longer `q`) rather than retrying it.
       operationId: listJobs
       parameters:
         - name: queue_name
@@ -1258,7 +1318,39 @@ paths:
           schema:
             type: string
             enum: [pending, scheduled, processing, completed, failed, deadletter, cancelled]
-          description: Filter by status. Matched case-insensitively (`Pending` = `pending`).
+          description: >-
+            Filter by status. Matched case-insensitively (`Pending` = `pending`). Several
+            statuses may be given comma-separated (`failed,deadletter`).
+        - name: q
+          in: query
+          schema:
+            type: string
+            maxLength: 255
+          description: >-
+            Search text, case-insensitive, at most 255 bytes: matches a job whose id starts with
+            it, or whose `queue_name` or `payload.job_type` contains it. `%` and `_` match
+            themselves. The job type part compares the text with the organization's distinct job
+            types, not with each job: the first 1000 distinct job types in sort order, each of at
+            most 255 bytes. A job whose type is beyond that is still found by `job_type` (exact),
+            by its id or by its queue.
+        - name: job_type
+          in: query
+          schema:
+            type: string
+            maxLength: 255
+          description: Exact `payload.job_type`, at most 255 bytes (a longer job type never matches).
+        - name: created_after
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: RFC 3339 instant; only jobs created at or after it.
+        - name: created_before
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: RFC 3339 instant; only jobs created before it.
         - name: tag
           in: query
           schema:
@@ -1298,6 +1390,12 @@ paths:
       responses:
         '200':
           description: List of jobs
+          headers:
+            X-Has-More:
+              description: '`true` when another page follows, else `false`'
+              schema:
+                type: string
+                enum: ['true', 'false']
           content:
             application/json:
               schema:
@@ -1305,7 +1403,10 @@ paths:
                 items:
                   $ref: '#/components/schemas/JobSummary'
         '400':
-          description: Invalid `status`, `queue_name`, `tag`, `order_by` or `order_dir`
+          description: >-
+            Invalid `status`, `queue_name`, `tag`, `q`, `job_type`, `created_after`,
+            `created_before`, `order_by` or `order_dir` (`VALIDATION_ERROR`), or the list hit its
+            statement timeout (`QUERY_TIMEOUT`)
           content:
             application/json:
               schema:
@@ -1598,6 +1699,67 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /api/v1/jobs/{id}/history:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      tags: [Jobs]
+      summary: Job history
+      description: |
+        The lifecycle events recorded for a job (`job_history`). A job of another organization,
+        or in a queue outside the key's scope, answers `404`. The `X-Has-More` response header
+        says whether more events follow.
+      operationId: getJobHistory
+      parameters:
+        - name: order_dir
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: asc
+          description: Oldest event first (`asc`, default) or newest first (`desc`). Alias `order`.
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+            default: 100
+          description: Events per page
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+          description: Events to skip
+      responses:
+        '200':
+          description: Job events
+          headers:
+            X-Has-More:
+              description: '`true` when more events follow, else `false`'
+              schema:
+                type: string
+                enum: ['true', 'false']
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/JobHistoryEvent'
+        '401':
+          description: Missing or invalid API key
+        '404':
+          description: Job not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
   /api/v1/jobs/stats:
     get:
       tags: [Jobs]
@@ -1753,8 +1915,10 @@ paths:
       tags: [Jobs]
       summary: List dead-letter queue
       description: |
-        List jobs in the dead-letter queue. Filters and ordering follow `GET /jobs`: an invalid
-        `queue_name`, `tag`, `order_by` or `order_dir` is a `400`, and ties are broken by job id.
+        List jobs in the dead-letter queue. Filters, ordering, the `X-Has-More` header and the
+        statement timeout follow `GET /jobs`: an invalid `queue_name`, `tag`, `q`, `job_type`,
+        `created_after`, `created_before`, `order_by` or `order_dir` is a `400`, ties are broken
+        by job id, and a list stopped by the timeout is a `400 QUERY_TIMEOUT`. `status` is ignored.
       operationId: listDeadLetterQueue
       parameters:
         - name: queue_name
@@ -1763,6 +1927,32 @@ paths:
             type: string
             maxLength: 255
           description: Filter by queue name (letters, digits, `-`, `_` and `.` only)
+        - name: q
+          in: query
+          schema:
+            type: string
+            maxLength: 255
+          description: >-
+            Search text, as `q` of `GET /jobs` (case-insensitive, at most 255 bytes; its job-type
+            part looks at the organization's first 1000 distinct job types).
+        - name: job_type
+          in: query
+          schema:
+            type: string
+            maxLength: 255
+          description: Exact `payload.job_type`, as `job_type` of `GET /jobs`.
+        - name: created_after
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: RFC 3339 instant; only jobs created at or after it.
+        - name: created_before
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: RFC 3339 instant; only jobs created before it.
         - name: tag
           in: query
           schema:
@@ -1798,6 +1988,12 @@ paths:
       responses:
         '200':
           description: List of dead-letter jobs
+          headers:
+            X-Has-More:
+              description: '`true` when another page follows, else `false`'
+              schema:
+                type: string
+                enum: ['true', 'false']
           content:
             application/json:
               schema:
@@ -1805,7 +2001,10 @@ paths:
                 items:
                   $ref: '#/components/schemas/JobSummary'
         '400':
-          description: Invalid `queue_name`, `tag`, `order_by` or `order_dir`
+          description: >-
+            Invalid `queue_name`, `tag`, `q`, `job_type`, `created_after`, `created_before`,
+            `order_by` or `order_dir` (`VALIDATION_ERROR`), or the list hit its statement timeout
+            (`QUERY_TIMEOUT`)
           content:
             application/json:
               schema:
@@ -2388,6 +2587,72 @@ paths:
                 message: Invalid or missing X-Webhook-Token
         '404':
           description: Organization not found, or soft-deleted
+
+  /api/v1/webhooks/deliveries:
+    get:
+      tags: [Webhooks]
+      summary: Inbound webhook log
+      description: |
+        Recent requests accepted by `POST /api/v1/webhooks/{org_id}/custom` for the caller's
+        organization, newest first. Entries carry neither the request payload nor any signature.
+        Requires an unrestricted key.
+      operationId: listInboundWebhookDeliveries
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [created, duplicate]
+          description: Only requests that created a job, or matched an existing one (idempotency key).
+        - name: since
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: RFC 3339 instant; only entries received at or after it.
+        - name: queue_name
+          in: query
+          schema:
+            type: string
+            maxLength: 255
+          description: Only entries whose job went to this queue (alias `queue`).
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+          description: Entries per page
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+          description: Entries to skip
+      responses:
+        '200':
+          description: Inbound webhook requests
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/InboundWebhookDelivery'
+        '400':
+          description: Invalid `status`, `since` or `queue_name` (over 255 characters)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Missing or invalid API key
+        '403':
+          description: The API key is restricted to queues (`ACCESS_DENIED`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   # Workflow Endpoints
   /api/v1/workflows:
@@ -3651,6 +3916,35 @@ components:
           type: string
           format: date-time
 
+    OrganizationMember:
+      type: object
+      description: An active API key of the organization, listed as a member
+      required: [id, user_id, email, name, role, joined_at]
+      properties:
+        id:
+          type: string
+          description: API key id
+        user_id:
+          type: string
+          description: Same as `id` (there are no user accounts)
+        email:
+          type: string
+          description: The organization's billing email (empty when none is set)
+        name:
+          type: string
+          description: API key name
+        role:
+          type: string
+          enum: [owner, member]
+          description: '`owner` when the key''s `queues` include `*`'
+        joined_at:
+          type: string
+          format: date-time
+          description: When the key was created
+        invited_by:
+          type: string
+          description: Not set today
+
     BillingEmailVerificationResponse:
       type: object
       required: [status]
@@ -3713,6 +4007,30 @@ components:
             unconfirmed.
         settings:
           type: object
+
+    JobHistoryEvent:
+      type: object
+      required: [id, job_id, event_type, details, created_at]
+      properties:
+        id:
+          type: string
+        job_id:
+          type: string
+        event_type:
+          type: string
+          description: >-
+            Lifecycle event: `processing`, `completed`, `retry_scheduled` or `deadlettered`
+            (`created` exists, but only the internal queue manager's enqueue writes it and no
+            REST or gRPC handler calls that). Events are recorded by REST claim, complete and
+            fail and by the scheduler's dead-letter sweeps; gRPC settlements record none.
+        worker_id:
+          type: [string, 'null']
+        details:
+          type: object
+          description: Event details (at most 64 KB)
+        created_at:
+          type: string
+          format: date-time
 
     Job:
       type: object
@@ -4042,6 +4360,8 @@ components:
           metadata,
           registered_at,
           updated_at,
+          jobs_processed,
+          jobs_failed,
         ]
       properties:
         id:
@@ -4078,10 +4398,32 @@ components:
         updated_at:
           type: string
           format: date-time
+        jobs_processed:
+          type: integer
+          format: int64
+          description: Jobs this worker completed (counted since 0.1.122)
+        jobs_failed:
+          type: integer
+          format: int64
+          description: >-
+            Failures this worker reported (a retry scheduled or a dead-letter); jobs released by
+            lease-expiry sweeps, and a job the server dead-letters because it is too large for a
+            gRPC message, are not counted
 
     WorkerSummary:
       type: object
-      required: [id, queue_name, hostname, status, current_jobs, max_concurrency, last_heartbeat]
+      required:
+        [
+          id,
+          queue_name,
+          hostname,
+          status,
+          current_jobs,
+          max_concurrency,
+          last_heartbeat,
+          jobs_processed,
+          jobs_failed,
+        ]
       properties:
         id:
           type: string
@@ -4098,6 +4440,14 @@ components:
         last_heartbeat:
           type: string
           format: date-time
+        jobs_processed:
+          type: integer
+          format: int64
+          description: Jobs this worker completed (counted since 0.1.122)
+        jobs_failed:
+          type: integer
+          format: int64
+          description: Failures this worker reported (see Worker.jobs_failed)
 
     RegisterWorkerRequest:
       type: object
@@ -4320,6 +4670,34 @@ components:
             Job status read back from the stored row. `pending` for a newly
             enqueued job; an idempotent replay reports the existing job's
             current status (processing, completed, failed, deadletter).
+
+    InboundWebhookDelivery:
+      type: object
+      description: One accepted request to the custom inbound webhook
+      required: [id, provider, event_type, created_at]
+      properties:
+        id:
+          type: string
+        provider:
+          type: string
+          description: '`custom`'
+        event_type:
+          type: string
+        matched_queue:
+          type: [string, 'null']
+          description: Queue the request was routed to
+        job_id:
+          type: [string, 'null']
+          description: Job the request created or matched (`null` for entries before 0.1.122)
+        status:
+          type: [string, 'null']
+          enum: [created, duplicate, null]
+          description: >-
+            `created` for a new job, `duplicate` when the idempotency key matched an existing
+            job (`null` for entries before 0.1.122)
+        created_at:
+          type: string
+          format: date-time
 
     # Bulk Operations
     BulkEnqueueRequest:
@@ -4828,7 +5206,7 @@ components:
     OutgoingWebhook:
       type: object
       required:
-        [id, organization_id, name, url, events, enabled, failure_count, created_at, updated_at]
+        [id, organization_id, name, url, events, format, enabled, failure_count, created_at, updated_at]
       properties:
         id:
           type: string
@@ -4841,6 +5219,9 @@ components:
           format: uri
         events:
           type: array
+          description: >-
+            Subscribed events; see CreateOutgoingWebhookRequest.events for the newer ones
+            (`workflow.completed` and `workflow.failed` are announced at most once).
           items:
             type: string
             enum:
@@ -4849,11 +5230,23 @@ components:
               - job.completed
               - job.failed
               - job.cancelled
+              - job.deadlettered
+              - job.retried
+              - workflow.completed
+              - workflow.failed
               - queue.paused
               - queue.resumed
               - worker.registered
               - worker.deregistered
               - schedule.triggered
+        format:
+          type: string
+          enum: [json, slack, discord, teams]
+          default: json
+          description: >-
+            Body format of the delivery, rendered when it is sent. `json` is the signed event
+            envelope; `slack`, `discord` and `teams` send a chat message for that service.
+            `X-Spooled-Signature` always covers the bytes actually sent.
         enabled:
           type: boolean
           description: >-
@@ -4900,6 +5293,33 @@ components:
         events:
           type: array
           minItems: 1
+          description: |
+            Events to deliver; each delivery names its event in `event` and `X-Spooled-Event`.
+            The events added in 0.1.122:
+
+            - `job.deadlettered`: sent next to every `job.failed` whose `data.status` is
+              `deadletter`, with the same `data`.
+            - `job.retried`: a `failed`, `deadletter` or `cancelled` job put back to `pending` by
+              `POST /api/v1/jobs/{id}/retry`, `POST /api/v1/jobs/dlq/retry` or
+              `POST /api/v1/workflows/{id}/retry` (`data.old_status`, `data.source`).
+            - `workflow.completed` / `workflow.failed`: a workflow finished with no / at least
+              one failed or dead-lettered job (a cancelled workflow sends neither). Announced
+              **at most once** per outcome: a scheduler pass every 10 s marks the outcome
+              announced and commits, then queues the event in memory. So no outcome is sent
+              twice, but one is lost if the process stops between that commit and the delivery
+              being recorded, if the delivery queue is full at that moment, or if recording the
+              delivery fails; a failed workflow retried with `POST /api/v1/workflows/{id}/retry`
+              before the next pass (within about 10 s) never announces that `workflow.failed`,
+              only the outcome it reaches after the retry; an outcome more than an hour old at
+              the pass is never sent. Confirm with `GET /api/v1/workflows/{id}`.
+
+            `data` of the new events: `job.deadlettered` has `job_id`, `queue_name`, `status`
+            (`deadletter`) and `error`; `job.retried` has `job_id`, `queue_name`, `status`
+            (`pending`), `old_status` (`failed`, `deadletter` or `cancelled`), `source`
+            (`job_retry`, `dlq_retry` or `workflow_retry`) and, for a workflow job, `workflow_id`;
+            `workflow.completed` / `workflow.failed` have `workflow_id`, `name`, `status`,
+            `total_jobs`, `completed_jobs`, `failed_jobs`, `created_at`, `started_at` (nullable),
+            `completed_at` and `metadata` (nullable).
           items:
             type: string
             enum:
@@ -4908,6 +5328,10 @@ components:
               - job.completed
               - job.failed
               - job.cancelled
+              - job.deadlettered
+              - job.retried
+              - workflow.completed
+              - workflow.failed
               - queue.paused
               - queue.resumed
               - worker.registered
@@ -4917,6 +5341,14 @@ components:
           type: string
           maxLength: 255
           description: Optional HMAC secret for signing webhook payloads
+        format:
+          type: string
+          enum: [json, slack, discord, teams]
+          default: json
+          description: >-
+            Body format of the delivery, rendered when it is sent. `json` is the signed event
+            envelope; `slack`, `discord` and `teams` send a chat message for that service.
+            `X-Spooled-Signature` always covers the bytes actually sent.
         enabled:
           type: boolean
           default: true
@@ -4934,6 +5366,9 @@ components:
           maxLength: 2048
         events:
           type: array
+          description: >-
+            Replaces the subscribed events; the values of CreateOutgoingWebhookRequest.events
+            (`workflow.completed` and `workflow.failed` are announced at most once).
           items:
             type: string
         secret:
@@ -4946,6 +5381,13 @@ components:
             X-Spooled-Signature header), or send a string to replace it.
             Note: clients that serialise unchanged fields as explicit null will
             clear the secret.
+        format:
+          type: string
+          enum: [json, slack, discord, teams]
+          description: >-
+            Body format of the delivery, rendered when it is sent. `json` is the signed event
+            envelope; `slack`, `discord` and `teams` send a chat message for that service.
+            `X-Spooled-Signature` always covers the bytes actually sent.
         enabled:
           type: boolean
           description: >-

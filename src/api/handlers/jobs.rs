@@ -25,8 +25,8 @@ use crate::error::{AppError, AppResult};
 use crate::models::ApiKeyContext;
 use crate::models::{
     normalize_idempotency_key, ClaimJobsRequest, ClaimJobsResponse, ClaimedJob, CompleteJobRequest,
-    CreateJobRequest, CreateJobResponse, FailJobRequest, HeartbeatJobRequest, Job, JobStats,
-    JobStatsQuery, JobSummary, ListJobsQuery, DEPENDENCY_CANCEL_REASONS,
+    CreateJobRequest, CreateJobResponse, FailJobRequest, HeartbeatJobRequest, Job, JobHistory,
+    JobHistoryQuery, JobStats, JobStatsQuery, JobSummary, ListJobsQuery, DEPENDENCY_CANCEL_REASONS,
 };
 use crate::queue::{QueueManager, WorkerOpOutcome};
 use axum::extract::Extension;
@@ -76,23 +76,424 @@ fn queue_filter(value: &Option<String>) -> AppResult<Option<&str>> {
     }
 }
 
-/// Status filters match case-insensitively (`Pending` = `pending`).
-fn status_filter(value: &Option<String>) -> AppResult<Option<&'static str>> {
-    let Some(status) = filter_value(value) else {
+/// Status filters match case-insensitively (`Pending` = `pending`). One status
+/// or a comma-separated list (`failed,deadletter`): empty entries are skipped
+/// and repeats dropped, so `?status=` is still no filter.
+fn status_filter(value: &Option<String>) -> AppResult<Vec<&'static str>> {
+    let Some(raw) = filter_value(value) else {
+        return Ok(Vec::new());
+    };
+    let mut statuses: Vec<&'static str> = Vec::new();
+    for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let status = VALID_JOB_STATUSES
+            .iter()
+            .copied()
+            .find(|valid| valid.eq_ignore_ascii_case(entry))
+            .ok_or_else(|| {
+                AppError::Validation(format!(
+                    "Invalid status filter '{}': expected one or more of {} (comma-separated)",
+                    entry,
+                    VALID_JOB_STATUSES.join(", ")
+                ))
+            })?;
+        if !statuses.contains(&status) {
+            statuses.push(status);
+        }
+    }
+    Ok(statuses)
+}
+
+/// Longest `q` search text and `job_type` filter, in bytes.
+const MAX_SEARCH_FILTER_LEN: usize = 255;
+
+/// Escape `\`, `%` and `_` so the text matches itself in a LIKE pattern (whose
+/// escape character is the default backslash).
+fn escape_like(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
+}
+
+/// Free text for `q` / `job_type`: at most 255 bytes, no NUL (Postgres text
+/// cannot hold it).
+fn text_filter<'a>(name: &str, value: Option<&'a str>) -> AppResult<Option<&'a str>> {
+    match value {
+        Some(text) if text.len() > MAX_SEARCH_FILTER_LEN || text.contains('\0') => {
+            Err(AppError::Validation(format!(
+                "Invalid {} filter: at most {} bytes and no NUL character",
+                name, MAX_SEARCH_FILTER_LEN
+            )))
+        }
+        text => Ok(text),
+    }
+}
+
+/// An RFC 3339 instant. A `+` offset sent unencoded in a query string arrives
+/// as a space (`...T10:00:00 02:00`); that one spelling is read as `+` too.
+fn parse_rfc3339(raw: &str) -> Option<chrono::DateTime<Utc>> {
+    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Some(t.with_timezone(&Utc));
+    }
+    let sign = raw.len().checked_sub(6)?;
+    if raw.as_bytes()[sign] != b' ' {
+        return None;
+    }
+    chrono::DateTime::parse_from_rfc3339(&format!("{}+{}", &raw[..sign], &raw[sign + 1..]))
+        .ok()
+        .map(|t| t.with_timezone(&Utc))
+}
+
+fn time_filter(name: &str, value: &Option<String>) -> AppResult<Option<chrono::DateTime<Utc>>> {
+    let Some(raw) = value.as_deref().map(str::trim).filter(|v| !v.is_empty()) else {
         return Ok(None);
     };
-    VALID_JOB_STATUSES
-        .iter()
-        .copied()
-        .find(|valid| valid.eq_ignore_ascii_case(status))
-        .map(Some)
-        .ok_or_else(|| {
-            AppError::Validation(format!(
-                "Invalid status filter '{}': expected one of {}",
-                status,
-                VALID_JOB_STATUSES.join(", ")
-            ))
+    parse_rfc3339(raw).map(Some).ok_or_else(|| {
+        AppError::Validation(format!(
+            "Invalid {} '{}': expected an RFC 3339 timestamp such as 2026-10-11T08:00:00Z",
+            name, raw
+        ))
+    })
+}
+
+/// The validated filters of `GET /jobs` and `GET /jobs/dlq`. Every value is a
+/// bound parameter; only fixed SQL text is pushed.
+struct JobListFilters<'a> {
+    queue: Option<&'a str>,
+    statuses: Vec<&'static str>,
+    tag: Option<&'a str>,
+    /// `q`, LIKE-escaped.
+    search: Option<String>,
+    job_type: Option<&'a str>,
+    created_after: Option<chrono::DateTime<Utc>>,
+    created_before: Option<chrono::DateTime<Utc>>,
+}
+
+impl<'a> JobListFilters<'a> {
+    /// Validate the query's filters; any invalid one is a 400. `with_status`
+    /// is false for `/jobs/dlq`, whose status is fixed (its `status` parameter
+    /// was always ignored, and still is).
+    fn parse(query: &'a ListJobsQuery, with_status: bool) -> AppResult<Self> {
+        let created_after = time_filter("created_after", &query.created_after)?;
+        let created_before = time_filter("created_before", &query.created_before)?;
+        if let (Some(after), Some(before)) = (created_after, created_before) {
+            if after >= before {
+                return Err(AppError::Validation(
+                    "created_after must be earlier than created_before".to_string(),
+                ));
+            }
+        }
+        Ok(Self {
+            queue: queue_filter(&query.queue_name)?,
+            statuses: if with_status {
+                status_filter(&query.status)?
+            } else {
+                Vec::new()
+            },
+            tag: tag_filter(&query.tag)?,
+            search: text_filter(
+                "q",
+                query.q.as_deref().map(str::trim).filter(|q| !q.is_empty()),
+            )?
+            .map(escape_like),
+            job_type: text_filter("job_type", filter_value(&query.job_type))?,
+            created_after,
+            created_before,
         })
+    }
+
+    /// ` AND ...` for each filter set except `q` (see [`job_list_query`]).
+    /// `with_job_type: false` leaves out the `job_type` filter, for the part
+    /// of a search that already matches one job type at a time.
+    fn push(&self, qb: &mut QueryBuilder<Postgres>, with_job_type: bool) {
+        if let Some(queue) = self.queue {
+            qb.push(" AND queue_name = ");
+            qb.push_bind(queue.to_string());
+        }
+        match self.statuses.as_slice() {
+            [] => {}
+            // One status keeps the plain equality (and its plans).
+            [status] => {
+                qb.push(" AND status = ");
+                qb.push_bind(*status);
+            }
+            statuses => {
+                qb.push(" AND status = ANY(");
+                qb.push_bind(
+                    statuses
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<String>>(),
+                );
+                qb.push("::TEXT[])");
+            }
+        }
+        if let Some(tag) = self.tag {
+            qb.push(" AND tags ? ");
+            qb.push_bind(tag.to_string());
+        }
+        if let Some(job_type) = self.job_type.filter(|_| with_job_type) {
+            // Answered by idx_jobs_org_job_type, whose partial predicate
+            // this repeats verbatim (the planner only uses a partial index
+            // whose predicate the query implies).
+            qb.push(" AND payload->>'job_type' = ");
+            qb.push_bind(job_type.to_string());
+            qb.push(JOB_TYPE_INDEXED);
+        }
+        if let Some(after) = self.created_after {
+            qb.push(" AND created_at >= ");
+            qb.push_bind(after);
+        }
+        if let Some(before) = self.created_before {
+            qb.push(" AND created_at < ");
+            qb.push_bind(before);
+        }
+    }
+}
+
+/// The predicate of idx_jobs_org_job_type (migration 20261014120000). Every
+/// query that should use the index repeats it verbatim.
+const JOB_TYPE_INDEXED: &str = " AND octet_length(payload->>'job_type') <= 255";
+
+/// Most distinct job types of an organization that `q` is compared with (in
+/// their sort order); the cap bounds the skip scan of [`SEARCH_JOB_TYPES_SQL`].
+pub const MAX_SEARCH_JOB_TYPES: i64 = 1000;
+
+/// The organization's (`$1`) job types that contain the `q` text (`$3`, an
+/// ILIKE pattern), among its first `$2` distinct job types in sort order.
+///
+/// A skip scan of idx_jobs_org_job_type: each step is one index descent to the
+/// next distinct type, so the cost follows the number of types, not of jobs,
+/// and no payload but one per type is read. A substring cannot be looked up in
+/// a btree, which is why `q` first resolves to whole job types here and then
+/// matches jobs of those types through the same index ([`job_list_query`]).
+/// It used to compare `payload->>'job_type'` with the text on every job of the
+/// organization, reading each payload from TOAST: 466 ms for a search on 130k
+/// jobs of ~3 KB payloads; this step takes about 1 ms there (41 types).
+pub const SEARCH_JOB_TYPES_SQL: &str = "\
+WITH RECURSIVE job_types(job_type) AS ( \
+    (SELECT payload->>'job_type' FROM jobs \
+      WHERE organization_id = $1 AND octet_length(payload->>'job_type') <= 255 \
+      ORDER BY payload->>'job_type' LIMIT 1) \
+  UNION ALL \
+    SELECT (SELECT payload->>'job_type' FROM jobs \
+             WHERE organization_id = $1 AND octet_length(payload->>'job_type') <= 255 \
+               AND payload->>'job_type' > job_types.job_type \
+             ORDER BY payload->>'job_type' LIMIT 1) \
+    FROM job_types WHERE job_types.job_type IS NOT NULL \
+) \
+SELECT job_type FROM (SELECT job_type FROM job_types WHERE job_type IS NOT NULL LIMIT $2) AS seen \
+WHERE job_type ILIKE $3";
+
+/// Where a job list reads from: the organization's jobs, only the
+/// dead-lettered ones for `/jobs/dlq`, only the key's queues for a scoped key.
+struct JobListScope<'a> {
+    org_id: &'a str,
+    dead_letter_only: bool,
+    queues: Option<&'a [String]>,
+}
+
+impl JobListScope<'_> {
+    /// ` FROM jobs WHERE ...` for this scope and `filters` (except `q`).
+    fn push_from(
+        &self,
+        qb: &mut QueryBuilder<Postgres>,
+        filters: &JobListFilters<'_>,
+        with_job_type: bool,
+    ) {
+        qb.push(" FROM jobs WHERE organization_id = ");
+        qb.push_bind(self.org_id.to_string());
+        if self.dead_letter_only {
+            qb.push(" AND status = 'deadletter'");
+        }
+        // Queue scope: a restricted key only ever lists jobs in its own queues.
+        // This must RESTRICT the result set (not merely validate an optional
+        // filter), otherwise a scoped key with no `queue_name` filter would
+        // see every queue's jobs.
+        if let Some(allowed) = self.queues {
+            qb.push(" AND queue_in_key_scope(queue_name, ");
+            qb.push_bind(allowed.to_vec());
+            qb.push("::TEXT[])");
+        }
+        filters.push(qb, with_job_type);
+    }
+}
+
+/// ` AND (...)` matching `q` on the columns stored in the row: an id prefix or
+/// a queue name substring (`NOT (...)` when `negate`). `search` is
+/// LIKE-escaped, so `%` and `_` in it match themselves; ILIKE ignores case.
+fn push_search_columns(qb: &mut QueryBuilder<Postgres>, search: &str, negate: bool) {
+    qb.push(if negate {
+        " AND NOT (id ILIKE "
+    } else {
+        " AND (id ILIKE "
+    });
+    qb.push_bind(format!("{search}%"));
+    qb.push(" OR queue_name ILIKE ");
+    qb.push_bind(format!("%{search}%"));
+    qb.push(")");
+}
+
+/// The SQL of one job list page: `limit + 1` rows from `offset`, so the
+/// caller can tell whether another page follows.
+///
+/// Without `q`, or when `q` names no job type (`search_types` empty), it is a
+/// single SELECT. Otherwise the jobs matching `q` are the union of two
+/// disjoint parts, each cut to the `offset + limit + 1` rows that could reach
+/// the page:
+/// - an id prefix or queue name match, read from the row's own columns;
+/// - for each job type of `search_types`, its jobs that the first part does
+///   not have, read through idx_jobs_org_job_type with the type as the index
+///   key (a LATERAL probe per type).
+///
+/// So no part of a search compares the text with a payload. The planner
+/// cannot tell that reading a payload is expensive (a large one is in TOAST),
+/// and given a single `... OR payload->>'job_type' = ANY(...)` condition it
+/// walked the organization's jobs and read every payload.
+fn job_list_query(
+    scope: &JobListScope<'_>,
+    filters: &JobListFilters<'_>,
+    search_types: &[String],
+    (column, direction): (&'static str, &'static str),
+    limit: i64,
+    offset: i64,
+) -> QueryBuilder<Postgres> {
+    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new("SELECT *");
+    match filters.search.as_deref() {
+        Some(search) if !search_types.is_empty() => {
+            let part_rows = offset.saturating_add(limit).saturating_add(1);
+            qb.push(" FROM ((SELECT *");
+            scope.push_from(&mut qb, filters, true);
+            push_search_columns(&mut qb, search, false);
+            push_job_order(&mut qb, column, direction);
+            qb.push(" LIMIT ");
+            qb.push_bind(part_rows);
+            qb.push(") UNION ALL (SELECT j.* FROM UNNEST(");
+            qb.push_bind(search_types.to_vec());
+            // `search_types` already honours a `job_type` filter.
+            qb.push("::TEXT[]) AS t(job_type) CROSS JOIN LATERAL (SELECT *");
+            scope.push_from(&mut qb, filters, false);
+            qb.push(" AND payload->>'job_type' = t.job_type");
+            qb.push(JOB_TYPE_INDEXED);
+            push_search_columns(&mut qb, search, true);
+            push_job_order(&mut qb, column, direction);
+            qb.push(" LIMIT ");
+            qb.push_bind(part_rows);
+            qb.push(") AS j)) AS matched");
+        }
+        search => {
+            scope.push_from(&mut qb, filters, true);
+            if let Some(search) = search {
+                push_search_columns(&mut qb, search, false);
+            }
+        }
+    }
+    push_job_order(&mut qb, column, direction);
+    qb.push(" LIMIT ");
+    qb.push_bind(limit + 1);
+    qb.push(" OFFSET ");
+    qb.push_bind(offset);
+    qb
+}
+
+/// One page of `GET /jobs` or `GET /jobs/dlq` and whether another follows.
+///
+/// The statements run in a short read-only transaction with a `SET LOCAL
+/// statement_timeout` (`DATABASE_LIST_STATEMENT_TIMEOUT_MS`, 5 s by default).
+/// Postgres cancels a statement that runs longer itself, which also bounds the
+/// work of a request whose client went away: dropping the request future does
+/// not cancel a running statement. LOCAL ends with the transaction, so the
+/// setting never reaches the next user of the pooled connection (nor another
+/// client behind a transaction-mode PgBouncer).
+async fn list_job_page(
+    state: &AppState,
+    scope: &JobListScope<'_>,
+    filters: &JobListFilters<'_>,
+    order: (&'static str, &'static str),
+    limit: i64,
+    offset: i64,
+) -> AppResult<(Vec<Job>, bool)> {
+    let timeout_ms = state.settings.database.list_statement_timeout_ms;
+    let run = async {
+        // AssertSqlSafe: the only value written into the text is a u64 from
+        // the configuration; SET takes no bind parameters.
+        let mut tx = state
+            .db
+            .pool()
+            .begin_with(sqlx::AssertSqlSafe(format!(
+                "BEGIN READ ONLY; SET LOCAL statement_timeout = {timeout_ms}"
+            )))
+            .await?;
+        let mut search_types: Vec<String> = match filters.search.as_deref() {
+            Some(search) => {
+                sqlx::query_scalar(SEARCH_JOB_TYPES_SQL)
+                    .bind(scope.org_id)
+                    .bind(MAX_SEARCH_JOB_TYPES)
+                    .bind(format!("%{search}%"))
+                    .fetch_all(&mut *tx)
+                    .await?
+            }
+            None => Vec::new(),
+        };
+        if let Some(job_type) = filters.job_type {
+            search_types.retain(|t| t == job_type);
+        }
+        let mut qb = job_list_query(scope, filters, &search_types, order, limit, offset);
+        let jobs: Vec<Job> = qb.build_query_as().fetch_all(&mut *tx).await?;
+        tx.commit().await?;
+        Ok::<_, sqlx::Error>(jobs)
+    };
+    let jobs = run.await.map_err(|e| list_query_error(e, timeout_ms))?;
+    Ok(split_page(jobs, limit))
+}
+
+/// A list statement that Postgres cancelled (SQLSTATE 57014: the statement
+/// timeout, or an operator's pg_cancel_backend) is a `400 QUERY_TIMEOUT`
+/// asking for a narrower list. Not a 5xx:
+/// the SDKs retry those and count them toward their circuit breaker, and the
+/// same list would only time out again. Any other failure stays a database
+/// error, a 500 whose body carries no SQL.
+fn list_query_error(e: sqlx::Error, timeout_ms: u64) -> AppError {
+    let cancelled = e
+        .as_database_error()
+        .and_then(|db| db.code())
+        .is_some_and(|code| code == "57014");
+    if !cancelled {
+        return AppError::Database(e);
+    }
+    warn!(timeout_ms, "Job list stopped by the list statement timeout");
+    AppError::QueryTimeout(format!(
+        "Listing these jobs took longer than {timeout_ms} ms and was stopped. Narrow it with \
+         queue_name, status, job_type, created_after or created_before, or a longer q"
+    ))
+}
+
+/// Response header saying whether another page follows: `true` when the
+/// page was full and at least one more row matched. The list bodies are bare
+/// arrays, so the hint rides in a header rather than a new body field.
+pub const HAS_MORE_HEADER: &str = "x-has-more";
+
+/// Fetch one row past `limit` to learn whether more follow, then drop it.
+fn split_page<T>(mut rows: Vec<T>, limit: i64) -> (Vec<T>, bool) {
+    let limit = usize::try_from(limit).unwrap_or(0);
+    let has_more = rows.len() > limit;
+    rows.truncate(limit);
+    (rows, has_more)
+}
+
+/// `body` with the [`HAS_MORE_HEADER`] paging hint.
+fn paged<T: serde::Serialize>(body: T, has_more: bool) -> impl IntoResponse {
+    (
+        [(
+            axum::http::HeaderName::from_static(HAS_MORE_HEADER),
+            axum::http::HeaderValue::from_static(if has_more { "true" } else { "false" }),
+        )],
+        Json(body),
+    )
 }
 
 /// Tags are stored as free-form JSON, so the filter takes any characters it
@@ -231,62 +632,32 @@ async fn refund_reserved_quota(state: &AppState, org_id: &str, reserved: bool, c
 
 /// List jobs with optional filtering
 ///
-/// Reduced max limit from 1000 to 100
+/// Reduced max limit from 1000 to 100. Filters: `queue_name`, `status` (one
+/// or a comma list), `tag`, `q`, `job_type`, `created_after`,
+/// `created_before`; the `X-Has-More` header says whether another page
+/// follows.
 pub async fn list(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
     Query(query): Query<ListJobsQuery>,
-) -> AppResult<Json<Vec<JobSummary>>> {
+) -> AppResult<impl IntoResponse> {
     // Cap limit at 100 to prevent memory exhaustion
     let limit = query.limit.unwrap_or(50).clamp(1, MAX_JOBS_PER_PAGE);
     let offset = query.offset.unwrap_or(0).max(0);
 
-    let validated_queue = queue_filter(&query.queue_name)?;
-    let validated_status = status_filter(&query.status)?;
-    let validated_tag = tag_filter(&query.tag)?;
-    let (order_by, order_dir) = query.order().map_err(AppError::Validation)?;
-    let org_id = &ctx.organization_id;
+    let filters = JobListFilters::parse(&query, true)?;
+    let order = query.order().map_err(AppError::Validation)?;
+    let scope = JobListScope {
+        org_id: &ctx.organization_id,
+        dead_letter_only: false,
+        queues: ctx.queue_scope_filter(),
+    };
 
-    // Build query dynamically to support optional filters without a combinatorial explosion.
-    // All filters are parameterized (no string interpolation of user input).
-    let mut qb: QueryBuilder<Postgres> =
-        QueryBuilder::new("SELECT * FROM jobs WHERE organization_id = ");
-    qb.push_bind(org_id);
-
-    // Queue scope: a restricted key only ever lists jobs in its own queues. This must
-    // RESTRICT the result set (not merely validate an optional filter), otherwise a
-    // scoped key with no `queue_name` filter would see every queue's jobs.
-    if let Some(allowed) = ctx.queue_scope_filter() {
-        qb.push(" AND queue_in_key_scope(queue_name, ");
-        qb.push_bind(allowed.to_vec());
-        qb.push("::TEXT[])");
-    }
-
-    if let Some(queue) = &validated_queue {
-        qb.push(" AND queue_name = ");
-        qb.push_bind(queue);
-    }
-
-    if let Some(status) = &validated_status {
-        qb.push(" AND status = ");
-        qb.push_bind(status);
-    }
-
-    if let Some(tag) = &validated_tag {
-        qb.push(" AND tags ? ");
-        qb.push_bind(tag);
-    }
-
-    push_job_order(&mut qb, order_by, order_dir);
-    qb.push(" LIMIT ");
-    qb.push_bind(limit);
-    qb.push(" OFFSET ");
-    qb.push_bind(offset);
-
-    let jobs: Vec<Job> = qb.build_query_as().fetch_all(state.db.pool()).await?;
+    // All filters are bound parameters (no string interpolation of user input).
+    let (jobs, has_more) = list_job_page(&state, &scope, &filters, order, limit, offset).await?;
 
     let summaries: Vec<JobSummary> = jobs.into_iter().map(Into::into).collect();
-    Ok(Json(summaries))
+    Ok(paged(summaries, has_more))
 }
 
 /// Create a new job
@@ -832,19 +1203,34 @@ pub async fn fail(
         }
     }
 
+    // The status this transition set (`pending` for a scheduled retry,
+    // `deadletter`). It is taken from the transition, not read back after the
+    // commit: by then the retry may be claimed again or the dead-lettered job
+    // retried, and job.failed (with the job.deadlettered it implies) would be
+    // skipped or carry the wrong status.
+    let new_status = outcome.new_status.clone().unwrap_or_else(|| {
+        if outcome.will_retry {
+            "pending"
+        } else {
+            "deadletter"
+        }
+        .to_string()
+    });
+
     // Metrics: processing -> pending (retry) OR processing -> deadletter. The gRPC
     // fail path counts the same series; without this REST workers' failures never
     // reached spooled_jobs_failed_total / spooled_jobs_deadlettered_total.
     state.metrics.jobs_processing.dec();
     state.metrics.jobs_failed.inc();
-    if outcome.new_status.as_deref() == Some("deadletter") {
+    if new_status == "deadletter" {
         state.metrics.jobs_deadlettered.inc();
     }
 
-    // Best-effort realtime publish (status after fail may be pending (retry), failed, or deadletter)
-    type FailJobRow = (String, String, i32, Option<String>, Option<String>);
+    // Best-effort realtime publish and webhooks; the row supplies the other
+    // fields.
+    type FailJobRow = (String, i32, Option<String>, Option<String>);
     let updated: Option<FailJobRow> = sqlx::query_as(
-        "SELECT status, queue_name, retry_count, completion_webhook, completion_webhook_secret FROM jobs WHERE id = $1 AND organization_id = $2",
+        "SELECT queue_name, retry_count, completion_webhook, completion_webhook_secret FROM jobs WHERE id = $1 AND organization_id = $2",
     )
     .bind(&id)
     .bind(&ctx.organization_id)
@@ -852,13 +1238,7 @@ pub async fn fail(
     .await
     .unwrap_or(None);
 
-    if let Some((
-        new_status,
-        queue_name,
-        retry_count,
-        completion_webhook,
-        completion_webhook_secret,
-    )) = updated
+    if let Some((queue_name, retry_count, completion_webhook, completion_webhook_secret)) = updated
     {
         if let Some(ref cache) = state.cache {
             let now = Utc::now().to_rfc3339();
@@ -996,6 +1376,56 @@ pub async fn get(
     }
 
     Ok(Json(job))
+}
+
+/// A job's recorded lifecycle events (`job_history`)
+///
+/// GET /api/v1/jobs/{id}/history?order_dir=asc|desc&limit=&offset=
+///
+/// Oldest first unless `order_dir=desc`. Same access rule as `GET /jobs/{id}`:
+/// another organization's job, or one in a queue outside the key's scope, is
+/// a 404. `worker_id` is the column, or else the `worker_id` the claim wrote
+/// into `details`. The `X-Has-More` header says whether more events follow.
+pub async fn history(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Path(id): Path<String>,
+    Query(query): Query<JobHistoryQuery>,
+) -> AppResult<impl IntoResponse> {
+    let direction = query.direction().map_err(AppError::Validation)?;
+    let (limit, offset) = query.page();
+
+    let queue_name: Option<String> =
+        sqlx::query_scalar("SELECT queue_name FROM jobs WHERE id = $1 AND organization_id = $2")
+            .bind(&id)
+            .bind(&ctx.organization_id)
+            .fetch_optional(state.db.pool())
+            .await?;
+    match queue_name {
+        Some(queue) if ctx.can_access_queue(&queue) => {}
+        // Out-of-scope existence is not revealed, as in get().
+        _ => return Err(AppError::NotFound("Job not found".to_string())),
+    }
+
+    // `direction` is one of two fixed strings. Walks
+    // idx_job_history_job_created (job_id, created_at DESC) either way.
+    let events: Vec<JobHistory> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT id, job_id, event_type, \
+                COALESCE(worker_id, details->>'worker_id') AS worker_id, \
+                details, created_at \
+         FROM job_history \
+         WHERE job_id = $1 \
+         ORDER BY created_at {direction}, id {direction} \
+         LIMIT $2 OFFSET $3"
+    )))
+    .bind(&id)
+    .bind(limit + 1)
+    .bind(offset)
+    .fetch_all(state.db.pool())
+    .await?;
+    let (events, has_more) = split_page(events, limit);
+
+    Ok(paged(events, has_more))
 }
 
 /// Cancel a job
@@ -1361,6 +1791,22 @@ pub async fn retry(
 
     state.metrics.jobs_retried.inc();
     state.metrics.jobs_pending.add(1 + reopened.len() as i64);
+
+    state.outgoing_webhooks.spawn_dispatch(
+        ctx.organization_id.clone(),
+        crate::outgoing_webhooks::events::JOB_RETRIED.to_string(),
+        job.id.clone(),
+        crate::outgoing_webhooks::events::job_retried_payload(
+            &job.id,
+            &job.queue_name,
+            before_status
+                .as_ref()
+                .map(|(s,)| s.as_str())
+                .unwrap_or("failed"),
+            crate::outgoing_webhooks::events::RETRY_SOURCE_JOB,
+            job.workflow_id.as_deref(),
+        ),
+    );
 
     // Notify Redis about job being available for workers
     if let Some(ref cache) = state.cache {
@@ -1899,47 +2345,25 @@ pub async fn list_dlq(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
     Query(query): Query<ListJobsQuery>,
-) -> AppResult<Json<Vec<JobSummary>>> {
+) -> AppResult<impl IntoResponse> {
     // Cap limit at 100 to prevent memory exhaustion
     let limit = query.limit.unwrap_or(50).clamp(1, MAX_JOBS_PER_PAGE);
     let offset = query.offset.unwrap_or(0).max(0);
 
-    // Same filter and order rules as list(); `status` is fixed to deadletter here.
-    let validated_queue = queue_filter(&query.queue_name)?;
-    let validated_tag = tag_filter(&query.tag)?;
-    let (order_by, order_dir) = query.order().map_err(AppError::Validation)?;
+    // Same filter, order and timeout rules as list(); `status` is fixed to
+    // deadletter here.
+    let filters = JobListFilters::parse(&query, false)?;
+    let order = query.order().map_err(AppError::Validation)?;
+    let scope = JobListScope {
+        org_id: &ctx.organization_id,
+        dead_letter_only: true,
+        queues: ctx.queue_scope_filter(),
+    };
 
-    let mut qb: QueryBuilder<Postgres> =
-        QueryBuilder::new("SELECT * FROM jobs WHERE status = 'deadletter' AND organization_id = ");
-    qb.push_bind(&ctx.organization_id);
-
-    // Queue scope: restrict a scoped key's DLQ listing to its own queues.
-    if let Some(allowed) = ctx.queue_scope_filter() {
-        qb.push(" AND queue_in_key_scope(queue_name, ");
-        qb.push_bind(allowed.to_vec());
-        qb.push("::TEXT[])");
-    }
-
-    if let Some(queue) = &validated_queue {
-        qb.push(" AND queue_name = ");
-        qb.push_bind(queue);
-    }
-
-    if let Some(tag) = &validated_tag {
-        qb.push(" AND tags ? ");
-        qb.push_bind(tag);
-    }
-
-    push_job_order(&mut qb, order_by, order_dir);
-    qb.push(" LIMIT ");
-    qb.push_bind(limit);
-    qb.push(" OFFSET ");
-    qb.push_bind(offset);
-
-    let jobs: Vec<Job> = qb.build_query_as().fetch_all(state.db.pool()).await?;
+    let (jobs, has_more) = list_job_page(&state, &scope, &filters, order, limit, offset).await?;
 
     let summaries: Vec<JobSummary> = jobs.into_iter().map(Into::into).collect();
-    Ok(Json(summaries))
+    Ok(paged(summaries, has_more))
 }
 
 /// The dead-lettered jobs a DLQ retry looks at: the named ids, else one
@@ -2144,8 +2568,10 @@ pub async fn retry_dlq(
     qb.push_bind(limit);
     qb.push(") AND organization_id = ");
     qb.push_bind(org_id);
-    qb.push(" AND status = 'deadletter' RETURNING id");
-    let retried_job_ids: Vec<String> = qb.build_query_scalar().fetch_all(&mut *tx).await?;
+    qb.push(" AND status = 'deadletter' RETURNING id, queue_name, workflow_id");
+    let retried_rows: Vec<(String, String, Option<String>)> =
+        qb.build_query_as().fetch_all(&mut *tx).await?;
+    let retried_job_ids: Vec<String> = retried_rows.iter().map(|(id, _, _)| id.clone()).collect();
     let retried_count = retried_job_ids.len() as i64;
 
     let skipped_jobs = match &revivable {
@@ -2212,6 +2638,22 @@ pub async fn retry_dlq(
     tx.commit().await?;
 
     state.metrics.jobs_retried.inc_by(retried_count as u64);
+
+    // One job.retried per job that left the DLQ, after the commit.
+    for (job_id, queue_name, workflow_id) in &retried_rows {
+        state.outgoing_webhooks.spawn_dispatch(
+            ctx.organization_id.clone(),
+            crate::outgoing_webhooks::events::JOB_RETRIED.to_string(),
+            job_id.clone(),
+            crate::outgoing_webhooks::events::job_retried_payload(
+                job_id,
+                queue_name,
+                "deadletter",
+                crate::outgoing_webhooks::events::RETRY_SOURCE_DLQ,
+                workflow_id.as_deref(),
+            ),
+        );
+    }
 
     Ok(Json(crate::models::RetryDlqResponse {
         retried_count,
@@ -2501,6 +2943,7 @@ mod tests {
             offset: None,
             order_by: None,
             order_dir: None,
+            ..Default::default()
         };
 
         // Default limit should be 50, capped at 1000
@@ -2522,6 +2965,7 @@ mod tests {
             offset: None,
             order_by: None,
             order_dir: None,
+            ..Default::default()
         };
 
         let limit = query_large.limit.unwrap_or(50).min(1000);
@@ -2535,6 +2979,7 @@ mod tests {
             offset: None,
             order_by: None,
             order_dir: None,
+            ..Default::default()
         };
 
         let limit = query_small.limit.unwrap_or(50).min(1000);
@@ -2573,5 +3018,230 @@ mod tests {
             "pending"
         };
         assert_eq!(status, "scheduled");
+    }
+
+    fn some(value: &str) -> Option<String> {
+        Some(value.to_string())
+    }
+
+    #[test]
+    fn status_filter_takes_a_comma_list() {
+        assert_eq!(status_filter(&None).unwrap(), Vec::<&str>::new());
+        assert_eq!(status_filter(&some("")).unwrap(), Vec::<&str>::new());
+        assert_eq!(status_filter(&some(" , ")).unwrap(), Vec::<&str>::new());
+        assert_eq!(status_filter(&some("Pending")).unwrap(), vec!["pending"]);
+        assert_eq!(
+            status_filter(&some("failed, DEADLETTER,,failed")).unwrap(),
+            vec!["failed", "deadletter"]
+        );
+        let err = status_filter(&some("failed,dead")).unwrap_err();
+        assert!(
+            matches!(&err, AppError::Validation(m) if m.contains("'dead'")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn escape_like_makes_wildcards_literal() {
+        assert_eq!(escape_like("abc-123"), "abc-123");
+        assert_eq!(escape_like("100%_off"), "100\\%\\_off");
+        assert_eq!(escape_like("a\\b"), "a\\\\b");
+    }
+
+    #[test]
+    fn rfc3339_filters_parse_and_reject() {
+        let utc = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+        assert_eq!(
+            parse_rfc3339("2026-10-11T08:00:00Z"),
+            Some(utc("2026-10-11T08:00:00Z"))
+        );
+        assert_eq!(
+            parse_rfc3339("2026-10-11T10:00:00.5+02:00"),
+            Some(utc("2026-10-11T08:00:00.5Z"))
+        );
+        // An unencoded `+` decoded to a space.
+        assert_eq!(
+            parse_rfc3339("2026-10-11T10:00:00 02:00"),
+            Some(utc("2026-10-11T08:00:00Z"))
+        );
+        for bad in [
+            "yesterday",
+            "2026-10-11",
+            "1728633600",
+            "2026-10-11T10:00:00 0200",
+            "é",
+        ] {
+            assert_eq!(parse_rfc3339(bad), None, "{bad}");
+        }
+        assert_eq!(time_filter("created_after", &some("  ")).unwrap(), None);
+        assert!(matches!(
+            time_filter("created_after", &some("soon")),
+            Err(AppError::Validation(m)) if m.contains("created_after")
+        ));
+    }
+
+    #[test]
+    fn list_filters_validate_every_new_parameter() {
+        let parse = |query: ListJobsQuery| JobListFilters::parse(&query, true).map(|_| ());
+        assert!(parse(ListJobsQuery::default()).is_ok());
+        assert!(parse(ListJobsQuery {
+            q: some("  "),
+            job_type: some(""),
+            ..Default::default()
+        })
+        .is_ok());
+        for bad in [
+            ListJobsQuery {
+                q: Some("x".repeat(256)),
+                ..Default::default()
+            },
+            ListJobsQuery {
+                q: some("a\0b"),
+                ..Default::default()
+            },
+            ListJobsQuery {
+                job_type: some("a\0b"),
+                ..Default::default()
+            },
+            ListJobsQuery {
+                created_before: some("not a time"),
+                ..Default::default()
+            },
+            // An empty window.
+            ListJobsQuery {
+                created_after: some("2026-10-11T08:00:00Z"),
+                created_before: some("2026-10-11T08:00:00Z"),
+                ..Default::default()
+            },
+            ListJobsQuery {
+                status: some("done"),
+                ..Default::default()
+            },
+        ] {
+            let shown = format!("{bad:?}");
+            assert!(
+                matches!(parse(bad), Err(AppError::Validation(_))),
+                "{shown}"
+            );
+        }
+
+        let query = ListJobsQuery {
+            q: some(" 50%_Off "),
+            status: some("failed,deadletter"),
+            ..Default::default()
+        };
+        let filters = JobListFilters::parse(&query, true).unwrap();
+        assert_eq!(filters.search.as_deref(), Some("50\\%\\_Off"));
+        assert_eq!(filters.statuses, vec!["failed", "deadletter"]);
+        // `/jobs/dlq` ignores `status`, as it always did.
+        let query = ListJobsQuery {
+            status: some("anything"),
+            ..Default::default()
+        };
+        assert!(JobListFilters::parse(&query, false)
+            .unwrap()
+            .statuses
+            .is_empty());
+    }
+
+    /// The SQL text `job_list_query` builds for `query`, with these job types
+    /// resolved for `q`.
+    fn list_sql(query: &ListJobsQuery, dead_letter_only: bool, types: &[&str]) -> String {
+        let filters = JobListFilters::parse(query, !dead_letter_only).unwrap();
+        let queues = vec!["billing-*".to_string()];
+        let scope = JobListScope {
+            org_id: "org",
+            dead_letter_only,
+            queues: Some(&queues),
+        };
+        let types: Vec<String> = types.iter().map(|t| t.to_string()).collect();
+        let order = query.order().unwrap();
+        job_list_query(&scope, &filters, &types, order, 50, 0)
+            .sql()
+            .as_str()
+            .to_string()
+    }
+
+    // W8-R2: `q` never compares its text with a payload. Job types matching
+    // it are probed through idx_jobs_org_job_type, one type at a time, and a
+    // `job_type` filter is spelled so that the same index answers it.
+    #[test]
+    fn job_list_sql_reads_job_types_only_through_the_index() {
+        let search = ListJobsQuery {
+            q: some("Mail"),
+            ..Default::default()
+        };
+        // `q` naming no job type: id prefix and queue name only.
+        let sql = list_sql(&search, false, &[]);
+        assert!(!sql.contains("payload"), "{sql}");
+        assert!(sql.contains("(id ILIKE $"), "{sql}");
+        assert!(!sql.contains("UNION"), "{sql}");
+
+        // `q` naming job types: the two disjoint parts, each cut to the rows
+        // that can reach the page, and the payload only as the index key.
+        let sql = list_sql(&search, false, &["send_mail", "mailer"]);
+        assert!(sql.contains(" UNION ALL "), "{sql}");
+        assert!(sql.contains("CROSS JOIN LATERAL"), "{sql}");
+        assert!(
+            sql.contains(
+                "payload->>'job_type' = t.job_type AND octet_length(payload->>'job_type') <= 255"
+            ),
+            "{sql}"
+        );
+        assert_eq!(sql.matches("payload").count(), 2, "{sql}");
+        assert!(sql.contains("AND NOT (id ILIKE $"), "{sql}");
+        // The scope and the order apply to both parts and to the page.
+        assert_eq!(sql.matches("queue_in_key_scope").count(), 2, "{sql}");
+        assert_eq!(
+            sql.matches("ORDER BY created_at DESC, id DESC").count(),
+            3,
+            "{sql}"
+        );
+        // The DLQ keeps its fixed status in both parts.
+        let sql = list_sql(&search, true, &["send_mail"]);
+        assert_eq!(sql.matches("status = 'deadletter'").count(), 2, "{sql}");
+
+        // `job_type` with `q`: the probe part is already that one type and
+        // does not repeat the filter.
+        let both = ListJobsQuery {
+            q: some("mail"),
+            job_type: some("send_mail"),
+            ..Default::default()
+        };
+        let sql = list_sql(&both, false, &["send_mail"]);
+        assert_eq!(sql.matches("payload->>'job_type' = $").count(), 1, "{sql}");
+
+        // The exact filter repeats the index predicate.
+        let exact = ListJobsQuery {
+            job_type: some("send_mail"),
+            ..Default::default()
+        };
+        let sql = list_sql(&exact, false, &[]);
+        let filter = "AND payload->>'job_type' = $";
+        let at = sql.find(filter).expect(&sql) + filter.len();
+        let after_bind = sql[at..].trim_start_matches(|c: char| c.is_ascii_digit());
+        assert!(after_bind.starts_with(JOB_TYPE_INDEXED), "{sql}");
+    }
+
+    #[test]
+    fn a_cancelled_list_statement_is_a_clean_400() {
+        // Any non-database error stays a database error.
+        assert!(matches!(
+            list_query_error(sqlx::Error::PoolTimedOut, 5000),
+            AppError::Database(_)
+        ));
+        let response = AppError::QueryTimeout("x".to_string()).into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn split_page_reports_a_following_row() {
+        assert_eq!(split_page(vec![1, 2, 3], 2), (vec![1, 2], true));
+        assert_eq!(split_page(vec![1, 2], 2), (vec![1, 2], false));
+        assert_eq!(split_page(Vec::<i32>::new(), 2), (vec![], false));
     }
 }

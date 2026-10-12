@@ -122,6 +122,9 @@ pub struct DatabaseSettings {
     pub min_connections: u32,
     /// Connection acquire timeout in seconds
     pub acquire_timeout_secs: u64,
+    /// Statement timeout of the job list reads (`GET /jobs`, `GET /jobs/dlq`)
+    /// in milliseconds; a list stopped by it answers `400 QUERY_TIMEOUT`.
+    pub list_statement_timeout_ms: u64,
 }
 
 /// Redis configuration
@@ -489,6 +492,7 @@ impl Settings {
                 max_connections: env_parse("DATABASE_MAX_CONNECTIONS", "25")?,
                 min_connections: env_parse("DATABASE_MIN_CONNECTIONS", "5")?,
                 acquire_timeout_secs: env_parse("DATABASE_ACQUIRE_TIMEOUT_SECS", "30")?,
+                list_statement_timeout_ms: env_parse("DATABASE_LIST_STATEMENT_TIMEOUT_MS", "5000")?,
             },
             redis: RedisSettings {
                 url: env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string()),
@@ -691,6 +695,14 @@ impl Settings {
             );
         }
 
+        // Postgres reads a statement_timeout of 0 as no timeout at all.
+        if self.database.list_statement_timeout_ms == 0 {
+            anyhow::bail!(
+                "DATABASE_LIST_STATEMENT_TIMEOUT_MS cannot be 0 (it would disable the job list \
+                 timeout); leave it unset for the 5000 ms default"
+            );
+        }
+
         // Validate heartbeat interval is not 0
         if self.worker.heartbeat_interval_secs == 0 {
             anyhow::bail!("WORKER_HEARTBEAT_INTERVAL_SECS cannot be 0");
@@ -789,6 +801,7 @@ impl Settings {
                 max_connections: 5,
                 min_connections: 1,
                 acquire_timeout_secs: 30,
+                list_statement_timeout_ms: 5000,
             },
             redis: RedisSettings {
                 url: "redis://localhost:6379".to_string(),
@@ -902,7 +915,21 @@ mod tests {
         assert!(settings.database.max_connections > 0);
         assert!(settings.database.min_connections > 0);
         assert!(settings.database.acquire_timeout_secs > 0);
+        assert_eq!(settings.database.list_statement_timeout_ms, 5000);
         assert!(settings.database.max_connections >= settings.database.min_connections);
+    }
+
+    // W8-R2: 0 would switch the job list timeout off in Postgres.
+    #[test]
+    fn a_zero_list_statement_timeout_is_refused() {
+        let mut settings = Settings::load_for_testing();
+        settings.validate().unwrap();
+        settings.database.list_statement_timeout_ms = 0;
+        let err = settings
+            .validate()
+            .expect_err("0 disables the timeout")
+            .to_string();
+        assert!(err.contains("DATABASE_LIST_STATEMENT_TIMEOUT_MS"), "{err}");
     }
 
     #[test]

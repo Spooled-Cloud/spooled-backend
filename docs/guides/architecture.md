@@ -394,20 +394,17 @@ Authorization: Bearer <jwt_token>
 
 ### Pagination
 
-Cursor-based pagination for large datasets:
+Job lists page with `limit` (default 50, at most 100) and `offset`; there is no cursor. Rows that tie
+on the sort column are ordered by job id, so pages do not repeat or skip rows:
 
 ```
-GET /api/v1/jobs?cursor=eyJpZCI6Ijk5OSJ9&limit=50
+GET /api/v1/jobs?status=failed,deadletter&limit=50&offset=50
 ```
 
-Response includes next cursor:
-```json
-{
-  "data": [...],
-  "next_cursor": "eyJpZCI6IjEwNDkifQ==",
-  "has_more": true
-}
-```
+The body is a plain array. The `X-Has-More: true|false` response header says whether another page
+follows (the server fetches one row past the page to know), so a client pages until it reads `false`.
+Job lists also run under a statement timeout (`400 QUERY_TIMEOUT` when a list is too broad to answer
+in time).
 
 ---
 

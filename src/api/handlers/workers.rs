@@ -523,9 +523,13 @@ mod tests {
             current_jobs: 3,
             max_concurrency: 10,
             last_heartbeat: Utc::now(),
+            jobs_processed: 12,
+            jobs_failed: 1,
         };
 
         let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("\"jobs_processed\":12"));
+        assert!(json.contains("\"jobs_failed\":1"));
         assert!(json.contains("worker-abc123"));
         assert!(json.contains("\"status\":\"healthy\""));
         assert!(json.contains("\"current_jobs\":3"));

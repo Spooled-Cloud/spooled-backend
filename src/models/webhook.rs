@@ -26,7 +26,80 @@ pub const VALID_WEBHOOK_EVENTS: &[&str] = &[
     "worker.registered",
     "worker.deregistered",
     "schedule.triggered",
+    "job.deadlettered",
+    "job.retried",
+    "workflow.completed",
+    "workflow.failed",
 ];
+
+/// Body formats an outgoing webhook can be delivered as.
+pub const VALID_WEBHOOK_FORMATS: &[&str] = &["json", "slack", "discord", "teams"];
+
+/// The body an outgoing webhook is delivered as.
+///
+/// `Json` is the signed envelope (`id`/`event`/`created_at`/`data`), unchanged.
+/// The others turn that envelope into the message a chat service's incoming
+/// webhook URL accepts, so such a URL can be pasted in as it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WebhookFormat {
+    #[default]
+    Json,
+    /// `{"text": ...}` (Slack incoming webhooks)
+    Slack,
+    /// `{"content": ...}` (Discord webhooks)
+    Discord,
+    /// A `MessageCard` (Microsoft Teams incoming webhooks)
+    Teams,
+}
+
+impl WebhookFormat {
+    /// Parse a requested format, ignoring case and surrounding spaces.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "json" => Some(Self::Json),
+            "slack" => Some(Self::Slack),
+            "discord" => Some(Self::Discord),
+            "teams" => Some(Self::Teams),
+            _ => None,
+        }
+    }
+
+    /// The stored format. Anything unknown (an empty value from a row read
+    /// without the column) is delivered as the JSON envelope.
+    pub fn from_stored(value: &str) -> Self {
+        Self::parse(value).unwrap_or_default()
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::Slack => "slack",
+            Self::Discord => "discord",
+            Self::Teams => "teams",
+        }
+    }
+}
+
+/// Check an optional requested format: `None` when omitted, else the
+/// canonical value to store.
+pub fn validate_webhook_format(format: Option<&str>) -> Result<Option<&'static str>, String> {
+    match format {
+        None => Ok(None),
+        Some(value) => WebhookFormat::parse(value)
+            .map(|f| Some(f.as_str()))
+            .ok_or_else(|| {
+                format!(
+                    "Invalid format '{}'. Valid formats: {}",
+                    value,
+                    VALID_WEBHOOK_FORMATS.join(", ")
+                )
+            }),
+    }
+}
+
+fn default_format() -> String {
+    WebhookFormat::Json.as_str().to_string()
+}
 
 /// Outgoing webhook configuration
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -44,6 +117,10 @@ pub struct OutgoingWebhook {
     pub secret: Option<String>,
     /// Event types that trigger this webhook
     pub events: Vec<String>,
+    /// Delivery body: `json` (default), `slack`, `discord` or `teams`
+    #[sqlx(default)]
+    #[serde(default = "default_format")]
+    pub format: String,
     /// Whether the webhook is enabled
     pub enabled: bool,
     /// Number of consecutive failures
@@ -66,6 +143,7 @@ pub struct OutgoingWebhookSummary {
     pub name: String,
     pub url: String,
     pub events: Vec<String>,
+    pub format: String,
     pub enabled: bool,
     pub failure_count: i32,
     pub last_triggered_at: Option<DateTime<Utc>>,
@@ -82,6 +160,7 @@ impl From<OutgoingWebhook> for OutgoingWebhookSummary {
             name: w.name,
             url: w.url,
             events: w.events,
+            format: w.format,
             enabled: w.enabled,
             failure_count: w.failure_count,
             last_triggered_at: w.last_triggered_at,
@@ -111,6 +190,10 @@ pub struct CreateOutgoingWebhookRequest {
     /// Whether the webhook is enabled (defaults to true)
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// Delivery body: `json` (default), `slack`, `discord` or `teams`.
+    /// Checked by [`validate_webhook_format`].
+    #[serde(default)]
+    pub format: Option<String>,
 }
 
 fn default_enabled() -> bool {
@@ -141,6 +224,10 @@ pub struct UpdateOutgoingWebhookRequest {
     pub secret: Option<Option<String>>,
     /// Whether the webhook is enabled
     pub enabled: Option<bool>,
+    /// Delivery body (`json`, `slack`, `discord`, `teams`); omit to keep it.
+    /// Checked by [`validate_webhook_format`].
+    #[serde(default)]
+    pub format: Option<String>,
 }
 
 /// Maximum length of a webhook signing secret.
@@ -360,13 +447,20 @@ pub struct CustomWebhookResponse {
     pub status: String,
 }
 
-/// Webhook delivery summary for list responses
-#[derive(Debug, Serialize)]
+/// One entry of the inbound webhook log (`GET /webhooks/deliveries`).
+///
+/// Deliberately without the stored `payload` (up to 5 MB each) and `signature`.
+#[derive(Debug, Serialize, FromRow)]
 pub struct WebhookDeliverySummary {
     pub id: String,
     pub provider: String,
     pub event_type: String,
+    /// Queue the job was created in
     pub matched_queue: Option<String>,
+    /// Job the request created or matched (`null` for entries before 0.1.122)
+    pub job_id: Option<String>,
+    /// `created` or `duplicate` (`null` for entries before 0.1.122)
+    pub status: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -377,8 +471,98 @@ impl From<WebhookDelivery> for WebhookDeliverySummary {
             provider: delivery.provider,
             event_type: delivery.event_type,
             matched_queue: delivery.matched_queue,
+            job_id: None,
+            status: None,
             created_at: delivery.created_at,
         }
+    }
+}
+
+/// `status` of an inbound request that created a new job.
+pub const INBOUND_DELIVERY_CREATED: &str = "created";
+/// `status` of an inbound request whose idempotency key matched an existing job.
+pub const INBOUND_DELIVERY_DUPLICATE: &str = "duplicate";
+
+/// Default and largest page of `GET /webhooks/deliveries`.
+pub const INBOUND_DELIVERIES_DEFAULT_LIMIT: i64 = 50;
+pub const INBOUND_DELIVERIES_MAX_LIMIT: i64 = 100;
+
+/// Query of `GET /webhooks/deliveries`.
+#[derive(Debug, Default, Deserialize)]
+pub struct ListInboundDeliveriesQuery {
+    /// Page size, 1-100 (default 50; out-of-range values are clamped)
+    pub limit: Option<i64>,
+    /// Entries to skip (default 0)
+    pub offset: Option<i64>,
+    /// `created` or `duplicate`
+    pub status: Option<String>,
+    /// RFC 3339 timestamp; only entries received at or after it
+    pub since: Option<String>,
+    /// Only entries whose job went to this queue (`queue` accepted as alias)
+    #[serde(alias = "queue")]
+    pub queue_name: Option<String>,
+}
+
+/// The checked filters of a [`ListInboundDeliveriesQuery`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct InboundDeliveriesFilter {
+    pub limit: i64,
+    pub offset: i64,
+    pub status: Option<&'static str>,
+    pub since: Option<DateTime<Utc>>,
+    pub queue_name: Option<String>,
+}
+
+impl ListInboundDeliveriesQuery {
+    /// Clamp the page and check the filters. An unknown `status`, a `since`
+    /// that is not RFC 3339 or an over-long queue name is an error (400), not
+    /// a silently unfiltered page.
+    pub fn filter(&self) -> Result<InboundDeliveriesFilter, String> {
+        let status = match self.status.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(s) if s.eq_ignore_ascii_case(INBOUND_DELIVERY_CREATED) => {
+                Some(INBOUND_DELIVERY_CREATED)
+            }
+            Some(s) if s.eq_ignore_ascii_case(INBOUND_DELIVERY_DUPLICATE) => {
+                Some(INBOUND_DELIVERY_DUPLICATE)
+            }
+            Some(other) => {
+                return Err(format!(
+                    "Invalid status '{}': expected {} or {}",
+                    other, INBOUND_DELIVERY_CREATED, INBOUND_DELIVERY_DUPLICATE
+                ))
+            }
+        };
+        let since = match self.since.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(s) => Some(
+                DateTime::parse_from_rfc3339(s)
+                    .map_err(|_| {
+                        format!(
+                            "Invalid since '{}': expected an RFC 3339 timestamp such as 2026-10-14T12:00:00Z",
+                            s
+                        )
+                    })?
+                    .with_timezone(&Utc),
+            ),
+        };
+        let queue_name = match self.queue_name.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(q) if q.len() > 255 => {
+                return Err("queue_name must be at most 255 characters".to_string())
+            }
+            Some(q) => Some(q.to_string()),
+        };
+        Ok(InboundDeliveriesFilter {
+            limit: self
+                .limit
+                .unwrap_or(INBOUND_DELIVERIES_DEFAULT_LIMIT)
+                .clamp(1, INBOUND_DELIVERIES_MAX_LIMIT),
+            offset: self.offset.unwrap_or(0).max(0),
+            status,
+            since,
+            queue_name,
+        })
     }
 }
 
@@ -437,6 +621,7 @@ mod tests {
             url: "https://example.com".to_string(),
             secret: Some("secret".to_string()),
             events: vec!["job.completed".to_string()],
+            format: "slack".to_string(),
             enabled: true,
             failure_count: 0,
             last_triggered_at: None,
@@ -448,6 +633,127 @@ mod tests {
         let summary: OutgoingWebhookSummary = webhook.into();
         assert_eq!(summary.id, "wh_123");
         assert_eq!(summary.name, "Test Webhook");
+        assert_eq!(summary.format, "slack");
         // Note: secret is not included in summary (skip_serializing)
+    }
+
+    #[test]
+    fn new_event_types_are_valid() {
+        for event in [
+            "job.deadlettered",
+            "job.retried",
+            "workflow.completed",
+            "workflow.failed",
+        ] {
+            assert!(VALID_WEBHOOK_EVENTS.contains(&event), "{event}");
+        }
+    }
+
+    #[test]
+    fn webhook_format_parses_and_validates() {
+        assert_eq!(WebhookFormat::parse(" Slack "), Some(WebhookFormat::Slack));
+        assert_eq!(WebhookFormat::parse("teams"), Some(WebhookFormat::Teams));
+        assert_eq!(WebhookFormat::parse("xml"), None);
+        assert_eq!(WebhookFormat::from_stored(""), WebhookFormat::Json);
+        assert_eq!(
+            WebhookFormat::from_stored("discord"),
+            WebhookFormat::Discord
+        );
+        for f in VALID_WEBHOOK_FORMATS {
+            assert_eq!(WebhookFormat::parse(f).unwrap().as_str(), *f);
+        }
+        assert_eq!(validate_webhook_format(None), Ok(None));
+        assert_eq!(
+            validate_webhook_format(Some("DISCORD")),
+            Ok(Some("discord"))
+        );
+        let err = validate_webhook_format(Some("xml")).unwrap_err();
+        assert!(err.contains("json, slack, discord, teams"), "{err}");
+    }
+
+    #[test]
+    fn outgoing_webhook_requests_take_an_optional_format() {
+        let create: CreateOutgoingWebhookRequest = serde_json::from_str(
+            r#"{"name":"n","url":"https://example.com","events":["job.failed"],"format":"slack"}"#,
+        )
+        .unwrap();
+        assert_eq!(create.format.as_deref(), Some("slack"));
+        let create: CreateOutgoingWebhookRequest = serde_json::from_str(
+            r#"{"name":"n","url":"https://example.com","events":["job.failed"]}"#,
+        )
+        .unwrap();
+        assert_eq!(create.format, None);
+        let update: UpdateOutgoingWebhookRequest =
+            serde_json::from_str(r#"{"format":"teams"}"#).unwrap();
+        assert_eq!(update.format.as_deref(), Some("teams"));
+    }
+
+    #[test]
+    fn inbound_deliveries_query_clamps_and_rejects_bad_filters() {
+        let f = ListInboundDeliveriesQuery::default().filter().unwrap();
+        assert_eq!((f.limit, f.offset, f.status, f.since), (50, 0, None, None));
+
+        let f = ListInboundDeliveriesQuery {
+            limit: Some(5_000),
+            offset: Some(-3),
+            status: Some("Duplicate".into()),
+            since: Some("2026-10-14T12:00:00+02:00".into()),
+            queue_name: Some(" orders ".into()),
+        }
+        .filter()
+        .unwrap();
+        assert_eq!(f.limit, 100);
+        assert_eq!(f.offset, 0);
+        assert_eq!(f.status, Some("duplicate"));
+        assert_eq!(f.since.unwrap().to_rfc3339(), "2026-10-14T10:00:00+00:00");
+        assert_eq!(f.queue_name.as_deref(), Some("orders"));
+
+        let bad_status = ListInboundDeliveriesQuery {
+            status: Some("failed".into()),
+            ..Default::default()
+        };
+        assert!(bad_status
+            .filter()
+            .unwrap_err()
+            .contains("created or duplicate"));
+        let bad_since = ListInboundDeliveriesQuery {
+            since: Some("yesterday".into()),
+            ..Default::default()
+        };
+        assert!(bad_since.filter().unwrap_err().contains("RFC 3339"));
+        let zero = ListInboundDeliveriesQuery {
+            limit: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(zero.filter().unwrap().limit, 1);
+    }
+
+    #[test]
+    fn inbound_delivery_summary_never_carries_payload_or_signature() {
+        let summary: WebhookDeliverySummary = WebhookDelivery {
+            id: "d1".into(),
+            organization_id: "o1".into(),
+            provider: "custom".into(),
+            event_type: "order.paid".into(),
+            payload: serde_json::json!({"secret": "x"}),
+            signature: Some("sig".into()),
+            matched_queue: Some("orders".into()),
+            created_at: Utc::now(),
+        }
+        .into();
+        let json = serde_json::to_value(&summary).unwrap();
+        let keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        for hidden in ["payload", "signature", "organization_id"] {
+            assert!(!keys.contains(&hidden), "{keys:?}");
+        }
+        assert!(
+            keys.contains(&"job_id") && keys.contains(&"status"),
+            "{keys:?}"
+        );
     }
 }

@@ -473,10 +473,21 @@ Response:
   "status": "healthy",
   "queue_names": ["emails"],
   "current_jobs": 5,
+  "jobs_processed": 1280,
+  "jobs_failed": 14,
   "last_heartbeat": "2024-01-15T10:00:00Z",
   "registered_at": "2024-01-15T09:00:00Z"
 }
 ```
+
+`jobs_processed` and `jobs_failed` are counted by the server (since 0.1.122; they start at 0 and
+survive a re-registration of the same worker id). `jobs_processed` is the jobs this worker
+completed. `jobs_failed` is the failures it reported: each retry scheduled and each dead-letter,
+so a job that fails twice and then completes adds 2 and 1. Only outcomes reported while the worker
+held the job's lease count. A job released because its lease expired or the worker went offline, a
+release on deregistration, and a job the server dead-letters because it is too large for a gRPC
+message are not the worker's failures and are not counted. The response above is trimmed to the
+fields that matter here; `GET /api/v1/workers` lists both counters for every worker.
 
 ---
 

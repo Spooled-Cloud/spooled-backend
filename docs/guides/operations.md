@@ -76,6 +76,15 @@ Rate limits are tracked per client:
 
 Throttled email-login routes answer `429 RATE_LIMIT_EXCEEDED` with a `Retry-After` header.
 
+Authenticated REST responses that went through the organization or key limiter also carry
+`X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset` (a Unix time in seconds) and
+`X-RateLimit-Scope` (`organization` or `api_key`); a `429` from that limiter has them too, with
+`Remaining` 0. They are left out on public and admin routes, without Redis, and when a check was
+skipped because Redis failed while `RATE_LIMIT_FAIL_CLOSED` is off. If a proxy or CDN sits in front,
+let them through: dashboards and SDKs read them. The CORS layer exposes them to browsers (see
+[CORS Configuration](#cors-configuration)). They add no metrics; the limiter's cost is the same
+Redis calls as before (the token-bucket script now also returns the time to the next token).
+
 ### Client IP Resolution
 
 For unauthenticated traffic the limiter buckets by client IP, so where that IP comes from
@@ -149,6 +158,20 @@ Monitor these metrics for backpressure:
 | `spooled_job_max_age_seconds` | > 300s | > 900s | Add workers or scale |
 | `spooled_jobs_pending` | Growing | > 10,000 | Check worker capacity |
 | `spooled_database_connections_active / spooled_database_connections_max` | > 80% | > 95% | Increase pool size |
+
+#### Job list timeouts
+
+`GET /jobs` and `GET /jobs/dlq` run in a read-only transaction under a statement timeout,
+`DATABASE_LIST_STATEMENT_TIMEOUT_MS` (default 5000; `0` is refused at startup because Postgres reads
+it as no timeout). Postgres cancels the statement itself, so a client that disconnected does not leave
+a long scan running. A list it stopped answers `400` with code `QUERY_TIMEOUT` and logs a warning,
+`Job list stopped by the list statement timeout` (with `timeout_ms`); it shows in
+`spooled_api_requests_total{status="4xx"}` and not as a 5xx. A steady trickle usually means one
+organization lists a very large `jobs` table with a broad `q` and no created window or queue; the
+fix is on the caller's side. Raise the setting only if the database can take the load: a list holds a
+pool connection for as long as it runs. The job-type search (`job_type`, `q`) reads
+`idx_jobs_org_job_type`; check it is valid after the upgrade (see [Deployment](./deployment.md),
+"0.1.122 checks").
 
 ---
 
@@ -423,6 +446,11 @@ Production mode: Restricted to configured origins
 CORS_ALLOWED_ORIGINS=https://app.yourdomain.com,https://admin.yourdomain.com
 ```
 
+Both the production and the development CORS layer expose these response headers to browsers:
+`X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`, `X-RateLimit-Scope`,
+`Retry-After`, `X-Request-Id` and `X-Has-More`. Without that a cross-origin dashboard could not read
+any of them. A proxy in front that rewrites CORS headers must keep `Access-Control-Expose-Headers`.
+
 ### JWT Security
 
 ```bash
@@ -496,6 +524,7 @@ custom webhooks must include the `X-Webhook-Token` header with the correct value
 | `DATABASE_MAX_CONNECTIONS` | `25` | Connection pool max |
 | `DATABASE_MIN_CONNECTIONS` | `5` | Connection pool min |
 | `DATABASE_ACQUIRE_TIMEOUT_SECS` | `30` | How long a request waits for a pooled connection |
+| `DATABASE_LIST_STATEMENT_TIMEOUT_MS` | `5000` | Statement timeout of the job list reads (`GET /jobs`, `GET /jobs/dlq`), set with `SET LOCAL` in each list's own read-only transaction. Postgres stops a list that runs longer (also one whose client went away) and the API answers `400 QUERY_TIMEOUT`; `0` is refused because Postgres reads it as no timeout |
 | `DATABASE_TEST_BEFORE_ACQUIRE` | `false` | Validate each connection on checkout (adds about 5 ms) |
 
 Postgres connections use TLS when the URL asks for it (`sslmode=require` / `verify-*`), and Redis when the URL is `rediss://` (rustls with the ring provider and the bundled public web roots; a private CA may need a different root setup). Plain `postgres://` and `redis://` URLs behave as before.
@@ -532,6 +561,18 @@ until the process dies.
 A webhook is disabled automatically after 20 consecutive failed deliveries
 (`enabled = false`, `last_status = "auto_disabled"`); re-enable it with
 `PUT /api/v1/outgoing-webhooks/{id}` and `{"enabled": true}`.
+
+`workflow.completed` and `workflow.failed` are sent by the scheduler, not by the request that
+finished the workflow: a pass at the end of the 10 second dependency tick claims up to 500 workflows
+that ended in the last hour (`workflows.announced_completed_at` records what was sent), commits, and
+then queues the events. They are **at most once**: a restart between the claim and the recorded
+delivery, a full delivery queue (`spooled_outgoing_webhook_deliveries_dropped_total` moves) or a
+scheduler that did not run for over an hour loses them, and a workflow retried within one tick never
+announces its failure. If the scheduler is stalled (`/health` shows `"scheduler": false`) nothing is
+announced and outcomes older than an hour are skipped when it recovers. `job.deadlettered` is derived
+from `job.failed` at dispatch and goes through the same bounded queue. The `format` of a webhook
+(`json`, `slack`, `discord`, `teams`) is rendered at delivery; a chat service that answers `400`
+to a delivery usually means the webhook still has the default `json` format.
 
 ### Trusted Proxy / Client IP
 

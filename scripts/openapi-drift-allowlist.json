@@ -1,0 +1,5 @@
+{
+  "_comment": "Exceptions for scripts/check_openapi_drift.py. undocumented: routes served on purpose without an OpenAPI entry. pending: documented operations whose route lands in another branch of the same release; delete an entry once its route is in src/api/mod.rs (the check warns until then). Every entry needs method, path and reason.",
+  "undocumented": [],
+  "pending": []
+}

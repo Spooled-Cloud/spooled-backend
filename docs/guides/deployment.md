@@ -298,6 +298,88 @@ Run these after the rollout. Everything is read-only; nothing here changes data.
    are briefly doubled, because old replicas count in the old Redis keys and new ones in sorted
    sets; the old `ws_connections:*` and `sse_connections:*` keys expire on their own.
 
+#### 0.1.122 checks
+
+Run these after the rollout. Everything is read-only; nothing here changes data except the optional
+step in 2.
+
+1. **The two concurrent indexes are valid.** The release builds `idx_workflows_unannounced_outcome`
+   (on `workflows`) and `idx_jobs_org_job_type` (on `jobs`, partial on job types of at most 255
+   bytes) with `CREATE INDEX CONCURRENTLY`. As in 0.1.121, the builds never block reads or writes
+   but each waits for transactions that were already open, so startup is slow while a long-lived or
+   idle-in-transaction session exists, and a replica that waits on the migrator's advisory lock can
+   be chosen as the deadlock victim: that pod fails to start once and the repair migration
+   (`...100202`, `...120001`) rebuilds the `INVALID` index on its next start, blocking writes to that
+   table for the build. The `jobs` index reads every payload once, so the build takes longer the
+   bigger `jobs` is (it was about half a second to rebuild at 130,000 jobs of ~3 KB payloads); every
+   later insert of a job with a `job_type` also writes one entry. Then:
+   ```sql
+   SELECT c.relname, i.indisvalid
+   FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+   WHERE c.relname IN ('idx_workflows_unannounced_outcome', 'idx_jobs_org_job_type');
+   ```
+   Expect two rows, both `indisvalid = t`. A `job_type` filter should then show an index scan:
+   ```sql
+   EXPLAIN SELECT id FROM jobs
+   WHERE organization_id = '<an organization id>' AND payload->>'job_type' = 'send_email'
+     AND octet_length(payload->>'job_type') <= 255
+   ORDER BY created_at DESC LIMIT 51;
+   ```
+   Expect `Index Scan using idx_jobs_org_job_type`. The predicate `octet_length(...) <= 255` must stay
+   in the query, or the planner cannot use the partial index.
+
+2. **The worker counter trigger is a deferred constraint trigger.** Migration `20261014110000`
+   creates it and adds `workers.jobs_processed` / `jobs_failed`. It takes `SHARE ROW EXCLUSIVE` on
+   `jobs` (it waits for writers in flight and blocks new ones while held) and then `ACCESS
+   EXCLUSIVE` on the small `workers` table, both under a 5 second `lock_timeout`: on a very busy
+   `jobs` table the start can fail once on the timeout and succeed on the next. Verify:
+   ```sql
+   SELECT tgname, tgenabled, tgdeferrable, tginitdeferred, tgconstraint <> 0 AS constraint_trigger
+   FROM pg_trigger
+   WHERE tgrelid = 'jobs'::regclass AND tgname = 'trigger_count_worker_job_outcome';
+   ```
+   Expect one row: `tgenabled` `O`, and `tgdeferrable`, `tginitdeferred` and `constraint_trigger`
+   all `t`. If `tginitdeferred` is `f` the trigger is the immediate draft, which could deadlock a
+   worker completing a job and a `dependency_mode = 'any'` dependent it was running at the same
+   instant. A database (a staging stack, a developer machine) that applied a pre-release build of
+   `20261014110000` stops at startup with a checksum mismatch, because the file was changed before
+   release. The migration is idempotent (it drops the trigger and creates it again, and the columns
+   are `IF NOT EXISTS`), so for such a database forget the old record and restart:
+   `DELETE FROM _sqlx_migrations WHERE version = 20261014110000;`. Only a database that ran an
+   unreleased build is affected.
+   Counters start at 0 and there is no backfill, so a worker that has been busy for weeks shows 0
+   until its next outcome.
+
+3. **Outgoing webhooks and the new events.** Existing webhooks are untouched (`format` is `json`,
+   the stored events are a subset of the new CHECK). To use the new events, `PUT` the webhook's
+   `events`. Workflow outcome events only cover workflows that end after the upgrade; everything
+   that ended earlier, and everything that ended while no scheduler ran for over an hour, is never
+   announced, and the announcement is at most once (see the webhooks guide). Watch
+   `increase(spooled_outgoing_webhook_deliveries_dropped_total[15m]) > 0` as for 0.1.121: a
+   dead-lettering now queues a second event (`job.deadlettered`) next to `job.failed` for a webhook
+   that subscribes to both.
+
+4. **Job list timeouts.** `GET /jobs` and `GET /jobs/dlq` stop after
+   `DATABASE_LIST_STATEMENT_TIMEOUT_MS` (5000 by default; `docker-compose.prod.yml` forwards it, a
+   blank value means the default, `0` stops the server from starting) and answer `400
+   QUERY_TIMEOUT`. Grep the logs for `Job list stopped by the list statement timeout` in the first
+   days; a caller that hits it needs a narrower filter, not a retry. Behind a transaction-mode
+   PgBouncer nothing changes: the timeout is set with `SET LOCAL` inside the list's own transaction.
+
+5. **Rate-limit headers and proxies.** Authenticated responses now carry `X-RateLimit-*` and the CORS
+   layer exposes them with `Retry-After`, `X-Request-Id` and `X-Has-More`. Make sure a proxy or CDN in
+   front neither strips those response headers nor rewrites `Access-Control-Expose-Headers`.
+   `X-RateLimit-Reset` is a Unix time in seconds; `Retry-After` is the wait.
+
+6. **Rolling back to 0.1.121** is safe: the old image boots against the new schema, the new columns
+   and indexes go unused, the widened event CHECK is a superset, and the counter trigger keeps
+   counting from the database side. Webhooks subscribed to the new events then receive none of them,
+   and a `PUT` that resends such an event answers `400` until 0.1.122 is back.
+
+7. **CI.** The new `openapi-drift` job needs `python3` on the runner (ubuntu-latest has it). A fork
+   that removes or renames a route must change `docs/openapi.yaml` in the same commit, or run
+   `python3 scripts/check_openapi_drift.py` to see what differs.
+
 ### 4. Start the Server
 
 ```bash

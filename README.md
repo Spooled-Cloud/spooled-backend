@@ -111,6 +111,7 @@ Portainer details (Git stacks, ephemeral checkouts, recreate): [docs/guides/prod
 | `EXTERNAL_URL` | ❌ | - | Public base URL of the API |
 | `ENABLE_HSTS` | ❌ | `false` | Send `Strict-Transport-Security` (only behind HTTPS) |
 | `DATABASE_DIRECT_URL` | ❌ | - | Direct (non-PgBouncer) Postgres URL; migrations run over it when set |
+| `DATABASE_LIST_STATEMENT_TIMEOUT_MS` | ❌ | `5000` | Statement timeout of `GET /jobs` and `GET /jobs/dlq` in milliseconds; a list it stops answers `400 QUERY_TIMEOUT`. `0` is refused (Postgres would read it as no timeout) |
 | `WORKER_LEASE_DURATION_SECS` | ❌ | `30` | Default job lease for a REST claim that sends none |
 | `GRPC_DEFAULT_LEASE_DURATION_SECS` | ❌ | `300` | Lease for gRPC claims and renewals that send none (`0` = 300, at most 3600, must be greater than `WORKER_HEARTBEAT_INTERVAL_SECS`); reported by gRPC `Register` |
 
@@ -204,7 +205,8 @@ cargo test
 |--------|----------|-------------|
 | `GET` | `/health` | Health check |
 | `POST` | `/api/v1/jobs` | Create a job (enforces plan limits) |
-| `GET` | `/api/v1/jobs` | List jobs |
+| `GET` | `/api/v1/jobs` | List jobs (filters: `status` list, `q`, `job_type`, `created_after`, `created_before`; `X-Has-More` header) |
+| `GET` | `/api/v1/jobs/{id}/history` | A job's recorded lifecycle events |
 | `POST` | `/api/v1/jobs/bulk` | Bulk enqueue jobs (enforces plan limits) |
 | `POST` | `/api/v1/jobs/claim` | Claim (lease) jobs for worker processing |
 | `POST` | `/api/v1/jobs/{id}/complete` | Mark a job completed (worker ack) |
@@ -245,6 +247,7 @@ cargo test
 | `GET` | `/api/v1/outgoing-webhooks/{id}/deliveries` | Get delivery history |
 | `POST` | `/api/v1/outgoing-webhooks/{id}/retry/{delivery_id}` | Retry failed delivery |
 | `POST` | `/api/v1/webhooks/{org_id}/custom` | Incoming webhook (ingestion → creates jobs) |
+| `GET` | `/api/v1/webhooks/deliveries` | Inbound webhook log (accepted requests, newest first) |
 
 #### Real-Time
 
@@ -369,9 +372,11 @@ curl -X POST http://localhost:8080/api/v1/outgoing-webhooks \
     "name": "Slack Alerts",
     "url": "https://hooks.slack.com/services/YOUR/WEBHOOK/URL",
     "events": ["job.failed", "queue.paused"],
-    "secret": "your-hmac-secret"
+    "format": "slack"
   }'
 ```
+
+`format` is `json` (the default: the signed event envelope), `slack`, `discord` or `teams`; a chat format sends one short message so the chat service's incoming-webhook URL works as it is. Events: `job.created`, `job.started`, `job.completed`, `job.failed`, `job.cancelled`, `job.deadlettered`, `job.retried`, `queue.paused`, `queue.resumed`, `worker.registered`, `worker.deregistered`, `schedule.triggered`, `workflow.completed` and `workflow.failed` (the two workflow events are announced at most once, see [docs/guides/webhooks.md](docs/guides/webhooks.md)).
 
 Deliveries retry with exponential backoff (`OUTGOING_WEBHOOK_MAX_ATTEMPTS`, default 5). After 20 consecutive failed deliveries the webhook is disabled automatically (`enabled: false`, `last_status: "auto_disabled"`) and receives no further events until you re-enable it with `PUT /api/v1/outgoing-webhooks/{id}` and `{"enabled": true}`. See [docs/guides/webhooks.md](docs/guides/webhooks.md).
 
@@ -644,7 +649,7 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317 ./target/release/spooled-backend
 - **Authentication**: API keys (bcrypt hashed) or JWT tokens
 - **Least privilege**: queue-scoped keys are enforced across REST, realtime, and gRPC operations; active streams revalidate current key state
 - **Multi-tenancy**: explicit per-organization scoping on every query
-- **Rate Limiting**: Per-organization token bucket by plan, plus an optional per-key limit in requests per minute, with Redis (fails closed when configured). Rejected requests get `429` with `Retry-After`; there are no `X-RateLimit-*` headers
+- **Rate Limiting**: Per-organization token bucket by plan, plus an optional per-key limit in requests per minute, with Redis (fails closed when configured). Rejected requests get `429` with `Retry-After` (seconds); authenticated responses carry `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset` (Unix time) and `X-RateLimit-Scope`
 - **Webhooks**: HMAC-SHA256 signature verification
 - **Input Validation**: All inputs sanitized and size-limited
 - **SSRF Protection**: Webhook URLs validated in production

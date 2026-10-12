@@ -71,6 +71,12 @@ pub enum AppError {
     #[error("Bad request: {0}")]
     BadRequest(String),
 
+    /// A read the database stopped at its statement timeout (a job list too
+    /// broad to answer in time). HTTP 400 with code `QUERY_TIMEOUT`: the same
+    /// request would time out again, so it is not a retryable 5xx.
+    #[error("Query timeout: {0}")]
+    QueryTimeout(String),
+
     /// Redis errors
     #[error("Cache error: {0}")]
     Cache(String),
@@ -196,6 +202,7 @@ impl IntoResponse for AppError {
                     };
                 (StatusCode::BAD_REQUEST, "BAD_REQUEST", safe_msg)
             }
+            AppError::QueryTimeout(msg) => (StatusCode::BAD_REQUEST, "QUERY_TIMEOUT", msg.clone()),
             AppError::Cache(msg) => {
                 error!(error = %msg, "Cache error");
                 (
@@ -402,6 +409,7 @@ mod tests {
             (AppError::NotFound("test".to_string()), 404),
             (AppError::BadRequest("test".to_string()), 400),
             (AppError::Validation("test".to_string()), 400),
+            (AppError::QueryTimeout("test".to_string()), 400),
             (AppError::Unauthorized("test".to_string()), 401),
             (AppError::Authentication("test".to_string()), 401),
             (AppError::Authorization("test".to_string()), 403),

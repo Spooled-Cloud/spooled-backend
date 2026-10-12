@@ -2038,6 +2038,14 @@ async fn release_unsent_claim(pool: &PgPool, org_id: &str, job_id: &str, lease_i
 /// it again, so no gRPC consumer could get past it. Fenced on the claim's
 /// lease; `retry_count` is kept, as no attempt ran. The job stays readable
 /// over REST.
+///
+/// This is the server's decision, not an outcome the worker reported, so it
+/// must not count on `workers.jobs_failed`: the counter trigger (migration
+/// 20261014110000) counts a move out of `processing` only while the lease is
+/// live. One transaction therefore first expires the lease
+/// (`lease_expires_at = NOW()`, the transaction's start, fenced on the
+/// `lease_id`) and then dead-letters the job, whose old row then carries no
+/// live lease.
 async fn dead_letter_oversized(
     pool: &PgPool,
     metrics: &Metrics,
@@ -2049,48 +2057,74 @@ async fn dead_letter_oversized(
         "Job too large for a gRPC message: {} bytes encoded (max {} bytes)",
         size, MAX_GRPC_MESSAGE_SIZE
     );
-    let moved = sqlx::query(
-        r#"
-        WITH deadlettered AS (
+    let moved = async {
+        let mut tx = pool.begin().await?;
+        let expired = sqlx::query(
+            r#"
             UPDATE jobs
-            SET
-                status = 'deadletter',
-                last_error = $1,
-                assigned_worker_id = NULL,
-                lease_id = NULL,
-                lease_expires_at = NULL,
-                updated_at = NOW()
-            WHERE id = $2
-              AND organization_id = $3
-              AND lease_id = $4
+            SET lease_expires_at = NOW()
+            WHERE id = $1
+              AND organization_id = $2
+              AND lease_id = $3
               AND status = 'processing'
-            RETURNING id, organization_id, queue_name, payload, retry_count
+            "#,
         )
-        INSERT INTO dead_letter_queue (
-            id, job_id, organization_id, queue_name, reason,
-            original_payload, error_details, created_at
+        .bind(&job.id)
+        .bind(&job.organization_id)
+        .bind(&job.lease_id)
+        .execute(&mut *tx)
+        .await?;
+        if expired.rows_affected() == 0 {
+            // Settled or claimed again in the meantime; dropping the
+            // transaction rolls it back.
+            return Ok::<u64, sqlx::Error>(0);
+        }
+        let moved = sqlx::query(
+            r#"
+            WITH deadlettered AS (
+                UPDATE jobs
+                SET
+                    status = 'deadletter',
+                    last_error = $1,
+                    assigned_worker_id = NULL,
+                    lease_id = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = NOW()
+                WHERE id = $2
+                  AND organization_id = $3
+                  AND lease_id = $4
+                  AND status = 'processing'
+                RETURNING id, organization_id, queue_name, payload, retry_count
+            )
+            INSERT INTO dead_letter_queue (
+                id, job_id, organization_id, queue_name, reason,
+                original_payload, error_details, created_at
+            )
+            SELECT
+                gen_random_uuid()::TEXT,
+                d.id,
+                d.organization_id,
+                d.queue_name,
+                $1,
+                d.payload,
+                jsonb_build_object('final_error', $1::TEXT, 'total_retries', d.retry_count),
+                NOW()
+            FROM deadlettered d
+            "#,
         )
-        SELECT
-            gen_random_uuid()::TEXT,
-            d.id,
-            d.organization_id,
-            d.queue_name,
-            $1,
-            d.payload,
-            jsonb_build_object('final_error', $1::TEXT, 'total_retries', d.retry_count),
-            NOW()
-        FROM deadlettered d
-        "#,
-    )
-    .bind(&reason)
-    .bind(&job.id)
-    .bind(&job.organization_id)
-    .bind(&job.lease_id)
-    .execute(pool)
+        .bind(&reason)
+        .bind(&job.id)
+        .bind(&job.organization_id)
+        .bind(&job.lease_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(moved.rows_affected())
+    }
     .await;
 
     match moved {
-        Ok(done) if done.rows_affected() > 0 => {}
+        Ok(moved) if moved > 0 => {}
         // Settled or claimed again in the meantime.
         Ok(_) => return,
         Err(e) => {

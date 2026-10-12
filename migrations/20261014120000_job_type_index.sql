@@ -1,0 +1,35 @@
+-- no-transaction
+-- An index of each organization's jobs by `payload->>'job_type'`, newest first.
+--
+-- GET /jobs and GET /jobs/dlq filter on the job type (`job_type`, exact) and
+-- search it (`q`, a substring). Without an index both walked
+-- idx_jobs_org_created through every job of the organization and read every
+-- payload to extract the type: a payload over ~2 KB lives in the TOAST table,
+-- so each row cost several extra page reads. EXPLAIN ANALYZE on PG16 with
+-- 130k jobs of ~3 KB payloads in one organization, `job_type` matching 50 of
+-- them: before, Index Scan using idx_jobs_org_created, 129,950 rows removed by
+-- the filter, 555,774 buffers, 381 ms; after, Index Scan using
+-- idx_jobs_org_job_type, 53 buffers, 0.12 ms. The `q` search reaches the job
+-- types through this index too (a skip scan over the distinct types, then one
+-- probe per matching type), never through the payloads. The regression test
+-- w8_job_type_filter_and_search_use_the_job_type_index checks the plans.
+--
+-- Only job types of at most 255 bytes are indexed. A btree entry cannot exceed
+-- 2704 bytes, and the job type is free text inside the payload: without the
+-- bound one long type would fail this build (and the repair after it) and
+-- would make inserting such a job fail. The `job_type` filter accepts at most
+-- 255 bytes, so it never matches a longer type anyway. The list queries repeat
+-- the predicate verbatim, because the planner only uses a partial index whose
+-- predicate the query implies. A job without a job type is not indexed either.
+--
+-- CONCURRENTLY keeps the jobs table writable while the index builds, which is
+-- why this file runs outside a transaction. It is a single statement on
+-- purpose: Postgres runs a multi-statement string as one implicit transaction
+-- block and refuses CREATE INDEX CONCURRENTLY inside it, so this file cannot
+-- carry the usual `SET lock_timeout` line. The build only takes a SHARE UPDATE
+-- EXCLUSIVE lock, which never blocks reads or writes. Should the build ever be
+-- interrupted it leaves an INVALID index that IF NOT EXISTS skips on the next
+-- start; 20261014120001 rebuilds it then.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_jobs_org_job_type
+    ON jobs (organization_id, (payload->>'job_type'), created_at DESC)
+    WHERE octet_length(payload->>'job_type') <= 255;

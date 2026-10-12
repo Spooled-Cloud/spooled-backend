@@ -113,6 +113,40 @@ curl -X POST https://api.spooled.cloud/api/v1/organizations/webhook-token/regene
   -H "Authorization: Bearer sp_live_YOUR_API_KEY"
 ```
 
+### Inbound Request Log
+
+`GET /api/v1/webhooks/deliveries` lists the requests this endpoint accepted for your
+organization, newest first, so you can check that a provider is calling and what became of each
+call:
+
+```bash
+curl "https://api.spooled.cloud/api/v1/webhooks/deliveries?status=duplicate&limit=20" \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY"
+```
+
+```json
+[
+  {
+    "id": "d3a1c0f2-...",
+    "provider": "custom",
+    "event_type": "order.created",
+    "matched_queue": "my-events",
+    "job_id": "job_550e8400e29b41d4",
+    "status": "created",
+    "created_at": "2026-10-12T09:15:00Z"
+  }
+]
+```
+
+`status` is `created` when the request made a new job and `duplicate` when its `idempotency_key`
+matched an existing one (`job_id` and `matched_queue` then name that job and its queue). Filters:
+`status`, `since` (RFC 3339), `queue_name` (alias `queue`), `limit` (default 50, at most 100) and
+`offset`. Only accepted requests are logged: a wrong token or an over-limit request writes
+nothing. The log never returns the payload, a signature or the token, it needs an unrestricted API
+key (a queue-scoped key gets `403`), and entries older than 0.1.122 have a `null` `job_id` and
+`status`. Entries are removed with the rest of your delivery history (see the retention table
+under [Delivery History](#delivery-history)).
+
 ---
 
 ## Signature Verification
@@ -187,6 +221,45 @@ curl -X POST https://api.spooled.cloud/api/v1/outgoing-webhooks \
   }'
 ```
 
+### Chat Formats (Slack, Discord, Teams)
+
+By default a webhook receives the signed JSON event envelope (see
+[Outgoing Webhook Format](#outgoing-webhook-format)). Set `format` to send a short chat message
+instead, so the incoming-webhook URL of the chat service can be used as it is:
+
+```bash
+curl -X POST https://api.spooled.cloud/api/v1/outgoing-webhooks \
+  -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
+  -d '{
+    "name": "Slack alerts",
+    "url": "https://hooks.slack.com/services/T000/B000/XXXX",
+    "events": ["job.failed", "workflow.failed"],
+    "format": "slack"
+  }'
+```
+
+| `format` | Body sent | Notes |
+|----------|-----------|-------|
+| `json` (default) | `{id, event, created_at, data}` | The signed envelope, unchanged. Every webhook created before 0.1.122 is `json` |
+| `slack` | `{"text": "..."}` | mrkdwn; `&`, `<` and `>` in values are escaped, so a value cannot become a link or an `<!channel>` |
+| `discord` | `{"content": "...", "allowed_mentions": {"parse": []}}` | At most 2,000 characters, markdown escaped; `allowed_mentions` is empty, so an `@everyone` in an error text pings nobody |
+| `teams` | A `MessageCard` (`title`, `summary`, `themeColor`, `text`, one section of `facts`) | The legacy Office 365 connector card. **Teams Workflows (Power Automate) webhooks expect an Adaptive Card and reject it** |
+
+The message has a title for the event ("Spooled: job failed") and these fields of the event's
+`data`, in this order, when present: name, workflow, job, queue, schedule, worker, host, status,
+previous status, source, completed / failed / total jobs, error, reason and message. A value is
+cut at 300 characters.
+
+- `format` is case-insensitive when you send it; anything but the four values is a `400`. On
+  `PUT /api/v1/outgoing-webhooks/{id}`, omitting it keeps the current format.
+- The headers are the same for every format and `X-Spooled-Signature` (when a secret is set)
+  signs the bytes actually sent. Chat services ignore it, so a `secret` is rarely worth setting
+  for them.
+- The message is built when the delivery is sent. The delivery history keeps the JSON envelope in
+  `payload`, and a manual retry sends with the webhook's current format.
+- `POST /api/v1/outgoing-webhooks/{id}/test` sends the test in the chat format as well; Slack and
+  Discord answer `400` to raw JSON.
+
 ### Updating a Webhook
 
 `PUT /api/v1/outgoing-webhooks/{id}` is a partial update: fields you omit keep their
@@ -258,11 +331,71 @@ deliveries per webhook are returned in any case — export anything you need to 
 | `job.completed` | Job completed successfully |
 | `job.failed` | Job failed; `data.status` may be `failed` or `deadletter`. A job dead-lettered because its lease expired or its worker went offline sends it too (`data.status` `deadletter`, `data.error` the reason) |
 | `job.cancelled` | Job cancelled |
+| `job.deadlettered` | Job moved to the dead-letter queue. Sent next to every `job.failed` whose `data.status` is `deadletter`, with the same `data` |
+| `job.retried` | A `failed`, `deadletter` or `cancelled` job put back to `pending` by `POST /api/v1/jobs/{id}/retry`, `POST /api/v1/jobs/dlq/retry` or `POST /api/v1/workflows/{id}/retry`; `data.old_status` is the status it left, `data.source` the endpoint (`job_retry`, `dlq_retry`, `workflow_retry`) |
+| `workflow.completed` | Workflow finished with no failed or dead-lettered job. Sent **at most once**, see below |
+| `workflow.failed` | Workflow finished with at least one failed or dead-lettered job (a cancelled workflow sends neither). Sent **at most once**, see below |
 | `queue.paused` | Queue paused |
 | `queue.resumed` | Queue resumed |
 | `worker.registered` | New worker connected |
 | `worker.deregistered` | Worker disconnected |
 | `schedule.triggered` | Schedule created jobs |
+
+#### Workflow outcomes are announced at most once
+
+`workflow.completed` and `workflow.failed` are not sent by the request that settles the
+workflow's last job: that happens inside a database trigger, where no webhook can be sent.
+Instead a scheduler pass, every 10 seconds, claims the workflows that ended since the last
+pass. The claim marks each outcome as announced and commits, and only then are the events
+handed to the in-memory delivery queue. So:
+
+- **No outcome is announced twice**, even with several Spooled instances running the pass.
+- **An outcome can be lost.** If the process stops between that commit and the delivery being
+  recorded (a restart or deploy at that instant), if the delivery queue is full at that moment
+  (the drop is counted in `spooled_outgoing_webhook_deliveries_dropped_total`), or if recording
+  the delivery fails, the outcome is marked announced but never sent, and no later pass sends
+  it. Once recorded, the delivery is retried like any other event (see
+  [Retry Behavior](#retry-behavior)).
+- **A pass sees only the workflow's state at that moment.** A failed workflow that is retried
+  with `POST /api/v1/workflows/{id}/retry` before the next pass, so within about 10 seconds of
+  failing, never announces that `workflow.failed`; the outcome it reaches after the retry is
+  announced.
+- **Only outcomes less than an hour old are sent.** An outcome reached while no scheduler ran
+  for over an hour, or before 0.1.122, is never sent.
+
+If you act on workflow outcomes, treat the event as a prompt and confirm with
+`GET /api/v1/workflows/{id}`, and reconcile periodically with `GET /api/v1/workflows` instead of
+relying on the event alone.
+
+#### Data of the newer events
+
+Every event uses the envelope below; only `data` differs.
+
+```json
+// job.deadlettered: the data of the job.failed it follows
+{"job_id": "job_xxx", "queue_name": "emails", "status": "deadletter", "error": "Failed after 3 retries"}
+
+// job.retried
+{"job_id": "job_xxx", "queue_name": "emails", "status": "pending", "old_status": "deadletter",
+ "source": "dlq_retry", "workflow_id": "wf_xxx"}
+
+// workflow.completed / workflow.failed
+{"workflow_id": "wf_xxx", "name": "nightly-export", "status": "failed", "total_jobs": 5,
+ "completed_jobs": 3, "failed_jobs": 2, "created_at": "2026-10-12T00:00:00Z",
+ "started_at": "2026-10-12T00:00:12Z", "completed_at": "2026-10-12T00:03:40Z",
+ "metadata": null}
+```
+
+- `job.deadlettered` is sent once per dead-lettering, whichever path did it (a failure the worker
+  reported over REST or gRPC, a lease that expired on the last retry, a worker that went offline,
+  a job too large for a gRPC message), right after the matching `job.failed`. Subscribe to only
+  one of the two unless you want both. Under heavy overload the second can be dropped while the
+  first is delivered.
+- `job.retried`: `old_status` is `failed`, `deadletter` or `cancelled` (a step a workflow retry
+  re-opens); `source` is `job_retry`, `dlq_retry` or `workflow_retry`; `workflow_id` is present
+  only for a workflow job. One event per job, sent after the retry committed.
+- `workflow_id` in `workflow.completed` / `workflow.failed` is the id to pass to
+  `GET /api/v1/workflows/{id}`.
 
 ### Outgoing Webhook Format
 
@@ -292,7 +425,8 @@ X-Spooled-Timestamp: 1705315800
 X-Spooled-Delivery-Attempt: 1
 ```
 
-The delivery ID is the top-level `id` field in the JSON body.
+The delivery ID is the top-level `id` field in the JSON body. With a chat `format` the body is
+the chat message, which has no `id`; read the delivery ID from the delivery history instead.
 
 ### Verify Outgoing Webhook Signature
 

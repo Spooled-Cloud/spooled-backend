@@ -1,14 +1,16 @@
 //! Webhook handlers
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    Json,
+    Extension, Json,
 };
 use chrono::Utc;
+use sqlx::{Postgres, QueryBuilder};
 use uuid::Uuid;
 
+use crate::api::handlers::require_unrestricted_key;
 use crate::api::middleware::limits::{
     check_job_limits, check_payload_size, daily_jobs_limit, refund_daily_jobs,
     try_increment_daily_jobs,
@@ -17,7 +19,10 @@ use crate::api::middleware::ValidatedJson;
 use crate::api::AppState;
 use crate::config::Environment;
 use crate::error::{AppError, AppResult};
-use crate::models::{CustomWebhookRequest, CustomWebhookResponse};
+use crate::models::{
+    ApiKeyContext, CustomWebhookRequest, CustomWebhookResponse, ListInboundDeliveriesQuery,
+    WebhookDeliverySummary, INBOUND_DELIVERY_CREATED, INBOUND_DELIVERY_DUPLICATE,
+};
 
 /// Maximum webhook payload size (5MB)
 const MAX_WEBHOOK_PAYLOAD_SIZE: usize = 5 * 1024 * 1024;
@@ -251,20 +256,27 @@ pub async fn custom(
         }
     }
 
-    // Record webhook delivery
+    // Record webhook delivery, with the job it resolved to and whether it
+    // created that job (GET /webhooks/deliveries shows both).
     let event_type = request.event_type.unwrap_or_else(|| "custom".to_string());
     sqlx::query(
         r#"
-        INSERT INTO webhook_deliveries (id, organization_id, provider, event_type, payload, matched_queue, created_at)
-        VALUES ($1, $2, 'custom', $3, $4::JSONB, $5, $6)
+        INSERT INTO webhook_deliveries (id, organization_id, provider, event_type, payload, matched_queue, created_at, job_id, status)
+        VALUES ($1, $2, 'custom', $3, $4::JSONB, $5, $6, $7, $8)
         "#,
     )
     .bind(Uuid::new_v4().to_string())
     .bind(&org_id) // Use org_id from path
     .bind(&event_type)
     .bind(serde_json::to_string(&request.payload).unwrap_or_default())
-    .bind(&request.queue_name)
+    .bind(&returned_queue)
     .bind(now)
+    .bind(&returned_id)
+    .bind(if created {
+        INBOUND_DELIVERY_CREATED
+    } else {
+        INBOUND_DELIVERY_DUPLICATE
+    })
     .execute(state.db.pool())
     .await?;
 
@@ -301,6 +313,51 @@ pub async fn custom(
         queue_name: returned_queue,
         status: returned_status,
     }))
+}
+
+/// The inbound webhook log: recent requests to `POST /webhooks/{org_id}/custom`
+/// that were accepted, newest first.
+///
+/// GET /api/v1/webhooks/deliveries?limit=&offset=&status=&since=&queue_name=
+///
+/// Organization-wide, so unrestricted keys only (a queue-scoped key would see
+/// other queues' traffic). Entries carry neither the stored payload nor any
+/// signature; the webhook token is never stored at all.
+pub async fn list_deliveries(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<ApiKeyContext>,
+    Query(query): Query<ListInboundDeliveriesQuery>,
+) -> AppResult<Json<Vec<WebhookDeliverySummary>>> {
+    require_unrestricted_key(&ctx, "read the inbound webhook log")?;
+    let filter = query.filter().map_err(AppError::Validation)?;
+
+    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
+        "SELECT id, provider, event_type, matched_queue, job_id, status, created_at \
+         FROM webhook_deliveries WHERE organization_id = ",
+    );
+    qb.push_bind(&ctx.organization_id);
+    if let Some(status) = filter.status {
+        qb.push(" AND status = ");
+        qb.push_bind(status);
+    }
+    if let Some(since) = filter.since {
+        qb.push(" AND created_at >= ");
+        qb.push_bind(since);
+    }
+    if let Some(queue) = &filter.queue_name {
+        qb.push(" AND matched_queue = ");
+        qb.push_bind(queue);
+    }
+    // `id` breaks ties, so paging never repeats or skips an entry received in
+    // the same instant as another.
+    qb.push(" ORDER BY created_at DESC, id DESC LIMIT ");
+    qb.push_bind(filter.limit);
+    qb.push(" OFFSET ");
+    qb.push_bind(filter.offset);
+
+    let deliveries: Vec<WebhookDeliverySummary> =
+        qb.build_query_as().fetch_all(state.db.pool()).await?;
+    Ok(Json(deliveries))
 }
 
 /// Constant-time string comparison to prevent timing attacks

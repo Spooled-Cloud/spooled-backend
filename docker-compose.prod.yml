@@ -192,6 +192,8 @@ services:
       DATABASE_MAX_CONNECTIONS: ${DATABASE_MAX_CONNECTIONS:-25}
       DATABASE_MIN_CONNECTIONS: ${DATABASE_MIN_CONNECTIONS:-5}
       DATABASE_ACQUIRE_TIMEOUT_SECS: ${DATABASE_ACQUIRE_TIMEOUT_SECS:-30}
+      # Statement timeout (ms) of GET /jobs and GET /jobs/dlq; a stopped list is a 400 QUERY_TIMEOUT.
+      DATABASE_LIST_STATEMENT_TIMEOUT_MS: ${DATABASE_LIST_STATEMENT_TIMEOUT_MS:-5000}
       # Validate each connection on checkout (adds ~5ms); off by default.
       DATABASE_TEST_BEFORE_ACQUIRE: ${DATABASE_TEST_BEFORE_ACQUIRE:-false}
       # Direct (non-PgBouncer) URL; blank = unset.

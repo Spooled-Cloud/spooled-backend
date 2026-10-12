@@ -160,6 +160,16 @@ pub struct Worker {
     pub created_at: DateTime<Utc>,
     /// Last update timestamp  
     pub updated_at: DateTime<Utc>,
+    /// Jobs this worker completed (migration 20261014110000; kept by a trigger
+    /// on `jobs`). Default 0 for a row read without the column.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub jobs_processed: i64,
+    /// Failures this worker reported (retry scheduled or dead-lettered).
+    /// Lease-expiry and offline-worker sweeps do not count.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub jobs_failed: i64,
 }
 
 /// Request to register a new worker
@@ -255,6 +265,11 @@ pub struct WorkerSummary {
     pub current_jobs: i32,
     pub max_concurrency: i32,
     pub last_heartbeat: DateTime<Utc>,
+    /// Jobs completed by this worker since the counters were added (0.1.122).
+    pub jobs_processed: i64,
+    /// Failures reported by this worker (each retry scheduled or dead-letter
+    /// it caused); jobs released by a lease-expiry sweep are not counted.
+    pub jobs_failed: i64,
 }
 
 impl From<Worker> for WorkerSummary {
@@ -267,6 +282,8 @@ impl From<Worker> for WorkerSummary {
             current_jobs: worker.current_job_count,
             max_concurrency: worker.max_concurrent_jobs,
             last_heartbeat: worker.last_heartbeat,
+            jobs_processed: worker.jobs_processed,
+            jobs_failed: worker.jobs_failed,
         }
     }
 }
@@ -288,6 +305,10 @@ pub struct WorkerResponse {
     pub version: Option<String>,
     pub registered_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// See [`WorkerSummary::jobs_processed`].
+    pub jobs_processed: i64,
+    /// See [`WorkerSummary::jobs_failed`].
+    pub jobs_failed: i64,
 }
 
 impl From<Worker> for WorkerResponse {
@@ -307,6 +328,8 @@ impl From<Worker> for WorkerResponse {
             version: worker.version,
             registered_at: worker.created_at,
             updated_at: worker.updated_at,
+            jobs_processed: worker.jobs_processed,
+            jobs_failed: worker.jobs_failed,
         }
     }
 }
@@ -352,12 +375,43 @@ mod tests {
             version: Some("1.0.0".to_string()),
             created_at: now,
             updated_at: now,
+            jobs_processed: 0,
+            jobs_failed: 0,
         };
 
         let summary = WorkerSummary::from(worker.clone());
         assert_eq!(summary.id, worker.id);
         assert_eq!(summary.queue_name, worker.queue_name);
         assert_eq!(summary.current_jobs, 2); // Uses current_job_count now
+    }
+
+    #[test]
+    fn worker_responses_carry_the_job_counters() {
+        let now = Utc::now();
+        let worker = Worker {
+            id: "worker-3".to_string(),
+            organization_id: "org-1".to_string(),
+            queue_name: "emails".to_string(),
+            queue_names: vec!["emails".to_string()],
+            hostname: "host".to_string(),
+            worker_type: None,
+            max_concurrent_jobs: 5,
+            current_job_count: 1,
+            status: "healthy".to_string(),
+            last_heartbeat: now,
+            metadata: serde_json::json!({}),
+            version: None,
+            created_at: now,
+            updated_at: now,
+            jobs_processed: 41,
+            jobs_failed: 3,
+        };
+        let summary = serde_json::to_value(WorkerSummary::from(worker.clone())).unwrap();
+        assert_eq!(summary["jobs_processed"], 41);
+        assert_eq!(summary["jobs_failed"], 3);
+        let detail = serde_json::to_value(WorkerResponse::from(worker)).unwrap();
+        assert_eq!(detail["jobs_processed"], 41);
+        assert_eq!(detail["jobs_failed"], 3);
     }
 
     #[test]
@@ -379,6 +433,8 @@ mod tests {
             version: None,
             created_at: now,
             updated_at: now,
+            jobs_processed: 0,
+            jobs_failed: 0,
         };
 
         assert_eq!(worker.queue_names.len(), 2);

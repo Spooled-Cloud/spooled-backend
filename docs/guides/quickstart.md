@@ -830,7 +830,7 @@ Per-second rate limiting returns HTTP `429 Too Many Requests`:
 }
 ```
 
-- The response carries a `Retry-After` header (seconds); it is the only rate-limit header, there are no `X-RateLimit-*` headers. The same wait is in `retry_after_secs`
+- The response carries a `Retry-After` header (seconds); the same wait is in `retry_after_secs`. Authenticated requests also get `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset` (a Unix time, equal to `reset_at`) and `X-RateLimit-Scope`
 - Check your plan's rate limits
 - Implement exponential backoff in clients
 - Use bulk operations where possible

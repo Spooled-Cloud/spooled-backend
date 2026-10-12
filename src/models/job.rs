@@ -541,8 +541,22 @@ pub struct ListJobsQuery {
     /// Filter by queue name (`queue_name` canonical; `queue` accepted as alias).
     #[serde(alias = "queue")]
     pub queue_name: Option<String>,
-    /// Filter by status
+    /// Filter by status: one status or a comma-separated list
+    /// (`status=failed,deadletter`), case-insensitive. Ignored by `/jobs/dlq`.
     pub status: Option<String>,
+    /// Search text, case-insensitive: matches a job whose id starts with it, or
+    /// whose `queue_name` or `payload.job_type` contains it. The job type part
+    /// looks at the organization's first `MAX_SEARCH_JOB_TYPES` (1000) distinct
+    /// job types in sort order, of at most 255 bytes each, through
+    /// idx_jobs_org_job_type; it never reads payloads.
+    pub q: Option<String>,
+    /// Exact `payload.job_type` (at most 255 bytes, so a longer type never
+    /// matches).
+    pub job_type: Option<String>,
+    /// RFC 3339 instant; only jobs created at or after it.
+    pub created_after: Option<String>,
+    /// RFC 3339 instant; only jobs created before it.
+    pub created_before: Option<String>,
     /// Filter by a single tag.
     ///
     /// Matches Postgres `jsonb ? tag` semantics, which works for:
@@ -612,6 +626,47 @@ pub struct JobStatsQuery {
     /// Optional queue filter (`queue_name` canonical; `queue` accepted as alias).
     #[serde(alias = "queue")]
     pub queue_name: Option<String>,
+}
+
+/// Default page size of `GET /jobs/{id}/history`.
+pub const DEFAULT_JOB_HISTORY_LIMIT: i64 = 100;
+/// Largest page of `GET /jobs/{id}/history`.
+pub const MAX_JOB_HISTORY_LIMIT: i64 = 500;
+
+/// Query parameters of `GET /jobs/{id}/history`.
+#[derive(Debug, Deserialize, Default)]
+pub struct JobHistoryQuery {
+    /// `asc` (default, oldest event first) or `desc` (newest first). `order`
+    /// is accepted as an alias.
+    #[serde(alias = "order")]
+    pub order_dir: Option<String>,
+    /// Events per page (default 100, at most 500).
+    pub limit: Option<i64>,
+    /// Events to skip.
+    pub offset: Option<i64>,
+}
+
+impl JobHistoryQuery {
+    /// `ASC` unless `desc` was asked for; anything else is an error, as on
+    /// `GET /jobs`.
+    pub fn direction(&self) -> Result<&'static str, String> {
+        match self.order_dir.as_deref().map(str::trim) {
+            None | Some("") => Ok("ASC"),
+            Some(dir) if dir.eq_ignore_ascii_case("asc") => Ok("ASC"),
+            Some(dir) if dir.eq_ignore_ascii_case("desc") => Ok("DESC"),
+            Some(dir) => Err(format!("Invalid order_dir '{}': expected asc or desc", dir)),
+        }
+    }
+
+    /// `(limit, offset)`, bounded like the job lists: the limit to 1-500.
+    pub fn page(&self) -> (i64, i64) {
+        (
+            self.limit
+                .unwrap_or(DEFAULT_JOB_HISTORY_LIMIT)
+                .clamp(1, MAX_JOB_HISTORY_LIMIT),
+            self.offset.unwrap_or(0).max(0),
+        )
+    }
 }
 
 /// Maximum job history details size (64KB)
@@ -1259,6 +1314,46 @@ mod tests {
             serde_json::json!({"worker_id": "w", "error": "x"})
         )
         .is_err());
+    }
+
+    #[test]
+    fn job_history_query_order_and_page() {
+        let query = |dir: Option<&str>, limit: Option<i64>, offset: Option<i64>| JobHistoryQuery {
+            order_dir: dir.map(str::to_string),
+            limit,
+            offset,
+        };
+        assert_eq!(query(None, None, None).direction(), Ok("ASC"));
+        assert_eq!(query(Some(" "), None, None).direction(), Ok("ASC"));
+        assert_eq!(query(Some("DESC"), None, None).direction(), Ok("DESC"));
+        assert!(query(Some("newest"), None, None).direction().is_err());
+        assert_eq!(query(None, None, None).page(), (100, 0));
+        assert_eq!(query(None, Some(0), Some(-4)).page(), (1, 0));
+        assert_eq!(query(None, Some(10_000), Some(7)).page(), (500, 7));
+
+        let via_alias: JobHistoryQuery =
+            serde_json::from_value(serde_json::json!({ "order": "desc" })).unwrap();
+        assert_eq!(via_alias.direction(), Ok("DESC"));
+    }
+
+    #[test]
+    fn list_jobs_query_reads_the_search_parameters() {
+        let query: ListJobsQuery = serde_json::from_value(serde_json::json!({
+            "q": "abc",
+            "job_type": "send_email",
+            "created_after": "2026-10-01T00:00:00Z",
+            "created_before": "2026-10-02T00:00:00Z",
+            "status": "failed,deadletter"
+        }))
+        .unwrap();
+        assert_eq!(query.q.as_deref(), Some("abc"));
+        assert_eq!(query.job_type.as_deref(), Some("send_email"));
+        assert_eq!(query.created_after.as_deref(), Some("2026-10-01T00:00:00Z"));
+        assert_eq!(
+            query.created_before.as_deref(),
+            Some("2026-10-02T00:00:00Z")
+        );
+        assert_eq!(query.status.as_deref(), Some("failed,deadletter"));
     }
 
     #[test]
