@@ -11,6 +11,27 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.124] - 2026-10-13
+
+Dependency security updates, three small API fixes and a correct version label on the `main` image. No migration, no new route; response bodies keep their shape (one new response header).
+
+### Security
+
+- **quinn-proto 0.11.19** fixes RUSTSEC-2026-0338, RUSTSEC-2026-0339, RUSTSEC-2026-0340, RUSTSEC-2026-0341 and RUSTSEC-2026-0342. The crate is listed in `Cargo.lock` as `reqwest`'s optional HTTP/3 dependency but is not compiled into the server (`cargo tree -i quinn-proto --target all` prints nothing); the lockfile is updated so `cargo audit` stays clean.
+- Patch updates from Dependabot #50: tokio 1.53.2, config 0.15.27, thiserror 2.0.21, uuid 1.28, redis 1.7.1, lazy_static 1.5.1 and tokio-test 0.4.6 (dev).
+
+### Fixed
+
+- **`GET /api/v1/webhooks/deliveries` has a paging hint.** The inbound webhook log returned a bare array with nothing saying whether another page follows. It now sends the `X-Has-More` response header (`true` or `false`) exactly like `GET /jobs` and `GET /jobs/{id}/history`: the handler reads one row past `limit` and drops it, so the body is still the same bare array. The header is already in the CORS expose list, so the dashboard can read it cross-origin. `docs/openapi.yaml` documents it. Test: `r0124::r0124_inbound_webhook_log_sends_x_has_more` (Docker).
+- **`POST /api/v1/organizations/generate-slug` no longer offers a reserved or an empty slug** (W9-R2). A name such as `Admin` or `API` came back as `admin` or `api`, which `check-slug` reports as reserved and signup refuses; such a base now gets the same random suffix a taken slug gets (`admin-1f2e3d`), and so does a base shorter than 3 characters (`AB` gives `ab-1f2e3d`). A name with no ASCII letter or digit (`!!!`, `日本語`) used to give `""`; it now gives `org-` and the suffix. Generated slugs are at most 50 characters (the base used to be cut at 80, plus the suffix). A name that merely contains a reserved word (`Admin Tools` gives `admin-tools`) is unchanged. Tests: `organizations::tests::test_generate_slug_*`, `r0124::r0124_generate_slug_never_offers_a_reserved_or_empty_slug` (Docker).
+- **`GET /api/v1/organizations/check-slug` applies the signup length** (W9-R1). It accepted 1-100 characters after the trim while website signup and `POST /organizations` take 3-50, so a short or long slug was green at the pre-check and a `400` at signup. It now answers `valid: false` with `error: "Validation failed: Slug must be 3-50 characters"` (the signup request's message, in the form of check-slug's other format errors) for a trimmed, lower-cased slug shorter than 3 or longer than 50, and the `suggestion` it offers for a reserved or taken slug is cut to fit in 50. What signup and `POST /organizations` accept is unchanged. Tests: `organizations::tests::test_check_slug_length_matches_signup`, `r0124::r0124_check_slug_applies_the_signup_length` (Docker); `docs_contract_tests::signup_slug_rules_agree_is_recorded` pins the knowledge-base entries.
+
+### Changed
+
+- **The `main` image's version label is the package version.** `docker/metadata-action` takes `org.opencontainers.image.version` from the first tag, so the `:latest` images were labelled `latest-arm64` / `latest-amd64`. `release.yml` now reads the version in a step and passes it as a label: the `Cargo.toml` version for `main` builds, the tag's version (`v0.1.124` gives `0.1.124`, as `{{version}}` does) for tag builds. `flavor: latest=false`, the revision label and the `:latest` manifest handling are unchanged.
+
+---
+
 ## [0.1.123] - 2026-10-12
 
 Wave 9, from the final production verification of waves 3-8 (2026-10-12): one runtime fix (a website signup can no longer take a reserved slug), the findings that are documented or deferred rather than fixed, and a test that pins those statements to the code. No migration, no new route and no change to an API response shape.

@@ -45,9 +45,23 @@ lowercase letters, digits and hyphens (not at either end) and refuses every name
 token usable. `SLUG_REGEX` (leading letter, no `--`) is NOT applied here: the website suggests
 slugs that start with a digit and `GET /organizations/check-slug` calls them valid. Pinned by
 `email_login::tests::test_complete_signup_checks_the_slug_before_it_consumes_the_token`.
-Length is NOT aligned: `check-slug` takes 1-100 characters after the trim, the signup request 3-50
-as sent (before the trim), so a very short or very long slug can pass the pre-check and be a 400 at
-signup (W9-R1); `generate-slug` does not read `RESERVED_SLUGS` (W9-R2). Both open, P3.
+Length (0.1.124, W9-R1 fixed): `GET /organizations/check-slug` reports `valid: false` with
+`Validation failed: Slug must be 3-50 characters` unless the trimmed, lower-cased slug is 3-50 characters
+(`validate_signup_slug_length`, `SLUG_MIN_LEN` / `SLUG_MAX_LEN` in `organizations.rs`), the length the
+signup request (`CompleteSignupRequest`, counted as sent, before the trim) and `POST /organizations`
+(`CreateOrganizationRequest`) accept; it used to take 1-100. Signup and `POST /organizations` are
+unchanged (`validate_slug` keeps its 1-100 for `POST /organizations`, behind the request's 3-50). The
+website trims before both calls, so the two agree; a client that pads a 50-character slug with spaces
+still gets a green check and a 400 at signup. A reserved or taken slug's `suggestion` is cut so it stays
+within 50 (`with_random_suffix`).
+`POST /organizations/generate-slug` (0.1.124, W9-R2 fixed): `slug_base_for_name` keeps ASCII letters
+and digits, one hyphen per other run, `org-` before a leading digit, at most 50 characters;
+`base_needs_suffix` (shorter than 3, or in `RESERVED_SLUGS`) or a taken base gets `-` and six random hex
+characters (base cut to 43 first), and an empty base (no ASCII letter or digit) becomes `org-` and the
+suffix. Every result passes `check-slug`, signup and `POST /organizations` (`SLUG_REGEX` included):
+`organizations::tests::test_generate_slug_*`, `test_check_slug_length_matches_signup`,
+`r0124::r0124_generate_slug_never_offers_a_reserved_or_empty_slug`,
+`r0124::r0124_check_slug_applies_the_signup_length`.
 
 `GET /api/v1/auth/check-email` returns `available`, `exists`, and `signup_enabled`
 (`EMAIL_SIGNUP_ENABLED`). The marketing signup page gates on `signup_enabled === false`

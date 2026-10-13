@@ -10,6 +10,7 @@ use chrono::Utc;
 use sqlx::{Postgres, QueryBuilder};
 use uuid::Uuid;
 
+use crate::api::handlers::jobs::{paged, split_page};
 use crate::api::handlers::require_unrestricted_key;
 use crate::api::middleware::limits::{
     check_job_limits, check_payload_size, daily_jobs_limit, refund_daily_jobs,
@@ -322,12 +323,14 @@ pub async fn custom(
 ///
 /// Organization-wide, so unrestricted keys only (a queue-scoped key would see
 /// other queues' traffic). Entries carry neither the stored payload nor any
-/// signature; the webhook token is never stored at all.
+/// signature; the webhook token is never stored at all. The body is a bare
+/// array; the `X-Has-More` header says whether another page follows, as on
+/// `GET /jobs` (one row past `limit` is read to tell).
 pub async fn list_deliveries(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
     Query(query): Query<ListInboundDeliveriesQuery>,
-) -> AppResult<Json<Vec<WebhookDeliverySummary>>> {
+) -> AppResult<impl IntoResponse> {
     require_unrestricted_key(&ctx, "read the inbound webhook log")?;
     let filter = query.filter().map_err(AppError::Validation)?;
 
@@ -351,13 +354,14 @@ pub async fn list_deliveries(
     // `id` breaks ties, so paging never repeats or skips an entry received in
     // the same instant as another.
     qb.push(" ORDER BY created_at DESC, id DESC LIMIT ");
-    qb.push_bind(filter.limit);
+    qb.push_bind(filter.limit + 1);
     qb.push(" OFFSET ");
     qb.push_bind(filter.offset);
 
     let deliveries: Vec<WebhookDeliverySummary> =
         qb.build_query_as().fetch_all(state.db.pool()).await?;
-    Ok(Json(deliveries))
+    let (deliveries, has_more) = split_page(deliveries, filter.limit);
+    Ok(paged(deliveries, has_more))
 }
 
 /// Constant-time string comparison to prevent timing attacks

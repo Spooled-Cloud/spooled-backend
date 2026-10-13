@@ -1026,11 +1026,11 @@ fn authorize_email_signup(
 ///
 /// The characters and hyphens accepted are those of `GET /organizations/check-slug`
 /// (the website's pre-check), so those two rules do not turn a green check into
-/// a failed signup. The length rules differ, and did before this function
-/// existed: `check-slug` takes 1-100 characters after the trim, while the signup
-/// request is 3-50 characters as sent (`CompleteSignupRequest`, validated before
-/// this function trims). A 1-2 or 51-100 character slug can therefore pass the
-/// pre-check and fail at signup with a `400`; not changed here (W9-R1).
+/// a failed signup. The length is checked before this function runs: the
+/// signup request takes 3-50 characters as sent (`CompleteSignupRequest`), and
+/// since 0.1.124 `check-slug` takes the same 3-50 after the trim
+/// (`validate_signup_slug_length`, W9-R1), so a slug the website trims before
+/// both calls gets the same answer from each.
 ///
 /// The names in `RESERVED_SLUGS` are refused here as they are by
 /// `POST /organizations`: a signup used to be able to take `admin`, `api` or

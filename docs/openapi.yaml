@@ -734,7 +734,14 @@ paths:
     get:
       tags: [Organizations]
       summary: Check slug availability
-      description: Check if an organization slug is available
+      description: |
+        Check if an organization slug is available. The slug is lower-cased and trimmed, then must
+        be 3-50 characters (the length website signup and `POST /organizations` accept; before
+        0.1.124 this check took 1-100) of lowercase letters, digits and hyphens, not at either
+        end; otherwise `valid` is false and `error` says why
+        (`Validation failed: Slug must be 3-50 characters`).
+        A reserved or taken slug is `valid` but not `available`, with a `suggestion` that is
+        itself at most 50 characters.
       operationId: checkSlug
       security: []
       parameters:
@@ -756,7 +763,14 @@ paths:
     post:
       tags: [Organizations]
       summary: Generate unique slug
-      description: Generate a unique slug from an organization name
+      description: |
+        Generate a unique slug from an organization name (1-200 characters). The slug is the
+        name's ASCII letters and digits, lower-cased, with every other run of characters one
+        hyphen, `org-` in front of a leading digit, at most 50 characters. When that base is
+        taken, is a reserved name (`admin`, `api`, ...) or is shorter than 3 characters, a
+        hyphen and six random hex characters are added (`admin-1f2e3d`); a name with no ASCII
+        letter or digit gives `org-` and the suffix. The result is a slug `check-slug`, website
+        signup and `POST /organizations` accept.
       operationId: generateSlug
       security: []
       requestBody:
@@ -2612,7 +2626,8 @@ paths:
       description: |
         Recent requests accepted by `POST /api/v1/webhooks/{org_id}/custom` for the caller's
         organization, newest first. Entries carry neither the request payload nor any signature.
-        Requires an unrestricted key.
+        Requires an unrestricted key. The body is a bare array; the `X-Has-More` response header
+        says whether another page follows (since 0.1.124).
       operationId: listInboundWebhookDeliveries
       parameters:
         - name: status
@@ -2650,6 +2665,12 @@ paths:
       responses:
         '200':
           description: Inbound webhook requests
+          headers:
+            X-Has-More:
+              description: '`true` when another page follows, else `false`'
+              schema:
+                type: string
+                enum: ['true', 'false']
           content:
             application/json:
               schema:
@@ -6131,9 +6152,15 @@ components:
           type: boolean
         valid:
           type: boolean
+        error:
+          type: string
+          description: >-
+            Why the slug is not valid (for example
+            `Validation failed: Slug must be 3-50 characters`), or
+            `This slug is reserved`; absent otherwise
         suggestion:
           type: string
-          description: Suggested alternative if not available
+          description: Suggested alternative if not available (at most 50 characters)
 
     GenerateSlugRequest:
       type: object

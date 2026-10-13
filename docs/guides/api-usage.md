@@ -1176,7 +1176,8 @@ in another queue. `job_id` and `status` are `null` for entries recorded before 0
 never returns the payload, a signature or the webhook token. It needs an unrestricted API key: a
 queue-scoped key gets `403 ACCESS_DENIED`. An unknown `status`, a `since` that is not RFC 3339 or a
 `queue_name` over 255 characters is a `400`. Entries are removed by the same retention sweep as the
-other delivery history.
+other delivery history. As on `GET /jobs`, the body is a bare array and the `X-Has-More` response
+header (`true` or `false`, since 0.1.124) says whether another page follows.
 
 ### Security Best Practices
 
@@ -1268,9 +1269,14 @@ If not available:
 {
   "available": false,
   "valid": true,
-  "suggestion": "my-company-2"
+  "suggestion": "my-company-4f9a1c"
 }
 ```
+
+The slug is trimmed and lower-cased first. It must be 3-50 characters (what signup accepts) of
+lowercase letters, digits and hyphens, not at either end; otherwise `valid` is `false` and `error`
+says why, for example `"Validation failed: Slug must be 3-50 characters"`. A reserved name such as `admin` is `valid`
+but not `available`, with `"error": "This slug is reserved"` and a suggestion.
 
 ### Generate Unique Slug
 
@@ -1292,12 +1298,16 @@ Response:
 }
 ```
 
-If slug exists, automatically appends number:
+If the slug is taken, is a reserved name (`Admin` gives `admin`) or is shorter than 3 characters,
+six random characters are appended:
 ```json
 {
-  "slug": "my-company-name-2"
+  "slug": "my-company-name-4f9a1c"
 }
 ```
+
+The slug is at most 50 characters. A name with no ASCII letter or digit gives `org-` and the random
+characters (`org-4f9a1c`); a name that starts with a digit gets `org-` in front (`3M` gives `org-3m`).
 
 ---
 

@@ -25,6 +25,7 @@ const OPENAPI: &str = include_str!("../docs/openapi.yaml");
 const PROTO: &str = include_str!("../proto/spooled.proto");
 const SERVER_CONVERT: &str = include_str!("../src/grpc/convert.rs");
 const EMAIL_LOGIN: &str = include_str!("../src/api/handlers/email_login.rs");
+const ORGANIZATIONS: &str = include_str!("../src/api/handlers/organizations.rs");
 const AUTH_DATAFLOW: &str = include_str!("../docs/ai/knowledge/dataflows/auth.md");
 const CHANGELOG: &str = include_str!("../CHANGELOG.md");
 const WORKFLOW_HANDLERS: &str = include_str!("../src/api/handlers/workflows.rs");
@@ -468,4 +469,65 @@ fn scale_costs_are_recorded_as_deferred() {
         JOBS_DATAFLOW,
         &["Known costs at scale (BEJOB-21, **deferred**"],
     );
+}
+
+// ---------------------------------------------------------------------------
+// W9-R1, W9-R2: check-slug, generate-slug and signup agree on the slug (0.1.124).
+// ---------------------------------------------------------------------------
+#[test]
+fn signup_slug_rules_agree_is_recorded() {
+    // The code the entries describe: check-slug applies the signup length before its character
+    // rules, generate-slug suffixes a reserved or short base, and both cut a suffixed slug to 50
+    // (the unit tests in organizations.rs pin the behaviour).
+    assert_mentions(
+        "src/api/handlers/organizations.rs",
+        ORGANIZATIONS,
+        &[
+            "pub(crate) const SLUG_MIN_LEN: usize = 3;",
+            "pub(crate) const SLUG_MAX_LEN: usize = 50;",
+            "validate_signup_slug_length(&slug).and_then(|()| validate_slug(&slug))",
+            "base.len() < SLUG_MIN_LEN || crate::models::RESERVED_SLUGS.contains(&base)",
+            "truncate_slug(base, SLUG_MAX_LEN - SLUG_SUFFIX_LEN)",
+        ],
+    );
+    // Signup itself is unchanged: still 3-50 as sent.
+    assert_mentions(
+        "src/api/handlers/email_login.rs",
+        EMAIL_LOGIN,
+        &["#[validate(length(min = 3, max = 50, message = \"Slug must be 3-50 characters\"))]"],
+    );
+
+    for id in ["W9-R1", "W9-R2"] {
+        let fixed = finding(id);
+        assert_eq!(fixed["fixed_in"], "0.1.124", "{fixed}");
+    }
+    assert_finding(
+        "W9-R1",
+        "fixed",
+        &[
+            "`validate_signup_slug_length`",
+            "Slug must be 3-50 characters",
+            "Deliberately NOT changed",
+        ],
+    );
+    assert_finding(
+        "W9-R2",
+        "fixed",
+        &["`RESERVED_SLUGS`", "`base_needs_suffix`", "`org-`"],
+    );
+    assert_mentions(
+        "dataflows/auth.md",
+        AUTH_DATAFLOW,
+        &[
+            "W9-R1 fixed",
+            "W9-R2 fixed",
+            "`validate_signup_slug_length`",
+        ],
+    );
+    assert_mentions(
+        "docs/openapi.yaml",
+        OPENAPI,
+        &["Slug must be 3-50 characters"],
+    );
+    assert_mentions("CHANGELOG.md", CHANGELOG, &["(W9-R1)", "(W9-R2)"]);
 }

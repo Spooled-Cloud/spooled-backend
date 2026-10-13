@@ -15728,3 +15728,349 @@ mod w9_signup {
         }
     }
 }
+
+// ---- 0.1.124 ----
+/// 0.1.124: the inbound webhook log sends the `X-Has-More` paging hint the job
+/// lists send; `generate-slug` never offers a reserved or an empty slug
+/// (W9-R2); `check-slug` applies the 3-50 length signup applies (W9-R1).
+mod r0124 {
+    use super::*;
+
+    /// (status, body, `X-Has-More`, `Access-Control-Expose-Headers`) of a GET.
+    async fn get_paged(
+        app: &Router,
+        uri: &str,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, Value, Option<String>, Option<String>) {
+        let mut req = Request::builder().method("GET").uri(uri);
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        let res = app
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .expect("request");
+        let status = res.status();
+        let header = |name: &str| {
+            res.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        let has_more = header("x-has-more");
+        let exposed = header("access-control-expose-headers");
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into()));
+        (status, body, has_more, exposed)
+    }
+
+    #[tokio::test]
+    async fn r0124_inbound_webhook_log_sends_x_has_more() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let other = seed_tenant(db.pool()).await;
+        let app = app(&db);
+        let auth = bearer(&t.key);
+        // Built at runtime so secret scanners do not report a test fixture.
+        let token = ["whk", "r0124", "log"].join("_");
+        sqlx::query(
+            "UPDATE organizations SET settings = settings || jsonb_build_object('webhook_token', $2::TEXT) \
+             WHERE id = $1",
+        )
+        .bind(&t.org_id)
+        .bind(&token)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let ingest = format!("/api/v1/webhooks/{}/custom", t.org_id);
+        for (queue, n) in [("r0124-a", 1), ("r0124-a", 2), ("r0124-b", 3)] {
+            let (status, res) = call(
+                &app,
+                "POST",
+                &ingest,
+                &[("X-Webhook-Token", &token)],
+                Some(json!({"queue_name": queue, "payload": {"n": n}})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{res}");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let ids = |body: &Value| -> Vec<String> {
+            body.as_array()
+                .unwrap_or_else(|| panic!("the body is a bare array: {body}"))
+                .iter()
+                .map(|e| e["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let headers = [("Authorization", auth.as_str())];
+        let (status, all, has_more, _) =
+            get_paged(&app, "/api/v1/webhooks/deliveries", &headers).await;
+        assert_eq!(status, StatusCode::OK, "{all}");
+        assert_eq!(ids(&all).len(), 3, "{all}");
+        assert_eq!(has_more.as_deref(), Some("false"), "everything fit");
+
+        // (query, entries on the page, X-Has-More)
+        for (query, len, more) in [
+            ("?limit=2", 2, "true"),
+            ("?limit=2&offset=2", 1, "false"),
+            ("?limit=3", 3, "false"),
+            ("?limit=1&offset=1", 1, "true"),
+            ("?limit=1&offset=3", 0, "false"),
+            ("?queue_name=r0124-a&limit=1", 1, "true"),
+            ("?queue_name=r0124-a&limit=2", 2, "false"),
+            ("?queue_name=r0124-b&limit=1", 1, "false"),
+        ] {
+            let (status, body, has_more, _) = get_paged(
+                &app,
+                &format!("/api/v1/webhooks/deliveries{query}"),
+                &headers,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{query}: {body}");
+            assert_eq!(ids(&body).len(), len, "{query}: {body}");
+            assert_eq!(has_more.as_deref(), Some(more), "{query}: {body}");
+        }
+
+        // The extra row read to tell is never returned: two pages are the list.
+        let (_, first, _, _) =
+            get_paged(&app, "/api/v1/webhooks/deliveries?limit=2", &headers).await;
+        let (_, second, _, _) = get_paged(
+            &app,
+            "/api/v1/webhooks/deliveries?limit=2&offset=2",
+            &headers,
+        )
+        .await;
+        let mut pages = ids(&first);
+        pages.extend(ids(&second));
+        assert_eq!(pages, ids(&all));
+
+        // A browser on another origin may read the header.
+        let (status, _, has_more, exposed) = get_paged(
+            &app,
+            "/api/v1/webhooks/deliveries?limit=1",
+            &[
+                ("Authorization", auth.as_str()),
+                ("Origin", "https://dashboard.example"),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(has_more.as_deref(), Some("true"));
+        let exposed = exposed.expect("Access-Control-Expose-Headers on a CORS response");
+        assert!(
+            exposed
+                .split(',')
+                .any(|h| h.trim().eq_ignore_ascii_case("x-has-more")),
+            "{exposed}"
+        );
+
+        // An empty log says there is nothing more.
+        let (status, body, has_more, _) = get_paged(
+            &app,
+            "/api/v1/webhooks/deliveries",
+            &[("Authorization", &bearer(&other.key))],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!([]));
+        assert_eq!(has_more.as_deref(), Some("false"));
+    }
+
+    async fn generate(app: &Router, name: &str) -> (StatusCode, Value) {
+        call(
+            app,
+            "POST",
+            "/api/v1/organizations/generate-slug",
+            &[],
+            Some(json!({ "name": name })),
+        )
+        .await
+    }
+
+    async fn check(app: &Router, slug: &str) -> Value {
+        let (status, body) = call(
+            app,
+            "GET",
+            &format!("/api/v1/organizations/check-slug?slug={slug}"),
+            &[],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{slug}: {body}");
+        body
+    }
+
+    /// The slug is one check-slug calls valid and available.
+    async fn assert_green(app: &Router, slug: &str, from: &str) {
+        let body = check(app, slug).await;
+        assert_eq!(body["valid"], true, "{from:?} -> {slug}: {body}");
+        assert_eq!(body["available"], true, "{from:?} -> {slug}: {body}");
+    }
+
+    async fn insert_org(pool: &sqlx::PgPool, name: &str, slug: &str) {
+        sqlx::query(
+            "INSERT INTO organizations (id, name, slug, plan_tier, settings, created_at, updated_at) \
+             VALUES ($1, $2, $3, 'free', '{}'::JSONB, NOW(), NOW())",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(name)
+        .bind(slug)
+        .execute(pool)
+        .await
+        .expect("seed org");
+    }
+
+    #[tokio::test]
+    async fn r0124_generate_slug_never_offers_a_reserved_or_empty_slug() {
+        let db = TestDatabase::new().await;
+        let app = app(&db);
+
+        // W9-R2: `Admin` came back as `admin`.
+        for reserved in spooled_backend::models::RESERVED_SLUGS {
+            let name = format!("{}{}", reserved[..1].to_uppercase(), &reserved[1..]);
+            let (status, body) = generate(&app, &name).await;
+            assert_eq!(status, StatusCode::OK, "{name}: {body}");
+            let slug = body["slug"].as_str().unwrap();
+            assert_ne!(slug, *reserved, "{name}");
+            assert!(
+                !spooled_backend::models::RESERVED_SLUGS.contains(&slug),
+                "{name} -> {slug}"
+            );
+            assert!(
+                slug.starts_with(&format!("{reserved}-")),
+                "{name} -> {slug}"
+            );
+            assert_green(&app, slug, &name).await;
+        }
+
+        // A name with no ASCII letter or digit used to give "".
+        for name in ["!!!", "日本語", "Ωμέγα ✓"] {
+            let (status, body) = generate(&app, name).await;
+            assert_eq!(status, StatusCode::OK, "{name}: {body}");
+            let slug = body["slug"].as_str().unwrap();
+            assert!(
+                slug.starts_with("org-") && slug.len() == 10,
+                "{name} -> {slug:?}"
+            );
+            assert_green(&app, slug, name).await;
+        }
+
+        // Short and long names come back within the signup length.
+        let long = "Spooled Regression Organization Name ".repeat(5);
+        for name in ["AB", long.as_str()] {
+            let (status, body) = generate(&app, name).await;
+            assert_eq!(status, StatusCode::OK, "{name}: {body}");
+            let slug = body["slug"].as_str().unwrap();
+            assert!((3..=50).contains(&slug.len()), "{name:?} -> {slug}");
+            assert_green(&app, slug, name).await;
+        }
+
+        // Plain names and taken slugs work as before.
+        let tag = &uuid::Uuid::new_v4().simple().to_string()[..8];
+        let name = format!("Acme {tag}");
+        let bare = format!("acme-{tag}");
+        let (_, body) = generate(&app, &name).await;
+        assert_eq!(body["slug"], bare.as_str(), "{body}");
+        insert_org(db.pool(), &name, &bare).await;
+        let (_, body) = generate(&app, &name).await;
+        let slug = body["slug"].as_str().unwrap();
+        assert!(slug.starts_with(&format!("{bare}-")), "{slug}");
+        assert_green(&app, slug, &name).await;
+    }
+
+    #[tokio::test]
+    async fn r0124_check_slug_applies_the_signup_length() {
+        let db = TestDatabase::new().await;
+        let app = app(&db);
+        let tag = &uuid::Uuid::new_v4().simple().to_string()[..8];
+
+        // W9-R1: 1-2 and 51-100 characters were valid and available here and
+        // a 400 at signup; over 100 said "1-100".
+        let fifty_one = format!("r{tag}{}", "x".repeat(42));
+        assert_eq!(fifty_one.len(), 51);
+        let hundred = "z".repeat(100);
+        let hundred_one = "z".repeat(101);
+        for slug in [
+            "",
+            "a",
+            "ab",
+            "AB",
+            "%20ab%20",
+            fifty_one.as_str(),
+            hundred.as_str(),
+            hundred_one.as_str(),
+        ] {
+            let body = check(&app, slug).await;
+            assert_eq!(body["valid"], false, "{slug}: {body}");
+            assert_eq!(body["available"], false, "{slug}: {body}");
+            // The form of check-slug's other format errors.
+            assert_eq!(
+                body["error"], "Validation failed: Slug must be 3-50 characters",
+                "{slug}: {body}"
+            );
+        }
+
+        // The bounds themselves are fine, counted after the trim.
+        let fifty = &fifty_one[..50];
+        for slug in [
+            format!("r{}", &tag[..2]),
+            fifty.to_string(),
+            format!("%20{fifty}%20"),
+        ] {
+            let body = check(&app, &slug).await;
+            assert_eq!(body["valid"], true, "{slug}: {body}");
+            assert_eq!(body["available"], true, "{slug}: {body}");
+        }
+
+        // The character rules still answer with their own message.
+        let body = check(&app, "ab_c").await;
+        assert_eq!(body["valid"], false);
+        assert_eq!(
+            body["error"],
+            "Validation failed: Slug can only contain lowercase letters, digits, and hyphens",
+            "{body}"
+        );
+
+        // A taken 50-character slug gets a suggestion that is itself green.
+        insert_org(db.pool(), "Fifty", fifty).await;
+        let body = check(&app, fifty).await;
+        assert_eq!(body["valid"], true, "{body}");
+        assert_eq!(body["available"], false, "{body}");
+        let suggestion = body["suggestion"].as_str().unwrap();
+        assert!(suggestion.len() <= 50, "{suggestion}");
+        assert_green(&app, suggestion, fifty).await;
+
+        // Signup is unchanged and takes a 50-character slug check-slug calls
+        // green.
+        let email = format!("r0124-{tag}@example.com");
+        let token = format!("r0124{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO email_login_codes (email, code, expires_at) \
+             VALUES ($1, $2, NOW() + INTERVAL '15 minutes')",
+        )
+        .bind(&email)
+        .bind(format!("signup:{token}"))
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let signup_slug = format!("s{tag}{}", "q".repeat(41));
+        assert_eq!(signup_slug.len(), 50);
+        assert_green(&app, &signup_slug, "signup").await;
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/api/v1/auth/signup/complete",
+            &[],
+            Some(json!({"signup_token": token, "name": "R0124 Co", "slug": signup_slug})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["organization"]["slug"], signup_slug.as_str(), "{body}");
+    }
+}

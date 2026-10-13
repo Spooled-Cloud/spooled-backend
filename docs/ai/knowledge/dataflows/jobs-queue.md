@@ -339,7 +339,8 @@ so every statement is a bounded batch (`RETENTION_JOB_BATCH` = 5,000 jobs per st
   or the planner cannot imply it (invariants #39). Jobs without a job type are not indexed.
 - **Paging hint.** `list_job_page` fetches `limit + 1` rows; `split_page` (`:481`) drops the extra and `paged` (`:489`) sets
   `X-Has-More: true|false` (`HAS_MORE_HEADER`). The body stays a bare `JobSummary[]`; `limit` is still capped at 100. The
-  header is invisible to browsers without CORS `expose_headers` (`api/mod.rs:85`).
+  header is invisible to browsers without CORS `expose_headers` (`api/mod.rs:85`). Both helpers are `pub(crate)`;
+  `GET /webhooks/deliveries` uses them too (0.1.124, `dataflows/webhooks.md`).
 - **Statement timeout.** Each list runs `BEGIN READ ONLY; SET LOCAL statement_timeout = <ms>` (`begin_with` + `AssertSqlSafe`:
   the only text written into the SQL is a `u64` from `DATABASE_LIST_STATEMENT_TIMEOUT_MS`, default 5000; `0` is refused by
   `Settings::validate`, `config/mod.rs:699`, because Postgres reads 0 as no timeout). Postgres cancels the statement itself,

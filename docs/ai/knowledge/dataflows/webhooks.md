@@ -79,7 +79,9 @@ organization-wide, so **unrestricted keys only** (`require_unrestricted_key`, a 
 `limit` default 50 clamped to 1..100, `offset`, `status` (`created` | `duplicate`), `since` (RFC 3339, `>=`), `queue_name` (alias
 `queue`, exact on `matched_queue`, at most 255 characters); an invalid filter is a 400. Newest first (`created_at DESC, id DESC`).
 Columns returned: `id, provider, event_type, matched_queue, job_id, status, created_at`, never the payload, a signature or the
-organization id (the webhook token is never stored). Only **accepted** requests are logged (a rejected one writes nothing, so
+organization id (the webhook token is never stored). The body is a bare array; since 0.1.124 the handler reads `limit + 1` rows and
+sends `X-Has-More: true|false` through the job lists' `split_page` / `paged` (`handlers/jobs.rs`), exposed over CORS like the
+other list headers (`cors_exposed_headers`); test `r0124::r0124_inbound_webhook_log_sends_x_has_more`. Only **accepted** requests are logged (a rejected one writes nothing, so
 unauthenticated traffic cannot amplify writes). `job_id`/`status` are nullable (`20261014100100`; the `status` CHECK is `NOT VALID`
 because validating would scan the log under `ACCESS EXCLUSIVE`; every existing row is NULL). Retention is the existing sweep.
 

@@ -478,7 +478,7 @@ fn list_query_error(e: sqlx::Error, timeout_ms: u64) -> AppError {
 pub const HAS_MORE_HEADER: &str = "x-has-more";
 
 /// Fetch one row past `limit` to learn whether more follow, then drop it.
-fn split_page<T>(mut rows: Vec<T>, limit: i64) -> (Vec<T>, bool) {
+pub(crate) fn split_page<T>(mut rows: Vec<T>, limit: i64) -> (Vec<T>, bool) {
     let limit = usize::try_from(limit).unwrap_or(0);
     let has_more = rows.len() > limit;
     rows.truncate(limit);
@@ -486,7 +486,7 @@ fn split_page<T>(mut rows: Vec<T>, limit: i64) -> (Vec<T>, bool) {
 }
 
 /// `body` with the [`HAS_MORE_HEADER`] paging hint.
-fn paged<T: serde::Serialize>(body: T, has_more: bool) -> impl IntoResponse {
+pub(crate) fn paged<T: serde::Serialize>(body: T, has_more: bool) -> impl IntoResponse {
     (
         [(
             axum::http::HeaderName::from_static(HAS_MORE_HEADER),

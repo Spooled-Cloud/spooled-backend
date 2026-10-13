@@ -141,7 +141,8 @@ curl "https://api.spooled.cloud/api/v1/webhooks/deliveries?status=duplicate&limi
 `status` is `created` when the request made a new job and `duplicate` when its `idempotency_key`
 matched an existing one (`job_id` and `matched_queue` then name that job and its queue). Filters:
 `status`, `since` (RFC 3339), `queue_name` (alias `queue`), `limit` (default 50, at most 100) and
-`offset`. Only accepted requests are logged: a wrong token or an over-limit request writes
+`offset`; the `X-Has-More` response header (`true` or `false`, since 0.1.124) says whether another
+page follows. Only accepted requests are logged: a wrong token or an over-limit request writes
 nothing. The log never returns the payload, a signature or the token, it needs an unrestricted API
 key (a queue-scoped key gets `403`), and entries older than 0.1.122 have a `null` `job_id` and
 `status`. Entries are removed with the rest of your delivery history (see the retention table

@@ -141,8 +141,8 @@ pub async fn check_slug(
     )
     .await?;
 
-    // Validate slug format
-    if let Err(e) = validate_slug(&slug) {
+    // Validate slug format: the length signup accepts, then the characters.
+    if let Err(e) = validate_signup_slug_length(&slug).and_then(|()| validate_slug(&slug)) {
         return Ok(Json(CheckSlugResponse {
             available: false,
             valid: false,
@@ -157,19 +157,14 @@ pub async fn check_slug(
             available: false,
             valid: true,
             error: Some("This slug is reserved".to_string()),
-            suggestion: Some(format!("{}-{}", slug, &Uuid::new_v4().to_string()[..6])),
+            suggestion: Some(with_random_suffix(&slug)),
         }));
     }
 
     // Check if slug exists in database
-    let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM organizations WHERE slug = $1")
-        .bind(&slug)
-        .fetch_optional(state.db.pool())
-        .await?;
-
-    if exists.is_some() {
+    if slug_taken(&state, &slug).await? {
         // Generate a suggestion
-        let suggestion = format!("{}-{}", slug, &Uuid::new_v4().to_string()[..6]);
+        let suggestion = with_random_suffix(&slug);
         return Ok(Json(CheckSlugResponse {
             available: false,
             valid: true,
@@ -204,7 +199,12 @@ pub struct GenerateSlugResponse {
 ///
 /// POST /api/v1/organizations/generate-slug
 ///
-/// Takes an organization name and generates a URL-safe, unique slug.
+/// Takes an organization name and generates a URL-safe, unique slug that
+/// `GET /organizations/check-slug`, website signup and `POST /organizations`
+/// all accept: 3-50 characters, a leading letter, never a name in
+/// `RESERVED_SLUGS`. The bare base is offered when it is long enough, not
+/// reserved and not taken; otherwise it gets a random suffix (`acme-1f2e3d`),
+/// and a name with no ASCII letter or digit gets `org-` and the suffix.
 pub async fn generate_slug(
     State(state): State<AppState>,
     Json(request): Json<GenerateSlugRequest>,
@@ -217,51 +217,93 @@ pub async fn generate_slug(
         ));
     }
 
-    // Convert name to slug: lowercase, replace spaces/special chars with hyphens
-    let base_slug: String = name
+    let base_slug = slug_base_for_name(name);
+    // Only a base that could be offered bare is looked up.
+    let offer_bare = !base_needs_suffix(&base_slug) && !slug_taken(&state, &base_slug).await?;
+    let final_slug = if offer_bare {
+        base_slug
+    } else {
+        with_random_suffix(&base_slug)
+    };
+
+    Ok(Json(GenerateSlugResponse { slug: final_slug }))
+}
+
+/// Shortest and longest slug website signup (`CompleteSignupRequest`) and
+/// `POST /organizations` (`CreateOrganizationRequest`) accept.
+pub(crate) const SLUG_MIN_LEN: usize = 3;
+pub(crate) const SLUG_MAX_LEN: usize = 50;
+
+/// `-` and six random hex characters, added to a slug that is taken, reserved
+/// or too short.
+const SLUG_SUFFIX_LEN: usize = 7;
+
+/// The signup length rule, counted the way the `validator` length check of the
+/// signup request counts (characters), on the trimmed and lower-cased slug.
+/// `check-slug` applies it so that a slug it reports valid is never refused for
+/// its length at signup (W9-R1). `POST /organizations` keeps [`validate_slug`]
+/// plus its own 3-50 request rule.
+fn validate_signup_slug_length(slug: &str) -> Result<(), AppError> {
+    let len = slug.chars().count();
+    if (SLUG_MIN_LEN..=SLUG_MAX_LEN).contains(&len) {
+        Ok(())
+    } else {
+        Err(AppError::Validation(format!(
+            "Slug must be {SLUG_MIN_LEN}-{SLUG_MAX_LEN} characters"
+        )))
+    }
+}
+
+/// The slug part of an organization name: lower-cased ASCII letters and digits,
+/// every other run of characters one hyphen, none at either end, `org-` in
+/// front of a leading digit, cut to [`SLUG_MAX_LEN`]. Empty when the name has
+/// no ASCII letter or digit.
+fn slug_base_for_name(name: &str) -> String {
+    let mapped: String = name
         .to_lowercase()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-
-    // Clean up consecutive hyphens and trim
-    let mut base_slug: String = base_slug
+    let mut base = mapped
         .split('-')
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("-");
-
-    // Ensure it doesn't start with a number
-    if base_slug
-        .chars()
-        .next()
-        .map(|c| c.is_ascii_digit())
-        .unwrap_or(false)
-    {
-        base_slug = format!("org-{}", base_slug);
+    if base.starts_with(|c: char| c.is_ascii_digit()) {
+        base = format!("org-{base}");
     }
+    truncate_slug(&base, SLUG_MAX_LEN).to_string()
+}
 
-    // Truncate if too long (leave room for unique suffix)
-    if base_slug.len() > 80 {
-        base_slug = base_slug[..80].to_string();
-        // Trim trailing hyphen if present
-        base_slug = base_slug.trim_end_matches('-').to_string();
-    }
+/// Whether a generated base cannot be offered as it is, whoever holds it: it
+/// is shorter than signup accepts (empty included) or a reserved name (W9-R2).
+fn base_needs_suffix(base: &str) -> bool {
+    base.len() < SLUG_MIN_LEN || crate::models::RESERVED_SLUGS.contains(&base)
+}
 
-    // Check if base slug is available
+/// `base` with `-` and six random hex characters, `base` cut first so the
+/// result is at most [`SLUG_MAX_LEN`]. An empty base becomes `org-` and the
+/// suffix. `base` is an ASCII slug (letters, digits, hyphens).
+fn with_random_suffix(base: &str) -> String {
+    let base = truncate_slug(base, SLUG_MAX_LEN - SLUG_SUFFIX_LEN);
+    let base = if base.is_empty() { "org" } else { base };
+    format!("{}-{}", base, &Uuid::new_v4().to_string()[..6])
+}
+
+/// `slug` cut to at most `max` bytes, without a trailing hyphen. Slugs are
+/// ASCII, so a byte cut is a character cut.
+fn truncate_slug(slug: &str, max: usize) -> &str {
+    let cut = slug.get(..max).unwrap_or(slug);
+    cut.trim_end_matches('-')
+}
+
+/// Whether an organization already holds `slug`.
+async fn slug_taken(state: &AppState, slug: &str) -> AppResult<bool> {
     let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM organizations WHERE slug = $1")
-        .bind(&base_slug)
+        .bind(slug)
         .fetch_optional(state.db.pool())
         .await?;
-
-    let final_slug = if exists.is_some() {
-        // Add unique suffix
-        format!("{}-{}", base_slug, &Uuid::new_v4().to_string()[..6])
-    } else {
-        base_slug
-    };
-
-    Ok(Json(GenerateSlugResponse { slug: final_slug }))
+    Ok(exists.is_some())
 }
 
 /// Constant-time string comparison to prevent timing attacks
@@ -1260,6 +1302,167 @@ mod tests {
         assert!(validate_slug("-starts-with").is_err());
         assert!(validate_slug("ends-with-").is_err());
         assert!(validate_slug("-both-").is_err());
+    }
+
+    /// The signup request's own rule for `slug` (3-50 characters as sent).
+    fn signup_accepts(slug: &str) -> bool {
+        use validator::Validate;
+        crate::api::handlers::email_login::CompleteSignupRequest {
+            signup_token: "t".to_string(),
+            name: "Valid Name".to_string(),
+            slug: slug.to_string(),
+        }
+        .validate()
+        .is_ok()
+    }
+
+    /// `POST /organizations`: its request rules (3-50, `SLUG_REGEX`, not
+    /// reserved), then `validate_slug`.
+    fn create_accepts(slug: &str) -> bool {
+        use validator::Validate;
+        CreateOrganizationRequest {
+            name: "Valid Name".to_string(),
+            slug: slug.to_string(),
+            billing_email: None,
+        }
+        .validate()
+        .is_ok()
+            && validate_slug(slug).is_ok()
+    }
+
+    /// What `check-slug` calls valid, before the reserved and taken checks.
+    fn check_slug_valid(slug: &str) -> bool {
+        validate_signup_slug_length(slug)
+            .and_then(|()| validate_slug(slug))
+            .is_ok()
+    }
+
+    /// W9-R1: `check-slug` used to take 1-100 characters, signup 3-50, so a
+    /// 1-2 or 51-100 character slug was green at the pre-check and a 400 at
+    /// signup. Both rules now agree at every length.
+    #[test]
+    fn test_check_slug_length_matches_signup() {
+        for len in (0..=60).chain([99, 100, 101]) {
+            let slug = "a".repeat(len);
+            assert_eq!(
+                check_slug_valid(&slug),
+                signup_accepts(&slug),
+                "length {len}: check-slug and signup disagree"
+            );
+            assert_eq!(check_slug_valid(&slug), (3..=50).contains(&len), "{len}");
+        }
+        let err = validate_signup_slug_length("ab").unwrap_err().to_string();
+        assert!(err.contains("Slug must be 3-50 characters"), "{err}");
+        // The character rules are still check-slug's own.
+        assert!(!check_slug_valid("ab_"));
+        assert!(!check_slug_valid("-abc"));
+    }
+
+    /// A generated slug must pass every rule a slug meets later: check-slug,
+    /// signup and `POST /organizations` (which also wants a leading letter and
+    /// no `--`), and must not be reserved.
+    fn assert_accepted_everywhere(slug: &str, from: &str) {
+        assert!(check_slug_valid(slug), "{from:?} -> {slug:?}: check-slug");
+        assert!(signup_accepts(slug), "{from:?} -> {slug:?}: signup");
+        assert!(
+            create_accepts(slug),
+            "{from:?} -> {slug:?}: POST /organizations"
+        );
+        assert!(
+            !crate::models::RESERVED_SLUGS.contains(&slug),
+            "{from:?} -> {slug:?}: reserved"
+        );
+    }
+
+    /// The slug generate-slug offers when no organization holds the base.
+    fn generated_untaken(name: &str) -> String {
+        let base = slug_base_for_name(name);
+        if base_needs_suffix(&base) {
+            with_random_suffix(&base)
+        } else {
+            base
+        }
+    }
+
+    /// W9-R2: `Admin` came back as `admin`, a slug check-slug reports as
+    /// reserved and signup refuses.
+    #[test]
+    fn test_generate_slug_never_offers_a_reserved_slug() {
+        for reserved in crate::models::RESERVED_SLUGS {
+            let upper = reserved.to_uppercase();
+            let capitalized = format!("{}{}", &upper[..1], &reserved[1..]);
+            for name in [
+                reserved.to_string(),
+                upper,
+                capitalized,
+                format!("  {reserved}!  "),
+            ] {
+                let base = slug_base_for_name(&name);
+                assert_eq!(base, *reserved, "{name:?}");
+                assert!(base_needs_suffix(&base), "{name:?}");
+                let slug = generated_untaken(&name);
+                assert!(slug.starts_with(&format!("{reserved}-")), "{slug}");
+                assert_eq!(slug.len(), reserved.len() + SLUG_SUFFIX_LEN, "{slug}");
+                assert_accepted_everywhere(&slug, &name);
+            }
+        }
+        // A name that only contains a reserved word is offered as it is.
+        assert_eq!(generated_untaken("Admin Tools"), "admin-tools");
+        assert!(!base_needs_suffix("admin-tools"));
+    }
+
+    /// A name with no ASCII letter or digit used to yield an empty slug.
+    #[test]
+    fn test_generate_slug_without_ascii_letters_is_org_and_a_suffix() {
+        for name in ["!!!", "---", "日本語", "Ωμέγα ✓", "·"] {
+            assert_eq!(slug_base_for_name(name), "", "{name:?}");
+            let slug = generated_untaken(name);
+            assert!(slug.starts_with("org-"), "{name:?} -> {slug}");
+            assert_eq!(slug.len(), "org".len() + SLUG_SUFFIX_LEN, "{slug}");
+            assert!(slug[4..].chars().all(|c| c.is_ascii_hexdigit()), "{slug}");
+            assert_accepted_everywhere(&slug, name);
+        }
+    }
+
+    /// Short and long names fit the 3-50 rule, with or without the suffix.
+    #[test]
+    fn test_generate_slug_fits_the_signup_length() {
+        // Too short to offer bare.
+        for name in ["A", "AB", "x!"] {
+            let base = slug_base_for_name(name);
+            assert!(base_needs_suffix(&base), "{name:?}");
+            let slug = generated_untaken(name);
+            assert!(slug.starts_with(&format!("{base}-")), "{slug}");
+            assert_accepted_everywhere(&slug, name);
+        }
+        assert_eq!(generated_untaken("ABC"), "abc");
+        assert_eq!(generated_untaken("3M Labs"), "org-3m-labs");
+        assert_eq!(
+            generated_untaken("  My   Company, Inc.  "),
+            "my-company-inc"
+        );
+
+        // Long names: the bare base and the suffixed form both stay within 50,
+        // and a cut never leaves a trailing hyphen.
+        let long_names = [
+            "a".repeat(200),
+            "word ".repeat(40),
+            format!("{} tail", "x".repeat(42)),
+            format!("{} tail", "y".repeat(49)),
+            "1234567890 ".repeat(18),
+        ];
+        for name in &long_names {
+            let base = slug_base_for_name(name);
+            assert!(base.len() <= SLUG_MAX_LEN, "{base}");
+            assert_accepted_everywhere(&base, name);
+            let suffixed = with_random_suffix(&base);
+            assert!(suffixed.len() <= SLUG_MAX_LEN, "{suffixed}");
+            assert_accepted_everywhere(&suffixed, name);
+        }
+        // check-slug's suggestion for a taken 50-character slug fits too.
+        let suggestion = with_random_suffix(&"z".repeat(50));
+        assert_eq!(suggestion.len(), SLUG_MAX_LEN, "{suggestion}");
+        assert_accepted_everywhere(&suggestion, "z * 50");
     }
 
     #[test]
