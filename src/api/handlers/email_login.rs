@@ -1039,6 +1039,13 @@ fn authorize_email_signup(
 /// start with a digit (`3m-labs-x7k2q9`).
 fn normalize_signup_slug(raw: &str) -> AppResult<String> {
     let slug = raw.to_lowercase().trim().to_string();
+    // The request validator counts the slug as sent; padding could make a 1-2 character
+    // (or empty) slug pass it, so the length is checked again after the trim.
+    if !(3..=50).contains(&slug.chars().count()) {
+        return Err(AppError::Validation(
+            "Slug must be 3-50 characters".to_string(),
+        ));
+    }
     if !slug
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
@@ -2347,6 +2354,24 @@ mod tests {
         assert!(refusal("my company").contains("lowercase letters, digits, and hyphens"));
         assert!(refusal("-acme").contains("start or end with a hyphen"));
         assert!(refusal("acme-").contains("start or end with a hyphen"));
+    }
+
+    #[test]
+    fn test_signup_slug_length_is_checked_after_the_trim() {
+        // Three spaces passed the 3-50 request check and used to be stored as an empty slug.
+        for padded in ["   ", "  a  ", " ab ", "	ab	"] {
+            assert!(
+                refusal(padded).contains("Slug must be 3-50 characters"),
+                "{padded:?}"
+            );
+        }
+        let long = format!(" {} ", "a".repeat(51));
+        assert!(refusal(&long).contains("Slug must be 3-50 characters"));
+        assert_eq!(normalize_signup_slug(" abc ").unwrap(), "abc");
+        assert_eq!(
+            normalize_signup_slug(&"a".repeat(50)).unwrap(),
+            "a".repeat(50)
+        );
     }
 
     /// The reserved name has to be refused BEFORE the one-time signup token is
