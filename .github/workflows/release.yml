@@ -104,6 +104,29 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # metadata-action derives `org.opencontainers.image.version` from the
+      # first tag, so a main build was labelled `latest-arm64`. A tag build is
+      # labelled with the tag's version (v0.1.1 -> 0.1.1, as `{{version}}` and
+      # the manifest step read it), any other build with the Cargo.toml
+      # version it was built from.
+      - name: Image version label
+        id: version
+        env:
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ "$REF" == refs/tags/v* ]]; then
+            version="${REF_NAME#v}"
+          else
+            version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+          fi
+          if [[ -z "$version" ]]; then
+            echo "could not determine the image version" >&2
+            exit 1
+          fi
+          echo "image version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v6
@@ -117,9 +140,12 @@ jobs:
           flavor: |
             latest=false
           # For workflow_run, github.sha is main's current head, which may be
-          # newer than the commit CI tested and this job built.
+          # newer than the commit CI tested and this job built. A custom label
+          # replaces the generated label of the same name (see the version
+          # step above).
           labels: |
             org.opencontainers.image.revision=${{ github.event.workflow_run.head_sha || github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
           tags: |
             # On main push: create latest-amd64 / latest-arm64
             type=raw,value=latest-${{ matrix.suffix }},enable=${{ github.ref == 'refs/heads/main' }}
