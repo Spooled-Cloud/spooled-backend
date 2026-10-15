@@ -49,7 +49,12 @@ Limits are **automatically checked** before:
 
 ### Limit Exceeded Response
 
-When a limit is exceeded, the API returns `429 Too Many Requests`:
+When a plan limit is exceeded, the API returns `429 Too Many Requests` with the code
+`QUOTA_EXCEEDED`. A `429` is also what a rate limit answers (`RATE_LIMIT_EXCEEDED`), so read the
+`code`: `RATE_LIMIT_EXCEEDED` carries a `Retry-After` header and clears by waiting;
+`QUOTA_EXCEEDED` carries no `Retry-After` (waiting does not help), names the `resource`, and has
+`upgrade_to` when a higher plan exists. One exception: too many open realtime streams (SSE or
+WebSocket) is also `RATE_LIMIT_EXCEEDED`, without `Retry-After`; it clears when one of your streams closes.
 
 ```json
 {
@@ -845,6 +850,14 @@ GET /api/v1/schedules/{schedule_id}/history?limit=50
 Authorization: Bearer <token>
 ```
 
+Each entry's `status` follows the job the run enqueued (since 0.1.125; before, it read `completed`
+as soon as the job existed): `pending` while the job is `pending` or `scheduled`, `running` while
+it is `processing`, `completed` once it completed, `failed` when it ended `failed`, `deadletter` or
+`cancelled`. `completed_at` is `null` until the job has ended, then the job's own finish time.
+`job_status` is the job's raw status. A run with no job (it enqueued nothing, for example because
+the daily job limit was reached, or retention removed the job) keeps its stored `completed` or
+`failed`. `status` is always one of `pending`, `running`, `completed`, `failed`.
+
 ### Delete Schedule
 
 ```bash
@@ -1471,7 +1484,9 @@ curl -N http://localhost:8080/api/v1/events/queues/{queue_name} \
 The SSE streams end when the access token expires or the session is logged out, and after 30
 minutes; reconnect to continue. An organization can have 100 open streams of each kind (`/events`,
 `/events/jobs/{id}`, `/events/queues/{name}`); the next one answers `429`. A job stream also ends
-when the job reaches a final status.
+when the job reaches a final status. A job stream for an unknown job, another organization's job or a
+job in a queue outside the key's scope answers the `404` of `GET /jobs/{id}`, and a queue stream for a
+queue outside the key's scope answers `403`, both before any stream starts.
 
 **Event Format:**
 ```
@@ -1758,7 +1773,8 @@ grpcurl -plaintext localhost:50051 describe spooled.v1.EnqueueRequest
 | 404 | `not_found` | Resource not found |
 | 409 | `conflict` | Resource conflict (e.g., duplicate) |
 | 400 | `QUERY_TIMEOUT` | A job list ran into its statement timeout; narrow the filters (retrying the same request times out again) |
-| 429 | `RATE_LIMIT_EXCEEDED` | Too many requests (also `QUOTA_EXCEEDED` for plan caps) |
+| 429 | `RATE_LIMIT_EXCEEDED` | Too many requests; has `Retry-After` (too many open realtime streams: no `Retry-After`, clears when a stream closes) |
+| 429 | `QUOTA_EXCEEDED` | A plan limit is full; no `Retry-After`, has `upgrade_to` when a higher plan exists |
 | 500 | `internal_error` | Server error |
 
 ### Rate Limiting

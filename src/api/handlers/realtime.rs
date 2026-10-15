@@ -29,6 +29,7 @@ use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
 use crate::api::handlers::auth::{is_token_revoked, Claims};
+use crate::api::handlers::require_queue_access;
 use crate::api::AppState;
 use crate::cache::RedisCache;
 use crate::error::{AppError, AppResult};
@@ -1011,7 +1012,9 @@ const TERMINAL_STATUSES: &[&str] = &["completed", "failed", "deadletter", "cance
 
 /// SSE stream for job updates
 ///
-/// Now closes stream when job reaches terminal status
+/// Closes the stream when the job reaches a terminal status. A job of another
+/// organization, an unknown id and a job in a queue outside the key's scope all
+/// answer the 404 `GET /jobs/{id}` gives, before the response becomes a stream.
 pub async fn sse_job_handler(
     Path(job_id): Path<String>,
     Extension(ctx): Extension<ApiKeyContext>,
@@ -1024,22 +1027,28 @@ pub async fn sse_job_handler(
 
     let session = stream_session(&state, &headers, raw_query.as_deref(), &ctx)
         .map_err(|e| AppError::Unauthorized(e.to_string()))?;
-    let slot = ConnectionSlot::admit(&state, RealtimeStream::Job, &org_id)
-        .await
-        .map_err(|_| AppError::RateLimit("Too many SSE connections".to_string()))?;
-    let auth = StreamAuth::new(&ctx, session, Duration::from_secs(MAX_SSE_DURATION_SECS));
 
-    // Fail closed if the authorization lookup fails. A missing/out-of-scope job uses
-    // the same closed stream behavior so its existence is not revealed.
+    // Same lookup and answer as REST `GET /jobs/{id}`, before a connection slot is
+    // taken and before the response upgrades to a stream: a missing id, another
+    // organization's job and an out-of-scope queue are one indistinguishable 404, so
+    // the stream is no oracle for job ids. A failed lookup is a 500 (fail closed).
     let queue_name: Option<String> =
         sqlx::query_scalar("SELECT queue_name FROM jobs WHERE id = $1 AND organization_id = $2")
             .bind(&job_id)
             .bind(&org_id)
             .fetch_optional(state.db.pool())
             .await?;
-    let deny = queue_name
+    if queue_name
         .as_deref()
-        .is_none_or(|queue| !ctx.can_access_queue(queue));
+        .is_none_or(|queue| !ctx.can_access_queue(queue))
+    {
+        return Err(AppError::NotFound("Job not found".to_string()));
+    }
+
+    let slot = ConnectionSlot::admit(&state, RealtimeStream::Job, &org_id)
+        .await
+        .map_err(|_| AppError::RateLimit("Too many SSE connections".to_string()))?;
+    let auth = StreamAuth::new(&ctx, session, Duration::from_secs(MAX_SSE_DURATION_SECS));
     let api_key_id = ctx.api_key_id.clone();
 
     // Poll for job status changes (filtered by org), until the job is terminal,
@@ -1053,9 +1062,6 @@ pub async fn sse_job_handler(
         // buffer the response until the first poll cycle (2s), which makes the
         // connection look dead to clients with short timeouts.
         yield Ok(Event::default().comment("connected"));
-        if deny {
-            return;
-        }
 
         let mut last_status: Option<String> = None;
         loop {
@@ -1247,6 +1253,7 @@ async fn load_queue_stream_counts(
 ///
 /// Now requires authentication and filters by organization.
 /// Previously returned stats for any queue without checking org isolation.
+/// A queue outside the key's scope is a 403 before the stream starts.
 pub async fn sse_queue_handler(
     Path(queue_name): Path<String>,
     Extension(ctx): Extension<ApiKeyContext>,
@@ -1259,14 +1266,18 @@ pub async fn sse_queue_handler(
 
     let session = stream_session(&state, &headers, raw_query.as_deref(), &ctx)
         .map_err(|e| AppError::Unauthorized(e.to_string()))?;
+
+    // Queue-scope guard: a restricted key must not stream stats for a queue outside
+    // its scope. It gets the 403 the REST queue routes and the `queue` filter of
+    // `/events` and `/ws` give, before the response becomes a stream. (A queue
+    // inside the scope that has no jobs yet is not a 404: queues are implicit and
+    // the stats are the caller's own organization's, so there is nothing to probe.)
+    require_queue_access(&ctx, &queue_name)?;
+
     let slot = ConnectionSlot::admit(&state, RealtimeStream::Queue, &org_id)
         .await
         .map_err(|_| AppError::RateLimit("Too many SSE connections".to_string()))?;
     let mut auth = StreamAuth::new(&ctx, session, Duration::from_secs(MAX_SSE_DURATION_SECS));
-
-    // Queue-scope guard: a restricted key must not stream stats for a queue outside
-    // its scope. If denied, the stream sends only the initial comment and closes.
-    let deny = !ctx.can_access_queue(&queue_name);
 
     let stream = async_stream::stream! {
         let mut slot = slot;
@@ -1274,9 +1285,6 @@ pub async fn sse_queue_handler(
         // Flush an initial SSE comment so headers/first chunk make it past
         // proxies before the first 5s poll cycle. See sse_job_handler for context.
         yield Ok(Event::default().comment("connected"));
-        if deny {
-            return;
-        }
 
         loop {
             tokio::time::sleep(Duration::from_secs(SSE_QUEUE_POLL_INTERVAL_SECS)).await;

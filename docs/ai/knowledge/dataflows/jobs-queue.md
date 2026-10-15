@@ -1,6 +1,6 @@
 # Dataflow: Jobs / Queue
 
-`GET /jobs` and `GET /jobs/dlq` summaries include `job_type` from `payload.job_type` (no column; empty string when absent) and `last_error` (null when none).
+`GET /jobs` and `GET /jobs/dlq` summaries (`JobSummary`, `models/job.rs`) include `job_type` from `payload.job_type` (no column) and `last_error` (null when none). `job_type` is `""` when the payload names no type; the published SDKs rely on that (QAV2-L3, kept in 0.1.125). `GET /workflows/{id}` still falls back to `"job"`.
 
 ## Happy path
 
@@ -148,6 +148,17 @@ It used to be read as a date mismatch and jump to the next midnight, silencing
 hourly / `*/N` schedules for ~20 h every fall-back (BE-45). The date-mismatch
 jump goes to the real next local midnight, so 23-hour days no longer skip
 00:00–00:59 matches.
+
+## Schedule history follows the job (0.1.125, QAV2-M2)
+
+`GET /schedules/{id}/history` (`schedules.rs` `history`, `effective_run_outcome`) joins each `schedule_runs` row to the job it
+enqueued (`LEFT JOIN jobs ... AND organization_id`) and answers `status` / `completed_at` from the job: `pending|scheduled` ->
+`pending` (null), `processing` -> `running` (null), `completed` -> `completed`, `failed|deadletter|cancelled` -> `failed`; the
+terminal ones carry the job's `completed_at` (the run's when the job has none). A run without a job (`job_id` NULL: nothing was
+enqueued, or retention deleted the job, `ON DELETE SET NULL`) keeps the stored status and time. The stored `schedule_runs.status`
+is unchanged: the scheduler and the manual trigger still insert `completed` with `completed_at = started_at` the moment the job
+exists (it means "enqueued"), `failed` when the enqueue was refused. The response uses only `pending|running|completed|failed`
+(SDK enums); `job_status` stays the raw job status. Nothing reads the stored status except this handler.
 
 ## Cron day fields and impossible dates (0.1.121)
 

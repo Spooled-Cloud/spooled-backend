@@ -53,6 +53,16 @@ info:
     A rejected request answers `429` with code `RATE_LIMIT_EXCEEDED`, a `Retry-After` header (seconds)
     and a JSON body with `retry_after_secs`, `limit`, `remaining` and `reset_at`.
 
+    `429` has two meanings; tell them apart by `code`, not by the status:
+    - `RATE_LIMIT_EXCEEDED`: too many requests for now. It carries `Retry-After`; waiting that long
+      and retrying works. Too many open realtime streams (SSE or WebSocket) also answers
+      `RATE_LIMIT_EXCEEDED`, without `Retry-After`: it clears when one of your streams closes.
+    - `QUOTA_EXCEEDED`: a plan limit is full (active jobs, queues, workers, workflows, schedules,
+      API keys, webhooks, ...). It carries no `Retry-After`, because waiting does not help: free
+      a slot (delete or finish something) or move to a bigger plan. The body names the `resource`,
+      the `current` count, the `limit` and the `plan`, plus `upgrade_to` (the next plan) when
+      there is a higher one.
+
     Authenticated responses also carry the state of the limit that answered the request:
     `X-RateLimit-Limit` (the plan burst for the organization bucket, or the key's per-minute
     limit), `X-RateLimit-Remaining` (requests that may still be made right now),
@@ -2624,8 +2634,11 @@ paths:
       tags: [Webhooks]
       summary: Inbound webhook log
       description: |
-        Recent requests accepted by `POST /api/v1/webhooks/{org_id}/custom` for the caller's
-        organization, newest first. Entries carry neither the request payload nor any signature.
+        The INBOUND request log: recent requests accepted by `POST /api/v1/webhooks/{org_id}/custom`
+        for the caller's organization, newest first. It is empty for an organization that only
+        sends webhooks. The deliveries Spooled makes to your own endpoints (outgoing webhooks) are
+        not here: read them per webhook at `GET /api/v1/outgoing-webhooks/{id}/deliveries`.
+        Entries carry neither the request payload nor any signature.
         Requires an unrestricted key. The body is a bare array; the `X-Has-More` response header
         says whether another page follows (since 0.1.124).
       operationId: listInboundWebhookDeliveries
@@ -3066,6 +3079,15 @@ paths:
                 $ref: '#/components/schemas/RealtimeEvent'
         '401':
           description: Invalid token, or it expired between authentication and the start of the stream
+        '404':
+          description: |
+            Unknown job id, a job of another organization, or a job in a queue outside the key's
+            scope: the same `NOT_FOUND` error as `GET /api/v1/jobs/{id}`, answered before any
+            stream starts
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '429':
           description: Too many SSE connections for the organization (100 job streams)
           content:
@@ -3098,6 +3120,15 @@ paths:
                 $ref: '#/components/schemas/RealtimeEvent'
         '401':
           description: Invalid token, or it expired between authentication and the start of the stream
+        '403':
+          description: |
+            The queue is outside the API key's queue scope (the error of the REST queue routes),
+            answered before any stream starts. A queue inside the scope that holds no jobs yet
+            streams zero counts.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '429':
           description: Too many SSE connections for the organization (100 queue streams)
           content:
@@ -3344,7 +3375,22 @@ paths:
     get:
       tags: [Schedules]
       summary: Schedule history
-      description: Get the execution history of a schedule
+      description: |
+        Get the execution history of a schedule, newest run first.
+
+        `status` follows the job a run enqueued, so a run is not `completed` while its job is
+        still waiting (since 0.1.125; before, it read `completed` as soon as the job existed):
+
+        | job (`job_status`) | `status` | `completed_at` |
+        |--------------------|----------|----------------|
+        | `pending`, `scheduled` | `pending` | `null` |
+        | `processing` | `running` | `null` |
+        | `completed` | `completed` | the job's `completed_at` |
+        | `failed`, `deadletter`, `cancelled` | `failed` | the job's `completed_at` (the run's if the job has none) |
+        | none: the run enqueued nothing (for example a daily-limit refusal), or retention removed the job | the run's own status (`completed` or `failed`) | the run's |
+
+        `job_status` is the job's raw current status (`null` when there is no job). `status` is
+        always one of `pending`, `running`, `completed`, `failed`.
       operationId: getScheduleHistory
       parameters:
         - name: id
@@ -3505,8 +3551,10 @@ paths:
       tags: [Outgoing Webhooks]
       summary: Get webhook delivery history
       description: |
-        Get the delivery history for an outgoing webhook. The newest 100
-        deliveries per webhook are readable.
+        Get the delivery history for an outgoing webhook: the OUTGOING deliveries Spooled made to
+        that webhook's URL. The newest 100 deliveries per webhook are readable. (The inbound
+        request log of `POST /api/v1/webhooks/{org_id}/custom` is a different list, at
+        `GET /api/v1/webhooks/deliveries`.)
 
         History is retained for the organization's plan history_retention_days
         (free 1, starter 7, pro 30, enterprise 90); older delivery rows are
@@ -3877,7 +3925,11 @@ components:
         status:
           type: string
           enum: [pending, running, completed, failed]
-          description: Outcome of the run itself — `completed` means the job was enqueued, not that it finished
+          description: |
+            Follows the enqueued job: `pending` while the job is `pending` or `scheduled`,
+            `running` while it is `processing`, `completed` once it completed, `failed` when it
+            ended `failed`, `deadletter` or `cancelled`. A run with no job (nothing was
+            enqueued, or retention removed the job) keeps the status stored with the run.
         error_message:
           type: string
         started_at:
@@ -3886,6 +3938,10 @@ components:
         completed_at:
           type: string
           format: date-time
+          nullable: true
+          description: |
+            `null` while the job is `pending` or `running`; the job's `completed_at` once it
+            ended (the run's own time when the job has none, or when there is no job).
         job_status:
           type: string
           nullable: true
@@ -3896,8 +3952,10 @@ components:
       description: |
         Every 4xx/5xx response is JSON with at least `code` and `message` (since
         0.1.114 this also covers extractor rejections, unknown routes and 405s).
-        Some errors add fields — `details` for validation, `resource`/`limit` for
-        quotas, a legacy `error` string on auth routes.
+        Some errors add fields — `details` for validation, `resource`/`limit`/`upgrade_to` for
+        quotas, a legacy `error` string on auth routes. `429` is either `RATE_LIMIT_EXCEEDED`
+        (has `Retry-After`) or `QUOTA_EXCEEDED` (a plan limit; no `Retry-After`, `upgrade_to`
+        names the next plan when there is one).
       required: [code, message]
       properties:
         code:
@@ -4166,7 +4224,9 @@ components:
           type: integer
         job_type:
           type: string
-          description: From payload.job_type when present; empty string otherwise
+          description: |
+            From payload.job_type (there is no column). An empty string when the payload names
+            no type; same on `GET /jobs` and `GET /jobs/dlq`.
         last_error:
           type: string
           nullable: true

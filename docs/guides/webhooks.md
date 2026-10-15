@@ -117,7 +117,9 @@ curl -X POST https://api.spooled.cloud/api/v1/organizations/webhook-token/regene
 
 `GET /api/v1/webhooks/deliveries` lists the requests this endpoint accepted for your
 organization, newest first, so you can check that a provider is calling and what became of each
-call:
+call. It is the log of INBOUND requests only, so it is empty for an organization that just sends
+webhooks; the deliveries Spooled makes to your own URLs are listed per webhook at
+`GET /api/v1/outgoing-webhooks/{id}/deliveries` (see [Delivery History](#delivery-history)):
 
 ```bash
 curl "https://api.spooled.cloud/api/v1/webhooks/deliveries?status=duplicate&limit=20" \

@@ -370,6 +370,16 @@ retry, plus (0.1.121) the scheduler's lease-expiry and offline-worker dead-lette
 (`Scheduler::announce_deadlettered`: `JobStatusChange` + `JobFailed`) — gRPC, schedules, workflows and webhook
 ingest do not publish realtime events.
 
+### Per-resource streams refuse before streaming (0.1.125, QAV2-L2)
+
+`GET /events/jobs/{id}` looks the job up (`WHERE id AND organization_id`, then `can_access_queue`) before it takes a connection
+slot or becomes an SSE response, and answers the `AppError::NotFound("Job not found")` of `GET /jobs/{id}` for an unknown id,
+another organization's job and a job outside the key's queue scope (one indistinguishable 404; a failed lookup is a 500).
+`GET /events/queues/{name}` answers the 403 of the REST queue routes (`require_queue_access`) for a queue outside the scope; a
+queue in scope with no jobs yet is not a 404 (queues are implicit, the counts are the caller's own). Before 0.1.125 both opened
+a 200 stream that only said `: connected` and closed, so a foreign id was an oracle. Order: 401 (`stream_session`), 404/403,
+then 429 (`ConnectionSlot::admit`). A job deleted while a stream is open still ends it with an `error` event.
+
 ### Stream lifetime, session expiry and connection caps (0.1.121, BEFLOW-12/13/14/15, BEAUTH-14/19)
 
 All four streams (WS, `/events`, `/events/jobs/{id}`, `/events/queues/{name}`) share `StreamAuth`

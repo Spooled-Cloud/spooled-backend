@@ -11631,38 +11631,28 @@ mod w5_integration {
             sse_open(&app, &format!("/api/v1/events/jobs/{job}"), &headers).await;
         let (s2, mut queue_stream) =
             sse_open(&app, "/api/v1/events/queues/orders.eu", &headers).await;
-        let (s3, mut hidden_job_stream) =
-            sse_open(&app, &format!("/api/v1/events/jobs/{hidden_job}"), &headers).await;
-        let (s4, mut hidden_queue_stream) =
-            sse_open(&app, "/api/v1/events/queues/ordersx", &headers).await;
+        // Outside the key's scope the job and queue streams are refused before they
+        // start (the 404 of `GET /jobs/{id}`, the 403 of the queue routes).
+        let (s3, _) = sse_open(&app, &format!("/api/v1/events/jobs/{hidden_job}"), &headers).await;
+        let (s4, _) = sse_open(&app, "/api/v1/events/queues/ordersx", &headers).await;
         assert_eq!(
             (s1, s2, s3, s4),
             (
                 StatusCode::OK,
                 StatusCode::OK,
-                StatusCode::OK,
-                StatusCode::OK
+                StatusCode::NOT_FOUND,
+                StatusCode::FORBIDDEN
             )
         );
         let limit = Duration::from_secs(8);
-        let ((job_seen, _), (queue_seen, _), (hidden_seen, hidden_ended), (hq_seen, hq_ended)) = tokio::join!(
+        let ((job_seen, _), (queue_seen, _)) = tokio::join!(
             sse_read(&mut job_stream, limit),
             sse_read(&mut queue_stream, limit),
-            sse_read(&mut hidden_job_stream, limit),
-            sse_read(&mut hidden_queue_stream, limit)
         );
         assert!(job_seen.contains("job.status"), "job stream: {job_seen}");
         assert!(
             queue_seen.contains("queue.stats"),
             "queue stream: {queue_seen}"
-        );
-        assert!(
-            hidden_ended && !hidden_seen.contains("job.status"),
-            "uncovered job stream: {hidden_seen}"
-        );
-        assert!(
-            hq_ended && !hq_seen.contains("queue.stats"),
-            "uncovered queue stream: {hq_seen}"
         );
     }
 
@@ -16072,5 +16062,456 @@ mod r0124 {
         .await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
         assert_eq!(body["organization"]["slug"], signup_slug.as_str(), "{body}");
+    }
+}
+
+// ---- 0.1.125 ----
+/// 0.1.125 (QA V2): schedule history follows the enqueued job (M-V2-2); the job
+/// and queue event streams refuse before streaming (L-V2-2); job summaries leave
+/// out an unknown `job_type` (L-V2-3); a body without a JSON content type gets a
+/// clean message (L-V2-5).
+mod r0125 {
+    use super::*;
+
+    use chrono::{DateTime, Duration as ChronoDuration, Utc};
+
+    async fn authed(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        key: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        call(app, method, uri, &[("Authorization", &bearer(key))], body).await
+    }
+
+    async fn enqueue(app: &Router, key: &str, queue: &str, payload: Value) -> String {
+        let (status, body) = authed(
+            app,
+            "POST",
+            "/api/v1/jobs",
+            key,
+            Some(json!({"queue_name": queue, "payload": payload})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        body["id"].as_str().unwrap().to_string()
+    }
+
+    /// A key of `org_id` limited to `queues`.
+    async fn seed_scoped_key(pool: &sqlx::PgPool, org_id: &str, queues: &[&str]) -> String {
+        let key = format!("sp_test_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO api_keys (id, organization_id, key_hash, key_prefix, lookup_hash, name, queues, is_active, created_at) \
+             VALUES ($1, $2, $3, $4, $5, 'r0125', $6, TRUE, NOW())",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(org_id)
+        .bind(bcrypt::hash(&key, 4).expect("hash key"))
+        .bind(key.chars().take(8).collect::<String>())
+        .bind(spooled_backend::models::api_key_lookup_hash(&key))
+        .bind(queues.iter().map(|q| q.to_string()).collect::<Vec<_>>())
+        .execute(pool)
+        .await
+        .expect("seed scoped key");
+        key
+    }
+
+    /// (status, `Content-Type`) of a GET whose body is not read: an event stream
+    /// never ends, so only its head is looked at.
+    async fn stream_head(app: &Router, uri: &str, key: &str) -> (StatusCode, Option<String>) {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("Authorization", bearer(key))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request");
+        let content_type = res
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        (res.status(), content_type)
+    }
+
+    // M-V2-2: a run read `completed` as soon as its job was enqueued, while the
+    // job was still pending. `status` and `completed_at` now follow the job.
+    #[tokio::test]
+    async fn r0125_schedule_history_follows_the_enqueued_job() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let app = app(&db);
+        let queue = "r0125-sched";
+
+        let (status, schedule) = authed(
+            &app,
+            "POST",
+            "/api/v1/schedules",
+            &t.key,
+            Some(json!({
+                "name": "r0125",
+                "cron_expression": "0 0 1 1 *",
+                "queue_name": queue,
+                "payload_template": {}
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{schedule}");
+        let schedule_id = schedule["id"].as_str().unwrap().to_string();
+        let (status, trigger) = authed(
+            &app,
+            "POST",
+            &format!("/api/v1/schedules/{schedule_id}/trigger"),
+            &t.key,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{trigger}");
+        let job_id = trigger["job_id"].as_str().unwrap().to_string();
+
+        // The stored run says `completed` (the job was enqueued); the response must not.
+        let stored: (String,) =
+            sqlx::query_as("SELECT status FROM schedule_runs WHERE job_id = $1")
+                .bind(&job_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(stored.0, "completed");
+
+        let history = |expect_job: Option<String>| {
+            let (app, key, uri) = (
+                app.clone(),
+                t.key.clone(),
+                format!("/api/v1/schedules/{schedule_id}/history"),
+            );
+            async move {
+                let (status, body) = authed(&app, "GET", &uri, &key, None).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                let runs = body.as_array().expect("array").clone();
+                for run in &runs {
+                    assert!(
+                        ["pending", "running", "completed", "failed"]
+                            .contains(&run["status"].as_str().unwrap()),
+                        "{run}"
+                    );
+                }
+                match expect_job {
+                    Some(job) => runs
+                        .into_iter()
+                        .find(|run| run["job_id"] == job.as_str())
+                        .unwrap_or_else(|| panic!("no run for job {job}: {body}")),
+                    None => Value::Array(runs),
+                }
+            }
+        };
+        let set_job = |status: &'static str, completed_at: Option<DateTime<Utc>>| {
+            let (pool, job_id) = (db.pool().clone(), job_id.clone());
+            async move {
+                sqlx::query("UPDATE jobs SET status = $2, completed_at = $3 WHERE id = $1")
+                    .bind(&job_id)
+                    .bind(status)
+                    .bind(completed_at)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+        };
+
+        // Waiting jobs: `pending`, not finished.
+        for waiting in ["pending", "scheduled"] {
+            set_job(waiting, None).await;
+            let run = history(Some(job_id.clone())).await;
+            assert_eq!(run["status"], "pending", "job {waiting}: {run}");
+            assert!(run["completed_at"].is_null(), "job {waiting}: {run}");
+            assert_eq!(run["job_status"], waiting, "{run}");
+        }
+
+        // Running.
+        set_job("processing", None).await;
+        let run = history(Some(job_id.clone())).await;
+        assert_eq!(run["status"], "running", "{run}");
+        assert!(run["completed_at"].is_null(), "{run}");
+        assert_eq!(run["job_status"], "processing", "{run}");
+
+        // Completed: the job's own finish time, not the enqueue time.
+        let finished = Utc::now() + ChronoDuration::seconds(90);
+        set_job("completed", Some(finished)).await;
+        let run = history(Some(job_id.clone())).await;
+        assert_eq!(run["status"], "completed", "{run}");
+        assert_eq!(run["job_status"], "completed", "{run}");
+        let done: DateTime<Utc> = run["completed_at"].as_str().unwrap().parse().unwrap();
+        assert_eq!(
+            done.timestamp_micros(),
+            finished.timestamp_micros(),
+            "{run}"
+        );
+        assert_ne!(run["completed_at"], run["started_at"], "{run}");
+
+        // Every terminal failure of the job reads `failed`.
+        for terminal in ["failed", "deadletter", "cancelled"] {
+            set_job(terminal, Some(finished)).await;
+            let run = history(Some(job_id.clone())).await;
+            assert_eq!(run["status"], "failed", "job {terminal}: {run}");
+            assert_eq!(run["job_status"], terminal, "{run}");
+            let done: DateTime<Utc> = run["completed_at"].as_str().unwrap().parse().unwrap();
+            assert_eq!(
+                done.timestamp_micros(),
+                finished.timestamp_micros(),
+                "{run}"
+            );
+        }
+        // A dead-lettered job has no `completed_at` (the dead-letter paths only
+        // touch `updated_at`): its last update is reported, not the run's start.
+        set_job("deadletter", None).await;
+        let run = history(Some(job_id.clone())).await;
+        assert_eq!(run["status"], "failed", "{run}");
+        assert_ne!(run["completed_at"], run["started_at"], "{run}");
+        let done: DateTime<Utc> = run["completed_at"].as_str().unwrap().parse().unwrap();
+        let started: DateTime<Utc> = run["started_at"].as_str().unwrap().parse().unwrap();
+        assert!(done > started, "{run}");
+
+        // A run that enqueued nothing keeps its stored status, error and times.
+        let failed_run = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO schedule_runs (id, schedule_id, status, error_message, started_at, completed_at) \
+             VALUES ($1, $2, 'failed', 'jobs per day limit reached (limit 1)', NOW() - INTERVAL '1 hour', NOW() - INTERVAL '1 hour')",
+        )
+        .bind(&failed_run)
+        .bind(&schedule_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        // A run whose job retention removed (the job_id is set to NULL) keeps its status too.
+        let purged_job = enqueue(&app, &t.key, queue, json!({})).await;
+        let purged_run = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO schedule_runs (id, schedule_id, job_id, status, started_at, completed_at) \
+             VALUES ($1, $2, $3, 'completed', NOW() - INTERVAL '2 hours', NOW() - INTERVAL '2 hours')",
+        )
+        .bind(&purged_run)
+        .bind(&schedule_id)
+        .bind(&purged_job)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let pending = history(Some(purged_job.clone())).await;
+        assert_eq!(pending["status"], "pending", "{pending}");
+        sqlx::query("DELETE FROM jobs WHERE id = $1")
+            .bind(&purged_job)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let runs = history(None).await;
+        let runs = runs.as_array().unwrap();
+        let by_id = |id: &str| runs.iter().find(|run| run["id"] == id).unwrap().clone();
+        let failed = by_id(&failed_run);
+        assert_eq!(failed["status"], "failed", "{failed}");
+        assert_eq!(
+            failed["error_message"], "jobs per day limit reached (limit 1)",
+            "{failed}"
+        );
+        assert!(failed["job_status"].is_null(), "{failed}");
+        assert!(failed["completed_at"].is_string(), "{failed}");
+        let purged = by_id(&purged_run);
+        assert_eq!(purged["status"], "completed", "{purged}");
+        assert!(purged["job_status"].is_null(), "{purged}");
+        assert!(purged["completed_at"].is_string(), "{purged}");
+    }
+
+    // L-V2-2: `GET /events/jobs/{id}` answered 200 and a `: connected` comment for
+    // another organization's job or an unknown id.
+    #[tokio::test]
+    async fn r0125_job_stream_refuses_foreign_and_unknown_jobs_before_streaming() {
+        let db = TestDatabase::new().await;
+        let a = seed_tenant(db.pool()).await;
+        let b = seed_tenant(db.pool()).await;
+        let app = app(&db);
+
+        let foreign = enqueue(&app, &b.key, "r0125-b", json!({})).await;
+        let own = enqueue(&app, &a.key, "r0125-a", json!({})).await;
+        let other_queue = enqueue(&app, &a.key, "r0125-other", json!({})).await;
+        let unknown = uuid::Uuid::new_v4().to_string();
+
+        // The 404 of REST `GET /jobs/{id}`, status and JSON error alike.
+        let (rest_status, rest_body) = authed(
+            &app,
+            "GET",
+            &format!("/api/v1/jobs/{foreign}"),
+            &a.key,
+            None,
+        )
+        .await;
+        assert_eq!(rest_status, StatusCode::NOT_FOUND, "{rest_body}");
+        for id in [&foreign, &unknown] {
+            let (status, body) = authed(
+                &app,
+                "GET",
+                &format!("/api/v1/events/jobs/{id}"),
+                &a.key,
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{id}: {body}");
+            assert_eq!(body, rest_body, "{id}: same error as GET /jobs/{{id}}");
+        }
+
+        // The caller's own job still streams.
+        let (status, content_type) =
+            stream_head(&app, &format!("/api/v1/events/jobs/{own}"), &a.key).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            content_type.is_some_and(|ct| ct.starts_with("text/event-stream")),
+            "event stream"
+        );
+
+        // A key limited to one queue: its own queue streams, a job elsewhere is the same 404.
+        let scoped = seed_scoped_key(db.pool(), &a.org_id, &["r0125-a"]).await;
+        let (status, _) = stream_head(&app, &format!("/api/v1/events/jobs/{own}"), &scoped).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = authed(
+            &app,
+            "GET",
+            &format!("/api/v1/events/jobs/{other_queue}"),
+            &scoped,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["code"], "NOT_FOUND", "{body}");
+        let (_, rest_scoped) = authed(
+            &app,
+            "GET",
+            &format!("/api/v1/jobs/{other_queue}"),
+            &scoped,
+            None,
+        )
+        .await;
+        assert_eq!(body, rest_scoped);
+    }
+
+    // L-V2-2, the sibling stream: a queue outside the key's scope opened a 200
+    // stream that only said `: connected` and closed; the REST queue routes and
+    // the `queue` filter of `/events` answer 403.
+    #[tokio::test]
+    async fn r0125_queue_stream_refuses_a_queue_outside_the_key_scope() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let app = app(&db);
+        let scoped = seed_scoped_key(db.pool(), &t.org_id, &["r0125-a"]).await;
+
+        let (status, body) =
+            authed(&app, "GET", "/api/v1/events/queues/r0125-b", &scoped, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        let (rest_status, rest_body) =
+            authed(&app, "GET", "/api/v1/queues/r0125-b", &scoped, None).await;
+        assert_eq!(rest_status, StatusCode::FORBIDDEN, "{rest_body}");
+        assert_eq!(body, rest_body, "same error as the REST queue route");
+
+        // In scope, and any queue for an unrestricted key (queues are implicit and
+        // may not hold a job yet), still stream.
+        let (status, _) = stream_head(&app, "/api/v1/events/queues/r0125-a", &scoped).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, content_type) =
+            stream_head(&app, "/api/v1/events/queues/r0125-new", &t.key).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            content_type.is_some_and(|ct| ct.starts_with("text/event-stream")),
+            "event stream"
+        );
+    }
+
+    // L-V2-3: the dead-letter list showed `job_type: ""`. The type comes from
+    // `payload.job_type` (there is no column), and the published SDKs read an
+    // empty string as "no type", so that contract stays: a typed job carries its
+    // type on both lists, an untyped one carries "".
+    #[tokio::test]
+    async fn r0125_job_summaries_carry_the_payload_job_type() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let app = app(&db);
+        let queue = "r0125-dlq";
+
+        let typed = enqueue(&app, &t.key, queue, json!({"job_type": "send_email"})).await;
+        let untyped = enqueue(&app, &t.key, queue, json!({"to": "a@example.com"})).await;
+        sqlx::query("UPDATE jobs SET status = 'deadletter', last_error = 'boom' WHERE queue_name = $1 AND organization_id = $2")
+            .bind(queue)
+            .bind(&t.org_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        for uri in [
+            format!("/api/v1/jobs/dlq?queue_name={queue}"),
+            format!("/api/v1/jobs?queue_name={queue}"),
+        ] {
+            let (status, body) = authed(&app, "GET", &uri, &t.key, None).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+            let rows = body.as_array().expect("array");
+            assert_eq!(rows.len(), 2, "{uri}: {body}");
+            let row = |id: &str| rows.iter().find(|r| r["id"] == id).unwrap();
+            assert_eq!(row(&typed)["job_type"], "send_email", "{uri}");
+            assert_eq!(row(&untyped)["job_type"], "", "{uri}");
+            assert_eq!(row(&untyped)["last_error"], "boom", "{uri}");
+        }
+    }
+
+    // L-V2-5: a body without a JSON content type came back as INVALID_JSON with the
+    // message "body: application/json`".
+    #[tokio::test]
+    async fn r0125_missing_json_content_type_has_a_clean_message() {
+        let db = TestDatabase::new().await;
+        let t = seed_tenant(db.pool()).await;
+        let app = app(&db);
+        let wanted = "Expected request with `Content-Type: application/json`";
+
+        let post = |content_type: Option<&'static str>, body: &'static str| {
+            let app = app.clone();
+            let key = t.key.clone();
+            async move {
+                let mut req = Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/jobs")
+                    .header("Authorization", bearer(&key));
+                if let Some(content_type) = content_type {
+                    req = req.header("Content-Type", content_type);
+                }
+                let res = app
+                    .oneshot(req.body(Body::from(body)).unwrap())
+                    .await
+                    .expect("request");
+                let status = res.status();
+                let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+            }
+        };
+
+        for (content_type, body) in [
+            (Some("text/plain"), "hello"),
+            (Some("text/plain; charset=utf-8"), r#"{"queue_name":"q"}"#),
+            (None, r#"{"queue_name":"q","payload":{}}"#),
+        ] {
+            let (status, resp) = post(content_type, body).await;
+            // The status code is unchanged.
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{content_type:?}: {resp}");
+            assert_eq!(resp["code"], "INVALID_JSON", "{resp}");
+            assert_eq!(resp["message"], wanted, "{content_type:?}: {resp}");
+            assert_eq!(resp["details"][0]["message"], wanted, "{resp}");
+        }
+
+        // Other malformed bodies keep their messages.
+        let (status, resp) = post(Some("application/json"), "{not json").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+        assert_eq!(resp["code"], "INVALID_JSON", "{resp}");
+        assert_ne!(resp["message"], wanted, "{resp}");
+        let (status, resp) = post(Some("application/json"), "{}").await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{resp}");
     }
 }

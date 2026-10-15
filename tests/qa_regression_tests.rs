@@ -537,7 +537,9 @@ async fn worker_outcomes_retry_budget_and_schedule_history() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{history}");
-    assert_eq!(history[0]["status"], "completed");
+    // The run follows its job: still waiting, so not `completed` (0.1.125).
+    assert_eq!(history[0]["status"], "pending", "{history}");
+    assert!(history[0]["completed_at"].is_null(), "{history}");
     assert_eq!(history[0]["job_status"], "pending", "{history}");
 }
 

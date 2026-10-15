@@ -11,6 +11,29 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.125] - 2026-10-15
+
+Four small API fixes from the V2 production QA report and the documentation it asked for. No migration, no new route. One response body changes (see "Fixed"): schedule-history `status` and `completed_at` now follow the job.
+
+### Security
+
+- **rustls 0.23.46** fixes RUSTSEC-2026-0346, RUSTSEC-2026-0347, RUSTSEC-2026-0348 and RUSTSEC-2026-0349 (`Cargo.lock` only; `cargo update -p rustls --precise 0.23.46`), so `cargo audit --ignore RUSTSEC-2023-0071` stays clean.
+
+### Fixed
+
+- **`GET /api/v1/schedules/{id}/history` no longer says `completed` while the job is still `pending`** (QA V2 M-V2-2). The stored run status only means "the job was enqueued", and the response used to repeat it, with `completed_at` equal to `started_at`. `status` and `completed_at` now come from the job the run enqueued: `pending` or `scheduled` gives `pending`, `processing` gives `running` (both with `completed_at: null`), `completed` gives `completed`, and `failed`, `deadletter` or `cancelled` gives `failed` (with the job's `completed_at`, or the run's when the job has none). A run with no job (nothing was enqueued, for example a daily-limit refusal, or retention removed the job) keeps its stored status and time. Only `pending`, `running`, `completed` and `failed` are sent, as the SDK enums say; `job_status` is still the job's raw status; the stored `schedule_runs.status` is unchanged. Tests: `schedules::tests::test_effective_run_outcome_*`, `r0125::r0125_schedule_history_follows_the_enqueued_job` (Docker); `qa_regression_tests::worker_outcomes_retry_budget_and_schedule_history` now expects `pending`.
+- **`GET /api/v1/events/jobs/{id}` answers 404 for a job that is not the caller's, before it streams** (QA V2 L-V2-2). A job of another organization or an unknown id used to get `200` and an event stream that only said `: connected`, which told a caller whether a job id exists. The job is now looked up in the caller's organization and queue scope first and a miss is the same `404 NOT_FOUND` ("Job not found") as `GET /jobs/{id}`, before a connection slot is taken. The sibling `GET /api/v1/events/queues/{name}` had the same gap for a queue outside the key's queue scope (a `200` stream that closed at once); it now answers the `403` of the REST queue routes. A queue inside the scope that holds no jobs yet still streams. Tests: `r0125::r0125_job_stream_refuses_foreign_and_unknown_jobs_before_streaming`, `r0125::r0125_queue_stream_refuses_a_queue_outside_the_key_scope` (Docker); `w5_realtime::w5_int_prefix_key_realtime_streams_follow_the_scope` expects 404 and 403.
+- **Not changed: `job_type: ""` on `GET /api/v1/jobs/dlq`** (QA V2 L-V2-3). The summary reads `payload.job_type` (there is no column), so a job whose payload names no type shows `""`; the published SDKs rely on that. It is now documented, and covered by `r0125::r0125_job_summaries_carry_the_payload_job_type` (Docker).
+- **A body without a JSON content type gets a clean message** (QA V2 L-V2-5). A `text/plain` (or no) `Content-Type` on a JSON route is still `400` with code `INVALID_JSON`, but the message was the stray fragment `body: application/json` plus a backtick, because the extractor's text was cut at its first `: `. It is now ``Expected request with `Content-Type: application/json` `` (detail field `Content-Type`, detail code `invalid_content_type`). Status codes are unchanged. Tests: `validation::tests::test_parse_missing_content_type_keeps_the_whole_message`, `r0125::r0125_missing_json_content_type_has_a_clean_message` (Docker).
+
+### Documentation
+
+- `docs/openapi.yaml` and `docs/guides/api-usage.md`: how the schedule-history `status` and `completed_at` follow the job; that a `429` is either `RATE_LIMIT_EXCEEDED` (has `Retry-After`) or `QUOTA_EXCEEDED` (a plan limit: no `Retry-After`, the body names the `resource` and has `upgrade_to` when a higher plan exists); the new `404` / `403` of the job and queue event streams; `job_type` of a job summary is `""` when the payload names no type.
+- `GET /api/v1/webhooks/deliveries` is the INBOUND request log of `POST /api/v1/webhooks/{org_id}/custom` (empty for an organization that only sends webhooks); outgoing deliveries are at `GET /api/v1/outgoing-webhooks/{id}/deliveries`. Stated in `docs/openapi.yaml` and `docs/guides/webhooks.md`.
+- Knowledge base: `dataflows/jobs-queue.md`, `dataflows/auth.md`, `contracts/invariants.md` #36, `MAINTENANCE.md` and findings QAV2-M2, QAV2-L2, QAV2-L3, QAV2-L5.
+
+---
+
 ## [0.1.124] - 2026-10-13
 
 Dependency security updates, three small API fixes and a correct version label on the `main` image. No migration, no new route; response bodies keep their shape (one new response header).

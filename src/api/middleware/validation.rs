@@ -96,6 +96,7 @@ impl IntoResponse for ValidationRejection {
 ///   * `Failed to deserialize the JSON body into the target type: missing field `queue_name` at line 1 column 2`
 ///   * `Failed to deserialize the JSON body into the target type: invalid type: integer `123`, expected a string at line 1 column 18`
 ///   * `Failed to parse the request body as JSON: EOF while parsing a value at line 1 column 0`
+///   * ``Expected request with `Content-Type: application/json` `` (no JSON content type)
 ///
 /// We extract the actionable bit (field name + concise message) so callers can
 /// fix their request without guessing. The previous "sanitized" implementation
@@ -104,6 +105,24 @@ impl IntoResponse for ValidationRejection {
 /// (it never told the caller *which* field).
 fn parse_json_error(body_text: &str) -> (StatusCode, ValidationErrorResponse) {
     let lower = body_text.to_ascii_lowercase();
+
+    // No JSON content type (`text/plain`, none at all). The text already is the
+    // message; the generic branch below would cut it after the first ": " and
+    // leave only the fragment "application/json`". The status stays 400.
+    if lower.contains("`content-type: application/json`") {
+        return (
+            StatusCode::BAD_REQUEST,
+            ValidationErrorResponse::new(
+                "Invalid JSON",
+                "INVALID_JSON",
+                vec![ValidationFieldError {
+                    field: "Content-Type".to_string(),
+                    message: "Expected request with `Content-Type: application/json`".to_string(),
+                    code: Some("invalid_content_type".to_string()),
+                }],
+            ),
+        );
+    }
 
     // missing field `name`
     if let Some(rest) = body_text.split("missing field `").nth(1) {
@@ -299,5 +318,20 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(resp.code, "INVALID_JSON");
         assert!(resp.details[0].message.to_lowercase().contains("empty"));
+    }
+
+    #[test]
+    fn test_parse_missing_content_type_keeps_the_whole_message() {
+        // axum's MissingJsonContentType text, which has a ": " inside the code span.
+        let body = "Expected request with `Content-Type: application/json`";
+        let (status, resp) = parse_json_error(body);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(resp.code, "INVALID_JSON");
+        assert_eq!(
+            resp.message,
+            "Expected request with `Content-Type: application/json`"
+        );
+        assert_eq!(resp.details[0].field, "Content-Type");
+        assert_eq!(resp.details[0].message, resp.message);
     }
 }

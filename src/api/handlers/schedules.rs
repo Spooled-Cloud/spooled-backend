@@ -820,6 +820,16 @@ pub async fn trigger(
 ///
 /// GET /api/v1/schedules/{id}/history
 ///
+/// `status` and `completed_at` follow the job a run enqueued, so a run does not
+/// read `completed` while its job is still waiting. The stored
+/// `schedule_runs.status` only says whether the enqueue worked (it is
+/// `completed` the moment the job exists), so it is used as is only when there
+/// is no job to look at (a run that failed to enqueue, or whose job retention
+/// removed). With a job: `pending`/`scheduled` -> `pending` (`completed_at`
+/// null), `processing` -> `running` (null), `completed` -> `completed`,
+/// `failed`/`deadletter`/`cancelled` -> `failed` (both with the job's
+/// `completed_at`, the run's when the job has none). The response only ever
+/// uses `pending|running|completed|failed`; `job_status` is the raw job status.
 pub async fn history(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
@@ -848,14 +858,17 @@ pub async fn history(
     }
 
     // Use safe_limit() to enforce maximum
-    // `status` is the outcome of the run itself (was the job enqueued?), so a
-    // manual trigger reads `completed` as soon as the job exists. `job_status`
-    // carries what the enqueued job is doing now, so a still-pending job is not
-    // mistaken for a finished one.
-    let runs: Vec<ScheduleRunRecord> = sqlx::query_as(
+    let rows: Vec<ScheduleRunRow> = sqlx::query_as(
         r#"
         SELECT sr.id, sr.schedule_id, sr.job_id, sr.status, sr.error_message,
-               sr.started_at, sr.completed_at, j.status AS job_status
+               sr.started_at, sr.completed_at, j.status AS job_status,
+               -- Dead-letter and cancel paths only touch `updated_at`, so a
+               -- failed job's last update is when it finished.
+               COALESCE(
+                   j.completed_at,
+                   CASE WHEN j.status IN ('failed', 'deadletter', 'cancelled')
+                        THEN j.updated_at END
+               ) AS job_completed_at
         FROM schedule_runs sr
         LEFT JOIN jobs j ON j.id = sr.job_id AND j.organization_id = $3
         WHERE sr.schedule_id = $1
@@ -877,7 +890,9 @@ pub async fn history(
         )
     })?;
 
-    Ok(Json(runs))
+    Ok(Json(
+        rows.into_iter().map(ScheduleRunRow::into_record).collect(),
+    ))
 }
 
 /// Query parameters for listing schedules
@@ -950,19 +965,83 @@ pub struct TriggerResponse {
 }
 
 /// Schedule run record
-#[derive(Debug, serde::Serialize, sqlx::FromRow)]
+#[derive(Debug, serde::Serialize)]
 pub struct ScheduleRunRecord {
     pub id: String,
     pub schedule_id: String,
     pub job_id: Option<String>,
+    /// `pending`, `running`, `completed` or `failed`: the enqueued job's
+    /// outcome while the job exists, the stored run status otherwise.
     pub status: String,
     pub error_message: Option<String>,
     pub started_at: chrono::DateTime<Utc>,
+    /// When the run finished: the job's `completed_at` once the job is
+    /// terminal, `null` while it is still `pending` or `running`.
     pub completed_at: Option<chrono::DateTime<Utc>>,
     /// Current status of the job this run enqueued (`pending`, `processing`,
     /// `completed`, ...). `None` when the run created no job or the job has
     /// since been removed by retention.
     pub job_status: Option<String>,
+}
+
+/// A `schedule_runs` row joined with the job it enqueued.
+#[derive(Debug, sqlx::FromRow)]
+struct ScheduleRunRow {
+    id: String,
+    schedule_id: String,
+    job_id: Option<String>,
+    status: String,
+    error_message: Option<String>,
+    started_at: chrono::DateTime<Utc>,
+    completed_at: Option<chrono::DateTime<Utc>>,
+    job_status: Option<String>,
+    job_completed_at: Option<chrono::DateTime<Utc>>,
+}
+
+impl ScheduleRunRow {
+    fn into_record(self) -> ScheduleRunRecord {
+        let (status, completed_at) = effective_run_outcome(
+            &self.status,
+            self.completed_at,
+            self.job_status.as_deref(),
+            self.job_completed_at,
+        );
+        ScheduleRunRecord {
+            id: self.id,
+            schedule_id: self.schedule_id,
+            job_id: self.job_id,
+            status,
+            error_message: self.error_message,
+            started_at: self.started_at,
+            completed_at,
+            job_status: self.job_status,
+        }
+    }
+}
+
+/// The `status` and `completed_at` a history entry reports (see [`history`]).
+///
+/// Without a joined job (`job_status` `None`: no job was enqueued, or retention
+/// removed it) the stored run status and time are kept.
+fn effective_run_outcome(
+    stored_status: &str,
+    stored_completed_at: Option<chrono::DateTime<Utc>>,
+    job_status: Option<&str>,
+    job_completed_at: Option<chrono::DateTime<Utc>>,
+) -> (String, Option<chrono::DateTime<Utc>>) {
+    match job_status {
+        Some("pending" | "scheduled") => ("pending".to_string(), None),
+        Some("processing") => ("running".to_string(), None),
+        Some("completed") => (
+            "completed".to_string(),
+            job_completed_at.or(stored_completed_at),
+        ),
+        Some("failed" | "deadletter" | "cancelled") => (
+            "failed".to_string(),
+            job_completed_at.or(stored_completed_at),
+        ),
+        _ => (stored_status.to_string(), stored_completed_at),
+    }
 }
 
 #[cfg(test)]
@@ -991,5 +1070,48 @@ mod tests {
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("job-123"));
+    }
+
+    #[test]
+    fn test_effective_run_outcome_follows_the_job() {
+        let run_at = Utc::now() - chrono::Duration::seconds(30);
+        let job_at = Utc::now();
+
+        for (job, want) in [
+            ("pending", "pending"),
+            ("scheduled", "pending"),
+            ("processing", "running"),
+        ] {
+            let (status, done) =
+                effective_run_outcome("completed", Some(run_at), Some(job), Some(job_at));
+            assert_eq!(status, want, "job {job}");
+            assert_eq!(done, None, "job {job} is not finished");
+        }
+
+        let (status, done) =
+            effective_run_outcome("completed", Some(run_at), Some("completed"), Some(job_at));
+        assert_eq!((status.as_str(), done), ("completed", Some(job_at)));
+
+        for job in ["failed", "deadletter", "cancelled"] {
+            let (status, done) =
+                effective_run_outcome("completed", Some(run_at), Some(job), Some(job_at));
+            assert_eq!((status.as_str(), done), ("failed", Some(job_at)), "{job}");
+            // A terminal job without its own completed_at falls back to the run's.
+            let (_, done) = effective_run_outcome("completed", Some(run_at), Some(job), None);
+            assert_eq!(done, Some(run_at), "{job}");
+        }
+    }
+
+    #[test]
+    fn test_effective_run_outcome_keeps_stored_status_without_a_job() {
+        let run_at = Utc::now();
+        assert_eq!(
+            effective_run_outcome("failed", Some(run_at), None, None),
+            ("failed".to_string(), Some(run_at))
+        );
+        assert_eq!(
+            effective_run_outcome("completed", Some(run_at), None, None),
+            ("completed".to_string(), Some(run_at))
+        );
     }
 }
