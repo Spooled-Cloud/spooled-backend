@@ -1010,25 +1010,32 @@ impl Scheduler {
             r#"
             UPDATE jobs child
             SET
-                dependencies_met = check_job_dependencies_met(child.id),
+                dependencies_met = recomputed.met,
                 updated_at = NOW()
+            FROM (
+                -- One function call per candidate (it used to run in SET and
+                -- again in WHERE); VOLATILE keeps this subquery from being
+                -- pulled up. A TRUE child with no job_dependencies rows is
+                -- already right and is skipped before the function runs.
+                SELECT c.id, check_job_dependencies_met(c.id) AS met
+                FROM jobs c
+                WHERE c.parent_job_id IS NOT NULL
+                  AND c.status IN ('pending', 'scheduled')
+                  AND (
+                      c.dependencies_met IS NOT TRUE
+                      OR EXISTS (SELECT 1 FROM job_dependencies d WHERE d.job_id = c.id)
+                  )
+                  AND EXISTS (
+                      SELECT 1 FROM jobs parent
+                      WHERE parent.id = c.parent_job_id
+                        AND parent.organization_id = c.organization_id
+                        AND parent.status = 'completed'
+                  )
+            ) recomputed
             WHERE
-                child.parent_job_id IS NOT NULL
+                child.id = recomputed.id
                 AND child.status IN ('pending', 'scheduled')
-                -- A TRUE child with no job_dependencies rows is already right;
-                -- skip it before the function runs (two queries a row, every
-                -- tick, over the whole pending backlog).
-                AND (
-                    child.dependencies_met IS NOT TRUE
-                    OR EXISTS (SELECT 1 FROM job_dependencies d WHERE d.job_id = child.id)
-                )
-                AND child.dependencies_met IS DISTINCT FROM check_job_dependencies_met(child.id)
-                AND EXISTS (
-                    SELECT 1 FROM jobs parent
-                    WHERE parent.id = child.parent_job_id
-                      AND parent.organization_id = child.organization_id
-                      AND parent.status = 'completed'
-                )
+                AND child.dependencies_met IS DISTINCT FROM recomputed.met
             "#,
         )
         .execute(&*self.db)

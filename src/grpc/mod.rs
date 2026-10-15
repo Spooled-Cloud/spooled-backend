@@ -57,12 +57,13 @@ pub mod validation {
 
     /// Validate queue name format
     pub fn validate_queue_name(name: &str) -> Result<(), Status> {
-        // Characters, not bytes: RegisterWorker and REST count characters, so
-        // a 100-character name of 3-byte letters registered and then failed
-        // here on Dequeue.
-        if name.is_empty() || name.chars().count() > 255 {
+        // 1-100 characters, like REST, RegisterWorker and Enqueue. Counted in
+        // characters, not bytes: a 100-character name of 3-byte letters
+        // registered and then failed here. 101-255 used to pass Dequeue and
+        // StreamJobs for a queue no job can be enqueued to.
+        if name.is_empty() || name.chars().count() > 100 {
             return Err(Status::invalid_argument(
-                "Queue name must be 1-255 characters",
+                "Queue name must be 1-100 characters",
             ));
         }
         if !name

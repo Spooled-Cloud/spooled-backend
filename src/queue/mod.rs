@@ -607,12 +607,23 @@ impl QueueManager {
                 r#"
                 UPDATE jobs
                 SET
-                    dependencies_met = check_job_dependencies_met(id),
+                    dependencies_met = recomputed.met,
                     updated_at = NOW()
-                WHERE parent_job_id = $1
-                  AND organization_id = $2
-                  AND status IN ('pending', 'scheduled')
-                  AND dependencies_met IS DISTINCT FROM check_job_dependencies_met(id)
+                FROM (
+                    -- One call per child: the function used to run in SET and
+                    -- again in WHERE. It is VOLATILE, so this subquery is not
+                    -- pulled up into the outer query.
+                    SELECT id, check_job_dependencies_met(id) AS met
+                    FROM jobs
+                    WHERE parent_job_id = $1
+                      AND organization_id = $2
+                      AND status IN ('pending', 'scheduled')
+                ) recomputed
+                WHERE jobs.id = recomputed.id
+                  AND jobs.parent_job_id = $1
+                  AND jobs.organization_id = $2
+                  AND jobs.status IN ('pending', 'scheduled')
+                  AND jobs.dependencies_met IS DISTINCT FROM recomputed.met
                   AND NOT EXISTS (
                       -- Single-parent (`parent_job_id`) edges only; multi-parent
                       -- workflow dependencies live in `job_dependencies`.
@@ -635,11 +646,18 @@ impl QueueManager {
                 r#"
                 UPDATE jobs
                 SET
-                    dependencies_met = check_job_dependencies_met(id),
+                    dependencies_met = recomputed.met,
                     updated_at = NOW()
-                WHERE parent_job_id = $1
-                  AND status IN ('pending', 'scheduled')
-                  AND dependencies_met IS DISTINCT FROM check_job_dependencies_met(id)
+                FROM (
+                    SELECT id, check_job_dependencies_met(id) AS met
+                    FROM jobs
+                    WHERE parent_job_id = $1
+                      AND status IN ('pending', 'scheduled')
+                ) recomputed
+                WHERE jobs.id = recomputed.id
+                  AND jobs.parent_job_id = $1
+                  AND jobs.status IN ('pending', 'scheduled')
+                  AND jobs.dependencies_met IS DISTINCT FROM recomputed.met
                   AND NOT EXISTS (
                       SELECT 1 FROM jobs parent
                       WHERE parent.id = jobs.parent_job_id
@@ -744,12 +762,20 @@ impl QueueManager {
             r#"
             UPDATE jobs
             SET
-                dependencies_met = check_job_dependencies_met(id),
+                dependencies_met = recomputed.met,
                 updated_at = NOW()
-            WHERE parent_job_id = $1
-              AND organization_id = $2
-              AND status IN ('pending', 'scheduled')
-              AND dependencies_met IS DISTINCT FROM check_job_dependencies_met(id)
+            FROM (
+                SELECT id, check_job_dependencies_met(id) AS met
+                FROM jobs
+                WHERE parent_job_id = $1
+                  AND organization_id = $2
+                  AND status IN ('pending', 'scheduled')
+            ) recomputed
+            WHERE jobs.id = recomputed.id
+              AND jobs.parent_job_id = $1
+              AND jobs.organization_id = $2
+              AND jobs.status IN ('pending', 'scheduled')
+              AND jobs.dependencies_met IS DISTINCT FROM recomputed.met
               AND NOT EXISTS (
                   SELECT 1 FROM jobs parent
                   WHERE parent.id = jobs.parent_job_id

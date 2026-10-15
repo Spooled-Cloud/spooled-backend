@@ -11,6 +11,17 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.127] - 2026-10-15
+
+The two P3 items left open in 0.1.126. No migration, no new route. One validation change: gRPC calls that take a queue name now accept 1-100 characters, not 255.
+
+### Fixed
+
+- **gRPC `Dequeue`, `StreamJobs`, `GetQueueStats` and the other queue-name calls accept 1-100 characters, like REST** (R0127-1). The shared gRPC validator allowed up to 255 while `Enqueue`, `RegisterWorker` and every REST route cap at 100, so a worker could poll a 101-255 character queue no job can be enqueued to. A longer name is now `INVALID_ARGUMENT` ("Queue name must be 1-100 characters"); production held no queue, job, worker or schedule with a longer name. Test: `r0126_grpc_parity_tests::grpc_queue_name_validator_counts_characters_not_bytes`.
+- **Recomputing a child's dependency flag calls `check_job_dependencies_met` once, not twice** (R0127-2). The parent-completion updates (`complete_with_worker_and_org`, the org-less fallback, the gRPC/REST completion path) and the scheduler's dependency sweep called the function in `SET` and again in `WHERE`, two queries each time. Each now computes it once per child in a `FROM` subquery (the function is `VOLATILE`, so Postgres does not inline it) and keeps the status and parent conditions on the updated row. Behavior is unchanged. Tests: `r0126_jobs_realtime_tests::jobs02_parent_completion_does_not_clear_unmet_dependency` and the existing dependency and workflow suites.
+
+---
+
 ## [0.1.126] - 2026-10-15
 
 Thirty-two fixes from a pre-release review of billing, authentication, the job lifecycle, realtime and gRPC, and from a live probe of the API. Two migrations (`20261015120000_revoked_sessions` creates the table `revoked_sessions`; `20261015120100_workflow_progress_deadletter` replaces the function `update_workflow_progress`), no new route. Clients may notice these response and behavior changes: a retry that waits for a future run time now has status `scheduled` (it was `pending`); schedules, workflows and incoming-webhook configs reject queue names a worker cannot claim (`400`); `POST /auth/validate` reports `valid: false` for refresh tokens and for inactive or expired keys, and can answer `503`; a custom rate-limit override of `0` now blocks (`429`) instead of allowing one request per second; changing a verified billing email ends the old email-login sessions; gRPC `RegisterWorker` caps queue names at 100 characters, and a negative `max_retries` or an unknown heartbeat status is `INVALID_ARGUMENT`; and a worker deregister no longer requeues a job whose lease is still live.

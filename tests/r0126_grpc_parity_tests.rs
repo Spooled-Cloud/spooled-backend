@@ -637,5 +637,8 @@ fn grpc_queue_name_validator_counts_characters_not_bytes() {
     let name = "\u{6f22}".repeat(100);
     assert_eq!(name.len(), 300);
     assert!(validate_queue_name(&name).is_ok());
-    assert!(validate_queue_name(&"a".repeat(256)).is_err());
+    // Same 1-100 cap as REST and Enqueue: Dequeue and StreamJobs used to
+    // accept 101-255 for a queue no job can be enqueued to.
+    assert!(validate_queue_name(&"a".repeat(100)).is_ok());
+    assert!(validate_queue_name(&"a".repeat(101)).is_err());
 }
