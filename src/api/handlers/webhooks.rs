@@ -21,8 +21,9 @@ use crate::api::AppState;
 use crate::config::Environment;
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    ApiKeyContext, CustomWebhookRequest, CustomWebhookResponse, ListInboundDeliveriesQuery,
-    WebhookDeliverySummary, INBOUND_DELIVERY_CREATED, INBOUND_DELIVERY_DUPLICATE,
+    normalize_idempotency_key, ApiKeyContext, CustomWebhookRequest, CustomWebhookResponse,
+    ListInboundDeliveriesQuery, WebhookDeliverySummary, INBOUND_DELIVERY_CREATED,
+    INBOUND_DELIVERY_DUPLICATE,
 };
 
 /// Maximum webhook payload size (5MB)
@@ -128,6 +129,10 @@ pub async fn custom(
     let job_id = Uuid::new_v4().to_string();
     let now = Utc::now();
     let priority = request.priority.unwrap_or(0);
+    // `""` and whitespace are not keys. The unique index treats them as values,
+    // so every blank delivery of the org collapsed onto the first job. POST
+    // /jobs already normalizes these to "no key".
+    let idempotency_key = normalize_idempotency_key(request.idempotency_key.clone());
 
     // Enforce plan limits for webhook-ingested jobs too (same as /jobs).
     let payload_json = serde_json::to_string(&request.payload).unwrap_or_default();
@@ -225,7 +230,7 @@ pub async fn custom(
     .bind(max_retries)
     .bind(timeout_seconds)
     .bind(now)
-    .bind(&request.idempotency_key)
+    .bind(&idempotency_key)
     .fetch_one(state.db.pool())
     .await;
 

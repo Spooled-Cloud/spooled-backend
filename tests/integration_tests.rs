@@ -2662,7 +2662,7 @@ async fn test_fail_by_worker_reschedules_with_valid_lease() {
         .expect("fail_by_worker should succeed");
     assert_eq!(outcome.outcome, WorkerOpOutcome::Ok);
     assert!(outcome.will_retry, "retry_count < max_retries should retry");
-    assert_eq!(outcome.new_status.as_deref(), Some("pending"));
+    assert_eq!(outcome.new_status.as_deref(), Some("scheduled"));
 
     // Verify the worker lease was released so a second claim is possible.
     let (assigned, lease): (Option<String>, Option<chrono::DateTime<chrono::Utc>>) =

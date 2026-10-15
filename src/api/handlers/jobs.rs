@@ -1203,14 +1203,14 @@ pub async fn fail(
         }
     }
 
-    // The status this transition set (`pending` for a scheduled retry,
-    // `deadletter`). It is taken from the transition, not read back after the
-    // commit: by then the retry may be claimed again or the dead-lettered job
-    // retried, and job.failed (with the job.deadlettered it implies) would be
-    // skipped or carry the wrong status.
+    // The status this transition set (`scheduled` for a retry, `deadletter`).
+    // It is taken from the transition, not read back after the commit: by then
+    // the retry may be claimed again or the dead-lettered job retried, and
+    // job.failed (with the job.deadlettered it implies) would be skipped or
+    // carry the wrong status.
     let new_status = outcome.new_status.clone().unwrap_or_else(|| {
         if outcome.will_retry {
-            "pending"
+            "scheduled"
         } else {
             "deadletter"
         }
@@ -1277,7 +1277,7 @@ pub async fn fail(
             .await;
         }
 
-        // Fire job.failed for terminal failure / DLQ; retries stay pending.
+        // Fire job.failed for terminal failure / DLQ; a retry is `scheduled`.
         if new_status == "failed" || new_status == "deadletter" {
             state.outgoing_webhooks.spawn_dispatch(
                 ctx.organization_id.clone(),

@@ -378,22 +378,10 @@ pub async fn deregister(
     ensure_worker_in_scope(&ctx, &worker)?;
     let previous_status = worker.status;
 
-    // Release any jobs assigned to this worker (with org isolation)
-    sqlx::query(
-        r#"
-        UPDATE jobs 
-        SET 
-            status = 'pending',
-            assigned_worker_id = NULL,
-            lease_id = NULL,
-            lease_expires_at = NULL
-        WHERE assigned_worker_id = $1 AND status = 'processing' AND organization_id = $2
-        "#,
-    )
-    .bind(&id)
-    .bind(&ctx.organization_id)
-    .execute(state.db.pool())
-    .await?;
+    // Expired leases only. A live lease is still being worked; releasing it
+    // lets another worker claim the job while this handler is in flight.
+    crate::queue::release_jobs_for_deregistered_worker(state.db.pool(), &id, &ctx.organization_id)
+        .await?;
 
     // Mark worker as offline (with org isolation)
     sqlx::query("UPDATE workers SET status = 'offline' WHERE id = $1 AND organization_id = $2")

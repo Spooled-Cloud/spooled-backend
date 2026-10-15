@@ -46,7 +46,7 @@ pub struct FailByWorkerOutcome {
     /// Whether the failed job was rescheduled (`true`) or moved to
     /// dead-letter (`false`). Undefined when `outcome != Ok`.
     pub will_retry: bool,
-    /// New status of the job (`"pending"` or `"deadletter"`) when
+    /// New status of the job (`"scheduled"` for a retry, or `"deadletter"`) when
     /// `outcome == Ok`.
     pub new_status: Option<String>,
 }
@@ -87,6 +87,64 @@ pub const CLAIM_BATCH_SQL: &str = r#"
     WHERE jobs.id = eligible_jobs.id
     RETURNING jobs.*
 "#;
+
+/// Release jobs whose worker is deregistering, and return how many moved.
+///
+/// A live lease means the process may still be inside the handler. The worker
+/// SDKs call deregister only after their own drain, but an operator can
+/// deregister while a handler is in flight. Clearing that lease made the job
+/// claimable immediately, the in-flight complete then missed, and a second
+/// worker ran the same payload. The offline-worker sweep already refuses to
+/// release a live lease for that reason. Only an expired lease (or a row that
+/// never had one) is returned to the queue here, and that counts as a retry
+/// with a history row. A still-valid lease stays owned until it expires and
+/// the lease-recovery sweep takes it.
+pub async fn release_jobs_for_deregistered_worker(
+    pool: &PgPool,
+    worker_id: &str,
+    organization_id: &str,
+) -> Result<u64, sqlx::Error> {
+    let released: Vec<(String,)> = sqlx::query_as(
+        r#"
+        WITH released AS (
+            UPDATE jobs
+            SET
+                status = 'pending',
+                assigned_worker_id = NULL,
+                lease_id = NULL,
+                lease_expires_at = NULL,
+                retry_count = retry_count + 1,
+                last_error = 'Worker deregistered',
+                updated_at = NOW()
+            WHERE assigned_worker_id = $1
+              AND organization_id = $2
+              AND status = 'processing'
+              AND retry_count < max_retries
+              -- Same live-lease guard as the offline-worker sweep.
+              AND (lease_expires_at IS NULL OR lease_expires_at <= NOW())
+            RETURNING id, organization_id, retry_count
+        )
+        INSERT INTO job_history (id, job_id, event_type, details, created_at)
+        SELECT
+            gen_random_uuid()::TEXT,
+            id,
+            'retry_scheduled',
+            jsonb_build_object(
+                'error', 'Worker deregistered',
+                'retry_count', retry_count,
+                'organization_id', organization_id
+            ),
+            NOW()
+        FROM released
+        RETURNING job_id
+        "#,
+    )
+    .bind(worker_id)
+    .bind(organization_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(released.len() as u64)
+}
 
 /// Queue manager for enqueueing and dequeuing jobs
 #[derive(Clone)]
@@ -535,26 +593,26 @@ impl QueueManager {
             ));
         }
 
-        // Unblock children gated on this job via the LEGACY scalar `parent_job_id`
-        // edge only. This is not the workflow dependency mechanism: workflow jobs
-        // express many-to-many dependencies in the `job_dependencies` table with a
-        // `dependency_mode` of 'all'/'any', and those are resolved by the
-        // `update_dependent_jobs` DB trigger (migrations/20241209000003_job_dependencies.sql)
-        // plus the safety-net sweep in `Scheduler::update_job_dependencies`
-        // (src/scheduler/mod.rs). Changing the query below does NOT change
-        // workflow dependency behaviour.
+        // Unblock children gated on this job. `parent_job_id` is the legacy
+        // single-parent edge; the same child can also wait on `job_dependencies`
+        // rows (added at create, or later via POST /jobs/{id}/dependencies).
+        // The completion trigger already stored `check_job_dependencies_met`.
+        // Forcing TRUE from `parent_job_id` alone overwrote that FALSE when
+        // another dependency was still pending, and claim treats TRUE as ready.
+        // Recompute the flag. A child whose only edge is the completed parent
+        // (no `job_dependencies` rows, or only that parent) still becomes TRUE.
         // SECURITY: Include organization_id when available for defense-in-depth
         let update_result = if let Some(oid) = org_id {
             sqlx::query(
                 r#"
                 UPDATE jobs
                 SET
-                    dependencies_met = TRUE,
+                    dependencies_met = check_job_dependencies_met(id),
                     updated_at = NOW()
                 WHERE parent_job_id = $1
                   AND organization_id = $2
                   AND status IN ('pending', 'scheduled')
-                  AND dependencies_met = FALSE
+                  AND dependencies_met IS DISTINCT FROM check_job_dependencies_met(id)
                   AND NOT EXISTS (
                       -- Single-parent (`parent_job_id`) edges only; multi-parent
                       -- workflow dependencies live in `job_dependencies`.
@@ -577,11 +635,11 @@ impl QueueManager {
                 r#"
                 UPDATE jobs
                 SET
-                    dependencies_met = TRUE,
+                    dependencies_met = check_job_dependencies_met(id),
                     updated_at = NOW()
                 WHERE parent_job_id = $1
                   AND status IN ('pending', 'scheduled')
-                  AND dependencies_met = FALSE
+                  AND dependencies_met IS DISTINCT FROM check_job_dependencies_met(id)
                   AND NOT EXISTS (
                       SELECT 1 FROM jobs parent
                       WHERE parent.id = jobs.parent_job_id
@@ -680,17 +738,18 @@ impl QueueManager {
                 .await;
         }
 
-        // Unblock child jobs whose only remaining parent just completed.
+        // Same recompute as `complete_with_worker_and_org`: do not force TRUE
+        // from `parent_job_id` when other `job_dependencies` are still unmet.
         let update_result = sqlx::query(
             r#"
             UPDATE jobs
             SET
-                dependencies_met = TRUE,
+                dependencies_met = check_job_dependencies_met(id),
                 updated_at = NOW()
             WHERE parent_job_id = $1
               AND organization_id = $2
               AND status IN ('pending', 'scheduled')
-              AND dependencies_met = FALSE
+              AND dependencies_met IS DISTINCT FROM check_job_dependencies_met(id)
               AND NOT EXISTS (
                   SELECT 1 FROM jobs parent
                   WHERE parent.id = jobs.parent_job_id
@@ -856,7 +915,10 @@ impl QueueManager {
                 r#"
                 UPDATE jobs
                 SET
-                    status = 'pending',
+                    -- A future scheduled_at is `scheduled`, same as create.
+                    -- `pending` made list and stats skip the retry until the
+                    -- backoff elapsed, while claim already waited on scheduled_at.
+                    status = 'scheduled',
                     retry_count = $1,
                     scheduled_at = $2,
                     last_error = $3,
@@ -918,7 +980,7 @@ impl QueueManager {
             Ok(FailByWorkerOutcome {
                 outcome: WorkerOpOutcome::Ok,
                 will_retry: true,
-                new_status: Some("pending".to_string()),
+                new_status: Some("scheduled".to_string()),
             })
         } else {
             // Status change and audit row are ONE statement: a crash between two
@@ -1062,7 +1124,8 @@ impl QueueManager {
                 r#"
                 UPDATE jobs
                 SET
-                    status = 'pending',
+                    -- Same as fail_by_worker: a backoff is a scheduled job.
+                    status = 'scheduled',
                     retry_count = $1,
                     scheduled_at = $2,
                     last_error = $3,

@@ -647,6 +647,19 @@ pub async fn trigger(
     // a restricted key must not trigger a schedule targeting a queue outside its scope.
     require_queue_access(&ctx, &schedule.queue_name).map_err(IntoResponse::into_response)?;
 
+    // A schedule stored before queue names were held to the claim rules (length
+    // 1-100, no spaces) must not enqueue a job claim will reject.
+    if !crate::models::is_claimable_queue_name(&schedule.queue_name) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "code": "VALIDATION_ERROR",
+                "message": "Queue name must be 1-100 characters and only letters, digits, '-', '_' or '.'",
+            })),
+        )
+            .into_response());
+    }
+
     // Check job limits before creating a job from the schedule trigger. Use the same
     // check_job_limits/check_payload_size helpers the direct enqueue path uses so a
     // triggered job over quota returns the structured 429 `QUOTA_EXCEEDED` (and an

@@ -685,17 +685,33 @@ impl StreamAuth {
     }
 }
 
-/// Query parameters for WebSocket subscription
-///
-#[derive(Debug, Clone)]
+/// One subscription. `queue` and `job_id` are ANDed. Several of these on a
+/// socket are ORed: a second subscribe must not hide events the first one
+/// asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SubscriptionFilter {
     queue: Option<String>,
     job_id: Option<String>,
 }
 
-fn event_matches_subscription(
+/// The upgrade query. Neither field set is an empty list, which matches every
+/// event the key's scope allows — the same answer as a both-empty filter.
+fn filters_from_query(query: &SubscribeQuery) -> Vec<SubscriptionFilter> {
+    if query.queue.is_some() || query.job_id.is_some() {
+        vec![SubscriptionFilter {
+            queue: query.queue.clone(),
+            job_id: query.job_id.clone(),
+        }]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Scope first, then the filter list. An empty list matches everything the
+/// scope allows. One filter is an AND of its fields; the list is an OR.
+fn event_matches_filters(
     event: &RealtimeEvent,
-    filter: &SubscriptionFilter,
+    filters: &[SubscriptionFilter],
     key_queues: &[String],
 ) -> bool {
     if !queue_scope_is_unrestricted(key_queues) && event.unverifiable_for_scoped_key() {
@@ -705,22 +721,55 @@ fn event_matches_subscription(
         if !queue_scope_allows(key_queues, queue) {
             return false;
         }
-        if filter
-            .queue
-            .as_deref()
-            .is_some_and(|wanted| wanted != queue)
-        {
-            return false;
-        }
-    } else if filter.queue.is_some() {
-        return false;
     }
+    if filters.is_empty() {
+        return true;
+    }
+    filters
+        .iter()
+        .any(|filter| filter_matches_event(event, filter))
+}
 
+fn filter_matches_event(event: &RealtimeEvent, filter: &SubscriptionFilter) -> bool {
+    if let Some(wanted) = filter.queue.as_deref() {
+        match event.queue_name() {
+            Some(queue) if queue == wanted => {}
+            _ => return false,
+        }
+    }
     match (filter.job_id.as_deref(), event.job_id()) {
         (Some(wanted), Some(actual)) => wanted == actual,
         (Some(_), None) => false,
         _ => true,
     }
+}
+
+fn event_matches_subscription(
+    event: &RealtimeEvent,
+    filter: &SubscriptionFilter,
+    key_queues: &[String],
+) -> bool {
+    event_matches_filters(event, std::slice::from_ref(filter), key_queues)
+}
+
+/// A filter matches an unsubscribe when every field the command names equals
+/// the filter's. A field the command omits is a wildcard, so unsubscribing a
+/// job id leaves a queue-only filter in place.
+fn unsubscribe_matches(
+    filter: &SubscriptionFilter,
+    queues: &[String],
+    job_id: Option<&str>,
+) -> bool {
+    let queue_ok = queues.is_empty()
+        || filter
+            .queue
+            .as_ref()
+            .is_some_and(|queue| queues.iter().any(|wanted| wanted == queue));
+    let job_ok = match job_id {
+        None => true,
+        Some(wanted) => filter.job_id.as_deref() == Some(wanted),
+    };
+    queue_ok && job_ok
 }
 
 #[derive(Debug, Deserialize)]
@@ -800,6 +849,13 @@ pub async fn websocket_handler(
     Ok(ws.on_upgrade(move |socket| handle_websocket(socket, query, auth, slot, state)))
 }
 
+async fn send_realtime(sender: &mut SplitSink<WebSocket, Message>, event: &RealtimeEvent) -> bool {
+    match serde_json::to_string(event) {
+        Ok(json) => sender.send(Message::Text(json.into())).await.is_ok(),
+        Err(_) => false,
+    }
+}
+
 /// Send the reason a WebSocket ends (an `Error` event, then the close frame).
 async fn close_websocket(sender: &mut SplitSink<WebSocket, Message>, end: StreamEnd) {
     if let Some(message) = end.message() {
@@ -829,20 +885,19 @@ async fn handle_websocket(
     let (mut sender, mut receiver) = socket.split();
     let org_id = auth.org_id.clone();
 
+    // Several commands accumulate. Empty means "everything in scope", which is
+    // what a socket with no query filter did before any subscribe arrived.
+    // Take it before `query.events` is moved.
+    let mut filters = filters_from_query(&query);
+
     // Parse event filter
     let event_filter: Option<Vec<String>> = query
         .events
         .map(|e| e.split(',').map(|s| s.trim().to_lowercase()).collect());
 
-    let mut subscription = SubscriptionFilter {
-        queue: query.queue,
-        job_id: query.job_id,
-    };
-
     info!(
         org_id = %org_id,
-        queue = ?subscription.queue,
-        job_id = ?subscription.job_id,
+        filters = filters.len(),
         events = ?event_filter,
         "WebSocket connection established"
     );
@@ -890,37 +945,30 @@ async fn handle_websocket(
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         debug!("Received text message: {}", text);
-                        if let Ok(cmd) = serde_json::from_str::<ClientCommand>(&text) {
-                            match cmd {
-                                ClientCommand::Subscribe { queue, job_id } => {
-                                    if queue
-                                        .as_deref()
-                                        .is_some_and(|requested| !auth.allows_queue(requested))
-                                    {
-                                        continue;
-                                    }
-                                    if queue.is_some() {
-                                        subscription.queue = queue;
-                                    }
-                                    if job_id.is_some() {
-                                        subscription.job_id = job_id;
-                                    }
+                        // Unknown text used to be ignored, so a client that sent
+                        // the documented shape kept an empty filter and saw
+                        // every event. Tell it, and leave the socket open.
+                        let outcome = match serde_json::from_str::<ClientCommand>(&text) {
+                            Ok(cmd) => apply_client_command(&mut filters, cmd, &auth),
+                            Err(_) => Err("Unrecognized realtime command"),
+                        };
+                        match outcome {
+                            Ok(true) => {
+                                let pong = RealtimeEvent::Ping {
+                                    timestamp: chrono::Utc::now(),
+                                };
+                                if !send_realtime(&mut sender, &pong).await {
+                                    break None;
                                 }
-                                ClientCommand::Unsubscribe { queue, job_id } => {
-                                    if queue.is_none() || subscription.queue == queue {
-                                        subscription.queue = None;
-                                    }
-                                    if job_id.is_none() || subscription.job_id == job_id {
-                                        subscription.job_id = None;
-                                    }
-                                }
-                                ClientCommand::Ping => {
-                                    let pong = RealtimeEvent::Ping {
-                                        timestamp: chrono::Utc::now(),
-                                    };
-                                    if sender.send(Message::Text(serde_json::to_string(&pong).unwrap().into())).await.is_err() {
-                                        break None;
-                                    }
+                            }
+                            Ok(false) => {}
+                            Err(message) => {
+                                let event = RealtimeEvent::Error {
+                                    message: message.to_string(),
+                                    timestamp: chrono::Utc::now(),
+                                };
+                                if !send_realtime(&mut sender, &event).await {
+                                    break None;
                                 }
                             }
                         }
@@ -958,7 +1006,7 @@ async fn handle_websocket(
                 if let Err(end) = auth.recheck_if_due(&state).await {
                     break Some(end);
                 }
-                if !event_matches_subscription(&event, &subscription, auth.scope()) {
+                if !event_matches_filters(&event, &filters, auth.scope()) {
                     continue;
                 }
 
@@ -1002,22 +1050,150 @@ async fn handle_websocket(
     info!(org_id = %org_id, "WebSocket connection closed");
 }
 
-/// Commands that clients can send via WebSocket
-#[derive(Debug, Deserialize)]
-#[serde(tag = "cmd")]
+/// Commands that clients can send via WebSocket.
+///
+/// The Node SDK sends `{"cmd":"Subscribe","queue","job_id"}`. Go, Python and
+/// PHP send the same object with a lowercase `cmd`, and PHP always includes
+/// null for a field it does not mean. The docs quickstart sends
+/// `{"type":"subscribe","queues":["emails"]}`. Null, missing and `""` are all
+/// "this field was not set".
+#[derive(Debug)]
 pub enum ClientCommand {
-    /// Subscribe to specific queue/job updates
+    /// Subscribe to specific queue/job updates. Each queue is its own filter
+    /// (OR). `job_id` is ANDed with each of those queues.
     Subscribe {
-        queue: Option<String>,
+        queues: Vec<String>,
         job_id: Option<String>,
     },
-    /// Unsubscribe from specific queue/job updates
+    /// Drop filters whose named fields all match. Naming nothing drops nothing.
     Unsubscribe {
-        queue: Option<String>,
+        queues: Vec<String>,
         job_id: Option<String>,
     },
     /// Ping request
     Ping,
+}
+
+impl<'de> Deserialize<'de> for ClientCommand {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let obj = value
+            .as_object()
+            .ok_or_else(|| serde::de::Error::custom("realtime command must be an object"))?;
+        let name = obj
+            .get("cmd")
+            .or_else(|| obj.get("type"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| serde::de::Error::custom("realtime command has no cmd or type"))?;
+        match name.to_ascii_lowercase().as_str() {
+            "ping" => Ok(ClientCommand::Ping),
+            "subscribe" => Ok(ClientCommand::Subscribe {
+                queues: command_queues(&value)?,
+                job_id: command_job_id(&value)?,
+            }),
+            "unsubscribe" => Ok(ClientCommand::Unsubscribe {
+                queues: command_queues(&value)?,
+                job_id: command_job_id(&value)?,
+            }),
+            _ => Err(serde::de::Error::custom("unrecognized realtime command")),
+        }
+    }
+}
+
+/// `queue` plus every entry of `queues`. Null and `""` are absent.
+fn command_queues<E: serde::de::Error>(value: &serde_json::Value) -> Result<Vec<String>, E> {
+    let mut names = Vec::new();
+    if let Some(queue) = optional_command_string(value.get("queue"))? {
+        names.push(queue);
+    }
+    match value.get("queues") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::Array(items)) => {
+            for item in items {
+                if let Some(queue) = optional_command_string(Some(item))? {
+                    names.push(queue);
+                }
+            }
+        }
+        Some(_) => return Err(E::custom("queues must be an array of strings")),
+    }
+    Ok(names)
+}
+
+fn command_job_id<E: serde::de::Error>(value: &serde_json::Value) -> Result<Option<String>, E> {
+    optional_command_string(value.get("job_id"))
+}
+
+/// Null, missing and empty string are "not set". Anything else that is not a
+/// string is a bad command.
+fn optional_command_string<E: serde::de::Error>(
+    value: Option<&serde_json::Value>,
+) -> Result<Option<String>, E> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(text)) if text.is_empty() => Ok(None),
+        Some(serde_json::Value::String(text)) => Ok(Some(text.clone())),
+        Some(_) => Err(E::custom("expected a string")),
+    }
+}
+
+/// `Ok(true)` means "send a pong". The error string is an `Error` event; the
+/// socket stays up. An invalid queue rejects the whole command so a bad name
+/// in a list cannot subscribe the others.
+fn apply_client_command(
+    filters: &mut Vec<SubscriptionFilter>,
+    cmd: ClientCommand,
+    auth: &StreamAuth,
+) -> Result<bool, &'static str> {
+    match cmd {
+        ClientCommand::Ping => Ok(true),
+        ClientCommand::Subscribe { queues, job_id } => {
+            for queue in &queues {
+                validate_queue_filter(&Some(queue.clone()))?;
+            }
+            // Out of scope is silent, matching the upgrade check. If every
+            // named queue is out of scope the job id on this command is not
+            // installed either.
+            let allowed: Vec<String> = queues
+                .iter()
+                .filter(|queue| auth.allows_queue(queue))
+                .cloned()
+                .collect();
+            if !queues.is_empty() && allowed.is_empty() {
+                return Ok(false);
+            }
+            if allowed.is_empty() && job_id.is_none() {
+                return Ok(false);
+            }
+            let targets: Vec<Option<String>> = if allowed.is_empty() {
+                vec![None]
+            } else {
+                allowed.into_iter().map(Some).collect()
+            };
+            for queue in targets {
+                let filter = SubscriptionFilter {
+                    queue,
+                    job_id: job_id.clone(),
+                };
+                if !filters.contains(&filter) {
+                    filters.push(filter);
+                }
+            }
+            Ok(false)
+        }
+        ClientCommand::Unsubscribe { queues, job_id } => {
+            for queue in &queues {
+                validate_queue_filter(&Some(queue.clone()))?;
+            }
+            // Naming nothing must not wipe the list. PHP sends null for the
+            // dimension it is not unsubscribing, and that used to clear it.
+            if queues.is_empty() && job_id.is_none() {
+                return Ok(false);
+            }
+            filters.retain(|filter| !unsubscribe_matches(filter, &queues, job_id.as_deref()));
+            Ok(false)
+        }
+    }
 }
 
 /// Terminal job statuses (stream should close when job reaches these)
@@ -1368,6 +1544,18 @@ pub async fn sse_queue_handler(
 /// Interval between `system.health` events on the global SSE stream.
 const SSE_HEALTH_INTERVAL_SECS: u64 = 10;
 
+fn sse_channel_closed() -> Event {
+    let message = StreamEnd::ChannelClosed
+        .message()
+        .unwrap_or("Realtime event channel closed; reconnect to resume events");
+    let event = RealtimeEvent::Error {
+        message: message.to_string(),
+        timestamp: chrono::Utc::now(),
+    };
+    let json = serde_json::to_string(&event).unwrap_or_default();
+    Event::default().event(event.event_type()).data(json)
+}
+
 /// Wait for the next payload on the org pub/sub channel. Resolves to `None` once
 /// the channel closes; pends forever when there is no channel (no Redis).
 async fn next_pubsub_payload(messages: &mut Option<redis::aio::PubSubStream>) -> Option<String> {
@@ -1428,30 +1616,31 @@ pub async fn sse_events_handler(
 
     info!(org_id = %org_id, "SSE connection for all events (authenticated)");
 
+    let subscription = filters_from_query(&query);
     let event_filter: Option<Vec<String>> = query.events.map(|e| {
         e.split(',')
             .map(|s| s.trim().to_lowercase())
             .filter(|s| !s.is_empty())
             .collect()
     });
-    let subscription = SubscriptionFilter {
-        queue: query.queue,
-        job_id: query.job_id,
-    };
 
     let stream = async_stream::stream! {
         let mut slot = slot;
 
         // Subscribe before the first frame, so a client that has seen `: connected`
-        // does not miss an event published right after.
+        // does not miss an event published right after. A failed subscribe used to
+        // fall through to health-only for the rest of the 30 minutes, and the
+        // client had no way to tell the channel was gone.
         let mut messages = match state.cache {
             Some(ref cache) => match cache.subscribe(&format!("org:{}:events", org_id)).await {
                 Ok(pubsub) => Some(pubsub.into_on_message()),
                 Err(e) => {
-                    warn!(error = %e, org_id = %org_id, "SSE could not subscribe to org events; health only");
-                    None
+                    warn!(error = %e, org_id = %org_id, "SSE could not subscribe to org events; closing");
+                    yield Ok(sse_channel_closed());
+                    return;
                 }
             },
+            // No Redis configured: health only, same as the WebSocket.
             None => None,
         };
 
@@ -1465,21 +1654,34 @@ pub async fn sse_events_handler(
         let deadline = auth.deadline;
 
         loop {
-            // `None` = health tick, `Some(payload)` = pub/sub event.
-            let payload: Option<String> = tokio::select! {
+            // Health tick, a pub/sub payload, or the channel closing.
+            enum SseTick {
+                Health,
+                Event(String),
+                Closed,
+            }
+            let tick = tokio::select! {
                 _ = tokio::time::sleep_until(deadline) => {
                     debug!(org_id = %org_id, reason = ?auth.deadline_reason, "SSE events stream deadline - closing");
                     break;
                 }
-                _ = health.tick() => None,
+                _ = health.tick() => SseTick::Health,
                 msg = next_pubsub_payload(&mut messages) => match msg {
-                    Some(payload) => Some(payload),
-                    None => {
-                        warn!(org_id = %org_id, "SSE org event channel closed; health only");
-                        messages = None;
-                        continue;
-                    }
+                    Some(payload) => SseTick::Event(payload),
+                    // The channel closed after `: connected`. Staying open and
+                    // emitting only health left clients thinking they were still
+                    // subscribed. End the stream so they reconnect.
+                    None => SseTick::Closed,
                 },
+            };
+            let payload: Option<String> = match tick {
+                SseTick::Closed => {
+                    warn!(org_id = %org_id, "SSE org event channel closed; closing");
+                    yield Ok(sse_channel_closed());
+                    break;
+                }
+                SseTick::Health => None,
+                SseTick::Event(payload) => Some(payload),
             };
 
             // Re-authorize (expired token, logout, revoked/expired key, deleted org,
@@ -1492,7 +1694,7 @@ pub async fn sse_events_handler(
 
             let event = match payload {
                 Some(payload) => match serde_json::from_str::<RealtimeEvent>(&payload) {
-                    Ok(event) if event_matches_subscription(&event, &subscription, auth.scope()) => event,
+                    Ok(event) if event_matches_filters(&event, &subscription, auth.scope()) => event,
                     _ => continue,
                 },
                 None => {
@@ -1633,8 +1835,8 @@ mod tests {
         let json = r#"{"cmd":"Subscribe","queue":"emails","job_id":null}"#;
         let cmd: ClientCommand = serde_json::from_str(json).unwrap();
         match cmd {
-            ClientCommand::Subscribe { queue, job_id } => {
-                assert_eq!(queue, Some("emails".to_string()));
+            ClientCommand::Subscribe { queues, job_id } => {
+                assert_eq!(queues, vec!["emails".to_string()]);
                 assert!(job_id.is_none());
             }
             _ => panic!("Wrong command type"),
@@ -1643,6 +1845,65 @@ mod tests {
         let json = r#"{"cmd":"Ping"}"#;
         let cmd: ClientCommand = serde_json::from_str(json).unwrap();
         assert!(matches!(cmd, ClientCommand::Ping));
+
+        // Go/Python/PHP send a lowercase cmd. PHP includes null for the field
+        // it is not setting; that must not become a filter value.
+        let json = r#"{"cmd":"subscribe","queue":null,"job_id":"job-1"}"#;
+        let cmd: ClientCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            ClientCommand::Subscribe { queues, job_id } => {
+                assert!(queues.is_empty());
+                assert_eq!(job_id.as_deref(), Some("job-1"));
+            }
+            _ => panic!("Wrong command type"),
+        }
+
+        // Docs quickstart: type + queues, not cmd + queue.
+        let json = r#"{"type":"subscribe","queues":["emails","billing"]}"#;
+        let cmd: ClientCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            ClientCommand::Subscribe { queues, job_id } => {
+                assert_eq!(queues, vec!["emails".to_string(), "billing".to_string()]);
+                assert!(job_id.is_none());
+            }
+            _ => panic!("Wrong command type"),
+        }
+
+        let json = r#"{"cmd":"ping"}"#;
+        let cmd: ClientCommand = serde_json::from_str(json).unwrap();
+        assert!(matches!(cmd, ClientCommand::Ping));
+    }
+
+    #[test]
+    fn test_subscription_list_is_or_and_unsubscribe_keeps_other_filters() {
+        let emails = SubscriptionFilter {
+            queue: Some("emails".to_string()),
+            job_id: None,
+        };
+        let job = SubscriptionFilter {
+            queue: None,
+            job_id: Some("job-1".to_string()),
+        };
+        let mut filters = vec![emails.clone(), job];
+        let other = RealtimeEvent::JobCreated {
+            job_id: "job-2".to_string(),
+            queue_name: "emails".to_string(),
+            priority: 0,
+            timestamp: chrono::Utc::now(),
+        };
+        let billing = RealtimeEvent::JobCreated {
+            job_id: "job-9".to_string(),
+            queue_name: "billing".to_string(),
+            priority: 0,
+            timestamp: chrono::Utc::now(),
+        };
+        assert!(event_matches_filters(&other, &filters, &[]));
+        assert!(!event_matches_filters(&billing, &filters, &[]));
+
+        filters.retain(|filter| !unsubscribe_matches(filter, &[], Some("job-1")));
+        assert_eq!(filters, vec![emails]);
+        assert!(event_matches_filters(&other, &filters, &[]));
+        assert!(!event_matches_filters(&billing, &filters, &[]));
     }
 
     #[test]

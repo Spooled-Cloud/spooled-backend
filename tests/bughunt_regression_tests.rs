@@ -1982,7 +1982,7 @@ mod grpcq {
             .unwrap();
         assert_eq!(
             job_state(db.pool(), &retried).await,
-            ("pending".to_string(), 2)
+            ("scheduled".to_string(), 2)
         );
 
         // Same through ProcessJobs.
@@ -14108,7 +14108,7 @@ mod w8_jobsapi {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(job_status(pool, &job).await, "pending");
+        assert_eq!(job_status(pool, &job).await, "scheduled");
         assert_eq!(worker_counters(&app, &auth, &worker).await, (1, 1));
 
         // REST fail without retries: dead-lettered, one more failure.
@@ -14205,7 +14205,10 @@ mod w8_jobsapi {
             .unwrap();
         assert_eq!(worker_counters(&app, &auth, &worker).await, (1, 3));
 
-        // Deregistering releases a held job without a retry: nothing counted.
+        // Deregistering leaves a live lease in place. Releasing it would let
+        // another worker run the job while this handler is still in flight,
+        // and the lease expiring later is what counts as a retry. Nothing is
+        // counted here.
         let job = create_job(&app, &auth, "w8-cnt-f", 3).await;
         claim(&app, &auth, "w8-cnt-f", &worker, &job).await;
         let (status, body) = post(
@@ -14216,7 +14219,7 @@ mod w8_jobsapi {
         )
         .await;
         assert!(status.is_success(), "{body}");
-        assert_eq!(job_status(pool, &job).await, "pending");
+        assert_eq!(job_status(pool, &job).await, "processing");
         assert_eq!(worker_counters(&app, &auth, &worker).await, (1, 3));
 
         // The list carries the counters too.

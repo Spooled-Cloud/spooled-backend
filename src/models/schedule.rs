@@ -107,8 +107,10 @@ pub struct CreateScheduleRequest {
     /// Now validated against allowed timezone values
     #[validate(custom(function = "validate_timezone"))]
     pub timezone: Option<String>,
-    /// Target queue
-    #[validate(length(min = 1, max = 255, message = "Queue name must be 1-255 characters"))]
+    /// Target queue. Same limit and character set as `POST /jobs`: a schedule
+    /// whose queue claim will reject must not be stored.
+    #[validate(length(min = 1, max = 100, message = "Queue name must be 1-100 characters"))]
+    #[validate(custom(function = "validate_schedule_queue_name"))]
     pub queue_name: String,
     /// Payload template (max 1MB)
     /// Now validated for size
@@ -136,6 +138,10 @@ pub struct CreateScheduleResponse {
     pub name: String,
     pub cron_expression: String,
     pub next_run_at: Option<DateTime<Utc>>,
+}
+
+fn validate_schedule_queue_name(name: &str) -> Result<(), validator::ValidationError> {
+    super::job::validate_queue_name_chars(name)
 }
 
 /// Validate optional timezone string

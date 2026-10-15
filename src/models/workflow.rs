@@ -218,8 +218,11 @@ pub struct CreateWorkflowRequest {
     pub description: Option<String>,
 
     /// Jobs to create as part of this workflow
-    /// Reduced from 1000 to 100 to prevent DoS
+    /// Reduced from 1000 to 100 to prevent DoS.
+    /// `nested` is required: without it Validate only counts this vec, so a
+    /// queue name claim will reject is stored and then never leased.
     #[validate(length(min = 1, max = 100, message = "Workflow must have 1-100 jobs"))]
+    #[validate(nested)]
     pub jobs: Vec<WorkflowJobDefinition>,
 
     /// Optional metadata
@@ -236,9 +239,9 @@ pub struct WorkflowJobDefinition {
     #[validate(custom(function = "validate_job_key"))]
     pub key: String,
 
-    /// Queue to enqueue the job to
-    /// Now validates for safe characters
-    #[validate(length(min = 1, max = 255))]
+    /// Queue to enqueue the job to. Claim rejects names outside 1-100, so a
+    /// longer workflow queue would create a job no worker can lease.
+    #[validate(length(min = 1, max = 100, message = "Queue name must be 1-100 characters"))]
     #[validate(custom(function = "validate_workflow_queue_name"))]
     pub queue_name: String,
 
@@ -562,6 +565,41 @@ mod tests {
 
         let result = request.validate();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_workflow_job_queue_name_matches_claim_rules() {
+        let mut request = CreateWorkflowRequest {
+            name: "wf".to_string(),
+            description: None,
+            jobs: vec![WorkflowJobDefinition {
+                key: "step".to_string(),
+                queue_name: "q".repeat(101),
+                payload: serde_json::json!({}),
+                depends_on: vec![],
+                dependency_mode: DependencyMode::All,
+                priority: 0,
+                max_retries: None,
+                timeout_seconds: None,
+                expires_at: None,
+            }],
+            metadata: None,
+        };
+
+        assert!(
+            request.validate().is_err(),
+            "a 101-character queue must be rejected"
+        );
+        request.jobs[0].queue_name = "bad queue".to_string();
+        assert!(
+            request.validate().is_err(),
+            "a queue name with a space must be rejected"
+        );
+        request.jobs[0].queue_name = "q".repeat(100);
+        assert!(
+            request.validate().is_ok(),
+            "a 100-character queue must stay valid"
+        );
     }
 
     #[test]

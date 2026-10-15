@@ -904,17 +904,27 @@ impl Inner {
         // `failure_count` is deliberately NOT touched here: this runs once per
         // ATTEMPT, and the counter must move once per DELIVERY. It is owned by
         // `record_delivery_outcome`, which also owns the auto-disable breaker.
+        //
+        // A manual retry forces `enabled` only on the in-memory copy it sends
+        // with. Writing `success` or `failed` over `auto_disabled` made the
+        // dashboard drop the re-enable banner (it keys off that marker) while
+        // `fan_out` still requires `enabled = true`, so later events were not
+        // delivered. The marker stays until the PUT that actually re-enables.
         let summary = sqlx::query(
             r#"
             UPDATE outgoing_webhooks
             SET last_triggered_at = NOW(),
-                last_status = $2,
+                last_status = CASE
+                    WHEN last_status = $3 THEN last_status
+                    ELSE $2
+                END,
                 updated_at = NOW()
             WHERE id = $1
             "#,
         )
         .bind(webhook_id)
         .bind(status)
+        .bind(AUTO_DISABLED_STATUS)
         .execute(&self.pool)
         .await;
         if let Err(e) = summary {

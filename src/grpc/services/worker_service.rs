@@ -672,10 +672,12 @@ impl WorkerService for WorkerServiceImpl {
         }))
     }
 
-    /// Deregister a worker
+    /// Deregister a worker.
     ///
-    /// SECURITY: Now releases any jobs assigned to this worker before marking offline.
-    /// Previously, jobs would be stuck in 'processing' until background cleanup ran.
+    /// Releases jobs whose lease has already expired (they would sit in
+    /// `processing` until the next sweep). A live lease is left in place: the
+    /// handler may still be running, and handing the job to another worker
+    /// executed it twice.
     async fn deregister(
         &self,
         request: Request<DeregisterRequest>,
@@ -722,33 +724,22 @@ impl WorkerService for WorkerServiceImpl {
             return Ok(Response::new(DeregisterResponse { success: false }));
         }
 
-        // First, release any jobs assigned to this worker (with org isolation)
-        // This prevents jobs from being stuck in 'processing' state
-        let released = sqlx::query(
-            r#"
-            UPDATE jobs
-            SET
-                status = 'pending',
-                assigned_worker_id = NULL,
-                lease_id = NULL,
-                lease_expires_at = NULL,
-                updated_at = NOW()
-            WHERE assigned_worker_id = $1 AND status = 'processing' AND organization_id = $2
-            "#,
+        // Expired leases only — see `release_jobs_for_deregistered_worker`.
+        let released = crate::queue::release_jobs_for_deregistered_worker(
+            self.pool.as_ref(),
+            &req.worker_id,
+            &auth.organization_id,
         )
-        .bind(&req.worker_id)
-        .bind(&auth.organization_id)
-        .execute(self.pool.as_ref())
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "Failed to release worker jobs");
             Status::internal("Failed to release worker jobs")
         })?;
 
-        if released.rows_affected() > 0 {
+        if released > 0 {
             info!(
                 worker_id = %req.worker_id,
-                released_jobs = released.rows_affected(),
+                released_jobs = released,
                 "Released jobs from deregistering worker"
             );
         }

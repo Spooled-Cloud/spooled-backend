@@ -1132,7 +1132,7 @@ impl QueueService for QueueServiceImpl {
                 SET
                     status = CASE
                         WHEN $1 = FALSE OR retry_count >= max_retries THEN 'deadletter'
-                        ELSE 'pending'
+                        ELSE 'scheduled'
                     END,
                     last_error = $2,
                     -- Like REST, dead-lettering counts no further retry: the
@@ -1192,7 +1192,7 @@ impl QueueService for QueueServiceImpl {
                 u.status as new_status,
                 u.retry_count as new_retry_count,
                 CASE
-                    WHEN u.status = 'pending'
+                    WHEN u.status = 'scheduled'
                     THEN EXTRACT(EPOCH FROM (u.scheduled_at - NOW()))::BIGINT
                     ELSE NULL
                 END as retry_delay_secs
@@ -1234,7 +1234,7 @@ impl QueueService for QueueServiceImpl {
         self.metrics.jobs_processing.dec();
         self.settle_signals.settled(&req.job_id);
 
-        let will_retry = result.new_status == "pending";
+        let will_retry = result.new_status == "scheduled";
         if result.new_status == "deadletter" {
             // The dead_letter_queue row was written by the same statement that
             // set this status — see the CTE above.
@@ -1328,12 +1328,16 @@ impl QueueService for QueueServiceImpl {
         let lease_id = Self::require_lease_id(&req.lease_id)?;
         let allowed_queues = queue_scope_filter(&auth);
         let extension_secs = self.lease_secs(req.extension_secs);
-        let new_expires_at = Utc::now() + chrono::Duration::seconds(extension_secs as i64);
 
-        let result = sqlx::query(
+        // `NOW()` is the transaction clock, after this statement has a
+        // connection. A timestamp taken in Rust first goes stale while the
+        // pool acquire waits, and a 30s extension can be stored already due.
+        let new_expires_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
             r#"
             UPDATE jobs
-            SET lease_expires_at = $1, lease_duration_secs = $7, updated_at = NOW()
+            SET lease_expires_at = NOW() + make_interval(secs => $1::int),
+                lease_duration_secs = $1,
+                updated_at = NOW()
             WHERE id = $2
               AND assigned_worker_id = $3
               AND organization_id = $4
@@ -1342,23 +1346,23 @@ impl QueueService for QueueServiceImpl {
               AND lease_expires_at > NOW()
               AND lease_id = $5
               AND queue_in_key_scope(queue_name, $6::TEXT[])
+            RETURNING lease_expires_at
             "#,
         )
-        .bind(new_expires_at)
+        .bind(extension_secs)
         .bind(&req.job_id)
         .bind(&req.worker_id)
         .bind(&auth.organization_id)
         .bind(lease_id)
         .bind(allowed_queues)
-        .bind(extension_secs)
-        .execute(self.pool.as_ref())
+        .fetch_optional(self.pool.as_ref())
         .await
         .map_err(|e| {
             error!(error = %e, "Failed to renew lease");
             Status::internal("Failed to renew lease")
         })?;
 
-        if result.rows_affected() == 0 {
+        let Some(new_expires_at) = new_expires_at else {
             return Err(classify_worker_miss_status(
                 self.pool.as_ref(),
                 &req.job_id,
@@ -1368,7 +1372,7 @@ impl QueueService for QueueServiceImpl {
                 allowed_queues,
             )
             .await);
-        }
+        };
 
         debug!(
             job_id = %req.job_id,
@@ -2746,7 +2750,7 @@ async fn handle_process_fail(
         SET
             status = CASE
                 WHEN $1 = FALSE OR retry_count >= max_retries THEN 'deadletter'
-                ELSE 'pending'
+                ELSE 'scheduled'
             END,
             last_error = $2,
             -- Like REST, dead-lettering counts no further retry.
@@ -2780,7 +2784,7 @@ async fn handle_process_fail(
             status as new_status,
             retry_count as new_retry_count,
             CASE
-                WHEN status = 'pending'
+                WHEN status = 'scheduled'
                 THEN EXTRACT(EPOCH FROM (scheduled_at - NOW()))::BIGINT
                 ELSE NULL
             END as retry_delay_secs
@@ -2798,7 +2802,7 @@ async fn handle_process_fail(
 
     match result {
         Ok(Some(update_result)) => {
-            let will_retry = update_result.new_status == "pending";
+            let will_retry = update_result.new_status == "scheduled";
             if update_result.new_status == "deadletter" {
                 // Parity with REST: insert into dead_letter_queue.
                 //
@@ -2949,16 +2953,20 @@ async fn handle_process_renew(
             )),
         };
     }
-    let new_expires_at = Utc::now() + chrono::Duration::seconds(extension_secs as i64);
+    // Same clock as unary RenewLease: the expiry is Postgres `NOW()` once
+    // `begin_stream_operation` has a connection, not a Rust timestamp taken
+    // while that acquire is still waiting.
     let (mut tx, _) = match begin_stream_operation(pool, api_key_id, org_id, None).await {
         Ok(locked) => locked,
         Err(status) => return process_status_error(&status),
     };
 
-    let result = sqlx::query(
+    let result: Result<Option<chrono::DateTime<chrono::Utc>>, sqlx::Error> = sqlx::query_scalar(
         r#"
         UPDATE jobs
-        SET lease_expires_at = $1, lease_duration_secs = $7, updated_at = NOW()
+        SET lease_expires_at = NOW() + make_interval(secs => $1::int),
+            lease_duration_secs = $1,
+            updated_at = NOW()
         WHERE id = $2
           AND assigned_worker_id = $3
           AND organization_id = $4
@@ -2972,20 +2980,20 @@ async fn handle_process_renew(
                 AND k.organization_id = jobs.organization_id
                 AND queue_in_key_scope(jobs.queue_name, k.queues)
           )
+        RETURNING lease_expires_at
         "#,
     )
-    .bind(new_expires_at)
+    .bind(extension_secs)
     .bind(&req.job_id)
     .bind(&req.worker_id)
     .bind(org_id)
     .bind(QueueServiceImpl::opt_lease_id(&req.lease_id))
     .bind(api_key_id)
-    .bind(extension_secs)
-    .execute(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await;
 
     match result {
-        Ok(res) if res.rows_affected() > 0 => {
+        Ok(Some(new_expires_at)) => {
             if let Err(e) = tx.commit().await {
                 error!(error = %e, "Failed to commit ProcessJobs lease renewal");
                 return process_error("INTERNAL", "Failed to renew lease");
@@ -2999,7 +3007,7 @@ async fn handle_process_renew(
                 )),
             }
         }
-        Ok(_) => {
+        Ok(None) => {
             let response = classify_worker_miss_process_response(
                 &mut tx,
                 &req.job_id,

@@ -224,8 +224,18 @@ fn validate_tags_size(tags: &serde_json::Value) -> Result<(), validator::Validat
     Ok(())
 }
 
+/// A queue name `POST /jobs` and `POST /jobs/claim` will accept.
+///
+/// Workflows, schedules and inbound webhooks used to store longer names (and
+/// schedules stored names with spaces). Claim then rejected the job, so it
+/// sat pending forever. Every path that inserts a job must use this.
+pub fn is_claimable_queue_name(name: &str) -> bool {
+    let len = name.chars().count();
+    (1..=100).contains(&len) && validate_queue_name_chars(name).is_ok()
+}
+
 /// Validate queue name characters
-fn validate_queue_name_chars(name: &str) -> Result<(), validator::ValidationError> {
+pub(crate) fn validate_queue_name_chars(name: &str) -> Result<(), validator::ValidationError> {
     if !name
         .chars()
         .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')

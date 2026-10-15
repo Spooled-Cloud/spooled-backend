@@ -415,7 +415,7 @@ fn validate_event_type(event_type: &str) -> Result<(), validator::ValidationErro
 #[derive(Debug, Deserialize, Validate)]
 pub struct CustomWebhookRequest {
     /// Target queue
-    #[validate(length(min = 1, max = 255, message = "Queue name must be 1-255 characters"))]
+    #[validate(length(min = 1, max = 100, message = "Queue name must be 1-100 characters"))]
     #[validate(custom(function = "validate_queue_name"))]
     pub queue_name: String,
     /// Event type

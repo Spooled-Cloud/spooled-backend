@@ -259,32 +259,52 @@ impl Scheduler {
         // Only retry jobs that haven't exceeded max_retries
         // Jobs that have exceeded max_retries should go to deadletter
 
-        // First, recover jobs that can still be retried
-        let result = sqlx::query(
+        // First, recover jobs that can still be retried. The history row is in
+        // the same statement as the deadletter half below: a timeout used to
+        // change retry_count and last_error with nothing on GET /jobs/{id}/history.
+        let recovered: i64 = sqlx::query_scalar(
             r#"
-            UPDATE jobs
-            SET 
-                status = 'pending',
-                assigned_worker_id = NULL,
-                lease_id = NULL,
-                lease_expires_at = NULL,
-                retry_count = retry_count + 1,
-                last_error = 'Lease expired (worker timeout)',
-                updated_at = NOW()
-            WHERE
-                status = 'processing'
-                -- `<=` so the expiry boundary is owned by reclaim: worker operations
-                -- require `lease_expires_at > NOW()`, so at exactly NOW() the lease is
-                -- no longer worker-usable and must be reclaimable (with `<` a lease at
-                -- the exact tick was neither usable nor reclaimable).
-                AND lease_expires_at <= NOW()
-                AND retry_count < max_retries
+            WITH recovered AS (
+                UPDATE jobs
+                SET
+                    status = 'pending',
+                    assigned_worker_id = NULL,
+                    lease_id = NULL,
+                    lease_expires_at = NULL,
+                    retry_count = retry_count + 1,
+                    last_error = 'Lease expired (worker timeout)',
+                    updated_at = NOW()
+                WHERE
+                    status = 'processing'
+                    -- `<=` so the expiry boundary is owned by reclaim: worker operations
+                    -- require `lease_expires_at > NOW()`, so at exactly NOW() the lease is
+                    -- no longer worker-usable and must be reclaimable (with `<` a lease at
+                    -- the exact tick was neither usable nor reclaimable).
+                    AND lease_expires_at <= NOW()
+                    AND retry_count < max_retries
+                RETURNING id, organization_id, retry_count
+            ),
+            history AS (
+                INSERT INTO job_history (id, job_id, event_type, details, created_at)
+                SELECT
+                    gen_random_uuid()::TEXT,
+                    id,
+                    'retry_scheduled',
+                    jsonb_build_object(
+                        'error', 'Lease expired (worker timeout)',
+                        'retry_count', retry_count,
+                        'organization_id', organization_id
+                    ),
+                    NOW()
+                FROM recovered
+            )
+            SELECT COUNT(*) FROM recovered
             "#,
         )
-        .execute(&*self.db)
+        .fetch_one(&*self.db)
         .await?;
 
-        let recovered = result.rows_affected();
+        let recovered = recovered as u64;
         if recovered > 0 {
             warn!(count = recovered, "Recovered expired leases");
             self.metrics.jobs_retried.inc_by(recovered);
@@ -573,6 +593,44 @@ impl Scheduler {
                 tx.rollback().await?;
                 continue;
             };
+
+            // Do not enqueue a queue name claim will reject (longer than 100
+            // characters, or characters POST /jobs refuses). Advance the schedule
+            // so a bad row does not stay due on every tick.
+            if !crate::models::is_claimable_queue_name(&schedule.queue_name) {
+                tx.rollback().await?;
+                warn!(
+                    schedule_id = %schedule.id,
+                    org_id = %schedule.organization_id,
+                    queue_name = %schedule.queue_name,
+                    "Cron schedule queue name is not claimable"
+                );
+                let cron = CronSchedule::parse(&schedule.cron_expression).ok();
+                let next_run = cron
+                    .as_ref()
+                    .and_then(|c| c.next_run_after_in_timezone(now, &schedule.timezone));
+                let run_id = uuid::Uuid::new_v4().to_string();
+                let _ = sqlx::query(
+                    r#"
+                    INSERT INTO schedule_runs (id, schedule_id, status, error_message, started_at, completed_at)
+                    VALUES ($1, $2, 'failed', $3, $4, $4)
+                    "#,
+                )
+                .bind(&run_id)
+                .bind(&schedule.id)
+                .bind("queue name is not claimable: use 1-100 letters, digits, '-', '_' or '.'")
+                .bind(now)
+                .execute(&*self.db)
+                .await;
+                let _ = sqlx::query(
+                    "UPDATE schedules SET next_run_at = $2, updated_at = NOW() WHERE id = $1",
+                )
+                .bind(&schedule.id)
+                .bind(next_run)
+                .execute(&*self.db)
+                .await;
+                continue;
+            }
 
             let cron = CronSchedule::parse(&schedule.cron_expression).ok();
 
@@ -940,18 +998,24 @@ impl Scheduler {
     /// This is a safety net to catch any jobs that weren't updated
     /// during parent completion (e.g., race conditions, server restarts)
     pub async fn update_job_dependencies(&self) -> Result<()> {
-        // Find jobs with dependencies_met = FALSE whose parent jobs are completed
+        // Safety net for the completion path. Set the flag from
+        // `check_job_dependencies_met`, not from `parent_job_id` alone: a child
+        // can also wait on other `job_dependencies` rows, and forcing TRUE made
+        // claim run it (and made the cancel sweep skip it) while those were open.
+        // NULL is claimable, so a child that is still blocked must become FALSE
+        // rather than be left NULL. Rows already storing the function's answer
+        // are skipped.
         // SECURITY: Include organization_id filter to ensure cross-tenant isolation
         let result = sqlx::query(
             r#"
             UPDATE jobs child
-            SET 
-                dependencies_met = TRUE,
+            SET
+                dependencies_met = check_job_dependencies_met(child.id),
                 updated_at = NOW()
-            WHERE 
+            WHERE
                 child.parent_job_id IS NOT NULL
                 AND child.status IN ('pending', 'scheduled')
-                AND (child.dependencies_met = FALSE OR child.dependencies_met IS NULL)
+                AND child.dependencies_met IS DISTINCT FROM check_job_dependencies_met(child.id)
                 AND EXISTS (
                     SELECT 1 FROM jobs parent
                     WHERE parent.id = child.parent_job_id
@@ -967,7 +1031,7 @@ impl Scheduler {
         if updated > 0 {
             info!(
                 count = updated,
-                "Unblocked child jobs with completed parent dependencies"
+                "Recomputed child dependency flags after parent completion"
             );
         }
 
@@ -1278,40 +1342,60 @@ impl Scheduler {
             warn!(count = marked_offline, "Marked stale workers as offline");
         }
 
-        // Release jobs from offline workers with retry_count increment
-        // This prevents accidental cross-tenant job release if worker IDs somehow collide
-        let result = sqlx::query(
+        // Release jobs from offline workers with retry_count increment.
+        // The organization check prevents a worker id collision from releasing
+        // another tenant's job. History is written here, same as the deadletter
+        // half of this sweep: the retry used to be invisible on the job timeline.
+        let released: i64 = sqlx::query_scalar(
             r#"
-            UPDATE jobs
-            SET 
-                status = 'pending',
-                assigned_worker_id = NULL,
-                lease_id = NULL,
-                lease_expires_at = NULL,
-                retry_count = retry_count + 1,
-                last_error = 'Worker went offline',
-                updated_at = NOW()
-            WHERE 
-                status = 'processing'
-                AND retry_count < max_retries
-                -- A live lease means someone is still renewing it: worker and
-                -- job heartbeats are separate calls, and a worker busy in a
-                -- long job may miss worker heartbeats (the PHP SDK did) while
-                -- its job heartbeats keep the lease alive. Releasing such a job
-                -- ran it twice. Expired leases are recovered elsewhere.
-                AND (lease_expires_at IS NULL OR lease_expires_at <= NOW())
-                AND EXISTS (
-                    SELECT 1 FROM workers w
-                    WHERE w.id = jobs.assigned_worker_id
-                      AND w.status = 'offline'
-                      AND w.organization_id = jobs.organization_id
-                )
+            WITH released AS (
+                UPDATE jobs
+                SET
+                    status = 'pending',
+                    assigned_worker_id = NULL,
+                    lease_id = NULL,
+                    lease_expires_at = NULL,
+                    retry_count = retry_count + 1,
+                    last_error = 'Worker went offline',
+                    updated_at = NOW()
+                WHERE
+                    status = 'processing'
+                    AND retry_count < max_retries
+                    -- A live lease means someone is still renewing it: worker and
+                    -- job heartbeats are separate calls, and a worker busy in a
+                    -- long job may miss worker heartbeats (the PHP SDK did) while
+                    -- its job heartbeats keep the lease alive. Releasing such a job
+                    -- ran it twice. Expired leases are recovered elsewhere.
+                    AND (lease_expires_at IS NULL OR lease_expires_at <= NOW())
+                    AND EXISTS (
+                        SELECT 1 FROM workers w
+                        WHERE w.id = jobs.assigned_worker_id
+                          AND w.status = 'offline'
+                          AND w.organization_id = jobs.organization_id
+                    )
+                RETURNING id, organization_id, retry_count
+            ),
+            history AS (
+                INSERT INTO job_history (id, job_id, event_type, details, created_at)
+                SELECT
+                    gen_random_uuid()::TEXT,
+                    id,
+                    'retry_scheduled',
+                    jsonb_build_object(
+                        'error', 'Worker went offline',
+                        'retry_count', retry_count,
+                        'organization_id', organization_id
+                    ),
+                    NOW()
+                FROM released
+            )
+            SELECT COUNT(*) FROM released
             "#,
         )
-        .execute(&*self.db)
+        .fetch_one(&*self.db)
         .await?;
 
-        let released = result.rows_affected();
+        let released = released as u64;
         if released > 0 {
             warn!(
                 count = released,
