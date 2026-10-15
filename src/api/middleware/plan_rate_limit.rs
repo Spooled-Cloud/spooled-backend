@@ -273,9 +273,11 @@ async fn get_org_rate_limits(state: &AppState, org_id: &str) -> Result<OrgRateLi
     })?;
 
     let limits = PlanLimits::for_tier_with_overrides(&row.0, row.1.as_ref());
+    // Do not clamp 0 to 1. A custom limit of 0 is "blocked"; check_token_bucket
+    // rejects it. Clamping here cached 1 rps for the whole TTL.
     let out = OrgRateLimits {
-        rps: limits.rate_limit_requests_per_second.max(1),
-        burst: limits.rate_limit_burst.max(1),
+        rps: limits.rate_limit_requests_per_second,
+        burst: limits.rate_limit_burst,
     };
 
     if let Some(ref cache) = state.cache {
@@ -320,39 +322,9 @@ pub async fn plan_rate_limit_middleware(
         let mut reported: Option<RateLimitHeaders> = None;
         let mut bypassed = false;
 
-        // 1) Org-level token bucket (plan rps/burst)
-        let org_key = format!("rate_limit:org:{}", ctx.organization_id);
-        match cache
-            .check_token_bucket(&org_key, org_limits.rps, org_limits.burst)
-            .await
-        {
-            Ok(result) => {
-                let headers = RateLimitHeaders::from_token_bucket(org_limits.burst, &result);
-                if !result.allowed {
-                    let retry_after_secs = result.retry_after_ms.div_ceil(1000);
-                    return rate_limit_exceeded_response(
-                        retry_after_secs,
-                        org_limits.burst,
-                        Some(headers.refused(retry_after_secs)),
-                    );
-                }
-                reported = Some(headers);
-            }
-            Err(e) => {
-                if fail_closed {
-                    warn!(
-                        error = %e,
-                        org_id = %ctx.organization_id,
-                        "Redis error during org rate limit check; denying (fail-closed)"
-                    );
-                    return rate_limit_unavailable_response(5);
-                }
-                warn!(error = %e, org_id = %ctx.organization_id, "Redis error during org rate limit check; allowing");
-                bypassed = true;
-            }
-        }
-
-        // 2) Optional per-API-key override (requests per minute)
+        // 1) Per-API-key window first. Charging the org bucket before this left
+        // a key 429 holding a token the org never got back.
+        let mut key_headers: Option<RateLimitHeaders> = None;
         if let Some(per_minute) = ctx.rate_limit {
             let key_limit = per_minute.max(1) as u32;
             let key = format!("rate_limit:api_key:{}", ctx.api_key_id);
@@ -369,10 +341,7 @@ pub async fn plan_rate_limit_middleware(
                             Some(headers.refused(retry_after_secs)),
                         );
                     }
-                    reported = Some(match reported {
-                        Some(org) => org.tighter(headers),
-                        None => headers,
-                    });
+                    key_headers = Some(headers);
                 }
                 Err(e) => {
                     if fail_closed {
@@ -390,6 +359,43 @@ pub async fn plan_rate_limit_middleware(
                     );
                     bypassed = true;
                 }
+            }
+        }
+
+        // 2) Org-level token bucket (plan rps/burst). Skipped when the key
+        // window already refused, so that refusal does not spend an org token.
+        let org_key = format!("rate_limit:org:{}", ctx.organization_id);
+        match cache
+            .check_token_bucket(&org_key, org_limits.rps, org_limits.burst)
+            .await
+        {
+            Ok(result) => {
+                let headers = RateLimitHeaders::from_token_bucket(org_limits.burst, &result);
+                if !result.allowed {
+                    let retry_after_secs = result.retry_after_ms.div_ceil(1000);
+                    return rate_limit_exceeded_response(
+                        retry_after_secs,
+                        org_limits.burst,
+                        Some(headers.refused(retry_after_secs)),
+                    );
+                }
+                // Org wins a tie, same as when the org check ran first.
+                reported = Some(match key_headers {
+                    Some(key) => headers.tighter(key),
+                    None => headers,
+                });
+            }
+            Err(e) => {
+                if fail_closed {
+                    warn!(
+                        error = %e,
+                        org_id = %ctx.organization_id,
+                        "Redis error during org rate limit check; denying (fail-closed)"
+                    );
+                    return rate_limit_unavailable_response(5);
+                }
+                warn!(error = %e, org_id = %ctx.organization_id, "Redis error during org rate limit check; allowing");
+                bypassed = true;
             }
         }
 

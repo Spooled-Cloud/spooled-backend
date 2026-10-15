@@ -420,6 +420,8 @@ pub async fn update_organization(
     }
 
     let old_plan = existing.plan_tier.clone();
+    let old_billing_email = existing.billing_email.clone();
+    let old_billing_email_verified = existing.billing_email_verified_at.is_some();
     // Stored lower-case: retention and limits compare plan_tier case-sensitively,
     // so "Pro" from this route silently got free-tier retention.
     let plan_tier = request
@@ -459,6 +461,14 @@ pub async fn update_organization(
         Some(Some(limits)) => Some(limits),
     };
 
+    // Replacing a verified billing email must drop the old email-login
+    // identity in the same transaction. A same-address re-vouch, or a write
+    // that does not touch billing_email, leaves the login alone.
+    let email_changed = billing_email_vouched
+        && old_billing_email_verified
+        && old_billing_email.as_deref().map(|e| e.to_lowercase())
+            != billing_email.as_deref().map(|e| e.to_lowercase());
+    let mut tx = state.db.pool().begin().await?;
     let mut updated: Organization = sqlx::query_as(
         r#"
         UPDATE organizations
@@ -490,8 +500,23 @@ pub async fn update_organization(
     .bind(&stripe_subscription_id)
     .bind(&id)
     .bind(billing_email_vouched)
-    .fetch_one(state.db.pool())
+    .fetch_one(&mut *tx)
     .await?;
+    let mut revoked_hashes = Vec::new();
+    if email_changed {
+        if let Some(ref old_email) = old_billing_email {
+            revoked_hashes = crate::api::handlers::email_login::revoke_email_login_identity(
+                &mut tx, &id, old_email,
+            )
+            .await?;
+        }
+    }
+    tx.commit().await?;
+    if let Some(cache) = state.cache.as_ref() {
+        for hash in &revoked_hashes {
+            crate::api::handlers::api_keys::invalidate_api_key_cache(cache, hash).await;
+        }
+    }
 
     // Best-effort: if admin sets a subscription id, reconcile immediately from Stripe so the org
     // reflects the correct plan_tier/status even if Stripe webhooks were missed (e.g. DB reset).

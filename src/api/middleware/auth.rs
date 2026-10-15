@@ -314,8 +314,11 @@ fn percent_decode(value: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Authenticate JWT token and return API key context
-async fn authenticate_jwt_token(
+/// Authenticate JWT token and return API key context.
+///
+/// Shared with `/auth/me` and `/auth/validate`, which used to accept tokens
+/// this function rejects (refresh tokens, inactive or expired keys).
+pub(crate) async fn authenticate_jwt_token(
     state: &AppState,
     token: &str,
 ) -> Result<ApiKeyContext, (StatusCode, String)> {
@@ -335,21 +338,22 @@ async fn authenticate_jwt_token(
         return Err((StatusCode::UNAUTHORIZED, "Invalid token type".to_string()));
     }
 
-    // Check if token is blacklisted (logged out)
-    if let Some(ref cache) = state.cache {
-        if crate::api::handlers::auth::is_token_revoked(
-            cache,
-            &token_data.claims.jti,
-            token_data.claims.sid.as_deref(),
-        )
-        .await
-        {
-            tracing::warn!(jti = %token_data.claims.jti, "Attempted to use revoked token");
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                "Token has been revoked".to_string(),
-            ));
-        }
+    // Redis plus revoked_sessions. Skipping the check when Redis was down used
+    // to accept every logged-out session.
+    let revoked = crate::api::handlers::auth::is_token_revoked(
+        state.cache.as_ref(),
+        state.db.pool(),
+        &token_data.claims.jti,
+        token_data.claims.sid.as_deref(),
+    )
+    .await
+    .map_err(auth_db_error)?;
+    if revoked {
+        tracing::warn!(jti = %token_data.claims.jti, "Attempted to use revoked token");
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Token has been revoked".to_string(),
+        ));
     }
 
     // Verify the API key is still active AND not expired, and read its CURRENT queue
@@ -960,19 +964,27 @@ async fn cache_api_key(
         return Ok(record);
     };
 
-    // Re-check is_active immediately before caching. The SELECT that found the
-    // record ran BEFORE the (slow) bcrypt verify, so a revoke that commits during
-    // bcrypt would otherwise be papered over by caching a stale active record for
-    // the full TTL. If the key was revoked in that window, refuse it and do not cache.
-    let still_active: Option<(bool,)> =
-        sqlx::query_as("SELECT is_active FROM api_keys WHERE id = $1")
-            .bind(&record.id)
-            .fetch_optional(pool)
-            .await
-            .map_err(auth_db_error)?;
-    if !matches!(still_active, Some((true,))) {
+    // Re-read authorization fields immediately before caching. The SELECT that
+    // found the record ran BEFORE the (slow) bcrypt verify, so a revoke or a
+    // queues/rate_limit update that commits during bcrypt would otherwise be
+    // cached for the full TTL. A cache hit trusts this record.
+    let fresh: Option<ApiKeyAuthorizationRow> = sqlx::query_as(
+        "SELECT is_active, rate_limit, expires_at, queues FROM api_keys WHERE id = $1",
+    )
+    .bind(&record.id)
+    .fetch_optional(pool)
+    .await
+    .map_err(auth_db_error)?;
+    let Some((true, rate_limit, expires_at, queues)) = fresh else {
         return Err((StatusCode::UNAUTHORIZED, "API key is inactive".to_string()));
-    }
+    };
+    let record = ApiKeyRecord {
+        queues,
+        rate_limit,
+        is_active: true,
+        expires_at,
+        ..record
+    };
 
     let _ = cache
         .set_json(

@@ -23,7 +23,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::api::middleware::limits::{
     check_job_limits_generic, check_new_queue_limit_generic, check_payload_size_generic,
-    daily_jobs_limit, queue_job_defaults, try_increment_daily_jobs, LimitCheckError,
+    daily_jobs_limit, queue_job_defaults, refund_daily_jobs, try_increment_daily_jobs,
+    LimitCheckError,
 };
 use crate::cache::RedisCache;
 use crate::config::{PlanLimits, QueueSettings, WorkerSettings};
@@ -109,9 +110,11 @@ struct OrgRateLimits {
 impl OrgRateLimits {
     fn from_plan(plan_tier: &str, custom_limits: Option<&serde_json::Value>) -> Self {
         let limits = PlanLimits::for_tier_with_overrides(plan_tier, custom_limits);
+        // 0 is a real "blocked" override. Clamping it to 1 cached a request per
+        // second under the shared org_rate_limits key (see check_token_bucket).
         Self {
-            rps: limits.rate_limit_requests_per_second.max(1),
-            burst: limits.rate_limit_burst.max(1),
+            rps: limits.rate_limit_requests_per_second,
+            burst: limits.rate_limit_burst,
         }
     }
 }
@@ -361,24 +364,7 @@ impl QueueServiceImpl {
         api_key_id: &str,
         api_key_per_minute: Option<i32>,
     ) -> Result<(), Status> {
-        let bucket_key = format!("rate_limit:grpc:org:{}", org_id);
-        match cache
-            .check_token_bucket(&bucket_key, org_limits.rps, org_limits.burst)
-            .await
-        {
-            Ok(result) if !result.allowed => {
-                return Err(Status::resource_exhausted("Rate limit exceeded"));
-            }
-            Ok(_) => {}
-            Err(e) => {
-                if self.rate_limit_fail_closed {
-                    warn!(error = %e, org_id = %org_id, "Redis error during gRPC org rate limit — denying (fail-closed)");
-                    return Err(Status::resource_exhausted("Rate limit unavailable"));
-                }
-                warn!(error = %e, org_id = %org_id, "Redis error during gRPC org rate limit — allowing (fail-open)");
-            }
-        }
-
+        // Key window first: a key 429 must not spend an org token.
         if let Some(per_min) = api_key_per_minute {
             let per_min = per_min.max(1) as u32;
             let key = format!("rate_limit:grpc:api_key:{}", api_key_id);
@@ -394,6 +380,24 @@ impl QueueServiceImpl {
                     }
                     warn!(error = %e, api_key_id = %api_key_id, "Redis error during gRPC api-key rate limit — allowing (fail-open)");
                 }
+            }
+        }
+
+        let bucket_key = format!("rate_limit:grpc:org:{}", org_id);
+        match cache
+            .check_token_bucket(&bucket_key, org_limits.rps, org_limits.burst)
+            .await
+        {
+            Ok(result) if !result.allowed => {
+                return Err(Status::resource_exhausted("Rate limit exceeded"));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                if self.rate_limit_fail_closed {
+                    warn!(error = %e, org_id = %org_id, "Redis error during gRPC org rate limit — denying (fail-closed)");
+                    return Err(Status::resource_exhausted("Rate limit unavailable"));
+                }
+                warn!(error = %e, org_id = %org_id, "Redis error during gRPC org rate limit — allowing (fail-open)");
             }
         }
 
@@ -618,6 +622,34 @@ impl QueueService for QueueServiceImpl {
                 LimitCheckError::LimitExceeded(err) => Status::resource_exhausted(err.to_string()),
             })?;
 
+        // A replay is answered before the quota check. At a full daily cap the
+        // limit check used to reject it with RESOURCE_EXHAUSTED even though the
+        // job already existed (REST looks the key up first).
+        let idempotency_key = if req.idempotency_key.is_empty() {
+            None
+        } else {
+            Some(req.idempotency_key.clone())
+        };
+        if let Some(ref key) = idempotency_key {
+            match sqlx::query_scalar::<_, String>(
+                "SELECT id FROM jobs WHERE organization_id = $1 AND idempotency_key = $2",
+            )
+            .bind(&auth.organization_id)
+            .bind(key)
+            .fetch_optional(self.pool.as_ref())
+            .await
+            {
+                Ok(Some(existing_id)) => {
+                    return Ok(Response::new(EnqueueResponse {
+                        job_id: existing_id,
+                        created: false,
+                    }));
+                }
+                Ok(None) => {}
+                Err(e) => return Err(enqueue_db_error_status(&e)),
+            }
+        }
+
         // Check job limits (daily + active) before creating
         check_job_limits_generic(self.pool.as_ref(), &auth.organization_id, 1)
             .await
@@ -680,6 +712,32 @@ impl QueueService for QueueServiceImpl {
             "pending"
         };
 
+        // Reserve the daily quota BEFORE inserting. Charging after the insert
+        // left a pending row that a worker could claim until a best-effort
+        // DELETE, and a replay at the cap was RESOURCE_EXHAUSTED. Refund when
+        // the insert fails or the row already existed.
+        let daily_limit = daily_jobs_limit(self.pool.as_ref(), &auth.organization_id)
+            .await
+            .unwrap_or(-1);
+        let quota_reserved = match try_increment_daily_jobs(
+            self.pool.as_ref(),
+            &auth.organization_id,
+            1,
+            daily_limit,
+        )
+        .await
+        {
+            Ok(count) if count >= 0 => true,
+            Ok(_) => {
+                return Err(Status::resource_exhausted("Daily job limit reached"));
+            }
+            Err(e) => {
+                // Counter DB error: accept the job uncounted (best-effort, as before).
+                tracing::warn!(error = %e, org_id = %auth.organization_id, "Failed to increment daily job counter");
+                false
+            }
+        };
+
         // Insert job with idempotency support
         let result = sqlx::query(
             r#"
@@ -706,16 +764,25 @@ impl QueueService for QueueServiceImpl {
         .bind(max_retries)
         .bind(timeout_seconds)
         .bind(scheduled_at)
-        .bind(if req.idempotency_key.is_empty() {
-            None
-        } else {
-            Some(&req.idempotency_key)
-        })
+        .bind(&idempotency_key)
         .bind(&tags_json)
         .bind(now)
         .fetch_one(self.pool.as_ref())
-        .await
-        .map_err(|e| enqueue_db_error_status(&e))?;
+        .await;
+
+        let result = match result {
+            Ok(row) => row,
+            Err(e) => {
+                if quota_reserved {
+                    if let Err(refund) =
+                        refund_daily_jobs(self.pool.as_ref(), &auth.organization_id, 1).await
+                    {
+                        tracing::warn!(error = %refund, org_id = %auth.organization_id, "Failed to refund an unused daily job reservation");
+                    }
+                }
+                return Err(enqueue_db_error_status(&e));
+            }
+        };
 
         use sqlx::Row;
         let returned_id: String = result.get("id");
@@ -723,34 +790,12 @@ impl QueueService for QueueServiceImpl {
 
         // Update metrics and usage counters
         if created {
-            // Atomically enforce + increment the daily quota, closing the check-then-
-            // increment race the generic pre-check above leaves open (mirrors the REST
-            // enqueue path). If over the cap, remove the job we just created and reject.
-            // The enqueued metric is only bumped for jobs that are kept, so an over-cap
-            // rejection doesn't inflate it.
-            let limit = daily_jobs_limit(self.pool.as_ref(), &auth.organization_id)
-                .await
-                .unwrap_or(-1);
-            match try_increment_daily_jobs(self.pool.as_ref(), &auth.organization_id, 1, limit)
-                .await
+            self.metrics.jobs_enqueued.inc();
+        } else if quota_reserved {
+            if let Err(refund) =
+                refund_daily_jobs(self.pool.as_ref(), &auth.organization_id, 1).await
             {
-                Ok(count) if count >= 0 => {
-                    self.metrics.jobs_enqueued.inc();
-                }
-                Ok(_) => {
-                    let _ = sqlx::query("DELETE FROM jobs WHERE id = $1 AND organization_id = $2")
-                        .bind(&returned_id)
-                        .bind(&auth.organization_id)
-                        .execute(self.pool.as_ref())
-                        .await;
-                    return Err(Status::resource_exhausted("Daily job limit reached"));
-                }
-                Err(e) => {
-                    // Counter DB error: keep the job (best-effort) rather than failing an
-                    // accepted enqueue, and still count it as enqueued.
-                    self.metrics.jobs_enqueued.inc();
-                    tracing::warn!(error = %e, org_id = %auth.organization_id, "Failed to increment daily job counter");
-                }
+                tracing::warn!(error = %refund, org_id = %auth.organization_id, "Failed to refund an unused daily job reservation");
             }
         }
 

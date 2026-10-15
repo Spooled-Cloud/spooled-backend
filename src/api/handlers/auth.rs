@@ -58,20 +58,54 @@ pub fn session_revocation_key(sid: &str) -> String {
 
 /// Whether a token was revoked by logout — the token itself (its `jti`) or the
 /// login session it belongs to (its `sid`).
+///
+/// `revoked_sessions` is the source of truth for sessions; Redis is a cache of
+/// it plus the `jti` blacklist. A missing Redis key is not enough —
+/// allkeys-lru can evict `session_revoked:{sid}` while the refresh token is
+/// still inside its exp — so a session id is always checked in Postgres.
+///
+/// A Redis error falls back to Postgres for tokens with a session id (logout
+/// revokes the whole session there). Sid-less tokens have only the Redis
+/// blacklist, so a Redis error fails closed for them. A Postgres error is
+/// returned to the caller as unavailable: reporting it as "revoked" would log
+/// every dashboard user out on a database blip.
 pub async fn is_token_revoked(
-    cache: &crate::cache::RedisCache,
+    cache: Option<&crate::cache::RedisCache>,
+    pool: &sqlx::PgPool,
     jti: &str,
     sid: Option<&str>,
-) -> bool {
-    if let Ok(Some(_)) = cache.get(&format!("token_blacklist:{}", jti)).await {
-        return true;
-    }
-    if let Some(sid) = sid {
-        if let Ok(Some(_)) = cache.get(&session_revocation_key(sid)).await {
-            return true;
+) -> Result<bool, sqlx::Error> {
+    if let Some(cache) = cache {
+        let mut keys = vec![format!("token_blacklist:{}", jti)];
+        if let Some(sid) = sid {
+            keys.push(session_revocation_key(sid));
+        }
+        for key in &keys {
+            match cache.get(key).await {
+                Ok(Some(_)) => return Ok(true),
+                Ok(None) => {}
+                Err(e) if sid.is_some() => {
+                    warn!(error = %e, "Token revocation lookup failed in Redis; checking Postgres");
+                    break;
+                }
+                Err(e) => {
+                    warn!(error = %e, "Token blacklist lookup failed; treating the sid-less token as revoked");
+                    return Ok(true);
+                }
+            }
         }
     }
-    false
+
+    let Some(sid) = sid else {
+        return Ok(false);
+    };
+    let revoked = sqlx::query_scalar::<_, i32>(
+        "SELECT 1 FROM revoked_sessions WHERE sid = $1 AND expires_at > NOW()",
+    )
+    .bind(sid)
+    .fetch_optional(pool)
+    .await?;
+    Ok(revoked.is_some())
 }
 
 /// Login request
@@ -394,21 +428,28 @@ pub async fn refresh_token(
         ));
     }
 
-    // Check if the token or its login session was revoked (in Redis)
-    if let Some(ref cache) = state.cache {
-        if is_token_revoked(
-            cache,
-            &token_data.claims.jti,
-            token_data.claims.sid.as_deref(),
+    // Redis plus the durable revoked_sessions row. A Redis miss is not "still
+    // logged in": the session key may have been evicted.
+    let revoked = is_token_revoked(
+        state.cache.as_ref(),
+        state.db.pool(),
+        &token_data.claims.jti,
+        token_data.claims.sid.as_deref(),
+    )
+    .await
+    .map_err(|e| {
+        error!(error = %e, "Failed to check session revocation on refresh");
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse::unavailable()),
         )
-        .await
-        {
-            warn!(jti = %token_data.claims.jti, "Attempted to use revoked refresh token");
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                Json(ErrorResponse::unauthorized()),
-            ));
-        }
+    })?;
+    if revoked {
+        warn!(jti = %token_data.claims.jti, "Attempted to use revoked refresh token");
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse::unauthorized()),
+        ));
     }
 
     // Verify API key is still active before refreshing
@@ -566,81 +607,121 @@ pub async fn logout(
         )
     })?;
 
-    // Logout without a working blacklist is a lie to the client: the tokens
-    // would remain fully usable. Fail loudly instead of pretending.
-    let Some(ref cache) = state.cache else {
-        error!(org_id = %context.organization_id, "Logout requested but Redis is unavailable; tokens cannot be invalidated");
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse::internal()),
-        ));
-    };
-
-    // Blacklist the access token
-    let blacklist_key = format!("token_blacklist:{}", token_data.claims.jti);
-    let ttl = (token_data.claims.exp - Utc::now().timestamp()).max(1) as u64;
-    cache.set(&blacklist_key, "1", ttl).await.map_err(|e| {
-        error!(error = %e, "Failed to blacklist access token on logout");
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse::internal()),
-        )
-    })?;
-
-    // Revoke the whole login session: the refresh token minted with this access
-    // token (and any access token refreshed from it) shares its `sid`, so the
-    // session ends even when the client does not send its refresh token. The TTL
-    // covers the longest-lived token of a session (the refresh token).
-    if let Some(ref sid) = token_data.claims.sid {
+    // Durable session revocation first. Redis is only a cache of this row:
+    // eviction or a later Redis outage must not resurrect the refresh token.
+    // Sid-less tokens (issued before sessions) still depend on the Redis jti
+    // blacklist, so a Redis failure for those stays a 503.
+    let sid = token_data.claims.sid.clone();
+    if let Some(ref sid) = sid {
         let session_ttl = state
             .settings
             .jwt
             .expiration_hours
             .saturating_mul(24 * 3600)
             .max(1);
-        cache
-            .set(&session_revocation_key(sid), "1", session_ttl)
+        let expires_at = Utc::now() + Duration::seconds(session_ttl as i64);
+        if let Err(e) = sqlx::query("DELETE FROM revoked_sessions WHERE expires_at <= NOW()")
+            .execute(state.db.pool())
             .await
-            .map_err(|e| {
-                error!(error = %e, "Failed to revoke login session on logout");
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(ErrorResponse::internal()),
-                )
-            })?;
+        {
+            warn!(error = %e, "Failed to prune revoked_sessions");
+        }
+        if let Err(e) = sqlx::query(
+            "INSERT INTO revoked_sessions (sid, expires_at) VALUES ($1, $2) \
+             ON CONFLICT (sid) DO UPDATE SET expires_at = EXCLUDED.expires_at",
+        )
+        .bind(sid)
+        .bind(expires_at)
+        .execute(state.db.pool())
+        .await
+        {
+            error!(error = %e, "Failed to persist session revocation on logout");
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse::internal()),
+            ));
+        }
     }
 
-    // Soft-parse optional body so empty JSON + Content-Type still logs out.
-    // Blacklist the refresh token as well when the client supplies it —
-    // otherwise the session survives logout via /auth/refresh.
-    let logout_body: Option<LogoutRequest> = if body.is_empty() {
-        None
-    } else {
-        serde_json::from_slice(&body).ok()
+    let unavailable = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorResponse::internal()),
+    );
+    // Redis records are best-effort once the session row is durable. Without a
+    // sid, they are the only revocation, so a Redis failure is still a 503.
+    let Some(ref cache) = state.cache else {
+        if sid.is_some() {
+            info!(org_id = %context.organization_id, "User logged out");
+            return Ok(StatusCode::NO_CONTENT);
+        }
+        error!(org_id = %context.organization_id, "Logout requested but Redis is unavailable; tokens cannot be invalidated");
+        return Err(unavailable);
     };
-    if let Some(LogoutRequest {
-        refresh_token: Some(refresh_token),
-    }) = logout_body
-    {
-        match decode::<Claims>(
-            &refresh_token,
-            &DecodingKey::from_secret(state.settings.jwt.secret.as_bytes()),
-            &Validation::default(),
-        ) {
-            Ok(refresh_data) if refresh_data.claims.token_type == "refresh" => {
-                let key = format!("token_blacklist:{}", refresh_data.claims.jti);
-                let ttl = (refresh_data.claims.exp - Utc::now().timestamp()).max(1) as u64;
-                cache.set(&key, "1", ttl).await.map_err(|e| {
-                    error!(error = %e, "Failed to blacklist refresh token on logout");
-                    (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(ErrorResponse::internal()),
-                    )
-                })?;
+    let redis_result = {
+        let blacklist_key = format!("token_blacklist:{}", token_data.claims.jti);
+        let ttl = (token_data.claims.exp - Utc::now().timestamp()).max(1) as u64;
+        let access_blacklisted = cache.set(&blacklist_key, "1", ttl).await;
+        let session_cached = if access_blacklisted.is_ok() {
+            if let Some(ref sid) = sid {
+                let session_ttl = state
+                    .settings
+                    .jwt
+                    .expiration_hours
+                    .saturating_mul(24 * 3600)
+                    .max(1);
+                cache
+                    .set(&session_revocation_key(sid), "1", session_ttl)
+                    .await
+            } else {
+                Ok(())
             }
-            _ => {
-                warn!(org_id = %context.organization_id, "Ignoring invalid refresh token supplied to logout");
+        } else {
+            access_blacklisted
+        };
+
+        // Soft-parse optional body so empty JSON + Content-Type still logs out.
+        // Blacklist the refresh token as well when the client supplies it.
+        let logout_body: Option<LogoutRequest> = if body.is_empty() {
+            None
+        } else {
+            serde_json::from_slice(&body).ok()
+        };
+        let refresh_blacklisted = if session_cached.is_ok() {
+            if let Some(LogoutRequest {
+                refresh_token: Some(refresh_token),
+            }) = logout_body
+            {
+                match decode::<Claims>(
+                    &refresh_token,
+                    &DecodingKey::from_secret(state.settings.jwt.secret.as_bytes()),
+                    &Validation::default(),
+                ) {
+                    Ok(refresh_data) if refresh_data.claims.token_type == "refresh" => {
+                        let key = format!("token_blacklist:{}", refresh_data.claims.jti);
+                        let ttl = (refresh_data.claims.exp - Utc::now().timestamp()).max(1) as u64;
+                        cache.set(&key, "1", ttl).await
+                    }
+                    _ => {
+                        warn!(org_id = %context.organization_id, "Ignoring invalid refresh token supplied to logout");
+                        Ok(())
+                    }
+                }
+            } else {
+                Ok(())
             }
+        } else {
+            session_cached
+        };
+        refresh_blacklisted
+    };
+
+    if let Err(e) = redis_result {
+        if sid.is_some() {
+            // The session row covers the refresh token. Redis can catch up.
+            warn!(error = %e, org_id = %context.organization_id, "Redis revocation failed after the session was revoked in the database");
+        } else {
+            error!(error = %e, "Failed to revoke token in Redis on logout");
+            return Err(unavailable);
         }
     }
 
@@ -673,6 +754,20 @@ pub async fn me(
         Json(ErrorResponse::unauthorized()),
     ))?;
 
+    // Same checks as every other authenticated route: access token, revocation,
+    // key active and unexpired, org not deleted. /auth/me used to skip key
+    // expiry, so an expired key's unexpired JWT still returned the org.
+    let ctx = crate::api::middleware::auth::authenticate_jwt_token(&state, token)
+        .await
+        .map_err(|(status, _message)| {
+            let body = match status {
+                StatusCode::SERVICE_UNAVAILABLE => ErrorResponse::unavailable(),
+                StatusCode::INTERNAL_SERVER_ERROR => ErrorResponse::internal(),
+                _ => ErrorResponse::unauthorized(),
+            };
+            (status, Json(body))
+        })?;
+
     let token_data: TokenData<Claims> = decode(
         token,
         &DecodingKey::from_secret(state.settings.jwt.secret.as_bytes()),
@@ -685,62 +780,11 @@ pub async fn me(
         )
     })?;
 
-    // Only access tokens may call /auth/me — same token-type separation the
-    // auth middleware enforces everywhere else; refresh tokens are for
-    // /auth/refresh only.
-    if token_data.claims.token_type != "access" {
-        warn!(jti = %token_data.claims.jti, "Non-access token used on /auth/me");
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(ErrorResponse::unauthorized()),
-        ));
-    }
-
-    // Check if token is blacklisted (logged out)
-    if let Some(ref cache) = state.cache {
-        if is_token_revoked(
-            cache,
-            &token_data.claims.jti,
-            token_data.claims.sid.as_deref(),
-        )
-        .await
-        {
-            warn!(jti = %token_data.claims.jti, "Attempted to use revoked token on /me");
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                Json(ErrorResponse::unauthorized()),
-            ));
-        }
-    }
-
-    // The JWT outlives the API key it was minted from: if that key has since been
-    // revoked or deleted, the token must stop working here too (the auth middleware
-    // enforces is_active on every other request; /auth/me did not).
-    let key_active: Option<(bool,)> =
-        sqlx::query_as("SELECT is_active FROM api_keys WHERE id = $1")
-            .bind(&token_data.claims.api_key_id)
-            .fetch_optional(state.db.pool())
-            .await
-            .map_err(|e| {
-                error!(error = %e, "Failed to check API key status for /auth/me");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse::internal()),
-                )
-            })?;
-    if !matches!(key_active, Some((true,))) {
-        warn!(api_key_id = %token_data.claims.api_key_id, "Revoked or missing API key used on /auth/me");
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(ErrorResponse::unauthorized()),
-        ));
-    }
-
     // Fetch organization details
     let org_info: Option<(String, String, String, String, Option<String>)> = sqlx::query_as(
         "SELECT id, name, slug, plan_tier, billing_email FROM organizations WHERE id = $1",
     )
-    .bind(&token_data.claims.org_id)
+    .bind(&ctx.organization_id)
     .fetch_optional(state.db.pool())
     .await
     .map_err(|e| {
@@ -763,9 +807,9 @@ pub async fn me(
         );
 
     Ok(Json(CurrentUserResponse {
-        organization_id: token_data.claims.org_id,
-        api_key_id: token_data.claims.api_key_id,
-        queues: token_data.claims.queues,
+        organization_id: ctx.organization_id,
+        api_key_id: ctx.api_key_id,
+        queues: ctx.queues,
         issued_at: chrono::DateTime::from_timestamp(token_data.claims.iat, 0)
             .unwrap_or_else(Utc::now),
         expires_at: chrono::DateTime::from_timestamp(token_data.claims.exp, 0)
@@ -781,46 +825,42 @@ pub async fn validate_token(
     State(state): State<AppState>,
     Json(body): Json<ValidateTokenRequest>,
 ) -> Result<Json<ValidateTokenResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let result = decode::<Claims>(
-        &body.token,
-        &DecodingKey::from_secret(state.settings.jwt.secret.as_bytes()),
-        &Validation::default(),
-    );
-
-    match result {
-        Ok(token_data) => {
-            // Check blacklist
-            if let Some(ref cache) = state.cache {
-                if is_token_revoked(
-                    cache,
-                    &token_data.claims.jti,
-                    token_data.claims.sid.as_deref(),
+    // Same acceptance rule as the auth middleware. A signature-only check used
+    // to report valid:true for refresh tokens, revoked keys, and expired keys.
+    // 500/503 stay errors: reporting them as valid:false would log the user out.
+    match crate::api::middleware::auth::authenticate_jwt_token(&state, &body.token).await {
+        Ok(_) => {
+            let token_data = decode::<Claims>(
+                &body.token,
+                &DecodingKey::from_secret(state.settings.jwt.secret.as_bytes()),
+                &Validation::default(),
+            )
+            .map_err(|_| {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(ErrorResponse::unauthorized()),
                 )
-                .await
-                {
-                    return Ok(Json(ValidateTokenResponse {
-                        valid: false,
-                        error: Some("Token has been revoked".to_string()),
-                        claims: None,
-                    }));
-                }
-            }
-
+            })?;
             Ok(Json(ValidateTokenResponse {
                 valid: true,
                 error: None,
                 claims: Some(token_data.claims),
             }))
         }
-        // Don't expose JWT error details (could reveal algorithm/secret info)
-        Err(e) => {
-            // Log the actual error for debugging
-            tracing::debug!(error = %e, "Token validation failed");
+        Err((status, message)) if status == StatusCode::UNAUTHORIZED => {
             Ok(Json(ValidateTokenResponse {
                 valid: false,
-                error: Some("Invalid token".to_string()), // Generic error
+                error: Some(message),
                 claims: None,
             }))
+        }
+        Err((status, _)) => {
+            let body = if status == StatusCode::SERVICE_UNAVAILABLE {
+                ErrorResponse::unavailable()
+            } else {
+                ErrorResponse::internal()
+            };
+            Err((status, Json(body)))
         }
     }
 }

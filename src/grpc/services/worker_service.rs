@@ -127,14 +127,34 @@ impl WorkerServiceImpl {
 
                 let limits =
                     PlanLimits::for_tier_with_overrides(&plan_tier, custom_limits.as_ref());
+                // 0 stays 0: a blocked override must not be cached as 1 rps.
                 let v = OrgRateLimits {
-                    rps: limits.rate_limit_requests_per_second.max(1),
-                    burst: limits.rate_limit_burst.max(1),
+                    rps: limits.rate_limit_requests_per_second,
+                    burst: limits.rate_limit_burst,
                 };
                 let _ = cache.set_json(&cache_key, &v, 60).await;
                 v
             }
         };
+
+        // Key window first: a key 429 must not spend an org token.
+        if let Some(per_min) = api_key_per_minute {
+            let per_min = per_min.max(1) as u32;
+            let key = format!("rate_limit:grpc:api_key:{}", api_key_id);
+            match cache.check_rate_limit(&key, per_min, 60).await {
+                Ok(rl) if !rl.allowed => {
+                    return Err(Status::resource_exhausted("Rate limit exceeded"));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    if self.rate_limit_fail_closed {
+                        warn!(error = %e, api_key_id = %api_key_id, "Redis error during gRPC api-key rate limit — denying (fail-closed)");
+                        return Err(Status::resource_exhausted("Rate limit unavailable"));
+                    }
+                    warn!(error = %e, api_key_id = %api_key_id, "Redis error during gRPC api-key rate limit — allowing (fail-open)");
+                }
+            }
+        }
 
         let bucket_key = format!("rate_limit:grpc:org:{}", org_id);
         match cache
@@ -151,24 +171,6 @@ impl WorkerServiceImpl {
                     return Err(Status::resource_exhausted("Rate limit unavailable"));
                 }
                 warn!(error = %e, org_id = %org_id, "Redis error during gRPC org rate limit — allowing (fail-open)");
-            }
-        }
-
-        if let Some(per_min) = api_key_per_minute {
-            let per_min = per_min.max(1) as u32;
-            let key = format!("rate_limit:grpc:api_key:{}", api_key_id);
-            match cache.check_rate_limit(&key, per_min, 60).await {
-                Ok(rl) if !rl.allowed => {
-                    return Err(Status::resource_exhausted("Rate limit exceeded"));
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    if self.rate_limit_fail_closed {
-                        warn!(error = %e, api_key_id = %api_key_id, "Redis error during gRPC api-key rate limit — denying (fail-closed)");
-                        return Err(Status::resource_exhausted("Rate limit unavailable"));
-                    }
-                    warn!(error = %e, api_key_id = %api_key_id, "Redis error during gRPC api-key rate limit — allowing (fail-open)");
-                }
             }
         }
 

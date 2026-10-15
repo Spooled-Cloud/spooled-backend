@@ -319,7 +319,7 @@ pub async fn revoke(
 /// Now computes the specific cache key using the same hash function as auth middleware.
 ///
 /// No longer logs the key_hash (even partial) to prevent exposure in logs.
-async fn invalidate_api_key_cache(cache: &crate::cache::RedisCache, key_hash: &str) {
+pub(crate) async fn invalidate_api_key_cache(cache: &crate::cache::RedisCache, key_hash: &str) {
     // Use targeted deletion based on the hash-derived lookup key
     // The auth middleware uses SHA256 hash of the raw key for cache lookup,
     // but we only have the bcrypt hash stored. Since we can't reverse the bcrypt hash,

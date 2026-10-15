@@ -740,28 +740,29 @@ pub async fn verify(
     // Check if organization exists
     match org_id {
         Some(existing_org_id) => {
-            // Soft-deleted orgs must not be revived via a pre-delete login code.
-            // `start()` refuses new codes for deleted orgs, but a code issued before
-            // soft-delete still carries organization_id; without this check,
-            // get_or_create_email_api_key would mint a fresh active key and restore access.
-            let org_tier: Option<(String,)> =
-                sqlx::query_as("SELECT plan_tier FROM organizations WHERE id = $1")
-                    .bind(&existing_org_id)
-                    .fetch_optional(state.db.pool())
-                    .await?;
-            match org_tier.as_ref().map(|(t,)| t.as_str()) {
-                Some("deleted") | None => {
-                    warn!(
-                        email = %mask_email(&email),
-                        org_id = %existing_org_id,
-                        "Rejecting email verify for missing or soft-deleted organization"
-                    );
-                    return Err(AppError::Authentication(
-                        "Invalid or expired code. Please request a new one.".to_string(),
-                    )
-                    .into());
-                }
-                Some(_) => {}
+            // The code's organization_id is not enough. Confirming or replacing
+            // the billing email used to leave the old code working for its
+            // remaining lifetime, and the system key it logged into stayed
+            // active. Accept the org only while this address is still its
+            // verified billing email. A soft-deleted org fails the same query.
+            let org_login: Option<(Option<String>, Option<chrono::DateTime<Utc>>)> =
+                sqlx::query_as(
+                    "SELECT lower(billing_email), billing_email_verified_at \
+                     FROM organizations WHERE id = $1 AND plan_tier <> 'deleted'",
+                )
+                .bind(&existing_org_id)
+                .fetch_optional(state.db.pool())
+                .await?;
+            if !matches!(org_login, Some((Some(ref stored), Some(_))) if stored == &email) {
+                warn!(
+                    email = %mask_email(&email),
+                    org_id = %existing_org_id,
+                    "Rejecting email verify for an organization that no longer uses this address"
+                );
+                return Err(AppError::Authentication(
+                    "Invalid or expired code. Please request a new one.".to_string(),
+                )
+                .into());
             }
 
             // Existing user - return login tokens
@@ -1956,7 +1957,15 @@ pub async fn verify_billing_email(
     // Only verify the address the code was sent to: if the email changed in the
     // meantime, nothing is updated and the caller has to start over. A verified
     // pending change replaces the old billing email, which stops being an
-    // email-login identity only now.
+    // email-login identity only now. The update and the revoke share a
+    // transaction so a failed revoke does not leave the new address in place
+    // with the old login still working.
+    let mut tx = state.db.pool().begin().await?;
+    let previous: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT billing_email FROM organizations WHERE id = $1")
+            .bind(&ctx.organization_id)
+            .fetch_optional(&mut *tx)
+            .await?;
     let updated = sqlx::query(
         "UPDATE organizations \
          SET billing_email = $2, billing_email_verified_at = NOW(), \
@@ -1969,14 +1978,61 @@ pub async fn verify_billing_email(
     )
     .bind(&ctx.organization_id)
     .bind(&email)
-    .execute(state.db.pool())
+    .execute(&mut *tx)
     .await?;
     if updated.rows_affected() == 0 {
         return Err(invalid());
     }
+    let mut revoked_hashes = Vec::new();
+    if let Some((Some(old),)) = previous {
+        if old.to_lowercase() != email {
+            revoked_hashes =
+                revoke_email_login_identity(&mut tx, &ctx.organization_id, &old).await?;
+        }
+    }
+    tx.commit().await?;
+    if let Some(cache) = state.cache.as_ref() {
+        for hash in &revoked_hashes {
+            crate::api::handlers::api_keys::invalidate_api_key_cache(cache, hash).await;
+        }
+    }
 
     info!(org_id = %ctx.organization_id, email = %mask_email(&email), "Billing email verified");
     Ok(verified_response())
+}
+
+/// Burn unused login codes for `old_email` and deactivate the email-login
+/// system key. Called in the same transaction as the billing-email change:
+/// the next login creates a new system key, and a code issued for the old
+/// address can no longer mint a session. Returns the deactivated key hashes
+/// so the caller can drop them from the auth cache after commit.
+pub(crate) async fn revoke_email_login_identity(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    org_id: &str,
+    old_email: &str,
+) -> AppResult<Vec<String>> {
+    sqlx::query(
+        "UPDATE email_login_codes SET used_at = NOW() \
+         WHERE organization_id = $1 \
+           AND lower(email) = lower($2) \
+           AND used_at IS NULL \
+           AND code NOT LIKE 'verify:%' \
+           AND code NOT LIKE 'signup:%'",
+    )
+    .bind(org_id)
+    .bind(old_email)
+    .execute(&mut **tx)
+    .await?;
+
+    let hashes: Vec<(String,)> = sqlx::query_as(
+        "UPDATE api_keys SET is_active = FALSE \
+         WHERE organization_id = $1 AND is_system AND is_active \
+         RETURNING key_hash",
+    )
+    .bind(org_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(hashes.into_iter().map(|(hash,)| hash).collect())
 }
 
 /// Mask email for privacy in logs and responses

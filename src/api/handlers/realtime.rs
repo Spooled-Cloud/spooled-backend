@@ -627,14 +627,27 @@ impl StreamAuth {
         queue_scope_allows(&self.scope, queue)
     }
 
-    /// The deadline and the session (Redis only, no database).
+    /// The deadline and the session. Redis is a cache of `revoked_sessions`;
+    /// a missing Redis key still has to be checked in Postgres.
     async fn check_session(&self, state: &AppState) -> Result<(), StreamEnd> {
         if Instant::now() >= self.deadline {
             return Err(self.deadline_reason);
         }
-        if let (Some(cache), Some(jti)) = (state.cache.as_ref(), self.session.jti.as_deref()) {
-            if is_token_revoked(cache, jti, self.session.sid.as_deref()).await {
-                return Err(StreamEnd::Revoked);
+        if self.session.jti.is_some() || self.session.sid.is_some() {
+            let jti = self.session.jti.as_deref().unwrap_or("");
+            // A database error is not a revocation: keep the stream and check
+            // again on the next turn.
+            match is_token_revoked(
+                state.cache.as_ref(),
+                state.db.pool(),
+                jti,
+                self.session.sid.as_deref(),
+            )
+            .await
+            {
+                Ok(true) => return Err(StreamEnd::Revoked),
+                Ok(false) => {}
+                Err(e) => warn!(error = %e, "Stream session revocation check failed"),
             }
         }
         Ok(())

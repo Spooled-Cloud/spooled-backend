@@ -681,7 +681,17 @@ impl RedisCache {
         refill_rate_per_sec: u32,
         capacity: u32,
     ) -> Result<TokenBucketResult> {
-        // Avoid division by zero; treat 0 as "blocked"
+        // A 0 override means "blocked". Clamping it to 1 let a zero rps/burst
+        // plan still accept one request per second. Reject before the script;
+        // the `.max(1)` below is only a divisor guard for the Lua rate.
+        if refill_rate_per_sec == 0 || capacity == 0 {
+            return Ok(TokenBucketResult {
+                allowed: false,
+                remaining: 0,
+                retry_after_ms: 60_000,
+                next_token_ms: 60_000,
+            });
+        }
         let refill_rate_per_sec = refill_rate_per_sec.max(1);
         let capacity = capacity.max(1);
 

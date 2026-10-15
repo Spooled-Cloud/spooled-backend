@@ -665,15 +665,7 @@ pub async fn webhook(
             handle_checkout_completed(&state, &event).await
         }
         "checkout.session.async_payment_failed" => {
-            let session = &event.data.object;
-            warn!(
-                event_id = %event.id,
-                session_id = ?session["id"].as_str(),
-                customer_id = ?session["customer"].as_str(),
-                subscription_id = ?session["subscription"].as_str(),
-                "Checkout payment failed; organization not linked"
-            );
-            Ok(())
+            handle_async_payment_failed(&state, &event).await
         }
         "customer.subscription.created" | "customer.subscription.updated" => {
             handle_subscription_updated(&state, &event).await
@@ -993,6 +985,9 @@ async fn cancel_superseded_subscriptions(state: &AppState, org_id: &str) -> AppR
     .fetch_optional(state.db.pool())
     .await?;
     let Some((superseded, current)) = row else {
+        // The organization was deleted. Delete already canceled this list
+        // (see `cancel_subscription_before_org_delete`), so a checkout retry
+        // has nothing left to cancel and must ACK rather than retry for days.
         return Ok(());
     };
 
@@ -1064,11 +1059,24 @@ async fn handle_subscription_updated(state: &AppState, event: &StripeEvent) -> A
             r#"
             UPDATE organizations
             SET
-                stripe_subscription_id = $1,
+                -- A terminal status must not write the id back. subscription.deleted
+                -- nulls it; a same-second subscription.updated (status=canceled)
+                -- used to match the NULL id and restore it, and the site treats
+                -- any id as a live subscription.
+                stripe_subscription_id = CASE
+                    WHEN $2 IN ('canceled', 'cancelled', 'unpaid', 'incomplete_expired') THEN NULL
+                    ELSE $1
+                END,
                 stripe_subscription_status = $2,
                 stripe_current_period_end = $3,
                 stripe_cancel_at_period_end = $4,
-                plan_tier = COALESCE($5, plan_tier),
+                -- `incomplete` has not been paid. Mapping the price here granted
+                -- the paid tier before checkout succeeded. Keep the current tier
+                -- (a canceled org stays free; past_due grace keeps its tier).
+                plan_tier = CASE
+                    WHEN $2 = 'incomplete' THEN plan_tier
+                    ELSE COALESCE($5, plan_tier)
+                END,
                 stripe_last_event_at = $7,
                 updated_at = NOW()
             WHERE stripe_customer_id = $6
@@ -1081,10 +1089,19 @@ async fn handle_subscription_updated(state: &AppState, event: &StripeEvent) -> A
               -- checkout.session.completed it would hide the subscription that
               -- checkout has to cancel, and afterwards an update of the
               -- canceled one would switch the org back to it.
-              AND (stripe_subscription_id IS NULL
-                   OR stripe_subscription_id = $1
-                   OR COALESCE(stripe_subscription_status, '')
-                      IN ('canceled', 'cancelled', 'incomplete_expired', 'unpaid'))
+              -- A terminal event matches only the subscription the org is on.
+              -- Matching a NULL id let the canceled update above resurrect it.
+              AND (
+                    stripe_subscription_id = $1
+                    OR (
+                        $2 NOT IN ('canceled', 'cancelled', 'unpaid', 'incomplete_expired')
+                        AND (
+                            stripe_subscription_id IS NULL
+                            OR COALESCE(stripe_subscription_status, '')
+                               IN ('canceled', 'cancelled', 'incomplete_expired', 'unpaid')
+                        )
+                    )
+                  )
             RETURNING id
             "#,
         )
@@ -1310,53 +1327,141 @@ async fn stripe_subscription_has_ended(stripe_secret: &str, subscription_id: &st
     )
 }
 
-/// Cancel the organization's Stripe subscription before the organization is
+/// Cancel the organization's Stripe subscriptions before the organization is
 /// deleted.
 ///
 /// Deleting an org used to leave its subscription running, so the customer
-/// kept being charged for an organization that no longer existed. Callers must
-/// abort the delete when this returns an error.
+/// kept being charged for an organization that no longer existed. A checkout
+/// that replaced a subscription records the old id in
+/// `stripe_superseded_subscription_ids` (not on [`crate::models::Organization`]).
+/// Canceling only the current id left that replaced subscription billing, and
+/// the checkout webhook then ACKed because the row was already gone. Callers
+/// must abort the delete when this returns an error.
 pub(crate) async fn cancel_subscription_before_org_delete(
     state: &AppState,
     org: &crate::models::Organization,
 ) -> AppResult<()> {
-    let Some(subscription_id) = org.stripe_subscription_id.as_deref() else {
-        return Ok(());
-    };
+    let superseded: Vec<String> = sqlx::query_as(
+        "SELECT stripe_superseded_subscription_ids FROM organizations WHERE id = $1",
+    )
+    .bind(&org.id)
+    .fetch_optional(state.db.pool())
+    .await?
+    .map(|(ids,): (Vec<String>,)| ids)
+    .unwrap_or_default();
+
+    let current = org.stripe_subscription_id.as_deref();
     let status = org.stripe_subscription_status.as_deref().unwrap_or("");
-    if matches!(status, "canceled" | "cancelled" | "incomplete_expired") {
+    let current_already_ended = matches!(status, "canceled" | "cancelled" | "incomplete_expired");
+
+    let mut to_cancel: Vec<&str> = Vec::new();
+    if let Some(subscription_id) = current {
+        if !current_already_ended {
+            to_cancel.push(subscription_id);
+        }
+    }
+    for id in &superseded {
+        if current != Some(id.as_str()) {
+            to_cancel.push(id.as_str());
+        }
+    }
+
+    if to_cancel.is_empty() {
         return Ok(());
     }
     if state.stripe.secret_key.is_none() {
         warn!(
             org_id = %org.id,
-            subscription_id = %subscription_id,
-            "Organization has a Stripe subscription but Stripe is not configured; not canceling it"
+            subscriptions = ?to_cancel,
+            "Organization has Stripe subscriptions but Stripe is not configured; not canceling them"
         );
         return Ok(());
     }
-    cancel_stripe_subscription(state, subscription_id)
-        .await
-        .map_err(|e| {
-            error!(org_id = %org.id, subscription_id = %subscription_id, error = %e,
-                "Could not cancel Stripe subscription before deleting organization");
-            AppError::Conflict(
-                "The organization's subscription could not be canceled, so nothing was \
-                 deleted. Try again, or cancel the subscription in the billing portal first."
-                    .to_string(),
-            )
-        })?;
 
-    // Record the cancel locally: a soft-deleted org no longer receives billing
-    // webhooks (its tombstone is protected), so without this a later hard
-    // delete would try to cancel the same subscription again.
-    sqlx::query(
-        "UPDATE organizations SET stripe_subscription_status = 'canceled', \
-         stripe_cancel_at_period_end = FALSE, updated_at = NOW() WHERE id = $1",
+    // Every Stripe cancel first. A failure here leaves the row in place so the
+    // caller can retry; the local status is updated only after all of them.
+    for subscription_id in &to_cancel {
+        cancel_stripe_subscription(state, subscription_id)
+            .await
+            .map_err(|e| {
+                error!(org_id = %org.id, subscription_id = %subscription_id, error = %e,
+                    "Could not cancel Stripe subscription before deleting organization");
+                AppError::Conflict(
+                    "The organization's subscription could not be canceled, so nothing was \
+                     deleted. Try again, or cancel the subscription in the billing portal first."
+                        .to_string(),
+                )
+            })?;
+    }
+
+    // Record the cancel locally only for a live current subscription: a
+    // soft-deleted org no longer receives billing webhooks (its tombstone is
+    // protected), so without this a later hard delete would try to cancel the
+    // same subscription again. Superseded ids are not the current one.
+    if current.is_some() && !current_already_ended {
+        sqlx::query(
+            "UPDATE organizations SET stripe_subscription_status = 'canceled', \
+             stripe_cancel_at_period_end = FALSE, updated_at = NOW() WHERE id = $1",
+        )
+        .bind(&org.id)
+        .execute(state.db.pool())
+        .await?;
+    }
+    Ok(())
+}
+
+/// Drop an unpaid checkout's subscription when the delayed payment fails.
+///
+/// `subscription.updated` (status=`incomplete`) can link the subscription
+/// before the money arrives. Clear it only while that link is still the
+/// incomplete subscription from this session, and leave `stripe_last_event_at`
+/// alone: checkout timestamps are a different stream from subscription events.
+async fn handle_async_payment_failed(state: &AppState, event: &StripeEvent) -> AppResult<()> {
+    let session = &event.data.object;
+    let Some(subscription_id) = session["subscription"].as_str() else {
+        info!(
+            event_id = %event.id,
+            "Checkout payment failed without a subscription; nothing to clear"
+        );
+        return Ok(());
+    };
+
+    let cleared = sqlx::query(
+        r#"
+        UPDATE organizations
+        SET stripe_subscription_id = NULL,
+            stripe_subscription_status = 'incomplete_expired',
+            plan_tier = 'free',
+            updated_at = NOW()
+        WHERE stripe_subscription_id = $1
+          AND stripe_subscription_status = 'incomplete'
+          AND plan_tier <> 'deleted'
+        RETURNING id
+        "#,
     )
-    .bind(&org.id)
-    .execute(state.db.pool())
+    .bind(subscription_id)
+    .fetch_all(state.db.pool())
     .await?;
+
+    for row in &cleared {
+        use sqlx::Row;
+        let org_id: String = row.get("id");
+        invalidate_org_rate_limits(state.cache.as_ref(), &org_id).await;
+    }
+
+    if cleared.is_empty() {
+        info!(
+            event_id = %event.id,
+            subscription_id = %subscription_id,
+            "Checkout payment failed; no incomplete subscription to clear"
+        );
+    } else {
+        warn!(
+            event_id = %event.id,
+            subscription_id = %subscription_id,
+            "Checkout payment failed; cleared the unpaid subscription"
+        );
+    }
     Ok(())
 }
 
@@ -1476,12 +1581,15 @@ async fn handle_invoice_paid(state: &AppState, event: &StripeEvent) -> AppResult
     let customer_id = invoice["customer"].as_str();
     let subscription_id = invoice_subscription_id(invoice);
 
-    if let (Some(customer_id), Some(_sub_id)) = (customer_id, subscription_id) {
+    if let (Some(customer_id), Some(subscription_id)) = (customer_id, subscription_id) {
         // Mark active without advancing stripe_last_event_at. Invoice timestamps share
         // a different stream than subscription.* events; bumping the shared clock here
         // used to drop a legitimate later plan-tier/subscription update that arrived
         // with an earlier Stripe `created` (out-of-order delivery).
         // Do not revive canceled subscriptions (subscription.deleted owns terminal state).
+        // Match the invoice's subscription only: one customer can have a live
+        // subscription and a replaced one, and a stale invoice must not overwrite
+        // a newer subscription event (the clock is not advanced, so compare it).
         let event_time = event_created_at(event);
         let result = sqlx::query(
             r#"
@@ -1490,11 +1598,15 @@ async fn handle_invoice_paid(state: &AppState, event: &StripeEvent) -> AppResult
                 stripe_subscription_status = 'active',
                 updated_at = NOW()
             WHERE stripe_customer_id = $1
-              AND stripe_subscription_id IS NOT NULL
+              AND stripe_subscription_id = $2
+              AND plan_tier <> 'deleted'
               AND COALESCE(stripe_subscription_status, '') NOT IN ('canceled', 'cancelled')
+              AND (stripe_last_event_at IS NULL OR stripe_last_event_at <= $3)
             "#,
         )
         .bind(customer_id)
+        .bind(subscription_id)
+        .bind(event_time)
         .execute(state.db.pool())
         .await?;
 
@@ -1508,7 +1620,7 @@ async fn handle_invoice_paid(state: &AppState, event: &StripeEvent) -> AppResult
             {
                 return Err(retry_until_linked(event, customer_id));
             }
-            info!(customer_id = %customer_id, event_id = %event.id, "Ignoring invoice.paid for unlinked or canceled org");
+            info!(customer_id = %customer_id, event_id = %event.id, "Ignoring invoice.paid for unlinked, canceled, deleted, or a different subscription");
             return Ok(());
         }
 
@@ -1527,14 +1639,16 @@ async fn handle_payment_failed(state: &AppState, event: &StripeEvent) -> AppResu
     // Only subscription-backed invoices may flip the org to past_due; a failed
     // one-off invoice must not degrade the subscription status (this also makes
     // the handler symmetric with invoice.paid).
-    if invoice_subscription_id(invoice).is_none() {
+    let Some(subscription_id) = invoice_subscription_id(invoice) else {
         info!(event_id = %event.id, "Ignoring invoice.payment_failed for non-subscription invoice");
         return Ok(());
-    }
+    };
 
     if let Some(customer_id) = customer_id {
         // Mark past_due without advancing stripe_last_event_at (see invoice.paid).
-        // Only degrade live paid subscriptions — never after cancel/free.
+        // Only the invoice's own subscription, and only when this invoice is not
+        // older than the last subscription event. A customer-wide update used to
+        // mark every live org past_due, including one already on a newer sub.
         let event_time = event_created_at(event);
         let result = sqlx::query(
             r#"
@@ -1543,11 +1657,15 @@ async fn handle_payment_failed(state: &AppState, event: &StripeEvent) -> AppResu
                 stripe_subscription_status = 'past_due',
                 updated_at = NOW()
             WHERE stripe_customer_id = $1
-              AND stripe_subscription_id IS NOT NULL
+              AND stripe_subscription_id = $2
+              AND plan_tier <> 'deleted'
               AND COALESCE(stripe_subscription_status, '') NOT IN ('canceled', 'cancelled')
+              AND (stripe_last_event_at IS NULL OR stripe_last_event_at <= $3)
             "#,
         )
         .bind(customer_id)
+        .bind(subscription_id)
+        .bind(event_time)
         .execute(state.db.pool())
         .await?;
 
@@ -1559,7 +1677,7 @@ async fn handle_payment_failed(state: &AppState, event: &StripeEvent) -> AppResu
             {
                 return Err(retry_until_linked(event, customer_id));
             }
-            info!(customer_id = %customer_id, event_id = %event.id, "Ignoring invoice.payment_failed for unlinked or canceled org");
+            info!(customer_id = %customer_id, event_id = %event.id, "Ignoring invoice.payment_failed for unlinked, canceled, deleted, stale, or a different subscription");
             return Ok(());
         }
 
@@ -1587,19 +1705,27 @@ fn subscription_period_end(subscription: &serde_json::Value) -> Option<i64> {
 /// `plan_tier = free`; if an updated(canceled) with the same-or-later
 /// `created` is applied afterward and we only map from price, COALESCE
 /// restores the paid tier. `unpaid` / `incomplete_expired` are terminal the
-/// same way. `past_due` / `incomplete` / `trialing` / `active` keep the
-/// price-mapped tier (grace / in-progress checkout).
+/// same way. `past_due`, `trialing`, and `active` keep the price-mapped tier
+/// (grace and paid). `incomplete` is not terminal, but payment has not been
+/// collected: [`resolve_plan_tier`] leaves the current tier unchanged.
 fn is_terminal_subscription_status(status: &str) -> bool {
     matches!(status, "canceled" | "unpaid" | "incomplete_expired")
 }
 
 /// Resolve plan tier from subscription status + price.
 ///
-/// Terminal statuses → `Some("free")`. Otherwise map from the price id.
+/// Terminal statuses → `Some("free")`. `incomplete` → `None` (keep the current
+/// tier; do not grant the price's plan before payment). Otherwise map from
+/// the price id.
 fn resolve_plan_tier(subscription: &serde_json::Value, state: &AppState) -> Option<String> {
     if let Some(status) = subscription["status"].as_str() {
         if is_terminal_subscription_status(status) {
             return Some("free".to_string());
+        }
+        // Not paid yet. Mapping the price granted the paid plan before checkout
+        // succeeded. None keeps the current tier, so a canceled org stays free.
+        if status == "incomplete" {
+            return None;
         }
     }
     determine_plan_tier(subscription, state)
