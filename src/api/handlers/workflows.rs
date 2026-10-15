@@ -853,8 +853,49 @@ pub async fn cancel(
     Extension(ctx): Extension<ApiKeyContext>,
     Path(workflow_id): Path<String>,
 ) -> AppResult<Json<WorkflowResponse>> {
+    // The scheduler's dependency sweep cancels a workflow's jobs first and then
+    // locks the workflow row (update_workflow_progress runs on `cancelled`);
+    // this handler locks the workflow first and then its jobs. Postgres aborts
+    // one side of that cycle as a deadlock. Retry it here rather than answer
+    // 500: the whole cancel is one transaction, so a retry starts clean.
+    let mut attempt = 0;
+    let workflow = loop {
+        attempt += 1;
+        match cancel_workflow_once(&state, &ctx, &workflow_id).await {
+            Err(AppError::Database(sqlx::Error::Database(e)))
+                if attempt < 3 && e.code().as_deref() == Some("40P01") =>
+            {
+                warn!(workflow_id = %workflow_id, attempt, "Workflow cancel hit a deadlock; retrying");
+            }
+            other => break other?,
+        }
+    };
+
+    info!(workflow_id = %workflow_id, org_id = %ctx.organization_id, "Cancelled workflow");
+
+    // Notify Redis that workflow was cancelled
+    if let Some(ref cache) = state.cache {
+        let _ = cache
+            .publish(
+                &format!("org:{}:workflow:{}", ctx.organization_id, workflow_id),
+                "cancelled",
+            )
+            .await;
+    }
+
+    Ok(Json(workflow.into()))
+}
+
+/// One attempt of [`cancel`]: lock, check, cancel and read back in a single
+/// transaction.
+async fn cancel_workflow_once(
+    state: &AppState,
+    ctx: &ApiKeyContext,
+    workflow_id: &str,
+) -> AppResult<Workflow> {
+    let workflow_id = workflow_id.to_string();
     let mut tx = state.db.pool().begin().await?;
-    require_workflow_access(&mut *tx, &ctx, &workflow_id).await?;
+    require_workflow_access(&mut *tx, ctx, &workflow_id).await?;
 
     // Lock the workflow row so cancellation serializes with retry and other workflow
     // state transitions. All workflow/job changes below commit or roll back together.
@@ -915,20 +956,7 @@ pub async fn cancel(
             .ok_or_else(|| AppError::NotFound(format!("Workflow {} not found", workflow_id)))?;
 
     tx.commit().await?;
-
-    info!(workflow_id = %workflow_id, org_id = %ctx.organization_id, "Cancelled workflow");
-
-    // Notify Redis that workflow was cancelled
-    if let Some(ref cache) = state.cache {
-        let _ = cache
-            .publish(
-                &format!("org:{}:workflow:{}", ctx.organization_id, workflow_id),
-                "cancelled",
-            )
-            .await;
-    }
-
-    Ok(Json(workflow.into()))
+    Ok(workflow)
 }
 
 /// Get job dependencies

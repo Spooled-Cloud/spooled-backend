@@ -49,6 +49,26 @@ fn validate_workflow_queue_name(name: &str) -> Result<(), validator::ValidationE
     Ok(())
 }
 
+/// The claim rules (1-100 characters, then [`validate_workflow_queue_name`])
+/// for every job of a workflow.
+#[allow(clippy::ptr_arg)]
+fn validate_workflow_job_queue_names(
+    jobs: &Vec<WorkflowJobDefinition>,
+) -> Result<(), validator::ValidationError> {
+    for job in jobs {
+        let len = job.queue_name.chars().count();
+        if !(1..=100).contains(&len) {
+            let mut err = validator::ValidationError::new("invalid_queue_name_length");
+            err.message = Some(std::borrow::Cow::Borrowed(
+                "Queue name must be 1-100 characters",
+            ));
+            return Err(err);
+        }
+        validate_workflow_queue_name(&job.queue_name)?;
+    }
+    Ok(())
+}
+
 /// Workflow status
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -219,10 +239,12 @@ pub struct CreateWorkflowRequest {
 
     /// Jobs to create as part of this workflow
     /// Reduced from 1000 to 100 to prevent DoS.
-    /// `nested` is required: without it Validate only counts this vec, so a
-    /// queue name claim will reject is stored and then never leased.
+    /// Each job's queue name is checked against the claim rules, or a queue
+    /// claim rejects is stored and then never leased. Not `nested`: that
+    /// would also switch on the job key, retry and payload rules, which never
+    /// ran here, and reject workflows clients already create.
     #[validate(length(min = 1, max = 100, message = "Workflow must have 1-100 jobs"))]
-    #[validate(nested)]
+    #[validate(custom(function = "validate_workflow_job_queue_names"))]
     pub jobs: Vec<WorkflowJobDefinition>,
 
     /// Optional metadata
@@ -599,6 +621,15 @@ mod tests {
         assert!(
             request.validate().is_ok(),
             "a 100-character queue must stay valid"
+        );
+
+        // Only the queue name is checked per job. Keys, retries and payloads
+        // were never validated here, and clients already send these.
+        request.jobs[0].key = "step:one.a b".to_string();
+        request.jobs[0].max_retries = Some(150);
+        assert!(
+            request.validate().is_ok(),
+            "per-job key and retry rules must not start rejecting workflows"
         );
     }
 

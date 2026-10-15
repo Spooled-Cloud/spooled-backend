@@ -1122,6 +1122,59 @@ async fn rt05_retry_keeps_auto_disabled_status() {
     assert!(!enabled);
 }
 
+/// A webhook re-enabled by PUT keeps the auto_disabled marker until its next
+/// delivery; that delivery must replace it. Keeping it on every delivery left
+/// a re-enabled webhook showing "Re-enabled" forever.
+#[tokio::test]
+async fn rt05_reenabled_webhook_delivery_replaces_auto_disabled_status() {
+    use spooled_backend::outgoing_webhooks::service::OutgoingWebhookService;
+
+    let db = TestDatabase::new().await;
+    let t = seed_tenant(db.pool()).await;
+    let webhook_id = uuid::Uuid::new_v4().to_string();
+    let delivery_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO outgoing_webhooks (id, organization_id, name, url, secret, events, enabled, failure_count, last_status) \
+         VALUES ($1, $2, 'hook', 'http://127.0.0.1:9/hook', 'sek', ARRAY['job.completed']::TEXT[], TRUE, 0, 'auto_disabled')",
+    )
+    .bind(&webhook_id)
+    .bind(&t.org_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let payload = json!({
+        "id": delivery_id.to_string(),
+        "event": "job.completed",
+        "data": {"job_id": "j"},
+    });
+    sqlx::query(
+        "INSERT INTO outgoing_webhook_deliveries (id, webhook_id, event, payload, status, attempts) \
+         VALUES ($1, $2, 'job.completed', $3, 'failed', 1)",
+    )
+    .bind(delivery_id.to_string())
+    .bind(&webhook_id)
+    .bind(payload)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let service = OutgoingWebhookService::new((*db.pool).clone(), 1, 4);
+    let delivered =
+        tokio::time::timeout(Duration::from_secs(15), service.retry_delivery(delivery_id))
+            .await
+            .expect("retry timed out")
+            .expect("retry");
+    assert!(!delivered);
+
+    let last_status: Option<String> =
+        sqlx::query_scalar("SELECT last_status FROM outgoing_webhooks WHERE id = $1")
+            .bind(&webhook_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(last_status.as_deref(), Some("failed"));
+}
+
 fn workflow_body(queue: &str) -> Value {
     json!({
         "name": "wf",

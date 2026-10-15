@@ -909,13 +909,15 @@ impl Inner {
         // with. Writing `success` or `failed` over `auto_disabled` made the
         // dashboard drop the re-enable banner (it keys off that marker) while
         // `fan_out` still requires `enabled = true`, so later events were not
-        // delivered. The marker stays until the PUT that actually re-enables.
+        // delivered. The marker stays only while the webhook is disabled: the
+        // PUT that re-enables leaves it for the next delivery to overwrite, and
+        // nothing else writes last_status.
         let summary = sqlx::query(
             r#"
             UPDATE outgoing_webhooks
             SET last_triggered_at = NOW(),
                 last_status = CASE
-                    WHEN last_status = $3 THEN last_status
+                    WHEN last_status = $3 AND NOT enabled THEN last_status
                     ELSE $2
                 END,
                 updated_at = NOW()

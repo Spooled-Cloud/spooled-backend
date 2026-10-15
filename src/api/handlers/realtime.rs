@@ -204,7 +204,9 @@ impl RealtimeEvent {
 /// Validate queue filter name for safe characters
 fn validate_queue_filter(queue: &Option<String>) -> Result<(), &'static str> {
     if let Some(q) = queue {
-        if q.len() > 100 {
+        // Characters, like queue names everywhere else: a 100-character name
+        // of multi-byte letters is a valid queue.
+        if q.chars().count() > 100 {
             return Err("Queue filter too long");
         }
         if !q
@@ -1735,6 +1737,14 @@ pub async fn sse_events_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_queue_filter_counts_characters_not_bytes() {
+        let name = "\u{6f22}".repeat(100);
+        assert_eq!(name.len(), 300);
+        assert!(validate_queue_filter(&Some(name)).is_ok());
+        assert!(validate_queue_filter(&Some("a".repeat(101))).is_err());
+    }
 
     #[test]
     fn test_realtime_event_types() {

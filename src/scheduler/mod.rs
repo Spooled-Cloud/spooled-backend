@@ -1015,6 +1015,13 @@ impl Scheduler {
             WHERE
                 child.parent_job_id IS NOT NULL
                 AND child.status IN ('pending', 'scheduled')
+                -- A TRUE child with no job_dependencies rows is already right;
+                -- skip it before the function runs (two queries a row, every
+                -- tick, over the whole pending backlog).
+                AND (
+                    child.dependencies_met IS NOT TRUE
+                    OR EXISTS (SELECT 1 FROM job_dependencies d WHERE d.job_id = child.id)
+                )
                 AND child.dependencies_met IS DISTINCT FROM check_job_dependencies_met(child.id)
                 AND EXISTS (
                     SELECT 1 FROM jobs parent
