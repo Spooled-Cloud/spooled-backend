@@ -195,6 +195,26 @@ outside the key's scope is still `NOT_FOUND`. The 2026-07-15 live check
 Dead-letter keeps `retry_count` (the statements at `:958-966` and `:2417-2424`), so the DLQ
 `total_retries` equals the retries run, as on REST; a retried failure still adds one.
 
+## Parity fixes (0.1.126, R0126-BILL-03, -05, RT-04, LIVE2-03..08)
+
+- **Enqueue reserves the quota first** (`queue_service.rs` `enqueue`): idempotency-key lookup (existing job -> `created: false`),
+  then `try_increment_daily_jobs` BEFORE the INSERT, and `refund_daily_jobs` when the insert fails or the row existed. The old
+  insert-then-increment-then-DELETE order let a worker claim a refused job and made a replay at the cap `RESOURCE_EXHAUSTED`.
+  A negative `max_retries` is `INVALID_ARGUMENT` (0 stays the queue default: proto3 cannot tell it from omitted).
+- **Rate limits**: `charge_rate_limits` (queue and worker services) checks the key window before the org bucket; `OrgRateLimits` keeps a
+  custom 0 (blocked), see the Plan rate limiter section in `auth.md`.
+- **Worker rules match REST**: `RegisterWorker` queue name 1-100 characters, counted as characters (`worker_service::validate_queue_name`;
+  the shared `grpc::validation::validate_queue_name` also counts characters, cap 255, claim paths still drain older long names);
+  `Heartbeat` rejects an unknown status (`requested_heartbeat_status` returns `Result`), the REST wording; `Deregister` releases only
+  expired leases (`queue::release_jobs_for_deregistered_worker`, shared with REST).
+- **Settlement**: `Complete` without `result` binds SQL NULL (`complete_result_text`; a present Struct, `{}` included, stores that JSON), unary
+  and ProcessJobs alike, the same SQL text as REST. A live lease with another token is REST's "lease_id does not match the job's current lease;
+  this worker no longer holds it" (`processing_lease_miss`; an expired lease still "Lease expired", expiry first). `Fail` with retries
+  left stores `scheduled` (not `pending`) in both `Fail` and ProcessJobs, so `will_retry` is `new_status == 'scheduled'`.
+  `RenewLease` / ProcessJobs renew set `NOW() + make_interval(secs => $1)` and `RETURNING lease_expires_at`: the expiry is never a Rust
+  `Utc::now()` taken before the statement has a connection.
+- Tests: `r0126_grpc_parity_tests::live2_*`, `r0126_billing_auth_tests::bill03_*`, `r0126_jobs_realtime_tests::rt04_*`.
+
 ## Struct numbers
 
 `google.protobuf.Struct` numbers are doubles. The conversion to an integer runs in ONE

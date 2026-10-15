@@ -196,6 +196,41 @@ Response:
 }
 ```
 
+`/auth/me` gets the checks of every authenticated route: an access token (a refresh token is
+`401`), a session that was not logged out, a key that is active and not expired, and an
+organization that is not deleted. `queues` is the key's current scope, not the list the token was
+issued with. A database failure while checking is a `503`, not a `401`.
+
+#### Validate a Token
+
+```bash
+POST /api/v1/auth/validate
+Content-Type: application/json
+
+{
+  "token": "eyJhbGciOiJIUzI1NiIs..."
+}
+```
+
+Response: `{"valid": true, "claims": {...}}`, or `{"valid": false, "error": "..."}`. `valid` is `true`
+only for a token the API would accept (since 0.1.126): an access token whose session was not
+logged out, whose key is active and not expired, and whose organization is not deleted. A refresh
+token, a token of a revoked or expired key and a logged-out token are `valid: false`. When the
+check cannot run (the database is unreachable) the answer is a `503`, not `valid: false`, so do not
+sign a user out on it; retry.
+
+#### Logout
+
+```bash
+POST /api/v1/auth/logout
+Authorization: Bearer <access_token>
+```
+
+Ends the login session: the access token and the refresh token that came with it stop working. The
+revocation is stored in the database and cached in Redis (since 0.1.126), so a Redis restart,
+eviction or outage neither brings the session back nor logs live sessions out. A `503` means the
+revocation was not stored: the session is still valid, so repeat the request.
+
 ---
 
 ## Jobs
@@ -265,7 +300,7 @@ Authorization: Bearer <token>
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `queue_name` | string | Filter by queue (letters, digits, `-`, `_`, `.`) |
-| `status` | string | One status or a comma-separated list (`failed,deadletter`): pending, scheduled, processing, completed, failed, deadletter, cancelled (any case) |
+| `status` | string | One status or a comma-separated list (`failed,deadletter`): pending, scheduled (also a failed job waiting for its retry backoff, since 0.1.126), processing, completed, failed, deadletter, cancelled (any case) |
 | `q` | string | Search text, at most 255 bytes, case-insensitive: matches a job whose id **starts with** it, or whose `queue_name` or `payload.job_type` contains it. `%` and `_` match themselves |
 | `job_type` | string | Exact `payload.job_type`, at most 255 bytes |
 | `created_after` | RFC 3339 | Only jobs created at or after this instant |
@@ -327,8 +362,9 @@ alias `order` works too). `limit` is 1 to 500 (default 100), `offset` skips even
 
 `event_type` is `processing`, `completed`, `retry_scheduled` or `deadlettered` (`created` exists,
 but only the internal queue manager's enqueue writes it and no REST or gRPC handler calls that).
-Events exist only where the server records them: REST claim, complete and fail, and the scheduler's
-dead-letter sweeps. **The history is sparse for jobs handled over gRPC, and a job has no `created`
+Events exist only where the server records them: REST claim, complete and fail, the scheduler's
+dead-letter sweeps and (since 0.1.126) its requeue of a job whose lease expired or whose worker went
+offline, and a deregister that releases an expired lease (`retry_scheduled`). **The history is sparse for jobs handled over gRPC, and a job has no `created`
 event.** Another organization's job, an unknown id and a job in a queue outside the key's scope all
 answer `404`.
 
@@ -707,6 +743,10 @@ POST /api/v1/workers/{worker_id}/deregister
 Authorization: Bearer <token>
 ```
 
+The worker becomes `offline` and its jobs whose lease has already expired go back to `pending`
+(each counts as a retry). A job whose lease is still live stays `processing` with that worker, which
+may be inside the handler: it completes, or the lease expires and the job is recovered (since
+0.1.126; before, it was requeued at once and could run twice).
 ---
 
 ## Schedules
@@ -732,6 +772,12 @@ Authorization: Bearer <token>
   "max_retries": 3
 }
 ```
+
+`queue_name` is 1-100 characters: letters, digits, `-`, `_` and `.`, not starting with `.` or `-`,
+the names `POST /jobs/claim` accepts; anything else is a `400` (since 0.1.126; a schedule used to
+accept 255 characters and any character, and its jobs could never be claimed). Triggering a schedule
+that was stored with a name outside these rules is a `400`, and its cron fires are recorded as
+`failed` runs.
 
 **Cron Expression Format:**
 
@@ -907,7 +953,10 @@ Authorization: Bearer <token>
 ```
 
 `depends_on` lists the `key`s of other jobs in the workflow. Listing the same key twice, an unknown
-key or a cycle is a `400`.
+key or a cycle is a `400`. Each job is validated: `queue_name` 1-100 characters of letters, digits,
+`-`, `_` and `.` (not starting with `.` or `-`), `key` 1-100 letters, digits, `-` and `_`,
+`priority` -100..100, `max_retries` 0..100 and `timeout_seconds` 1..86400; a job outside these
+is a `400 VALIDATION_ERROR` (since 0.1.126 these per-job rules are enforced).
 
 ### List Workflows
 
@@ -1066,7 +1115,7 @@ Content-Type: application/json
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `queue_name` | string | Yes | Target queue for the job (1-255 chars) |
+| `queue_name` | string | Yes | Target queue for the job (1-100 chars: letters, digits, `-`, `_`, `.`) |
 | `payload` | object | Yes | Job data (max 1MB) |
 | `event_type` | string | No | Event type label (for logging/tracking) |
 | `priority` | integer | No | -100 to 100 (default: 0) |
@@ -1458,6 +1507,17 @@ seconds, and closes the socket when the token expires or the session is revoked.
 
 An organization can have 100 open WebSockets; the next connection answers `429`.
 
+**Commands.** Send `{"cmd":"Subscribe","queue":"emails","job_id":null}`, `{"cmd":"Unsubscribe",...}`
+or `{"cmd":"Ping"}` after connecting. Since 0.1.126 `cmd` is case-insensitive (the Go, Python and PHP
+SDKs send `"subscribe"`), `type` works in its place, `queues: ["emails","billing"]` is read next to
+`queue`, and a missing field, `null` and `""` all mean "not set". A frame that is not a command
+gets an `Error` event and the socket stays open; `Ping` is answered with a `Ping` event.
+Subscriptions add up, and an event is delivered when any of them matches: a `Subscribe` adds one
+subscription per named queue (its `job_id` is combined with each queue), the `queue` / `job_id` of
+the URL is the first one, and a socket with none receives everything the key's scope allows. An
+`Unsubscribe` removes the subscriptions whose named fields all match, and nothing when it names
+nothing.
+
 ### Server-Sent Events (SSE)
 
 #### All Events
@@ -1486,7 +1546,10 @@ minutes; reconnect to continue. An organization can have 100 open streams of eac
 `/events/jobs/{id}`, `/events/queues/{name}`); the next one answers `429`. A job stream also ends
 when the job reaches a final status. A job stream for an unknown job, another organization's job or a
 job in a queue outside the key's scope answers the `404` of `GET /jobs/{id}`, and a queue stream for a
-queue outside the key's scope answers `403`, both before any stream starts.
+queue outside the key's scope answers `403`, both before any stream starts. When the event channel
+of `/events` cannot be opened or is lost, the stream sends an `error` event and ends (since
+0.1.126; it used to stay open with only `system.health`): reconnect. The `queue.stats` event counts
+`pending` jobs only, like `GET /queues/{name}/stats`; `scheduled` jobs are not included.
 
 **Event Format:**
 ```
@@ -1826,8 +1889,11 @@ treat them as optional; a refusal there still has `Retry-After`. Browsers can re
 
 The main limit is a token bucket **per organization** (requests per second and burst, by plan; see
 [Rate Limits](#rate-limits)). An API key can also carry its own `rate_limit` in **requests per
-minute**; it is checked after the organization limit, so it can only lower what that key may do,
-and it is counted per key. Unauthenticated routes are limited per client IP.
+minute**; it is checked together with the organization limit, so it can only lower what that key
+may do, and it is counted per key. The key's window runs first: a request it refuses does not use an
+organization token (since 0.1.126). An organization whose `custom_limits` set
+`rate_limit_requests_per_second` or `rate_limit_burst` to `0` is blocked: every request answers
+`429` with `Retry-After: 60` (it used to be enforced as one request per second). Unauthenticated routes are limited per client IP.
 
 ---
 

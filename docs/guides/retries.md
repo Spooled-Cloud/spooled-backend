@@ -130,6 +130,9 @@ delay = min(2^retry_count seconds, 60 seconds) + random jitter (0-499 ms)
 - maximum delay = 60 seconds
 - jitter = 0-499 ms
 - A job that lost its worker (lease expired) goes through the same retry or dead-letter decision as a reported failure.
+- While a job waits for its backoff its status is `scheduled` (since 0.1.126; it read `pending`). It
+  is claimable once `scheduled_at` passes, and counts under `scheduled`, not `pending`, in
+  `GET /jobs?status=` and `GET /jobs/stats`.
 
 ### What you can and cannot tune
 

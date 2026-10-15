@@ -321,6 +321,12 @@ curl -X POST https://api.spooled.cloud/api/v1/workers/emails-worker-1/deregister
   -H "Authorization: Bearer sp_live_YOUR_API_KEY"
 ```
 
+Deregistering marks the worker `offline` and releases only the jobs whose lease has already
+expired (each counts as a retry). A job whose lease is still live stays `processing`: the worker
+may be inside its handler, so deregister it after it has drained, and the lease expires on its
+own if the process is gone (since 0.1.126; before, such a job was requeued at once and could run
+twice).
+
 ---
 
 ## Processing Jobs

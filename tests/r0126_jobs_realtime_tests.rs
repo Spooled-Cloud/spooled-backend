@@ -1,5 +1,5 @@
 #![cfg(feature = "docker-tests")]
-//! Regressions for the grok-be2 batch (jobs, realtime, queue names, webhooks).
+//! Regressions for the 0.1.126 batch (jobs, realtime, queue names, webhooks).
 //!
 //! `TEST_DATABASE_URL=postgres://$USER@localhost:5432/postgres`
 //! `TEST_REDIS_URL=redis://127.0.0.1:6379`

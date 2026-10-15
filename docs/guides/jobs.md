@@ -54,13 +54,13 @@ Jobs are the fundamental unit of work in Spooled. A job represents an asynchrono
 
 | State | Description |
 |-------|-------------|
-| `pending` | Waiting to be claimed by a worker |
+| `pending` | Waiting to be claimed by a worker (claimable now) |
 | `processing` | Currently being processed by a worker |
 | `completed` | Successfully processed |
 | `failed` | Processing failed (will retry if retries remaining) |
 | `deadletter` | Failed after exhausting all retries |
 | `cancelled` | Manually cancelled |
-| `scheduled` | Scheduled for future execution |
+| `scheduled` | Waiting for a future time: a job created with a future `scheduled_at`, or a failed job waiting for its retry backoff (it was `pending` meanwhile before 0.1.126) |
 
 ---
 
@@ -319,8 +319,8 @@ curl "https://api.spooled.cloud/api/v1/jobs/job_xxx/history?order_dir=desc" \
   -H "Authorization: Bearer sp_live_YOUR_API_KEY"
 ```
 
-The recorded lifecycle events of one job (`processing`, `completed`, `retry_scheduled`,
-`deadlettered`), oldest first unless `order_dir=desc`, `limit` 1 to 500 (default 100), `offset` and
+The recorded lifecycle events of one job (`processing`, `completed`, `retry_scheduled` including
+a requeue after a lease expiry, an offline worker or a deregister, `deadlettered`), oldest first unless `order_dir=desc`, `limit` 1 to 500 (default 100), `offset` and
 an `X-Has-More` header. Jobs handled over gRPC record few events, and a job has no `created` event.
 See the [API usage guide](./api-usage.md#job-history).
 

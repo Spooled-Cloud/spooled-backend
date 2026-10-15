@@ -2,6 +2,10 @@
 
 ## Incoming (job ingest)
 
+0.1.126: `queue_name` is 1-100 characters (`CustomWebhookRequest`, the names claim accepts: R0126-LIVE-01), and a blank or whitespace
+`idempotency_key` goes through `normalize_idempotency_key` and is stored as NULL, so blank keys never dedupe (R0126-LIVE-03; the unique index
+treats `""` as a value).
+
 `POST /api/v1/webhooks/{org_id}/custom` — requires `X-Webhook-Token`; a soft-deleted org (`plan_tier = 'deleted'`) answers 404 like an unknown one, and admin soft delete also removes the org's webhook token, pauses its schedules and disables its outgoing webhooks in the same transaction (0.1.120, BEFLOW-06); production HTTPS via `X-Forwarded-Proto`. Inserts jobs using configured queue defaults (`QUEUE_DEFAULT_MAX_RETRIES` / `QUEUE_DEFAULT_TIMEOUT_SECS` via settings). Response is `{ job_id, queue_name, status }` (OpenAPI `WebhookResponse`), not an empty 200. All three come from the upsert's `RETURNING`, so an idempotent replay reports the **existing** job's queue and current status (`processing`/`completed`/...), not a hardcoded `pending`. The token lives in `organizations.settings.webhook_token`. `PUT /organizations/{id}` and `PATCH /admin/organizations/{id}` preserve it on object settings (omit keeps it); a non-object `settings` body is 400 while a token is configured, because that replace would drop it. `POST .../webhook-token/clear` is not allowed (rotate instead). `POST .../webhook-token/regenerate` always writes the new token into an object (non-object settings become `{webhook_token}`).
 
 Since 0.1.122 (QW11) the `webhook_deliveries` row written for each accepted request (`handlers/webhooks.rs:93` `custom`) also records `job_id` and `status` (`created`, or `duplicate` when the idempotency key matched an existing job; NULL before 0.1.122), and `matched_queue` is the queue of the job the request resolved to (the request's `queue_name` only differs on an idempotent replay). See "Inbound webhook log" below.
@@ -105,6 +109,10 @@ because validating would scan the log under `ACCESS EXCLUSIVE`; every existing r
 `AUTO_DISABLE_FAILURE_THRESHOLD = 20` / `AUTO_DISABLED_STATUS = "auto_disabled"` (`outgoing_webhooks/service.rs` ~20–24). After 20 **consecutive** failed deliveries the row flips to `enabled = false`, `last_status = "auto_disabled"` and stops receiving events. Re-enable is `PUT /api/v1/outgoing-webhooks/{id}` `{"enabled": true}`, which is charged against the plan webhook cap — so re-enabling can fail `429 QUOTA_EXCEEDED`. `last_status` domain is now `success | failed | auto_disabled`.
 
 `failure_count` is incremented once per **delivery**, not once per retry attempt, so for the same real-world failures it is ~5x smaller than pre-0.1.111 numbers; any inherited `failure_count > N` threshold is wrong. A successful delivery resets it to 0, including a successful manual retry.
+
+A manual retry of a delivery keeps `last_status = auto_disabled` on an auto-disabled webhook (0.1.126, R0126-RT-05): the retry forces `enabled` only
+on its in-memory copy, `record_attempt` leaves the marker alone (the dashboard's re-enable banner keys off `enabled = false AND last_status =
+'auto_disabled'`), and only the `PUT` that re-enables it clears it. A successful retry still resets `failure_count`.
 
 ### Delivery history retention
 

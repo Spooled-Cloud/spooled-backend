@@ -22,7 +22,8 @@ Redis is **not critical** - the system degrades gracefully:
 | Feature | Without Redis | Impact |
 |---------|--------------|--------|
 | Job notifications | Fallback to DB polling (5s interval) | Slight delay in job pickup |
-| WebSocket updates | Disabled: a socket whose Redis event channel cannot be opened or drops gets an `Error` event and closes with `1011` (since 0.1.121; it used to stay open and silent). Clients reconnect with backoff | Dashboard not real-time |
+| WebSocket updates | Disabled: a socket whose Redis event channel cannot be opened or drops gets an `Error` event and closes with `1011` (since 0.1.121; it used to stay open and silent). The global SSE stream (`GET /events`) does the same with an `error` event and then ends (since 0.1.126). Clients reconnect with backoff | Dashboard not real-time |
+| Logout and session revocation | The revocation is a row in Postgres (`revoked_sessions`, since 0.1.126); Redis only caches it. A token with a session id is checked in Postgres when Redis has no key or errors, so an evicted key does not revive a logged-out session and an outage does not log live sessions out. A token without a session id (issued before 0.1.114) has only the Redis blacklist and is treated as revoked while Redis errors | None for current tokens |
 | Realtime connection caps | Fail open (a Redis error or the 500 ms timeout admits the connection) | Per-organization caps are not enforced meanwhile |
 | Rate limiting | 10 req/min fallback | More restrictive |
 | Worker coordination | Direct DB queries | Higher DB load |

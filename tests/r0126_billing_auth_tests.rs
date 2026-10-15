@@ -107,9 +107,9 @@ fn bearer(key: &str) -> String {
     format!("Bearer {key}")
 }
 
-const WEBHOOK_SECRET: &str = "whsec_grok_be1_fixture";
-const STRIPE_KEY: &str = "sk_test_grok_be1_fixture";
-const PRO_PRICE: &str = "price_grok_be1_pro";
+const WEBHOOK_SECRET: &str = "whsec_r0126_fixture";
+const STRIPE_KEY: &str = "sk_test_r0126_fixture";
+const PRO_PRICE: &str = "price_r0126_pro";
 
 fn stripe_settings() -> Settings {
     let mut settings = Settings::load_for_testing();
@@ -783,7 +783,7 @@ async fn auth01_billing_email_change_invalidates_old_login() {
     .unwrap();
 
     let mut settings = Settings::load_for_testing();
-    settings.registration.admin_api_key = Some("grok-be1-admin".to_string());
+    settings.registration.admin_api_key = Some("r0126-admin".to_string());
     let app = app_with(&db, None, settings);
 
     let login_auth = bearer(&raw);
@@ -814,7 +814,7 @@ async fn auth01_billing_email_change_invalidates_old_login() {
         &app,
         "PATCH",
         &format!("/api/v1/admin/organizations/{}", tenant.org_id),
-        &[("X-Admin-Key", "grok-be1-admin")],
+        &[("X-Admin-Key", "r0126-admin")],
         Some(json!({ "billing_email": "bob-auth01@example.com" })),
     )
     .await;

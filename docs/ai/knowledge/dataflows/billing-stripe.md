@@ -116,7 +116,26 @@ Self-serve `DELETE /organizations/{id}` and admin soft/hard delete call
 `billing::cancel_subscription_before_org_delete` first; a failed cancel aborts
 the delete with 409 (BE-48). A 404 from Stripe counts as already canceled.
 Subscription/checkout handlers skip orgs whose `plan_tier = 'deleted'`, so a late
-Stripe event cannot resurrect a soft-deleted org. Gap: `cancel_subscription_before_org_delete` cancels only the org's
-current subscription, not ids still pending in `stripe_superseded_subscription_ids` (they exist only briefly while a
-cancel retry is outstanding); a follow-up should call `cancel_superseded_subscriptions` there, with its own test.
+Stripe event cannot resurrect a soft-deleted org. Since 0.1.126 (R0126-BILL-02) `cancel_subscription_before_org_delete` also cancels every id in
+`stripe_superseded_subscription_ids` (read from the row; `Organization` does not map the array) before any local write, so a replaced
+subscription whose own cancel is still outstanding does not keep billing. Any Stripe failure aborts the delete with the 409; the
+local `canceled` status is written only after all cancels. Because delete has already cancelled that list,
+`cancel_superseded_subscriptions` finding no row (the checkout retry after a hard delete) is a deliberate ACK. Test:
+`r0126_billing_auth_tests::bill02_org_delete_cancels_superseded_subscriptions`.
+
+## Webhook state fixes (0.1.126, R0126-BILL-01, -06)
+
+- **Terminal subscription statuses never write the id back.** `handle_subscription_updated` sets `stripe_subscription_id` to NULL for
+  `canceled|cancelled|unpaid|incomplete_expired`, and such an event matches only a row already on that subscription (the NULL-id and
+  terminal-status "accept any subscription" arm applies to non-terminal events only). The website gates "Upgrade" on the id, so a
+  resurrected id had hidden checkout.
+- **`incomplete` grants nothing.** `resolve_plan_tier` returns `None` for `incomplete` (the SQL also keeps `plan_tier` when `$2 = 'incomplete'`), so
+  a delayed payment (SEPA) leaves the tier unchanged until the subscription is `active`/`trialing`.
+  `checkout.session.async_payment_failed` (`handle_async_payment_failed`) now clears an `incomplete` subscription of the failed session
+  (`incomplete_expired`, id NULL, tier `free`, rate-limit cache invalidated) and does not touch `stripe_last_event_at` (checkout timestamps
+  are another stream).
+- **Invoice events are scoped.** `invoice.paid` / `invoice.payment_failed` update only the row whose `stripe_subscription_id` equals the
+  invoice's subscription, skip `plan_tier = 'deleted'`, and skip an invoice older than `stripe_last_event_at`; they still never advance
+  that clock (see the pipeline step 4).
+- Tests: `r0126_billing_auth_tests::bill01_*`, `bill06_*`.
 

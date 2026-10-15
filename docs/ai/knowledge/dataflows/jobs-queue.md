@@ -185,6 +185,30 @@ worker is still renewing it (BEJOB-01: the PHP SDK sent no worker heartbeat
 during a long handler and its jobs were re-run). `QueueManager::renew_lease`
 also refreshes `workers.last_heartbeat` on success.
 
+## Job lifecycle fixes (0.1.126)
+
+- **A retry waits as `scheduled`** (R0126-JOBS-05). `fail_by_worker`, the legacy `fail`, gRPC `Fail` and ProcessJobs fail store
+  `status = 'scheduled'` with `scheduled_at = now + backoff` (`FailByWorkerOutcome.new_status`, `will_retry` = status `scheduled`); the
+  scheduler's activation (`status = 'scheduled' AND scheduled_at <= NOW()` -> `pending`) and claim (`status IN ('pending','scheduled')`) are
+  unchanged. List filters and stats read the status, so a waiting retry is `scheduled` everywhere. Do not store `pending` with a future
+  `scheduled_at` again.
+- **Deregister keeps a live lease** (R0126-JOBS-01). `queue::release_jobs_for_deregistered_worker` (REST and gRPC) releases only
+  `lease_expires_at IS NULL OR <= NOW()` jobs with `retry_count < max_retries`, as `retry_count + 1`, `last_error = 'Worker deregistered'`
+  and a `retry_scheduled` history row; a live lease stays `processing` for the worker or the expiry sweep. Same rule as
+  `cleanup_stale_workers` above.
+- **Requeues write history** (R0126-JOBS-04). `recover_expired_leases` and `cleanup_stale_workers` are CTEs that insert a
+  `retry_scheduled` `job_history` row (`error`, `retry_count`, `organization_id`) for each requeued job, like their dead-letter halves.
+- **`dependencies_met` is recomputed, not forced** (R0126-JOBS-02). `complete_with_worker_and_org`, `complete_by_worker` and
+  `update_job_dependencies` set `dependencies_met = check_job_dependencies_met(id)` (only `IS DISTINCT FROM`), never TRUE from
+  `parent_job_id` alone; a blocked child becomes FALSE because NULL means claimable.
+- **Workflow progress sees dead-letter and cancel** (R0126-JOBS-03). Migration `20261015120100` replaces `update_workflow_progress`
+  (guard `NEW.status IN ('completed','failed','deadletter','cancelled')`); terminal workflows stay terminal; no backfill.
+- **Queue names are claimable everywhere a job is inserted** (R0126-LIVE-01, -02). `models::is_claimable_queue_name` (1-100 characters,
+  `validate_queue_name_chars`) guards schedule trigger (400) and the cron tick (a `failed` `schedule_runs` row, `next_run_at` advanced);
+  `CreateScheduleRequest`, `WorkflowJobDefinition` and `CustomWebhookRequest` are 1-100 characters, and
+  `CreateWorkflowRequest.jobs` is `#[validate(nested)]` (without it no per-job rule ran). Any new insert path must use these.
+- Tests: `r0126_jobs_realtime_tests::jobs01..05_*`, `live01..03_*`.
+
 ## Failure text (0.1.118)
 
 `models::normalize_failure_message` (REST `/fail` and gRPC `Fail`): empty →

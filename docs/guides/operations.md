@@ -65,8 +65,8 @@ Configure via environment variables:
 Rate limits are tracked per client:
 - **Organization**: authenticated routes share one token bucket per organization, sized by the plan
   (requests per second and burst; see [API Reference > Rate Limits](./api-usage.md#rate-limits))
-- **API Key**: an optional per-key `rate_limit` in requests per **minute**, checked after the
-  organization bucket (so it can only lower it)
+- **API Key**: an optional per-key `rate_limit` in requests per **minute**, checked first, then the
+  organization bucket (a request the key refuses spends no organization token; it can only lower the limit)
 - **IP Address**: See [Client IP Resolution](#client-ip-resolution) below. It also keys the
   failed-auth budget, `check-email`, `check-slug` and the email-login throttles
   (`POST /auth/email/start`: 3 per minute and 10 per hour per client; `POST /auth/email/verify`:
@@ -147,7 +147,8 @@ curl -X PUT /api/v1/queues/emails/config \
 
 `rate_limit` is accepted, validated, stored and returned, but it is **not enforced yet**: no claim
 path throttles a queue by it. The only enforced rate limits are the plan's request limit and an
-API key's `rate_limit` (requests per minute, checked after the plan limit, so it can only lower it).
+API key's `rate_limit` (requests per minute, checked before the plan limit, so it can only lower it). A custom rate limit of
+`0` blocks the organization (`429`, `Retry-After: 60`) instead of allowing one request per second (0.1.126).
 
 ### Backpressure Indicators
 

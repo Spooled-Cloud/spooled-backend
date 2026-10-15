@@ -6,15 +6,16 @@ Update the KB in the **same change** when you touch these areas.
 |-----------|-------------------|
 | `src/api/handlers/jobs.rs`, `src/queue/` | `dataflows/jobs-queue.md` (lists, search, history, timeouts), `contracts/invariants.md` (#38, #39) |
 | `src/grpc/services/queue_service.rs`, `proto/` | `dataflows/grpc-rest.md`, `contracts/invariants.md`, findings if defaults change |
-| `src/api/middleware/auth.rs`, `admin_auth.rs` | `dataflows/auth.md` |
-| `src/api/handlers/email_login.rs` | `dataflows/auth.md` |
+| `src/api/middleware/auth.rs` (`authenticate_jwt_token`, `cache_api_key`), `admin_auth.rs`, `api/handlers/auth.rs` (`is_token_revoked`, logout, `/auth/me`, `/auth/validate`), table `revoked_sessions` | `dataflows/auth.md` (Sessions and logout, API key resolution), `contracts/invariants.md` #36 |
+| `src/api/handlers/email_login.rs`, billing-email changes in `admin.rs` (`revoke_email_login_identity`) | `dataflows/auth.md` (Billing email) |
 | `src/api/middleware/client_ip.rs`, `main.rs` (ConnectInfo), any per-address limiter | `dataflows/auth.md` (Client IP), `contracts/invariants.md` #30 |
-| `src/api/handlers/billing.rs`, Stripe migrations | `dataflows/billing-stripe.md`, findings |
+| `src/api/handlers/billing.rs` (subscription and invoice handlers, org delete cancels), Stripe migrations | `dataflows/billing-stripe.md`, findings |
 | `src/outgoing_webhooks/` (service, `events.rs`, `format.rs`), `handlers/webhooks.rs`, `handlers/outgoing_webhooks.rs`, `models/webhook.rs` | `dataflows/webhooks.md`, `contracts/invariants.md` (#37, #41, #42), `docs/guides/webhooks.md` |
 | `src/api/middleware/limits.rs`, `config/plans.rs` | `dataflows/billing-stripe.md`, `contracts/invariants.md` |
 | Cap-counting SQL (`get_org_resource_counts`), `handlers/api_keys.rs` / `schedules.rs` / `workflows.rs` re-activation and retry, `custom_limits`, soft delete (`admin.rs`) | `contracts/invariants.md` #25-#29 |
 | `src/scheduler/` | `dataflows/jobs-queue.md` (retention, sweeps, cron), `dataflows/webhooks.md` (workflow outcome announcements), `contracts/invariants.md` #35, #41, chesterton fences |
-| `src/api/handlers/realtime.rs` | `dataflows/auth.md` (Realtime), `contracts/invariants.md` #36 |
+| `src/api/handlers/realtime.rs` (`ClientCommand`, subscription filter list, SSE channel loss) | `dataflows/auth.md` (Realtime, WebSocket commands), `contracts/invariants.md` #36, `docs/openapi.yaml` (WebSocket, `/events`) |
+| `src/queue/mod.rs` (`fail_by_worker`, `release_jobs_for_deregistered_worker`, dependency recompute), scheduler lease-expiry / offline requeues and cron (`is_claimable_queue_name`), `models/{job,schedule,workflow,webhook}.rs` queue-name rules | `dataflows/jobs-queue.md` (Job lifecycle fixes 0.1.126), `dataflows/grpc-rest.md`, `docs/openapi.yaml`, `docs/guides/{jobs,retries,workers}.md` |
 | `src/api/handlers/schedules.rs` `history` (`effective_run_outcome`), `models/job.rs` `JobSummary` | `dataflows/jobs-queue.md` (Schedule history follows the job, summaries), `docs/openapi.yaml` (`ScheduleRun`, `JobSummary`) |
 | `src/models/api_key.rs` queue scope, any SQL filtering rows by a key's queues, `queue_in_key_scope` | `dataflows/auth.md` (queue scope), `dataflows/grpc-rest.md`, `contracts/invariants.md` #32 |
 | Claim queries (`queue/mod.rs` `CLAIM_BATCH_SQL`, gRPC claims), indexes on `jobs` | `contracts/invariants.md` #33 (#39 for `idx_jobs_org_job_type`), `dataflows/jobs-queue.md`, chesterton #24, #28 |

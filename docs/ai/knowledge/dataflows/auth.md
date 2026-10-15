@@ -77,6 +77,29 @@ checks both in the JWT middleware, `/auth/refresh`, `/auth/me` and `/auth/valida
 So logout ends the session even when the client does not send its refresh token.
 Tokens minted before 0.1.114 have no `sid` and keep the old per-token behaviour.
 
+### Revocation is a Postgres row; Redis is a cache of it (0.1.126, R0126-AUTH-02)
+
+Redis alone lost a logout: `allkeys-lru` eviction of `session_revoked:{sid}`, or a timed-out GET, read as "not revoked" while the
+refresh token lives `expiration_hours x 24`. Migration `20261015120000` adds `revoked_sessions (sid PRIMARY KEY, expires_at)` with an
+index on `expires_at`. `POST /auth/logout` writes that row first (a failed write is 503; `DELETE ... WHERE expires_at <= NOW()` runs on each
+logout, so the table stays small), then the Redis keys (`token_blacklist:{jti}`, `session_revoked:{sid}`); with a `sid` a Redis failure
+after the row is only a warning, without a `sid` it stays a 503 because Redis is the only record.
+`auth::is_token_revoked(cache, pool, jti, sid)` is the one check (middleware `authenticate_jwt_token`, `/auth/refresh`, `/auth/me`,
+`/auth/validate`, `StreamAuth::check_session`): a Redis hit is final; a missing key, or any Redis error, for a token WITH a `sid` falls
+back to `SELECT 1 FROM revoked_sessions WHERE sid = $1 AND expires_at > NOW()` (so a Redis outage neither revives a logged-out session nor
+logs live ones out); a token WITHOUT a `sid` has only the Redis blacklist and is treated as revoked on a Redis error. A Postgres error is
+`Err`: 503 on the REST routes (never 401, which would sign every user out on a database blip), and an open realtime stream logs it and
+re-checks on its next turn. Sessions logged out before 0.1.126 exist only as Redis keys.
+
+### `/auth/me` and `/auth/validate` share the middleware check (0.1.126, R0126-AUTH-04)
+
+Both call `authenticate_jwt_token` (now `pub(crate)`), so they accept exactly what a protected route accepts: access token, not revoked,
+key active and unexpired, org not `deleted`. `/auth/validate` maps every 401 reason to `200 {valid: false, error}` and keeps 503/500 as
+errors (a `valid: false` on a database failure would log the caller out). `/auth/me` returns the key's current `queues` from the
+middleware context; `/auth/refresh` still copies the claim's `queues` into the next access token, which is harmless because no route
+trusts the claim (the middleware reloads `api_keys.queues` on every request). A new place that decides "is this JWT acceptable" must call
+`authenticate_jwt_token`, never decode and trust the signature.
+
 ## API key permissions
 
 There are no per-permission scopes; `queues` is the only way to narrow a key.
@@ -124,6 +147,15 @@ person's later email "signup" into their org (BE-42). Existing addresses were
 grandfathered as verified by migration `20261010120100` where email login could
 already resolve them (stored lower-cased; the oldest org of a duplicate group).
 
+**Replacing the verified address ends the old email login (0.1.126, R0126-AUTH-01).** `verify_billing_email` and the admin PATCH run the
+address change and `revoke_email_login_identity` in ONE transaction: unused `email_login_codes` of the old address are marked used
+(`signup:` / `verify:` pseudo-codes excluded) and every active `is_system` key of the org is deactivated; the auth-cache entries are dropped
+after the commit (`invalidate_api_key_cache`). The next email login creates a new system key. `POST /auth/email/verify` for an existing org
+now requires `lower(billing_email) = <the code's address>` and `billing_email_verified_at IS NOT NULL` (a soft-deleted org fails the same
+query), so a code issued before the change cannot log in. Re-confirming the same address, or a PATCH that does not touch `billing_email`,
+changes nothing. Open: the verified-email index is not UNIQUE, so two concurrent signups for
+one mailbox can both verify it.
+
 **Pending billing email (0.1.121, W1-14).** `PUT /organizations/{id}` with a different address on an org whose
 billing email is verified stores it in `organizations.pending_billing_email` (migration `20261013130000`) and leaves
 `billing_email` and `billing_email_verified_at` alone: the old address keeps resolving email login and stays the
@@ -158,10 +190,13 @@ refuse an empty configured key explicitly.
 ## Plan rate limiter and `X-RateLimit-*` headers (0.1.122, QW9, W8-R1)
 
 `plan_rate_limit_middleware` (`api/middleware/plan_rate_limit.rs:291`) runs on the protected and realtime routers (JWT requests of the
-dashboard too). Per request it checks (1) the organization's token bucket (`cache::check_token_bucket`, key `rate_limit:org:{org}`,
-size = plan burst, refill = plan rps, or the `custom_limits` overrides) and then (2) the API key's own `rate_limit` (requests per
-**minute**, fixed one-minute window, `cache::check_rate_limit`, key `rate_limit:api_key:{id}`), so a key limit can only lower the plan
-limit (invariants #31). Public routes use a per-client limiter and admin routes their own; both answer `429` with `Retry-After` only.
+dashboard too). Per request it checks (1) the API key's own `rate_limit` when it has one (requests per **minute**, fixed one-minute window,
+`cache::check_rate_limit`, key `rate_limit:api_key:{id}`) and then (2) the organization's token bucket (`cache::check_token_bucket`, key
+`rate_limit:org:{org}`, size = plan burst, refill = plan rps, or the `custom_limits` overrides), so a key limit can only lower the plan
+limit (invariants #31). Since 0.1.126 (R0126-BILL-04) the key window runs FIRST: a request it refuses never reaches the organization bucket,
+so a runaway key cannot drain the tokens of the others (gRPC `charge_rate_limits` has the same order). A `custom_limits` rps or burst of 0
+is no longer clamped to 1 (R0126-BILL-05): `get_org_rate_limits`, the gRPC `OrgRateLimits` and `check_token_bucket` keep 0, and the bucket
+refuses before the script (`retry_after_ms` 60000, so `Retry-After: 60`); the `.max(1)` left in the bucket is only a Lua divisor guard. Public routes use a per-client limiter and admin routes their own; both answer `429` with `Retry-After` only.
 
 - **Headers** (`RateLimitHeaders` `:92`, constants `HEADER_LIMIT` ... `HEADER_SCOPE` `:49-57`): `X-RateLimit-Limit`,
   `X-RateLimit-Remaining`, `X-RateLimit-Reset`, `X-RateLimit-Scope` (`organization` | `api_key`) on every authenticated response
@@ -339,7 +374,9 @@ the larger of its own scan and the turn holder's (sum of candidate units × meas
 doubled while the other lane scans if there is a single verify permit) + 1 s
 (`LEGACY_SCAN_WAIT_MARGIN` `:41`), at most 10 s (`LEGACY_SCAN_MAX_WAIT` `:45`); `Ok(None)` =
 busy. A verify that cannot run is a 503, never "no match" (a valid key must not be negatively
-cached). Throughput ceiling without Redis (every request a cache miss): about permits × 4
+cached). `cache_api_key` re-reads `is_active, rate_limit, expires_at, queues` after the bcrypt verify and caches THAT row, not the
+record selected before the verify (0.1.126, R0126-AUTH-05): a queue-scope or rate-limit update that commits during a 100 ms bcrypt must
+not be served for the 60 s TTL. Throughput ceiling without Redis (every request a cache miss): about permits × 4
 verifies/s per process at cost 12. A new bcrypt call on a request path must use the gate.
 
 `/auth/login` used to carry its own copy of the lookup with inline bcrypt. It now shares the
@@ -369,6 +406,25 @@ only emitted `system.health`. Published today by REST job create/bulk/complete/f
 retry, plus (0.1.121) the scheduler's lease-expiry and offline-worker dead-lettering
 (`Scheduler::announce_deadlettered`: `JobStatusChange` + `JobFailed`) — gRPC, schedules, workflows and webhook
 ingest do not publish realtime events.
+
+### WebSocket commands and subscription filters (0.1.126, R0126-RT-01, -02)
+
+`ClientCommand` has a hand-written `Deserialize` (`realtime.rs`): the name is `cmd` or `type`, matched case-insensitively
+(`Subscribe` from Node, `subscribe` from Go/Python/PHP, `{type:"subscribe",queues:[...]}` from the quickstart); `queue` and every entry of
+`queues` are read; null, missing and `""` are unset (PHP sends null for the field it does not use). `apply_client_command` mutates
+`filters: Vec<SubscriptionFilter>` (empty = everything the scope allows): a subscribe adds one filter per allowed queue (the `job_id`
+ANDed with each), an unsubscribe `retain`s the filters that do not match every field it names and does nothing when it names nothing.
+`event_matches_filters` = scope check, then ANY filter matches; one filter ANDs its fields. The upgrade query is the first filter and
+global SSE (`/events`) uses the same list. A frame that is not a command, or has an invalid queue, gets an `Error` event and the socket
+stays open (it used to be dropped silently); out-of-scope queues are ignored silently, as at upgrade. Never go back to one
+`SubscriptionFilter`: the SDKs record several subscriptions and replay them one command at a time.
+
+### Global SSE ends when its event channel is lost (0.1.126, R0126-RT-03)
+
+`sse_events_handler` yields an `error` event (`sse_channel_closed`, text of `StreamEnd::ChannelClosed`) and ends the stream when the Redis
+subscribe fails or the pub/sub stream closes, so the client reconnects; it used to continue with `system.health` only for the remaining
+30 minutes. Without a cache configured it is still health-only. This matches the WebSocket's `Error` + 1011. `queue.stats` counts only
+`pending` (not `scheduled`) in the pending field (R0126-LIVE2-03).
 
 ### Per-resource streams refuse before streaming (0.1.125, QAV2-L2)
 

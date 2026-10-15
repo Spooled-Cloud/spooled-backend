@@ -117,7 +117,8 @@ Job queue operations for enqueueing, processing, and managing jobs.
 > lease, send a longer one or call `RenewLease` before it expires.
 
 **`Enqueue` limits** (same as REST, `INVALID_ARGUMENT` otherwise): queue name up to 100
-characters, `priority` -100..100, `idempotency_key` up to 255 characters, `tags` up to 64 KB
+characters, `max_retries` 0..100 (a negative value is rejected since 0.1.126; `0` means the queue
+default, as proto3 cannot tell it from an omitted field), `priority` -100..100, `idempotency_key` up to 255 characters, `tags` up to 64 KB
 as JSON, `scheduled_at` between years 1 and 9999 (an all-zero Timestamp means unset).
 A whole number below 2^53 in a Struct that a client sends (an `Enqueue` payload, a `Complete`
 result) is stored as a JSON integer, so REST reads `42`, not `42.0`. The way back to a worker
@@ -194,7 +195,17 @@ checked under the same lock as REST, so concurrent registrations cannot exceed t
 Healthy, degraded and draining workers (draining only while they keep heartbeating, 2 minutes)
 count toward the limit. Limits: metadata 64 KB, `worker_type` and `version` 50 characters,
 `max_concurrency` 1-100 (larger values are lowered, 0 means 5). `Heartbeat` without metadata
-keeps the stored metadata, and without a status keeps the stored status.
+keeps the stored metadata, and without a status keeps the stored status. A `Register` queue name is
+1-100 characters (counted as characters, not bytes), as on REST and in `Enqueue`; a `Heartbeat`
+status must be `healthy`, `degraded`, `draining` or `offline` (`INVALID_ARGUMENT` otherwise; it used
+to be rewritten to `healthy`). `Deregister` releases only the worker's jobs whose lease has
+expired; a live lease stays with the worker.
+
+**Settlement details (same as REST).** `Complete` without a `result` stores NULL (an explicit empty
+Struct stores `{}`); a `lease_id` that is not the job's live lease is `FAILED_PRECONDITION` with
+"lease_id does not match the job's current lease; this worker no longer holds it", and "Lease
+expired" is kept for a lease that is gone. `Fail` with retries left sets the job `scheduled` until
+its backoff elapses. `RenewLease` stamps the new expiry with the database clock.
 
 ### 3. Health Service (`grpc.health.v1.Health`)
 

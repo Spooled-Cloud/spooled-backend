@@ -47,8 +47,14 @@ info:
     - Pro tier: 100 requests/second (burst: 200)
     - Enterprise: 500 requests/second (burst: 1000)
 
-    An API key may also carry its own `rate_limit` in requests per **minute**; it is checked after
-    the organization limit, so it can only lower what that key may do.
+    An API key may also carry its own `rate_limit` in requests per **minute**; it is checked together
+    with the organization limit, so it can only lower what that key may do. The key's window runs
+    first: a request it refuses does not use up an organization token (before 0.1.126 it did, and one
+    runaway key could starve the others).
+
+    An organization whose `custom_limits` set `rate_limit_requests_per_second` or `rate_limit_burst`
+    to `0` is blocked: every authenticated request answers `429` with `Retry-After: 60`. Before
+    0.1.126 a `0` was read as one request per second.
 
     A rejected request answers `429` with code `RATE_LIMIT_EXCEEDED`, a `Retry-After` header (seconds)
     and a JSON body with `retry_after_secs`, `limit`, `remaining` and `reset_at`.
@@ -306,7 +312,10 @@ paths:
     post:
       tags: [Authentication]
       summary: Refresh access token
-      description: Exchange a valid refresh token for a new access token
+      description: |
+        Exchange a valid refresh token for a new access token. A refresh token whose login
+        session was logged out is refused (`401`), whether or not Redis still holds the
+        revocation: the session revocation is stored in Postgres (since 0.1.126).
       operationId: refreshToken
       security: []
       requestBody:
@@ -328,6 +337,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          $ref: '#/components/responses/AuthUnavailable'
 
   /api/v1/auth/logout:
     post:
@@ -339,6 +350,11 @@ paths:
         share a session id). Sending `refresh_token` in the body is optional; tokens
         issued before 0.1.114 carry no session id, so for those only the access
         token (and a refresh token passed in the body) are revoked.
+
+        Since 0.1.126 the session revocation is stored in Postgres first and Redis only
+        caches it, so a Redis eviction, restart or outage does not bring a logged-out session
+        back, and does not log live sessions out. A logout whose revocation could not be
+        stored answers `503` and must be repeated.
       operationId: logout
       requestBody:
         required: false
@@ -354,12 +370,19 @@ paths:
           description: Logged out successfully
         '401':
           description: Not authenticated
+        '503':
+          description: The revocation could not be stored; the session is still valid, retry
 
   /api/v1/auth/me:
     get:
       tags: [Authentication]
       summary: Get current user info
-      description: Returns information about the authenticated user from the JWT token
+      description: |
+        Returns the organization and the key behind the access token. The token gets the checks
+        of every authenticated route (since 0.1.126): an access token (not a refresh token), its
+        session not logged out, the key active and not expired, the organization not deleted;
+        otherwise `401`. `queues` is the key's current queue scope, not the list the token was
+        issued with. A database failure while checking is `503`, not `401`.
       operationId: getCurrentUser
       responses:
         '200':
@@ -377,7 +400,14 @@ paths:
     post:
       tags: [Authentication]
       summary: Validate a token
-      description: Check if a JWT token is valid and not blacklisted
+      description: |
+        Check whether a JWT would be accepted by the API. Since 0.1.126 the rule is the API
+        middleware's: `valid` is `true` only for an access token (a refresh token is
+        `valid: false`) whose session was not logged out, whose key is active and not expired,
+        and whose organization is not deleted; `error` says why it is not. An unreadable or
+        forged token is `valid: false` too. When the check cannot run (database unavailable)
+        the answer is `503`, not `valid: false`, so a caller does not sign its user out on a
+        database blip.
       operationId: validateToken
       security: []
       requestBody:
@@ -393,6 +423,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ValidateTokenResponse'
+        '503':
+          $ref: '#/components/responses/AuthUnavailable'
 
   # Email-based Authentication
   /api/v1/auth/check-email:
@@ -1662,8 +1694,10 @@ paths:
       tags: [Jobs]
       summary: Fail job
       description: |
-        Mark a claimed job as failed. If retries remain, job will be rescheduled.
-        If no retries remain, job moves to dead-letter queue.
+        Mark a claimed job as failed. If retries remain, the job is rescheduled: its status is
+        `scheduled` until the backoff elapses (`scheduled_at`), then it is claimable again
+        (before 0.1.126 it read `pending` meanwhile). If no retries remain, job moves to
+        dead-letter queue.
       operationId: failJob
       requestBody:
         required: true
@@ -2403,6 +2437,12 @@ paths:
     post:
       tags: [Workers]
       summary: Deregister worker
+      description: |
+        Marks the worker `offline` and releases its jobs whose lease has already expired (each
+        counts as a retry and records a `retry_scheduled` history event). A job whose lease is
+        still live stays `processing` with the worker, which may be inside its handler: it is
+        completed by that worker or recovered when the lease expires (since 0.1.126; before, it
+        was requeued at once and could run twice).
       operationId: deregisterWorker
       responses:
         '204':
@@ -2550,7 +2590,9 @@ paths:
         ## Security
 
         - In production, HTTPS is required (HTTP webhooks are rejected)
-        - Use idempotency keys to handle retries from external services
+        - Use idempotency keys to handle retries from external services. An empty or
+          whitespace-only `idempotency_key` is no key: each delivery creates its own job (before
+          0.1.126 all blank keys of an organization shared one job)
         - The payload is stored as-is, validate in your worker
       operationId: customWebhook
       security: []
@@ -2612,7 +2654,9 @@ paths:
                 queue_name: payments
                 status: pending
         '400':
-          description: Invalid request (missing queue_name, payload too large, etc.)
+          description: >-
+            Invalid request (missing queue_name, a queue name a worker cannot claim, payload too
+            large, etc.)
           content:
             application/json:
               schema:
@@ -2967,6 +3011,18 @@ paths:
         {"cmd": "Ping"}
         ```
 
+        Since 0.1.126 `cmd` is case-insensitive (`"subscribe"` as the Go, Python and PHP SDKs send
+        it), `type` works in its place, and `queues: ["emails", "billing"]` is read next to `queue`.
+        A missing field, `null` and `""` all mean "not set". A frame that is not a command, or
+        that names an invalid queue, gets an `Error` event and the socket stays open; `Ping` is
+        answered with a `Ping` event. A queue outside the key's scope is ignored.
+
+        Subscriptions add up and an event is delivered when **any** of them matches (the
+        `queue` / `job_id` of the upgrade URL is the first one; a socket with none receives
+        everything the key's scope allows). One subscribe adds one subscription per named queue;
+        its `job_id` is combined (AND) with each of those queues. An unsubscribe removes the
+        subscriptions whose named fields all match, and removes nothing when it names nothing.
+
         ## Lifetime and close codes
         The socket lives as long as the credential it was opened with. The server re-checks
         the access token's session (logout), the API key (revoked, expired, organization
@@ -3020,6 +3076,11 @@ paths:
         plus `system.health` every 10 s). Each `data:` is the
         `{"type": "<Variant>", "data": {...}}` envelope. The key's queue scope
         always applies. Before 0.1.114 this stream only emitted `system.health`.
+
+        When the stream's event channel cannot be opened or is lost, the server sends an
+        `error` event and ends the stream, so the client reconnects (since 0.1.126; before, the
+        stream stayed open with only `system.health`). Without Redis configured it carries
+        `system.health` only.
 
         All four realtime endpoints end when the access JWT they were opened with expires
         (`exp` plus a 60 s validation leeway) or its session is logged out, and when the key is
@@ -3353,7 +3414,10 @@ paths:
     post:
       tags: [Schedules]
       summary: Trigger schedule
-      description: Manually trigger a schedule to create a job immediately
+      description: >-
+        Manually trigger a schedule to create a job immediately. A schedule stored with a queue
+        name a worker cannot claim (created before 0.1.126) answers `400` and enqueues nothing;
+        the cron tick records a `failed` run for it and moves on.
       operationId: triggerSchedule
       parameters:
         - name: id
@@ -3368,6 +3432,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TriggerScheduleResponse'
+        '400':
+          description: The schedule's queue name is not one a worker can claim
         '404':
           description: Schedule not found
 
@@ -3759,7 +3825,7 @@ components:
           type: boolean
         error:
           type: string
-          description: Error message if token is invalid
+          description: Why the token is not accepted, when `valid` is `false`
         claims:
           type: object
           description: Token claims if valid
@@ -3843,6 +3909,12 @@ components:
           default: UTC
         queue_name:
           type: string
+          minLength: 1
+          maxLength: 100
+          description: >-
+            Letters, digits, `-`, `_` and `.`, not starting with `.` or `-`: the names
+            `POST /jobs/claim` accepts. 1-100 characters, `400` otherwise (since 0.1.126; before,
+            255 characters and any character were stored and the jobs could not be claimed).
         payload_template:
           type: object
         priority:
@@ -4120,7 +4192,9 @@ components:
             Lifecycle event: `processing`, `completed`, `retry_scheduled` or `deadlettered`
             (`created` exists, but only the internal queue manager's enqueue writes it and no
             REST or gRPC handler calls that). Events are recorded by REST claim, complete and
-            fail and by the scheduler's dead-letter sweeps; gRPC settlements record none.
+            fail, by the scheduler's dead-letter sweeps and, since 0.1.126, by its requeues of an
+            expired lease or an offline worker and by a worker deregister that releases an expired
+            lease (`retry_scheduled`); gRPC settlements record none.
         worker_id:
           type: [string, 'null']
         details:
@@ -4156,6 +4230,10 @@ components:
         status:
           type: string
           enum: [pending, scheduled, processing, completed, failed, deadletter, cancelled]
+          description: >-
+            `scheduled` is a job waiting for a future `scheduled_at`, which includes a job that
+            failed and waits for its retry backoff (since 0.1.126; before, that read `pending`).
+            `pending` is claimable now.
         payload:
           type: object
         result:
@@ -4632,8 +4710,9 @@ components:
         rate_limit:
           type: integer
           description: >-
-            Per-key cap in requests per minute (1-10000). Checked after the organization's plan
-            rate limit, so it can only lower that limit for this key, never raise it.
+            Per-key cap in requests per minute (1-10000). Checked together with the organization's
+            plan rate limit (first, so a refusal does not use an organization token), so it can only
+            lower that limit for this key, never raise it.
         is_active:
           type: boolean
         is_system:
@@ -4681,8 +4760,9 @@ components:
           minimum: 1
           maximum: 10000
           description: >-
-            Per-key cap in requests per minute. Checked after the organization's plan rate
-            limit, so it can only lower that limit for this key, never raise it.
+            Per-key cap in requests per minute. Checked together with the organization's plan rate
+            limit (first, so a refusal does not use an organization token), so it can only lower
+            that limit for this key, never raise it.
         expires_at:
           type: string
           format: date-time
@@ -4728,8 +4808,9 @@ components:
           minimum: 1
           maximum: 10000
           description: >-
-            Per-key cap in requests per minute. Checked after the organization's plan rate
-            limit, so it can only lower that limit for this key, never raise it.
+            Per-key cap in requests per minute. Checked together with the organization's plan rate
+            limit (first, so a refusal does not use an organization token), so it can only lower
+            that limit for this key, never raise it.
         is_active:
           type: boolean
           description: >-
@@ -4742,6 +4823,12 @@ components:
       properties:
         queue_name:
           type: string
+          minLength: 1
+          maxLength: 100
+          description: >-
+            Letters, digits, `-`, `_` and `.`, not starting with `.` or `-`: the names
+            `POST /jobs/claim` accepts. 1-100 characters since 0.1.126 (it allowed 255, which stored
+            jobs no worker could claim).
         event_type:
           type: string
         payload:
@@ -5034,7 +5121,12 @@ components:
           maxLength: 100
         queue_name:
           type: string
-          maxLength: 255
+          minLength: 1
+          maxLength: 100
+          description: >-
+            Letters, digits, `-`, `_` and `.`, not starting with `.` or `-`: the names
+            `POST /jobs/claim` accepts. 1-100 characters, `400` otherwise (since 0.1.126; before,
+            255 and any character).
         payload:
           type: object
         depends_on:
@@ -5801,7 +5893,10 @@ components:
               means unlimited.
             - Settings `max_payload_size_bytes`, `rate_limit_requests_per_second`,
               `rate_limit_burst`, `job_retention_days`, `history_retention_days`: `null` keeps the
-              plan default; the two retention keys must be 0-36500 days.
+              plan default; the two retention keys must be 0-36500 days. `0` for
+              `rate_limit_requests_per_second` or `rate_limit_burst` blocks the organization: every
+              authenticated request answers `429` (`Retry-After: 60`; gRPC `RESOURCE_EXHAUSTED`).
+              Before 0.1.126 it was enforced as one request per second.
 
             Unknown keys, non-integers and any other negative or out-of-range value are a
             `400 VALIDATION_ERROR`.
