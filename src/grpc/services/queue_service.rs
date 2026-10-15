@@ -37,7 +37,8 @@ use crate::grpc::constants::{
     MAX_RESULT_SIZE,
 };
 use crate::grpc::convert::{
-    datetime_to_timestamp, job_to_proto, struct_to_json_opt, timestamp_to_datetime_opt,
+    datetime_to_timestamp, job_to_proto, struct_to_json, struct_to_json_opt,
+    timestamp_to_datetime_opt,
 };
 use crate::grpc::proto::{
     queue_service_server::QueueService, CompleteRequest, CompleteResponse, DequeueRequest,
@@ -692,7 +693,16 @@ impl QueueService for QueueServiceImpl {
                     }
                 })?;
         }
-        let max_retries = if req.max_retries <= 0 {
+        // 0 is proto3's omitted int32: the queue default, as when REST omits
+        // the field (explicit zero retries are not expressible here). A
+        // negative is present on the wire and is rejected like REST's 0-100
+        // check, instead of being stored as that default.
+        if req.max_retries < 0 {
+            return Err(Status::invalid_argument(
+                "Max retries must be between 0 and 100",
+            ));
+        }
+        let max_retries = if req.max_retries == 0 {
             queue_defaults.max_retries.clamp(0, 100)
         } else {
             self.resolve_max_retries(req.max_retries)
@@ -964,23 +974,17 @@ impl QueueService for QueueServiceImpl {
         let lease_id = Self::require_lease_id(&req.lease_id)?;
         let allowed_queues = queue_scope_filter(&auth);
 
-        // Validate result size
-        let result_json = struct_to_json_opt(req.result.as_ref());
-        let result_str = serde_json::to_string(&result_json).unwrap_or_default();
-        if result_str.len() > MAX_RESULT_SIZE {
-            return Err(Status::invalid_argument(format!(
-                "Result too large: {} bytes (max: {} bytes)",
-                result_str.len(),
-                MAX_RESULT_SIZE
-            )));
-        }
+        // Omitted `result` is SQL NULL, matching REST. A present Struct,
+        // including `{}`, is stored as that JSON.
+        let result_json =
+            complete_result_text(req.result.as_ref()).map_err(Status::invalid_argument)?;
 
         // NOTE: this SQL is byte-identical to QueueManager::complete_by_worker's.
         // sqlx caches prepared statements per connection KEYED BY THE SQL STRING,
         // so $1 must be bound with the same wire type as the REST path (a TEXT
-        // JSON string cast by ::JSONB) — binding serde_json::Value (JSONB oid)
-        // here poisons whichever path prepares second on a shared pool
-        // connection ("invalid input syntax for type json").
+        // JSON string, NULL when omitted, cast by ::JSONB) — binding
+        // serde_json::Value (JSONB oid) here poisons whichever path prepares
+        // second on a shared pool connection ("invalid input syntax for type json").
         let db_result = sqlx::query(
             r#"
             UPDATE jobs
@@ -999,7 +1003,7 @@ impl QueueService for QueueServiceImpl {
               AND queue_in_key_scope(queue_name, $6::TEXT[])
             "#,
         )
-        .bind(&result_str)
+        .bind(&result_json)
         .bind(&req.job_id)
         .bind(&req.worker_id)
         .bind(&auth.organization_id)
@@ -2370,12 +2374,64 @@ async fn handle_process_dequeue(
     }
 }
 
+/// REST `lease_mismatch_error` (`jobs.rs`). Same failed-precondition class
+/// as a timeout, but the text says the token was wrong while the lease was
+/// still live.
+const LEASE_MISMATCH_MESSAGE: &str =
+    "lease_id does not match the job's current lease; this worker no longer holds it";
+
+/// Why a still-`processing` row's worker UPDATE missed, when it is a lease
+/// problem. An expired (or missing) lease is "Lease expired", even if the
+/// token also differs — REST checks expiry first. A live lease whose token
+/// is not the one presented is [`LEASE_MISMATCH_MESSAGE`]. `None` means the
+/// row looked eligible, so the miss is reported as not found.
+fn processing_lease_miss(
+    lease: Option<chrono::DateTime<Utc>>,
+    current_lease_id: Option<&str>,
+    presented: Option<&str>,
+) -> Option<&'static str> {
+    let expired = lease.map(|t| t <= Utc::now()).unwrap_or(true);
+    if expired {
+        return Some("Lease expired");
+    }
+    let fenced_out = match presented {
+        Some(token) => current_lease_id != Some(token),
+        None => false,
+    };
+    if fenced_out {
+        Some(LEASE_MISMATCH_MESSAGE)
+    } else {
+        None
+    }
+}
+
+/// JSON text for `jobs.result` (`$1::JSONB`). An omitted Complete `result`
+/// is SQL NULL, matching REST `complete_by_worker`. A present Struct,
+/// including an empty one, is that JSON. The value stays a TEXT string so
+/// this SQL can share a prepared statement with the REST path (a JSONB bind
+/// poisons whichever path prepares second).
+fn complete_result_text(result: Option<&prost_types::Struct>) -> Result<Option<String>, String> {
+    let Some(result) = result else {
+        return Ok(None);
+    };
+    let result_str = serde_json::to_string(&struct_to_json(result)).unwrap_or_default();
+    if result_str.len() > MAX_RESULT_SIZE {
+        return Err(format!(
+            "Result too large: {} bytes (max: {} bytes)",
+            result_str.len(),
+            MAX_RESULT_SIZE
+        ));
+    }
+    Ok(Some(result_str))
+}
+
 /// Classify why a worker-scoped UPDATE affected zero rows into a
 /// `tonic::Status` for unary RPCs. Returns `FailedPrecondition`
 /// (LEASE_EXPIRED) when a matching row exists but its lease is
-/// null/past or was requeued, `FailedPrecondition` "Job is already
-/// <status>" when it already finished (REST 409), and `NotFound`
-/// otherwise.
+/// null/past or was requeued, `FailedPrecondition` with the REST mismatch
+/// text when the presented token is not the live lease, `FailedPrecondition`
+/// "Job is already <status>" when it already finished (REST 409), and
+/// `NotFound` otherwise.
 async fn classify_worker_miss_status(
     pool: &PgPool,
     job_id: &str,
@@ -2407,17 +2463,9 @@ async fn classify_worker_miss_status(
 
     match row {
         Ok(Some((status, lease, current_lease_id))) if status == "processing" => {
-            let expired = lease.map(|t| t <= Utc::now()).unwrap_or(true);
-            // A presented fencing token that no longer matches means the
-            // caller's lease was superseded — report it as expired.
-            let fenced_out = match lease_id {
-                Some(presented) => current_lease_id.as_deref() != Some(presented),
-                None => false,
-            };
-            if expired || fenced_out {
-                Status::failed_precondition("Lease expired")
-            } else {
-                Status::not_found("Job not found or not authorized")
+            match processing_lease_miss(lease, current_lease_id.as_deref(), lease_id) {
+                Some(message) => Status::failed_precondition(message),
+                None => Status::not_found("Job not found or not authorized"),
             }
         }
         // Requeued after its lease ran out: the worker lost the job.
@@ -2477,17 +2525,9 @@ async fn classify_worker_miss_process_response(
     .await
     {
         Ok(Some((status, lease, current_lease_id))) if status == "processing" => {
-            let expired = lease.map(|t| t <= Utc::now()).unwrap_or(true);
-            // A presented fencing token that no longer matches means the
-            // caller's lease was superseded — report it as expired.
-            let fenced_out = match lease_id {
-                Some(presented) => current_lease_id.as_deref() != Some(presented),
-                None => false,
-            };
-            if expired || fenced_out {
-                ("LEASE_EXPIRED", "Lease expired".to_string())
-            } else {
-                ("NOT_FOUND", "Job not found or not authorized".to_string())
+            match processing_lease_miss(lease, current_lease_id.as_deref(), lease_id) {
+                Some(message) => ("LEASE_EXPIRED", message.to_string()),
+                None => ("NOT_FOUND", "Job not found or not authorized".to_string()),
             }
         }
         // Requeued after its lease ran out: the worker lost the job.
@@ -2528,22 +2568,20 @@ async fn handle_process_complete(
             )),
         };
     }
-    let result_json = struct_to_json_opt(req.result.as_ref());
-    let result_str = serde_json::to_string(&result_json).unwrap_or_default();
-    if result_str.len() > MAX_RESULT_SIZE {
-        return ProcessResponse {
-            response: Some(crate::grpc::proto::process_response::Response::Error(
-                crate::grpc::proto::ErrorResponse {
-                    code: "INVALID_ARGUMENT".to_string(),
-                    message: format!(
-                        "Result too large: {} bytes (max: {} bytes)",
-                        result_str.len(),
-                        MAX_RESULT_SIZE
-                    ),
-                },
-            )),
-        };
-    }
+    // Same NULL-vs-JSON rule as the unary Complete (and REST).
+    let result_json = match complete_result_text(req.result.as_ref()) {
+        Ok(text) => text,
+        Err(message) => {
+            return ProcessResponse {
+                response: Some(crate::grpc::proto::process_response::Response::Error(
+                    crate::grpc::proto::ErrorResponse {
+                        code: "INVALID_ARGUMENT".to_string(),
+                        message,
+                    },
+                )),
+            };
+        }
+    };
 
     let (mut tx, _) = match begin_stream_operation(pool, api_key_id, org_id, None).await {
         Ok(locked) => locked,
@@ -2573,7 +2611,7 @@ async fn handle_process_complete(
           )
         "#,
     )
-    .bind(&result_str)
+    .bind(&result_json)
     .bind(&req.job_id)
     .bind(&req.worker_id)
     .bind(org_id)
@@ -3069,6 +3107,52 @@ mod tests {
                 Operation::Dequeue(_) => panic!("unexpected dequeue"),
             }
         }
+    }
+
+    #[test]
+    fn processing_lease_miss_distinguishes_a_live_mismatch_from_expiry() {
+        let future = Utc::now() + chrono::Duration::minutes(5);
+        let past = Utc::now() - chrono::Duration::minutes(5);
+        assert_eq!(
+            processing_lease_miss(Some(future), Some("real"), Some("other")),
+            Some(LEASE_MISMATCH_MESSAGE)
+        );
+        assert_eq!(
+            processing_lease_miss(Some(past), Some("real"), Some("real")),
+            Some("Lease expired")
+        );
+        // Expiry wins when the token is also wrong, same as REST.
+        assert_eq!(
+            processing_lease_miss(Some(past), Some("real"), Some("other")),
+            Some("Lease expired")
+        );
+        assert_eq!(
+            processing_lease_miss(None, Some("real"), Some("other")),
+            Some("Lease expired")
+        );
+        assert_eq!(
+            processing_lease_miss(Some(future), Some("real"), Some("real")),
+            None
+        );
+        assert_eq!(
+            processing_lease_miss(Some(future), Some("real"), None),
+            None
+        );
+    }
+
+    #[test]
+    fn complete_without_result_is_sql_null_not_empty_object() {
+        assert_eq!(complete_result_text(None).unwrap(), None);
+        let empty = crate::grpc::convert::json_to_struct(&serde_json::json!({})).unwrap();
+        assert_eq!(
+            complete_result_text(Some(&empty)).unwrap().as_deref(),
+            Some("{}")
+        );
+        let value = crate::grpc::convert::json_to_struct(&serde_json::json!({"ok": true})).unwrap();
+        assert_eq!(
+            complete_result_text(Some(&value)).unwrap().as_deref(),
+            Some("{\"ok\":true}")
+        );
     }
 
     #[test]

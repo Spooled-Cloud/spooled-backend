@@ -1251,15 +1251,23 @@ async fn load_queue_stream_counts(
     .await?;
     let mut counts = QueueStreamCounts::default();
     for (status, count) in rows {
-        match status.as_str() {
-            "pending" | "scheduled" => counts.pending += count,
-            "processing" => counts.processing += count,
-            "completed" => counts.completed += count,
-            "failed" | "deadletter" => counts.failed += count,
-            _ => {}
-        }
+        add_queue_stream_count(&mut counts, &status, count);
     }
     Ok(counts)
+}
+
+/// Fold one status bucket into the `queue.stats` payload.
+///
+/// `scheduled` is not pending. REST `pending_jobs` and gRPC `pending` count
+/// only `status = 'pending'`; a future job must not inflate this event.
+fn add_queue_stream_count(counts: &mut QueueStreamCounts, status: &str, count: i64) {
+    match status {
+        "pending" => counts.pending += count,
+        "processing" => counts.processing += count,
+        "completed" => counts.completed += count,
+        "failed" | "deadletter" => counts.failed += count,
+        _ => {}
+    }
 }
 
 /// SSE stream for queue updates
@@ -1822,5 +1830,25 @@ mod tests {
             .is_err());
         cache.get_or_load("org", "emails", ttl, load).await.unwrap();
         assert_eq!(loads.load(Ordering::SeqCst), 5);
+    }
+
+    #[test]
+    fn queue_stream_counts_do_not_treat_scheduled_as_pending() {
+        let mut counts = QueueStreamCounts::default();
+        add_queue_stream_count(&mut counts, "scheduled", 4);
+        add_queue_stream_count(&mut counts, "pending", 1);
+        add_queue_stream_count(&mut counts, "processing", 2);
+        add_queue_stream_count(&mut counts, "completed", 3);
+        add_queue_stream_count(&mut counts, "deadletter", 5);
+        add_queue_stream_count(&mut counts, "failed", 6);
+        assert_eq!(
+            counts,
+            QueueStreamCounts {
+                pending: 1,
+                processing: 2,
+                completed: 3,
+                failed: 11,
+            }
+        );
     }
 }

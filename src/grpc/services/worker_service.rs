@@ -198,11 +198,14 @@ impl WorkerServiceImpl {
         Ok(())
     }
 
-    /// Validate queue name format
+    /// Validate queue name format. Length matches REST `RegisterWorkerRequest`
+    /// (1-100 characters). Enqueue already rejects past 100; this used to
+    /// allow 255, so a worker could register for a queue no job can use.
     fn validate_queue_name(name: &str) -> Result<(), Status> {
-        if name.is_empty() || name.len() > 255 {
+        // Characters, not bytes, like the REST validator.
+        if name.is_empty() || name.chars().count() > 100 {
             return Err(Status::invalid_argument(
-                "Queue name must be 1-255 characters",
+                "Queue name must be 1-100 characters",
             ));
         }
         if !name
@@ -289,16 +292,19 @@ impl WorkerServiceImpl {
         Ok(Some(json))
     }
 
-    /// The status a heartbeat asks for. `None` (empty in the request) keeps the
-    /// stored one; an unknown value falls back to healthy as before.
-    fn requested_heartbeat_status(status: &str) -> Option<&str> {
+    /// The status a heartbeat asks for. `Ok(None)` (empty in the request) keeps
+    /// the stored one. An unknown value is rejected: rewriting it to `healthy`
+    /// cleared a real `degraded` status. The text matches REST.
+    fn requested_heartbeat_status(status: &str) -> Result<Option<&str>, Status> {
         if status.is_empty() {
-            None
+            Ok(None)
         } else if VALID_WORKER_STATUSES.contains(&status) {
-            Some(status)
+            Ok(Some(status))
         } else {
-            warn!(status = %status, "Invalid worker status, defaulting to healthy");
-            Some("healthy")
+            Err(Status::invalid_argument(format!(
+                "Status must be one of: {}",
+                VALID_WORKER_STATUSES.join(", ")
+            )))
         }
     }
 
@@ -577,7 +583,7 @@ impl WorkerService for WorkerServiceImpl {
             return Err(Status::invalid_argument("Worker ID is required"));
         }
 
-        let requested_status = Self::requested_heartbeat_status(&req.status);
+        let requested_status = Self::requested_heartbeat_status(&req.status)?;
         // Empty metadata binds NULL so the stored metadata is kept.
         let metadata_json = Self::metadata_json(&req.metadata)?;
 
@@ -821,34 +827,43 @@ mod tests {
         assert!(WorkerServiceImpl::validate_queue_name("default").is_ok());
         assert!(WorkerServiceImpl::validate_queue_name("my-queue").is_ok());
         assert!(WorkerServiceImpl::validate_queue_name("queue.name").is_ok());
+        assert!(WorkerServiceImpl::validate_queue_name(&"q".repeat(100)).is_ok());
 
         assert!(WorkerServiceImpl::validate_queue_name("").is_err());
         assert!(WorkerServiceImpl::validate_queue_name("bad@queue").is_err());
+        let too_long = WorkerServiceImpl::validate_queue_name(&"q".repeat(101)).unwrap_err();
+        assert_eq!(too_long.code(), tonic::Code::InvalidArgument);
+        assert_eq!(too_long.message(), "Queue name must be 1-100 characters");
     }
 
     #[test]
     fn test_requested_heartbeat_status() {
         assert_eq!(
-            WorkerServiceImpl::requested_heartbeat_status("healthy"),
+            WorkerServiceImpl::requested_heartbeat_status("healthy").unwrap(),
             Some("healthy")
         );
         assert_eq!(
-            WorkerServiceImpl::requested_heartbeat_status("degraded"),
+            WorkerServiceImpl::requested_heartbeat_status("degraded").unwrap(),
             Some("degraded")
         );
         assert_eq!(
-            WorkerServiceImpl::requested_heartbeat_status("draining"),
+            WorkerServiceImpl::requested_heartbeat_status("draining").unwrap(),
             Some("draining")
         );
         assert_eq!(
-            WorkerServiceImpl::requested_heartbeat_status("offline"),
+            WorkerServiceImpl::requested_heartbeat_status("offline").unwrap(),
             Some("offline")
         );
+        let unknown = WorkerServiceImpl::requested_heartbeat_status("invalid").unwrap_err();
+        assert_eq!(unknown.code(), tonic::Code::InvalidArgument);
         assert_eq!(
-            WorkerServiceImpl::requested_heartbeat_status("invalid"),
-            Some("healthy")
+            unknown.message(),
+            "Status must be one of: healthy, degraded, draining, offline"
         );
-        assert_eq!(WorkerServiceImpl::requested_heartbeat_status(""), None);
+        assert_eq!(
+            WorkerServiceImpl::requested_heartbeat_status("").unwrap(),
+            None
+        );
     }
 
     #[test]
