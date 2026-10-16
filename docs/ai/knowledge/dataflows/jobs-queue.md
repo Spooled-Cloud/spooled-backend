@@ -206,7 +206,7 @@ also refreshes `workers.last_heartbeat` on success.
 - **Queue names are claimable everywhere a job is inserted** (R0126-LIVE-01, -02). `models::is_claimable_queue_name` (1-100 characters,
   `validate_queue_name_chars`) guards schedule trigger (400) and the cron tick (a `failed` `schedule_runs` row, `next_run_at` advanced);
   `CreateScheduleRequest`, `WorkflowJobDefinition` and `CustomWebhookRequest` are 1-100 characters, and
-  `CreateWorkflowRequest.jobs` runs `validate_workflow_job_queue_names` (queue rules only; deliberately not `nested`, which would newly enforce key/priority/retry rules that never ran). Any new insert path must use these.
+  `CreateWorkflowRequest.jobs` runs `validate_workflow_job_queue_names` plus the per-job priority, max_retries, timeout_seconds and expires_at checks (0.1.128); job `key` rules are still not enforced. Each job stores its step key in `jobs.workflow_job_key` (0.1.129), which `GET /workflows/{id}` returns as `jobs[].key` (null for older workflows). Any new insert path must use these.
 - Tests: `r0126_jobs_realtime_tests::jobs01..05_*`, `live01..03_*`.
 
 ## Round-2 fixes (0.1.128)

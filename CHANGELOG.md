@@ -11,6 +11,20 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.129] - 2026-10-16
+
+`GET /workflows/{id}` returns each job's step key. One migration (`20261016130000_workflow_job_key` adds the nullable column `jobs.workflow_job_key`), no new route. Responses gain one field.
+
+### Fixed
+
+- **Workflow jobs read back with the key they were created with** (R0129-1). `POST /workflows` used each job's `key` only to wire dependencies and returned the key-to-id map once, in `job_ids`; nothing stored the key, so the jobs in `GET /workflows/{id}` had no `key` and a client that lost the create response could not tell its steps apart (the PHP SDK's `WorkflowJob::$key` was always `''`, and the Go and Node SDKs documented the gap). Workflow create now stores the key on the job (`jobs.workflow_job_key`) and the detail response sends it as `jobs[].key`. Workflows created before 0.1.129 did not record a key and return `key: null`. Test: `r0128_flow_tests::workflow_detail_returns_each_job_key`.
+
+### Documentation
+
+- `docs/openapi.yaml`: `POST /workflows` and `GET /workflows/{id}` describe `jobs[].key`.
+
+---
+
 ## [0.1.128] - 2026-10-16
 
 Thirty-two fixes from a second pre-release review of outgoing and inbound webhooks, organizations and tenancy, the job and workflow flow, the scheduler and gRPC, from a live probe of the API, and from the backend side of the dashboard and website reports. Two migrations (`20261016040000_webhook_delivery_retry_claim` adds `retry_claim_token` and `retry_claimed_at` to `outgoing_webhook_deliveries`; `20261016120000_any_mode_delete_dependents` replaces the function `cancel_blocked_dependents_of_deleted_job`), no new route. Clients may notice these response and behavior changes: webhook deliveries (organization webhooks, the test call and per-job completion callbacks) no longer follow redirects, so a 3xx is a failed attempt; `GET /api-keys` takes `limit` and `offset` and sends `X-Has-More`; an idempotency replay outside a queue-scoped key's scope is `409` on REST (`FAILED_PRECONDITION` on gRPC) instead of returning the other queue's job; `POST /billing/checkout` is `409` while an operator-set paid plan has no Stripe subscription; `POST /jobs/{id}/retry` on a job of a cancelled workflow is `409` and DLQ retry skips those jobs; workflow create rejects an out-of-range `priority`, `max_retries` or `timeout_seconds` and a past `expires_at` with `400` (job keys are still not validated); REST worker registration and gRPC `RegisterWorker` reject queue names that start with `.` or `-`; inbound custom webhooks accept the queue names `POST /jobs` accepts (`default`, names containing `..`) and answer `400` for U+0000; `GET /dashboard` has `jobs.scheduled`, its worker totals count every worker and its queues include configured queues that have no jobs; `GET /workflows/{id}` has a separate `progress.cancelled` count; and a manual delivery retry that loses to the pending automatic retry is `409`, a schedule update over the plan's payload cap is `403`, and gRPC `ProcessJobs` answers an illegal queue name with `INVALID_ARGUMENT` instead of `NO_JOBS`.
