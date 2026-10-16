@@ -2909,39 +2909,22 @@ async fn w3_auth_legacy_key_behind_a_busy_scan_turn_is_503_with_retry_after() {
     use std::time::{Duration, Instant};
 
     use spooled_backend::api::middleware::auth::AUTH_RETRY_AFTER_SECS;
-    use spooled_backend::grpc::auth::authenticate_request;
+    use spooled_backend::api::middleware::bcrypt_gate::test_hooks;
 
     let db = TestDatabase::new().await;
     let tenant = seed_tenant(db.pool()).await;
     let legacy = unknown_token("sp_test_");
     insert_key(db.pool(), &tenant.org_id, &legacy, true).await;
-    let one_verify = insert_decoys(
-        db.pool(),
-        &tenant.org_id,
-        "sp_test_",
-        Duration::from_secs(3),
-        10,
-    )
-    .await;
     let (app, cache, _redis) = app_with_redis(&db).await;
 
-    // The wait is computed from the measured verify speed: measure it first
-    // with a few production-cost keys found by lookup_hash (one verify each).
-    let modern = unknown_token("sp_warm_");
-    insert_key_with_cost(db.pool(), &tenant.org_id, &modern, false, 12).await;
-    for _ in 0..4 {
-        authenticate_request(db.pool(), &grpc_request(&modern))
-            .await
-            .expect("a modern key authenticates");
-    }
-
-    // Two unknown tokens take the REST turn one after the other, so a third
-    // request would wait for two scans.
-    let first = spawn_rest_call(&app, &unknown_token("sp_test_"), &unique_client_ip());
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let second = spawn_rest_call(&app, &unknown_token("sp_test_"), &unique_client_ip());
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(!first.is_finished(), "the decoy scan ended too early");
+    // The wait is about one scan of the turn's holder at the measured verify
+    // speed. Real decoy scans on a loaded machine drifted from that estimate,
+    // so the test pins both: the holder's scan is estimated at 2 s and the
+    // margin stays 1 s, so a waiter gives up after about 3 s.
+    const HOLDER_UNITS: u64 = 1 << 20;
+    test_hooks::pin_verify_speed(2_000_000_000 / HOLDER_UNITS);
+    test_hooks::set_wait_margin(Duration::from_secs(1));
+    let held = test_hooks::hold_rest_turn(HOLDER_UNITS).await;
 
     let ip = unique_client_ip();
     let started = Instant::now();
@@ -2978,12 +2961,11 @@ async fn w3_auth_legacy_key_behind_a_busy_scan_turn_is_503_with_retry_after() {
             .and_then(|v| v.to_str().ok()),
         Some(AUTH_RETRY_AFTER_SECS.to_string().as_str())
     );
-    let scan = one_verify * 10;
     assert!(
-        waited >= Duration::from_millis(2500) && waited >= scan,
-        "waited {waited:?}, less than one scan ({scan:?})"
+        waited >= Duration::from_millis(2900),
+        "waited {waited:?}, less than the holder's estimated scan plus the margin"
     );
-    assert!(waited < Duration::from_secs(12), "waited {waited:?}");
+    assert!(waited < Duration::from_secs(10), "waited {waited:?}");
 
     let (status, headers, body) = login.await.unwrap();
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
@@ -2999,12 +2981,8 @@ async fn w3_auth_legacy_key_behind_a_busy_scan_turn_is_503_with_retry_after() {
         "a scan that never ran is not a failed authentication"
     );
 
-    for holder in [first, second] {
-        let (status, _, body) = holder.await.unwrap();
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
-    }
-
     // With the turn free again the legacy key authenticates.
+    drop(held);
     let (status, _, body) = spawn_rest_call(&app, &legacy, &ip).await.unwrap();
     assert_eq!(status, StatusCode::OK, "{body}");
 }
@@ -3040,6 +3018,13 @@ async fn w3_auth_failed_auth_budget_is_charged_before_the_scan() {
     .await;
     // Its own Redis database: this test spends the gRPC budget.
     let (app, cache, _redis) = app_with_redis_db(&db, Some(12)).await;
+    // The budget's worth of concurrent unknown tokens queue for one lane's
+    // turn. On a loaded machine the last ones outlived the default wait (one
+    // estimated scan plus 1 s) and answered 503 / UNAVAILABLE instead of being
+    // scanned. Waiting is not what this test checks; give the queue room.
+    spooled_backend::api::middleware::bcrypt_gate::test_hooks::set_wait_margin(
+        Duration::from_secs(10),
+    );
     cache.delete(FAILED_AUTH_GRPC_KEY).await.unwrap();
 
     async fn negatively_cached(

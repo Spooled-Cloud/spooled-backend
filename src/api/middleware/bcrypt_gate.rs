@@ -105,6 +105,10 @@ pub(crate) fn verify_units(hash: &str) -> u64 {
 
 /// Fold one measured verify into [`NANOS_PER_UNIT`].
 fn record_verify(units: u64, took: Duration) {
+    #[cfg(feature = "test-hooks")]
+    if test_hooks::SPEED_PINNED.load(Ordering::Relaxed) {
+        return;
+    }
     let sample = u64::try_from(took.as_nanos() / u128::from(units.max(1))).unwrap_or(u64::MAX);
     let previous = NANOS_PER_UNIT.load(Ordering::Relaxed);
     NANOS_PER_UNIT.store(previous / 2 + sample / 2, Ordering::Relaxed);
@@ -197,8 +201,20 @@ fn scan_wait(lane: ScanLane, units: u64) -> Duration {
         expected = expected.saturating_mul(2);
     }
     expected
-        .saturating_add(LEGACY_SCAN_WAIT_MARGIN)
+        .saturating_add(wait_margin())
         .min(LEGACY_SCAN_MAX_WAIT)
+}
+
+/// [`LEGACY_SCAN_WAIT_MARGIN`], or the margin a test set.
+fn wait_margin() -> Duration {
+    #[cfg(feature = "test-hooks")]
+    {
+        let ms = test_hooks::WAIT_MARGIN_MS.load(Ordering::Relaxed);
+        if ms != u64::MAX {
+            return Duration::from_millis(ms);
+        }
+    }
+    LEGACY_SCAN_WAIT_MARGIN
 }
 
 /// Wait for `lane`'s turn to bcrypt-scan legacy (`lookup_hash IS NULL`) keys,
@@ -245,6 +261,50 @@ async fn acquire_within(
     match tokio::time::timeout(wait, semaphore.acquire()).await {
         Ok(permit) => Ok(Some(permit?)),
         Err(_elapsed) => Ok(None),
+    }
+}
+
+/// Controls for the integration tests (`--features test-hooks`, never in a
+/// release build). The scan-turn tests used real bcrypt timing, so on a loaded
+/// machine the measured speed and the queued scans drifted apart and a waiter
+/// gave up early or got the turn late. These pin the inputs instead.
+#[cfg(feature = "test-hooks")]
+pub mod test_hooks {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    pub(super) static SPEED_PINNED: AtomicBool = AtomicBool::new(false);
+    pub(super) static WAIT_MARGIN_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+    /// Fix the verify speed the turn wait is estimated from; measured verifies
+    /// no longer move it.
+    pub fn pin_verify_speed(nanos_per_unit: u64) {
+        NANOS_PER_UNIT.store(nanos_per_unit, Ordering::Relaxed);
+        SPEED_PINNED.store(true, Ordering::Relaxed);
+    }
+
+    /// Replace the margin added to every turn wait (still capped at
+    /// [`LEGACY_SCAN_MAX_WAIT`]).
+    pub fn set_wait_margin(margin: Duration) {
+        WAIT_MARGIN_MS.store(
+            u64::try_from(margin.as_millis()).unwrap_or(u64::MAX - 1),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// The REST lane's turn, held as a scan of `units` holds it, until dropped.
+    pub struct HeldTurn {
+        _turn: ScanTurn,
+    }
+
+    /// Take the REST lane's turn as a scan of `units` would. Panics if another
+    /// scan holds it.
+    pub async fn hold_rest_turn(units: u64) -> HeldTurn {
+        let turn = legacy_scan_turn(ScanLane::Rest, units)
+            .await
+            .expect("scan turn")
+            .expect("the REST scan turn is free");
+        HeldTurn { _turn: turn }
     }
 }
 
