@@ -2869,7 +2869,7 @@ paths:
         '200':
           description: >-
             Workflow created. The status is `200`, not `201`. The body maps each job `key` to its
-            job id (`job_ids`); the jobs in `GET /workflows/{id}` carry no `key`.
+            job id (`job_ids`); the jobs in `GET /workflows/{id}` carry the same `key` (since 0.1.129).
           content:
             application/json:
               schema:
@@ -2887,9 +2887,11 @@ paths:
       description: |
         Get workflow details including progress.
 
-        In the returned `jobs`, `job_type` is the payload's `job_type` (`"job"` when the payload
-        has none), `failed_at` is the failure time of a `failed` or `deadletter` job (null
-        otherwise) and `backoff_type` is always `exponential`. A workflow turns `running`, with
+        In the returned `jobs`, `key` is the step key the job was created with (`jobs[].key` on
+        create; null for workflows created before 0.1.129, which did not store it), `job_type` is
+        the payload's `job_type` (`"job"` when the payload has none), `failed_at` is the failure
+        time of a `failed` or `deadletter` job (null otherwise) and `backoff_type` is always
+        `exponential`. A workflow turns `running`, with
         `started_at` set, within about 10 s of its first job being claimed.
 
         `progress` has `total`, `completed`, `failed`, `pending`, `processing` and `cancelled`.

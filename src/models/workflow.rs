@@ -428,6 +428,9 @@ pub struct WorkflowDetailResponse {
 /// Job response within a workflow
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowJobResponse {
+    /// The step key this job was created for (`jobs[].key` on create). `None`
+    /// for workflows created before 0.1.129, which did not store it.
+    pub key: Option<String>,
     pub id: String,
     pub organization_id: String,
     pub queue: String,

@@ -499,3 +499,68 @@ async fn workflow_detail_counts_cancelled_apart_from_failed() {
         .expect("workflow in the list");
     assert_eq!(row["failed_jobs"].as_i64(), Some(0));
 }
+
+/// GET /workflows/{id} returns each job's step key, so a client can match the
+/// jobs it reads back to the steps it defined. A job created before the key
+/// was stored has `key: null`.
+#[tokio::test]
+async fn workflow_detail_returns_each_job_key() {
+    let db = TestDatabase::new().await;
+    let t = seed_tenant(db.pool()).await;
+    let app = app(&db);
+
+    let (status, created) = call(
+        &app,
+        "POST",
+        "/api/v1/workflows",
+        &t.key,
+        Some(json!({
+            "name": "keys",
+            "jobs": [
+                job("extract", json!({})),
+                job("load", json!({"depends_on": ["extract"]})),
+            ],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let workflow_id = created["workflow_id"].as_str().unwrap().to_string();
+    let id_of = |key: &str| {
+        created["job_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["key"] == key)
+            .map(|m| m["job_id"].as_str().unwrap().to_string())
+            .unwrap()
+    };
+    let (extract, load) = (id_of("extract"), id_of("load"));
+
+    // A job written before the column existed has no key.
+    sqlx::query("UPDATE jobs SET workflow_job_key = NULL WHERE id = $1")
+        .bind(&load)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let (status, detail) = call(
+        &app,
+        "GET",
+        &format!("/api/v1/workflows/{workflow_id}"),
+        &t.key,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    let key_of = |id: &str| {
+        detail["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|j| j["id"] == id)
+            .map(|j| j["key"].clone())
+            .unwrap()
+    };
+    assert_eq!(key_of(&extract), json!("extract"), "{detail}");
+    assert_eq!(key_of(&load), Value::Null, "{detail}");
+}

@@ -196,9 +196,34 @@ pub async fn get(
         }
     }
 
+    // The step key each job was created for (NULL for workflows created before
+    // the key was stored).
+    let keys: std::collections::HashMap<String, String> = if !job_ids.is_empty() {
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT id, workflow_job_key FROM jobs \
+             WHERE id = ANY($1) AND organization_id = $2 AND workflow_job_key IS NOT NULL",
+        )
+        .bind(&job_ids)
+        .bind(&ctx.organization_id)
+        .fetch_all(state.db.pool())
+        .await?
+        .into_iter()
+        .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+
     // Convert jobs to response format
-    let job_responses: Vec<WorkflowJobResponse> =
-        jobs.into_iter().map(workflow_job_response).collect();
+    let job_responses: Vec<WorkflowJobResponse> = jobs
+        .into_iter()
+        .map(|job| {
+            let key = keys.get(&job.id).cloned();
+            WorkflowJobResponse {
+                key,
+                ..workflow_job_response(job)
+            }
+        })
+        .collect();
 
     // Convert dependencies to response format
     let dependency_responses: Vec<WorkflowDependencyResponse> = dependencies
@@ -259,6 +284,7 @@ fn workflow_job_response(job: Job) -> WorkflowJobResponse {
         matches!(job.status.as_str(), "failed" | "deadletter").then_some(job.updated_at);
 
     WorkflowJobResponse {
+        key: None,
         id: job.id,
         organization_id: job.organization_id,
         queue: job.queue_name,
@@ -513,9 +539,9 @@ pub async fn create(
                 INSERT INTO jobs (
                     id, organization_id, queue_name, status, payload, priority,
                     max_retries, timeout_seconds, expires_at, workflow_id, workflow_step,
-                    dependency_mode, dependencies_met, created_at, updated_at
+                    dependency_mode, dependencies_met, created_at, updated_at, workflow_job_key
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $14)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $14, $15)
                 "#,
             )
             .bind(&job_id)
@@ -549,6 +575,8 @@ pub async fn create(
             .bind(job_def.dependency_mode.to_string())
             .bind(!has_dependencies) // dependencies_met = true if no dependencies
             .bind(now)
+            // GET /workflows/{id} returns it, so a client can match jobs to steps.
+            .bind(&job_def.key)
             .execute(&mut *tx)
             .await?;
 
