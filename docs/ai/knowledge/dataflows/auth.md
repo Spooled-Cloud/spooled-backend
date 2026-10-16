@@ -179,6 +179,17 @@ among live orgs: an unverified copy never resolves a login, so it must not block
 the real owner from signing up. Before 0.1.114 admin create/update accepted
 duplicates and the login landed in an arbitrary org.
 
+## Organization create, signup and restore (0.1.128, R0128-ORG-01, -04, -05)
+
+- **Restore drops a contested verified email.** `admin.rs` `update_organization`: when `plan_tier` leaves `deleted` and the request sends no
+  `billing_email`, a verified address that a live organization now holds (`billing_email_taken`) is cleared with its verification and any pending
+  change, so email login cannot resolve two live rows (and mint a system key for the old one). Still open: no UNIQUE index, so concurrent
+  verifies of one address can both commit.
+- **Org, first key and signup token are one transaction.** `organizations::create` and `email_login::complete_signup` hash the key (bcrypt)
+  before `begin()`, insert organization and key on the transaction, and `complete_signup` consumes the token last (`UPDATE ... used_at IS NULL`),
+  so a failed insert leaves the token usable. Admin create was already transactional.
+- **`GET /api-keys` pages** (`limit` 1-100, `offset`, `created_at DESC, id DESC`, `X-Has-More`); older live keys stay reachable. The body is a bare array.
+
 ## Empty secrets
 
 Optional secrets are read with `config::non_empty_env`: an empty or blank value

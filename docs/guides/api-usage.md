@@ -386,6 +386,9 @@ Retrying a step of a workflow also re-opens the steps that were cancelled becaus
 a `failed` workflow back to `running`. That takes a slot of the plan's workflow limit: `429
 QUOTA_EXCEEDED` when none is free, `403 feature_disabled` on a plan without workflows.
 
+A dead-lettered step of a `cancelled` workflow cannot be retried: the call answers `409` ("Job belongs
+to a cancelled workflow and cannot be retried"), because the workflow stays cancelled.
+
 ### Boost Priority
 
 ```bash
@@ -546,6 +549,9 @@ free those steps stay in the DLQ and are listed in `skipped_jobs`; everything el
 retried. If only such steps are left, the request answers the limit's error (`429`, or `403` on a
 plan without workflows).
 
+Dead-lettered steps of a `cancelled` workflow are skipped (whether you pass `job_ids`, a
+`queue_name` or neither): they stay in the DLQ and are not counted in `retried_count`.
+
 ### Purge DLQ
 
 Permanently delete jobs from DLQ:
@@ -679,7 +685,7 @@ Authorization: Bearer <token>
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `queue_name` | string | Yes | Queue this worker processes (1-100 chars) |
+| `queue_name` | string | Yes | Queue this worker processes (1-100 chars: letters, digits, `-`, `_`, `.`, not starting with `.` or `-`, the names a job can be claimed from; anything else is a `400`) |
 | `hostname` | string | Yes | Host the worker runs on (1-255 chars) |
 | `worker_id` | string | No | Stable worker id, 1-128 chars from `A-Z a-z 0-9 . _ -` |
 | `worker_type` | string | No | Free-form label (max 50 chars) |
@@ -858,6 +864,9 @@ Authorization: Bearer <token>
 }
 ```
 
+A `payload_template` over your plan's payload cap (Free 64 KB, Starter 256 KB) is a `403`, as on
+create, and nothing is changed. Before 0.1.128 it was stored and every later fire failed.
+
 ### Pause Schedule
 
 ```bash
@@ -953,10 +962,12 @@ Authorization: Bearer <token>
 ```
 
 `depends_on` lists the `key`s of other jobs in the workflow. Listing the same key twice, an unknown
-key or a cycle is a `400`. Each job is validated: `queue_name` 1-100 characters of letters, digits,
-`-`, `_` and `.` (not starting with `.` or `-`), `key` 1-100 letters, digits, `-` and `_`,
-`priority` -100..100, `max_retries` 0..100 and `timeout_seconds` 1..86400; a job outside these
-is a `400 VALIDATION_ERROR` (since 0.1.126 these per-job rules are enforced).
+key or a cycle is a `400`. At most 100 jobs. Each job is validated: `queue_name` 1-100 characters of
+letters, digits, `-`, `_` and `.` (not starting with `.` or `-`; since 0.1.126), `priority` -100..100,
+`max_retries` 0..100, `timeout_seconds` 1..86400 and, when sent, an `expires_at` in the future
+(these four since 0.1.128; before that an out-of-range `priority` was a `500` and the other two
+numbers were stored clamped); a job outside these is a `400 VALIDATION_ERROR`. The per-job `key`
+rules are not applied (`depends_on` must still name keys that exist).
 
 ### List Workflows
 
@@ -976,7 +987,11 @@ Each job in `jobs` has a `job_type` (the `job_type` of its payload, `"job"` when
 none) and, for a failed or dead-lettered job, a `failed_at`. A workflow turns `running`, with
 `started_at` set, within about 10 seconds of its first job being claimed. When a step failed the
 workflow ends `failed`; when a step was cancelled and none failed it ends `cancelled`; it is
-`completed` only when every step completed.
+`completed` only when every step completed. `progress` counts the steps as `total`, `completed`,
+`failed` (failed and dead-lettered, like `failed_jobs` in the list), `pending`, `processing` and
+`cancelled`; before 0.1.128 cancelled steps were added to `failed`. A workflow whose jobs expire
+(`expires_at`) before they run ends `failed` when a step failed, otherwise `cancelled`, and stops
+counting toward your workflow limit.
 
 ### Cancel Workflow
 
@@ -991,7 +1006,9 @@ workflow answers `409` and keeps its outcome.
 ### Retry Failed Workflow
 
 Retry all failed jobs in a workflow. This resets failed/deadletter jobs back to pending,
-clears retry counts, and resumes the workflow. Only workflows with status `failed` can be retried.
+clears retry counts, and resumes the workflow. Steps cancelled because a dependency failed are
+reopened too; a step you cancelled stays cancelled. Only workflows with status `failed` can be
+retried.
 A running workflow counts toward the plan's `max_workflows` again, so the retry answers
 `429 QUOTA_EXCEEDED` when the organization is at its limit, and `403 feature_disabled` on a plan
 without workflows.
@@ -1116,7 +1133,7 @@ Content-Type: application/json
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `queue_name` | string | Yes | Target queue for the job (1-100 chars: letters, digits, `-`, `_`, `.`) |
-| `payload` | object | Yes | Job data (max 1MB) |
+| `payload` | object | Yes | Job data (max 1MB; a string or object key containing U+0000 is a `400`) |
 | `event_type` | string | No | Event type label (for logging/tracking) |
 | `priority` | integer | No | -100 to 100 (default: 0) |
 | `idempotency_key` | string | No | Prevent duplicate jobs (max 255 chars) |
@@ -1196,7 +1213,7 @@ curl -X POST https://api.spooled.cloud/api/v1/webhooks/org_abc123/custom \
 | Status | Description |
 |--------|-------------|
 | 200 | Job created successfully |
-| 400 | Invalid request (missing queue_name, invalid JSON, etc.) |
+| 400 | Invalid request (missing queue_name, a queue name a worker cannot claim, invalid JSON, a payload containing U+0000, etc.) |
 | 401 | Invalid or missing `X-Webhook-Token` |
 | 404 | Organization not found |
 
@@ -1429,7 +1446,7 @@ organization's verified billing email.
 |--------|------|
 | 400 `VALIDATION_ERROR` | `plan` is missing, not `starter` or `pro`, or the body is not JSON |
 | 403 `ACCESS_DENIED` | The API key is restricted to queues |
-| 409 `CONFLICT` | The organization already has that plan with an active or trialing subscription; use the billing portal |
+| 409 `CONFLICT` | The organization already has that plan with an active or trialing subscription (use the billing portal), or it is on a paid plan an operator set and has no Stripe subscription (contact support) |
 | 503 `SERVICE_UNAVAILABLE` | Billing or that plan's price is not configured, or Stripe is unavailable |
 
 Buying a different plan than the current one replaces the current subscription once the payment
@@ -1730,6 +1747,10 @@ Send requests:
 {"renew_lease": {"job_id": "job_3", "worker_id": "w1", "extension_secs": 60}}
 ```
 
+A `dequeue` for an illegal queue name (over 100 characters, a character outside letters, digits, `-`,
+`_` and `.`, or a leading `.` or `-`) is answered with an `error` response with code
+`INVALID_ARGUMENT`, as `Dequeue` does, not with `NO_JOBS`.
+
 ### WorkerService RPCs
 
 #### Register
@@ -1961,6 +1982,10 @@ Response:
 sign in by email (`is_system: true` in `GET /api-keys`) is not counted. Re-activating a revoked
 key or a paused schedule with `PUT` ... `{"is_active": true}` is checked against the limit like a
 new one (`429 QUOTA_EXCEEDED`).
+
+`GET /api-keys` lists keys newest first, revoked ones included, 100 at a time: `limit` (1-100,
+default 100) and `offset` page it, and the `X-Has-More` response header says whether another page
+follows. The body is a plain array.
 
 History retention covers the delivery history behind
 `GET /api/v1/outgoing-webhooks/{id}/deliveries`, the run history of schedules

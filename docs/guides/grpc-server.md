@@ -162,6 +162,11 @@ one message is dead-lettered with the reason `Job too large for a gRPC message`.
 `FAILED_PRECONDITION` `Job is already <status>` (inside `ProcessJobs`: error code `CONFLICT`),
 like REST's 409. `NOT_FOUND` means the job is not this worker's or not in the key's scope.
 
+**`ProcessJobs` queue names**: a `dequeue` message validates its queue name like unary `Dequeue`
+(1-100 characters of letters, digits, `-`, `_` and `.`, not starting with `.` or `-`). A bad name is
+an `error` response with code `INVALID_ARGUMENT` and the validator's message, not `NO_JOBS`, which a
+worker takes for an empty queue and polls again.
+
 **`StreamJobs`**: a stream hands the worker one job at a time. The next job is sent once the
 previous one is completed or failed, released, or its lease has run out, so settle each job with
 `Complete` or `Fail`; to run several jobs at once, open one stream per job slot. A job claimed
@@ -199,7 +204,9 @@ Healthy, degraded and draining workers (draining only while they keep heartbeati
 count toward the limit. Limits: metadata 64 KB, `worker_type` and `version` 50 characters,
 `max_concurrency` 1-100 (larger values are lowered, 0 means 5). `Heartbeat` without metadata
 keeps the stored metadata, and without a status keeps the stored status. A `Register` queue name is
-1-100 characters (counted as characters, not bytes), as on REST and in `Enqueue`; a `Heartbeat`
+1-100 characters (counted as characters, not bytes) of letters, digits, `-`, `_` and `.` that does
+not start with `.` or `-` (`INVALID_ARGUMENT`; the names a job can be claimed from), as on REST and
+in `Enqueue`; a `Heartbeat`
 status must be `healthy`, `degraded`, `draining` or `offline` (`INVALID_ARGUMENT` otherwise; it used
 to be rewritten to `healthy`). `Deregister` releases only the worker's jobs whose lease has
 expired; a live lease stays with the worker.

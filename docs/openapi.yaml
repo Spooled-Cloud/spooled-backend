@@ -213,6 +213,13 @@ paths:
 
         Requires authentication. Data is scoped to the authenticated organization.
         `system.uptime_seconds` and `system.started_at` count from process start.
+
+        `jobs.scheduled` counts jobs waiting out a retry backoff and is not part of
+        `jobs.pending`. `workers.total` is every worker of the organization (offline ones
+        included); `workers.healthy` are those with status `healthy` and a heartbeat in the last
+        two minutes, and `workers.unhealthy` is the difference. `queues` lists the queues in
+        `queue_config` (a paused queue with no jobs too) and the queues that have jobs, paused
+        ones first, then by name, at most 20.
       operationId: dashboardData
       security:
         - BearerAuth: []
@@ -696,7 +703,9 @@ paths:
         '409':
           description: >-
             `CONFLICT`: the organization already has that plan with an active or trialing
-            subscription; manage it through the billing portal
+            subscription (manage it through the billing portal), or it is on a paid plan
+            (`starter`, `pro` or `enterprise`) that an operator set and has no Stripe
+            subscription: contact support to change plans. Checked before any Stripe call.
           content:
             application/json:
               schema:
@@ -1593,6 +1602,10 @@ paths:
         puts the job's `failed` workflow back to `running`. A job someone cancelled stays
         cancelled.
 
+        A dead-lettered step of a `cancelled` workflow cannot be retried: cancelling the workflow
+        cancelled only its pending and scheduled steps, and retrying the rest would run the payload
+        of a workflow that stays `cancelled`. That call is a `409`.
+
         Putting a failed workflow back to `running` takes one of the plan's `max_workflows`
         slots (only pending and running workflows count), like `POST /workflows/{id}/retry`: the
         call is refused with `429 QUOTA_EXCEEDED` (resource `workflows`) when the organization is
@@ -1614,7 +1627,9 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '409':
-          description: Job cannot be retried
+          description: >-
+            Job cannot be retried: it is not failed or dead-lettered, or it belongs to a cancelled
+            workflow ("Job belongs to a cancelled workflow and cannot be retried")
         '429':
           description: >-
             `QUOTA_EXCEEDED` (resource `workflows`): the job belongs to a failed workflow and
@@ -2113,6 +2128,10 @@ paths:
         the oldest step first) and leaves the other steps in the dead-letter queue, listed in
         `skipped_jobs`. Only when nothing else could be retried does it fail with the limit's
         error (`429`, or `403` on a plan without workflows).
+
+        A dead-lettered step of a `cancelled` workflow is skipped, whether the call selects jobs by
+        `job_ids`, by `queue_name` or neither: it stays in the dead-letter queue and is not counted
+        (`POST /jobs/{id}/retry` answers `409` for it).
       operationId: retryDeadLetterJobs
       requestBody:
         required: true
@@ -2364,6 +2383,11 @@ paths:
         already holds. The plan's `max_workers` limit counts healthy and degraded workers
         plus draining workers that sent a heartbeat in the last 2 minutes; re-registering a
         counted id does not take a second slot.
+
+        `queue_name` follows the claim rules: 1-100 characters of letters, digits, `-`, `_` and
+        `.`, not starting with `.` or `-` (`400 VALIDATION_ERROR` otherwise). A worker registered
+        for any other name could never be given a job. gRPC `RegisterWorker` applies the same
+        rule (`INVALID_ARGUMENT`).
       operationId: registerWorker
       requestBody:
         required: true
@@ -2631,7 +2655,8 @@ paths:
         - Use idempotency keys to handle retries from external services. An empty or
           whitespace-only `idempotency_key` is no key: each delivery creates its own job (before
           0.1.126 all blank keys of an organization shared one job)
-        - The payload is stored as-is, validate in your worker
+        - The payload is stored as-is, validate in your worker. A payload that contains the NUL
+          character (`\u0000`) in a string or an object key is a `400`, as on `POST /jobs`
       operationId: customWebhook
       security: []
       parameters:
@@ -2694,7 +2719,7 @@ paths:
         '400':
           description: >-
             Invalid request (missing queue_name, a queue name a worker cannot claim, payload too
-            large, etc.)
+            large, a payload containing `\u0000` (`payload_contains_nul`), etc.)
           content:
             application/json:
               schema:
@@ -2827,6 +2852,12 @@ paths:
         Create a new workflow with multiple jobs and dependencies.
         Jobs within a workflow can have dependencies on other jobs,
         creating a DAG of job execution.
+
+        At most 100 jobs. Each job's `queue_name` follows the claim rules, `priority` is
+        -100..100, `max_retries` 0..100, `timeout_seconds` 1..86400 and `expires_at`, when sent,
+        must be in the future; otherwise the request is a `400 VALIDATION_ERROR` (before 0.1.128 an
+        out-of-range `priority` was a `500` and the other two numbers were stored clamped). The job
+        `key` rules of `POST /jobs` are not applied.
       operationId: createWorkflow
       requestBody:
         required: true
@@ -2845,8 +2876,9 @@ paths:
                 $ref: '#/components/schemas/CreateWorkflowResponse'
         '400':
           description: >-
-            Invalid workflow definition: a circular dependency, an unknown key in `depends_on`, or
-            a job that lists the same key twice in `depends_on` (it used to be a 500)
+            Invalid workflow definition: a circular dependency, an unknown key in `depends_on`, a
+            job that lists the same key twice in `depends_on` (it used to be a 500), or a job
+            field outside the ranges above (`VALIDATION_ERROR`)
 
   /api/v1/workflows/{id}:
     get:
@@ -2859,6 +2891,10 @@ paths:
         has none), `failed_at` is the failure time of a `failed` or `deadletter` job (null
         otherwise) and `backoff_type` is always `exponential`. A workflow turns `running`, with
         `started_at` set, within about 10 s of its first job being claimed.
+
+        `progress` has `total`, `completed`, `failed`, `pending`, `processing` and `cancelled`.
+        `failed` counts failed and dead-lettered jobs, the same as `failed_jobs` in the list;
+        cancelled jobs are counted in `cancelled` (until 0.1.128 they were added to `failed`).
       operationId: getWorkflow
       parameters:
         - name: id
@@ -2916,7 +2952,8 @@ paths:
       description: |
         Retry all failed jobs in a workflow. This resets failed/deadletter jobs
         back to pending status, clears retry counts and error messages, and
-        resumes the workflow.
+        resumes the workflow. Steps the scheduler cancelled because a dependency failed are
+        reopened too; a step someone cancelled stays cancelled.
 
         Only workflows with status 'failed' can be retried.
 
@@ -3351,6 +3388,10 @@ paths:
         it is checked against the plan's schedule limit (429 `QUOTA_EXCEEDED`) and the next run is
         computed from the current time, so the run missed while paused does not fire. Turning a
         schedule off never fails on quota.
+
+        A `payload_template` larger than the plan's payload cap (Free 64 KB, Starter 256 KB) is a
+        `403`, as on create, and nothing is written. A template already stored is not checked again
+        by an update that does not send one.
       operationId: updateSchedule
       parameters:
         - name: id
@@ -3373,6 +3414,12 @@ paths:
                 $ref: '#/components/schemas/Schedule'
         '400':
           description: Invalid cron expression (including a date that never occurs) or timezone
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: '`payload_template` is larger than the plan''s payload cap'
           content:
             application/json:
               schema:
@@ -3541,6 +3588,11 @@ paths:
       description: |
         Create a new outgoing webhook configuration.
         The webhook will be called when any of the subscribed events occur.
+
+        Deliveries (and `POST /outgoing-webhooks/{id}/test`, and the per-job `completion_webhook`
+        callbacks) never follow redirects: a `3xx` answer is the response, the delivery is
+        `failed` with that status code and `HTTP 3xx` as its error, and it is retried like any
+        other non-2xx answer. Configure the final URL.
       operationId: createOutgoingWebhook
       requestBody:
         required: true
@@ -3632,7 +3684,9 @@ paths:
     post:
       tags: [Outgoing Webhooks]
       summary: Test outgoing webhook
-      description: Send a test payload to the webhook URL to verify connectivity
+      description: >-
+        Send a test payload to the webhook URL to verify connectivity. Redirects are not
+        followed: a `3xx` answer is `success: false` with `HTTP 3xx` as the error.
       operationId: testOutgoingWebhook
       responses:
         '200':
@@ -3704,6 +3758,9 @@ paths:
         - Cannot retry successful deliveries (returns 400)
         - Maximum 10 total attempts per delivery (returns 400 when exceeded)
         - Deliveries removed by the plan retention sweep can no longer be retried
+        - Only one retry of a delivery sends at a time. A retry that loses to another retry of the
+          same delivery (the automatic retry waiting out its backoff, or a second click) answers
+          `409` and sends nothing; a delivery that succeeded in the meantime answers success
       operationId: retryOutgoingWebhookDelivery
       responses:
         '200':
@@ -3726,6 +3783,14 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
           description: Webhook or delivery not found
+        '409':
+          description: >-
+            `CONFLICT` ("A retry of this delivery is already in progress"): another retry of this
+            delivery owns it
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
 components:
   responses:
@@ -4695,6 +4760,9 @@ components:
           type: string
           minLength: 1
           maxLength: 100
+          description: >-
+            Letters, digits, `-`, `_` and `.`, not starting with `.` or `-`: the names
+            `POST /jobs/claim` accepts.
         hostname:
           type: string
           minLength: 1
@@ -4872,8 +4940,9 @@ components:
           maxLength: 100
           description: >-
             Letters, digits, `-`, `_` and `.`, not starting with `.` or `-`: the names
-            `POST /jobs/claim` accepts. 1-100 characters since 0.1.126 (it allowed 255, which stored
-            jobs no worker could claim).
+            `POST /jobs/claim` and `POST /jobs` accept, `default` and names containing `..`
+            included (before 0.1.128 these were refused here). 1-100 characters since 0.1.126 (it
+            allowed 255, which stored jobs no worker could claim).
         event_type:
           type: string
         payload:
@@ -5381,6 +5450,9 @@ components:
     QueueSummary:
       type: object
       required: [name, pending, processing, paused]
+      description: >-
+        A queue with a `queue_config` row (counts are 0 when it has no jobs) or with jobs. At most 20,
+        paused queues first.
       properties:
         name:
           type: string
@@ -5397,10 +5469,13 @@ components:
       properties:
         total:
           type: integer
+          description: Every worker of the organization, offline ones included.
         healthy:
           type: integer
+          description: Workers with status `healthy` and a heartbeat in the last two minutes.
         unhealthy:
           type: integer
+          description: '`total` minus `healthy`.'
 
     RecentActivity:
       type: object

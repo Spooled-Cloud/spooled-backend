@@ -279,7 +279,8 @@ If the job is a step of a workflow, retrying it also re-opens the steps that wer
 because it failed (they wait again until it completes; a step you cancelled yourself stays
 cancelled) and puts a `failed` workflow back to `running`. A running workflow counts toward your
 plan's workflow limit, so the retry answers `429 QUOTA_EXCEEDED` when no slot is free, and
-`403 feature_disabled` on a plan without workflows.
+`403 feature_disabled` on a plan without workflows. A dead-lettered step of a `cancelled`
+workflow cannot be retried (`409`); DLQ retry skips such jobs.
 
 ### List Jobs
 

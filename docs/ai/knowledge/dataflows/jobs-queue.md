@@ -136,7 +136,7 @@ cancels jobs still blocked on a deleted job that had not completed (scalar
 sorts before the `RI_ConstraintTrigger_*` FK actions so it still sees the links.
 Without it the orphan sweep would release those jobs after 1 h. The expiry sweep
 (`scheduler/mod.rs` cleanup) cancels children of an expiring parent first so it
-can dispatch `job.cancelled` (reason `parent_expired`).
+can dispatch `job.cancelled` (reason `parent_expired`). Since 0.1.128 the trigger and the sweeps honor `dependency_mode = 'any'` (see "Round-2 fixes").
 
 ## Cron and DST (0.1.117)
 
@@ -208,6 +208,35 @@ also refreshes `workers.last_heartbeat` on success.
   `CreateScheduleRequest`, `WorkflowJobDefinition` and `CustomWebhookRequest` are 1-100 characters, and
   `CreateWorkflowRequest.jobs` runs `validate_workflow_job_queue_names` (queue rules only; deliberately not `nested`, which would newly enforce key/priority/retry rules that never ran). Any new insert path must use these.
 - Tests: `r0126_jobs_realtime_tests::jobs01..05_*`, `live01..03_*`.
+
+## Round-2 fixes (0.1.128)
+
+- **Idempotency is org-wide, the answer is scoped** (R0128-FLOW-06, RT-01). `existing_idempotent_job` returns id and queue; a hit outside the
+  key's queue scope is `409` ("Idempotency key is already in use", `models::IDEMPOTENCY_KEY_IN_USE`), never the id. `POST /jobs/bulk`
+  refuses the whole request. The insert's `ON CONFLICT ... DO UPDATE` carries `WHERE queue_in_key_scope(jobs.queue_name, $n)`, so a race
+  returns no row and writes nothing; the caller refunds its quota reservation. The unique index is unchanged.
+- **One lock opens a queue** (R0128-ORG-02). Every path that can make a queue new takes `lock_resource(..., "queues")` and re-reads
+  `queue_name_exists` (`queue_config`, any job, an active schedule) before `check_new_queue_limit_*_conn`: `POST /jobs`, bulk, gRPC
+  `Enqueue`, schedule create, workflow create, and `cron_new_queue_refusal` in the cron tick. A queue that already exists takes no lock.
+  A new path that inserts jobs for an unseen queue name must do the same.
+- **`any` is honored on every cancel path** (R0128-FLOW-02, SCHED-03). A child with `dependency_mode = 'any'` is cancelled only when no
+  other dependency is outside failed/deadletter/cancelled: the `parent_job_id` failure sweep, the expiry sweep, and the delete trigger
+  (migration `20261016120000` replaces `cancel_blocked_dependents_of_deleted_job`; it locks the dependents first, found through the two indexed lookups as a UNION (an OR would scan the organization's pending backlog per deleted row), `FOR NO KEY UPDATE` in id order).
+  DLQ retry resets a child's `dependencies_met` with `check_job_dependencies_met` for `any` children, not FALSE.
+- **Expiry sweep announces and finishes** (R0128-SCHED-04, FLOW-01). Before the delete it cancels `job_dependencies` children
+  (`last_error` "Dependency job <id> expired before it completed") and dispatches `job.cancelled` (`dependency_expired`; `parent_expired`
+  for `parent_job_id` children). After the delete it finishes each affected `pending`/`running` workflow with no active job left
+  (failed if a step failed, cancelled if a step was cancelled or removed or none is left). Workflow create rejects a past `expires_at`.
+- **Retries of cancelled work** (R0128-FLOW-03, -04). Workflow retry reopens failed/deadletter steps and cancelled steps whose `last_error`
+  is in `DEPENDENCY_CANCEL_REASONS`. `POST /jobs/{id}/retry` is 409 for a job of a `cancelled` workflow; DLQ retry skips those jobs.
+- **Workflow create limits** (R0128-LIVE3-01, -04). `validate_workflow_job_limits` on `jobs`: priority -100..100, `max_retries` 0..100,
+  `timeout_seconds` 1..86400, `expires_at` in the future (400). Not `nested`: job key rules still do not run. The handler's clamps now
+  bound only defaults. `progress.cancelled` is separate from `progress.failed` (R0128-FLOW-07).
+- **Cron next run** (R0128-SCHED-02): after the insert, `next_run_after_clock` from `clock_timestamp()`; failure paths other than "queue not
+  claimable" still advance from the batch clock. `PUT /schedules/{id}` checks the plan payload cap for a supplied template (SCHED-01).
+- **`GET /dashboard`** (R0128-DASH-29, -32, -35): `jobs.scheduled`; workers total = all, healthy = `healthy` with a heartbeat under 2 minutes;
+  queues from `queue_config` plus implicit queues, paused first, LIMIT 20.
+- Tests: `r0128_flow_tests`, `r0128_sched_tests`, `r0128_jobs_tests`, `r0128_followup_tests`, `r0128_live3_tests`, `r0128_dash_tests`.
 
 ## Failure text (0.1.118)
 

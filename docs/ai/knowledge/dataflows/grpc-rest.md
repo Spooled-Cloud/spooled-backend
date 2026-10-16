@@ -215,6 +215,18 @@ Dead-letter keeps `retry_count` (the statements at `:958-966` and `:2417-2424`),
   `Utc::now()` taken before the statement has a connection.
 - Tests: `r0126_grpc_parity_tests::live2_*`, `r0126_billing_auth_tests::bill03_*`, `r0126_jobs_realtime_tests::rt04_*`.
 
+## Parity fixes (0.1.128, R0128-RT-01, -02, ORG-02, LIVE3-02, -03)
+
+- **Enqueue idempotency**: a blank key (`normalize_idempotency_key`) is no key; a hit outside the key's queue scope is `FAILED_PRECONDITION`
+  "Idempotency key is already in use" and the insert's conflict arm is guarded by `queue_in_key_scope` (same as REST 409, see
+  `jobs-queue.md`). A new queue name inserts under the `queues` lock and the cap is re-checked (`RESOURCE_EXHAUSTED`).
+- **ProcessJobs `Dequeue`** validates the queue name with `grpc::validation::validate_queue_name`; a bad name is an `INVALID_ARGUMENT` error
+  response, not `NO_JOBS`.
+- **`RegisterWorker`** also rejects a name starting with `.` or `-` (`worker_service::validate_queue_name`); REST register uses the same
+  claimable-name rule (`RegisterWorkerRequest.queue_name`).
+- Tests: `r0128_jobs_tests::rt01_*`, `rt02_*`, `org02_*`, `r0128_live3_tests::process_jobs_dequeue_rejects_an_illegal_queue_name`,
+  `r0128_followup_tests::grpc_register_rejects_a_queue_name_starting_with_dot_or_dash`.
+
 ## Struct numbers
 
 `google.protobuf.Struct` numbers are doubles. The conversion to an integer runs in ONE

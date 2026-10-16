@@ -100,7 +100,7 @@ Response:
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `queue_name` | string | Yes | Target queue (1-100 chars: letters, digits, `-`, `_`, `.`; the names a worker can claim) |
-| `payload` | object | Yes | Job data (request body is capped at 2 MiB; the plan's job payload cap also applies) |
+| `payload` | object | Yes | Job data (request body is capped at 2 MiB; the plan's job payload cap also applies; a string or object key containing U+0000 is a `400`, as on `POST /jobs`) |
 | `event_type` | string | No | Event type for logging |
 | `priority` | integer | No | -100 to 100 (default: 0) |
 | `idempotency_key` | string | No | Prevent duplicates (an empty or whitespace-only value is no key: each delivery creates its own job) |
@@ -308,6 +308,9 @@ curl -X POST https://api.spooled.cloud/api/v1/outgoing-webhooks/{id}/retry/{deli
 ```
 
 > **Note:** You cannot retry successful deliveries, and each delivery has a maximum of 10 total delivery attempts across automatic and manual retries.
+> Only one retry of a delivery sends at a time: a manual retry made while the automatic retry of
+> the same delivery is waiting out its backoff (or a second click) answers `409` ("A retry of this
+> delivery is already in progress") and sends nothing.
 
 Each delivery record explains a failure: `error` holds the reason (`HTTP 503`, a transport error such
 as a refused connection or a timeout, or `Invalid webhook URL: ...`), `response_body` the first 1 KiB
@@ -467,6 +470,14 @@ Five attempts is the default; on a self-hosted deployment the limit is
 `OUTGOING_WEBHOOK_MAX_ATTEMPTS`. After the attempt limit, the delivery remains failed.
 You can also use the manual retry endpoint above; manual retry sends immediately and
 records the new result.
+
+A delivery is successful only when your URL itself answers 2xx. **Redirects are not followed**
+(organization webhooks, `POST /outgoing-webhooks/{id}/test` and per-job completion callbacks): a
+`301`, `302`, `303`, `307` or `308` is a failed attempt, stored with that status code and the error
+`HTTP 302`, and it is retried like any other non-2xx answer. A redirected POST would reach the new
+address as a GET with no body, or, for `307` and `308`, would send the signed body and headers to
+a host you did not configure, so set the webhook URL to the final address (including a trailing
+slash if your server redirects without one).
 
 Deliveries go through a bounded queue worked by a fixed number of senders
 (`OUTGOING_WEBHOOK_MAX_CONCURRENT_DELIVERIES`, default 64, which also sets the queue size:

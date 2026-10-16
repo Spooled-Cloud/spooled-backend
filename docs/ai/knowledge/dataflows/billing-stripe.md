@@ -139,3 +139,12 @@ local `canceled` status is written only after all cancels. Because delete has al
   that clock (see the pipeline step 4).
 - Tests: `r0126_billing_auth_tests::bill01_*`, `bill06_*`.
 
+
+## Operator plans and checkout (0.1.128, R0128-SITE-01, ORG-03)
+
+- `create_checkout` is `409` before any Stripe call when `plan_tier` is `starter`, `pro` or `enterprise` and `stripe_subscription_id` is empty
+  (an operator-set plan): a paid checkout would have lowered `plan_tier` through the webhook. Free organizations and organizations with a
+  subscription are unchanged. Test: `r0128_billing_tests::site01_checkout_refuses_an_operator_set_paid_plan`.
+- `cancel_subscription_before_org_delete` sets `stripe_subscription_id = NULL` with the `canceled` status, and the admin `PATCH` reconciles from
+  Stripe only when the request itself sets a subscription id (`subscription_explicitly_set`), so a plan-only restore keeps the plan the operator
+  chose. Test: `r0128_org_tests::org03_canceled_subscription_does_not_own_the_plan`.

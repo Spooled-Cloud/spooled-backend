@@ -287,7 +287,7 @@ Response:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `queue_name` | string | Yes | Queue this worker processes (1-100 chars) |
+| `queue_name` | string | Yes | Queue this worker processes (1-100 chars: letters, digits, `-`, `_`, `.`, not starting with `.` or `-`; anything else is a `400`) |
 | `hostname` | string | Yes | Host the worker runs on (1-255 chars) |
 | `worker_id` | string | No | Stable worker id, 1-128 chars from `A-Z a-z 0-9 . _ -` |
 | `worker_type` | string | No | Free-form label (max 50 chars) |

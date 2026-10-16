@@ -2,6 +2,9 @@
 
 ## Incoming (job ingest)
 
+0.1.128: `queue_name` follows `validate_queue_name_chars` only (`default`, `admin`, names with `..` are accepted; R0128-HOOK-04), and a payload with
+U+0000 (value or key) is `400 payload_contains_nul` before the insert (R0128-HOOK-03; `models::contains_nul`, shared with `POST /jobs`).
+
 0.1.126: `queue_name` is 1-100 characters (`CustomWebhookRequest`, the names claim accepts: R0126-LIVE-01), and a blank or whitespace
 `idempotency_key` goes through `normalize_idempotency_key` and is stored as NULL, so blank keys never dedupe (R0126-LIVE-03; the unique index
 treats `""` as a value).
@@ -113,6 +116,16 @@ because validating would scan the log under `ACCESS EXCLUSIVE`; every existing r
 A manual retry of a delivery keeps `last_status = auto_disabled` on an auto-disabled webhook (0.1.126, R0126-RT-05): the retry forces `enabled` only
 on its in-memory copy, `record_attempt` leaves the marker alone (the dashboard's re-enable banner keys off `enabled = false AND last_status =
 'auto_disabled'`), and only the `PUT` that re-enables it clears it. A successful retry still resets `failure_count`.
+
+### No redirects, one sender per retry (0.1.128, R0128-HOOK-01, -02)
+
+`security::build_outbound_http_client` uses `Policy::none()`, shared by org webhooks, `POST .../test` and per-job completion callbacks: a 3xx is the
+response, stored with its status code and the error `HTTP 3xx`, and fails like any non-2xx. (A followed 301/302/303 became a bodyless GET and a
+final 2xx was stored as delivered; the SSRF resolver still checks the connected address.) A retry claims its delivery row first
+(`Inner::claim_retry`, migration `20261016040000`: `retry_claim_token`, `retry_claimed_at`; the UPDATE matches the observed `attempts` and
+`status = 'failed'`, and a claim older than 2 minutes can be retaken). The automatic retry claims from attempt 2, the manual endpoint claims too;
+the loser neither sends nor writes (manual: `409`, `RetryInProgress`), and `record_attempt` writes a claimed outcome only where `retry_claim_token`
+still equals its token. A failed row write clears `retry_claimed_at` (`Recorded::Released`) so the automatic chain continues. `failure_count` accounting is unchanged.
 
 ### Delivery history retention
 
