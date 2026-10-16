@@ -178,7 +178,7 @@ fn validate_payload_size(payload: &serde_json::Value) -> Result<(), validator::V
 /// Whether any string or object key in `value` holds U+0000. Postgres `jsonb`
 /// rejects it, so such a payload failed the INSERT with a 500 (and took a whole
 /// bulk batch down with it) instead of being refused as invalid input.
-fn contains_nul(value: &serde_json::Value) -> bool {
+pub(crate) fn contains_nul(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::String(s) => s.contains('\0'),
         serde_json::Value::Array(items) => items.iter().any(contains_nul),
@@ -198,6 +198,13 @@ fn contains_nul(value: &serde_json::Value) -> bool {
 pub fn normalize_idempotency_key(key: Option<String>) -> Option<String> {
     key.filter(|k| !k.trim().is_empty())
 }
+
+/// Replay of a key whose job is outside the caller's queue scope.
+///
+/// The key stays unique per organization. The caller is allowed to use the
+/// queue it named, so this is not a permission error, and the other job's id
+/// is not part of the message.
+pub const IDEMPOTENCY_KEY_IN_USE: &str = "Idempotency key is already in use";
 
 /// Maximum tags size in bytes (64KB)
 const MAX_TAGS_SIZE: usize = 64 * 1024;

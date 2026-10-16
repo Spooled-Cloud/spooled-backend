@@ -188,17 +188,20 @@ When job completes, Spooled POSTs to your URL. With `completion_webhook_secret` 
 
 ```json
 {
+  "id": "dlv_xxx",
   "event": "job.completed",
   "created_at": "2024-01-15T10:30:00Z",
   "data": {
     "job_id": "job_xxx",
     "queue_name": "exports",
     "status": "completed",
-    "result": { ... },
-    "completed_at": "2024-01-15T10:30:00Z"
+    "result": { ... }
   }
 }
 ```
+
+`id` is the delivery id included in the signed bytes. A failed or dead-lettered job uses event
+`job.failed` and `data.error` (a string) instead of `data.result`. There is no `data.completed_at`.
 
 A completion webhook is a single attempt with no delivery history. It shares the outgoing-webhook
 HTTP client but has its own limits: an organization gets a quarter of the request slots and of the

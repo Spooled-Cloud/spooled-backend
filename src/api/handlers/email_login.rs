@@ -1139,19 +1139,9 @@ pub async fn complete_signup(
         ));
     }
 
-    // Consume the one-time signup token now that validation has passed. The conditional
-    // UPDATE (used_at IS NULL) also blocks a concurrent double-use of the same token.
-    let consumed: Option<(Uuid,)> = sqlx::query_as(
-        "UPDATE email_login_codes SET used_at = NOW() WHERE id = $1 AND used_at IS NULL RETURNING id",
-    )
-    .bind(record_id)
-    .fetch_optional(state.db.pool())
-    .await?;
-    if consumed.is_none() {
-        return Err(AppError::Authentication(
-            "Invalid or expired signup token. Please verify your email again.".to_string(),
-        ));
-    }
+    // The token is consumed inside the transaction below, after the org and its
+    // key exist. Burning it here left a used token and no organization when the
+    // insert failed (a slug taken between the check and the insert, for example).
 
     // Create organization with auto-generated webhook token
     let org_id = Uuid::new_v4().to_string();
@@ -1163,29 +1153,7 @@ pub async fn complete_signup(
         "webhook_token": webhook_token
     });
 
-    sqlx::query(
-        r#"
-        INSERT INTO organizations (id, name, slug, plan_tier, billing_email, billing_email_verified_at, settings, created_at, updated_at)
-        VALUES ($1, $2, $3, 'free', $4, $6, $5, $6, $6)
-        "#,
-    )
-    .bind(&org_id)
-    .bind(&request.name)
-    .bind(&slug)
-    .bind(&email)
-    .bind(&initial_settings)
-    .bind(now)
-    .execute(state.db.pool())
-    .await
-    .map_err(|e| {
-        if e.to_string().contains("duplicate key") {
-            AppError::Conflict("Organization creation failed due to conflict".to_string())
-        } else {
-            AppError::Database(e)
-        }
-    })?;
-
-    // Create API key
+    // Create API key. The organization row is inserted in the same transaction.
     let api_key_id = Uuid::new_v4().to_string();
     // Uses sp_ prefix (new standard); sk_ is legacy and only accepted for backward compatibility
     let raw_key = format!(
@@ -1198,9 +1166,33 @@ pub async fn complete_signup(
         generate_api_key_string()
     );
     let key_prefix: String = raw_key.chars().take(8).collect();
+    // Hash before the transaction so bcrypt does not hold the connection.
     let key_hash = bcrypt::hash(&raw_key, bcrypt::DEFAULT_COST)
         .map_err(|e| AppError::Internal(format!("Failed to hash API key: {}", e)))?;
     let lookup_hash = crate::models::api_key_lookup_hash(&raw_key);
+
+    let mut tx = state.db.pool().begin().await?;
+    sqlx::query(
+        r#"
+        INSERT INTO organizations (id, name, slug, plan_tier, billing_email, billing_email_verified_at, settings, created_at, updated_at)
+        VALUES ($1, $2, $3, 'free', $4, $6, $5, $6, $6)
+        "#,
+    )
+    .bind(&org_id)
+    .bind(&request.name)
+    .bind(&slug)
+    .bind(&email)
+    .bind(&initial_settings)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        if e.to_string().contains("duplicate key") {
+            AppError::Conflict("Organization creation failed due to conflict".to_string())
+        } else {
+            AppError::Database(e)
+        }
+    })?;
 
     sqlx::query(
         r#"
@@ -1214,8 +1206,23 @@ pub async fn complete_signup(
     .bind(&key_prefix)
     .bind(now)
     .bind(&lookup_hash)
-    .execute(state.db.pool())
+    .execute(&mut *tx)
     .await?;
+
+    // Conditional update blocks a concurrent double-use. Failure rolls the org
+    // and the key back, and a failed insert above never reaches this update.
+    let consumed: Option<(Uuid,)> = sqlx::query_as(
+        "UPDATE email_login_codes SET used_at = NOW() WHERE id = $1 AND used_at IS NULL RETURNING id",
+    )
+    .bind(record_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if consumed.is_none() {
+        return Err(AppError::Authentication(
+            "Invalid or expired signup token. Please verify your email again.".to_string(),
+        ));
+    }
+    tx.commit().await?;
 
     // Generate JWT tokens
     let access_expiration = state.settings.jwt.expiration_hours as i64;

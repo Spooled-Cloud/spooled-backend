@@ -471,28 +471,59 @@ pub async fn check_new_queue_limit(
         })
 }
 
-/// Same as [`check_new_queue_limit`] but runs its reads on a caller-provided
-/// connection. Required wherever the caller already holds a transaction (and
-/// possibly an advisory lock): taking a second pool connection there deadlocks
-/// the pool once pool-size callers are waiting on the lock.
-pub async fn check_new_queue_limit_conn(
+/// Whether `queue_name` already counts toward `max_queues` for this org.
+///
+/// Same definition as [`queue_job_defaults`]'s `exists` flag, on the caller's
+/// connection so it can run under [`lock_resource`].
+pub async fn queue_name_exists(
+    conn: &mut sqlx::PgConnection,
+    org_id: &str,
+    queue_name: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        r#"
+        SELECT (
+            EXISTS (
+                SELECT 1 FROM queue_config
+                WHERE organization_id = $1 AND queue_name = $2
+            )
+            OR EXISTS (
+                SELECT 1 FROM jobs
+                WHERE organization_id = $1 AND queue_name = $2
+            )
+            OR EXISTS (
+                SELECT 1 FROM schedules
+                WHERE organization_id = $1 AND queue_name = $2 AND is_active = TRUE
+            )
+        )
+        "#,
+    )
+    .bind(org_id)
+    .bind(queue_name)
+    .fetch_one(&mut *conn)
+    .await
+}
+
+/// Same as [`check_new_queue_limit_generic`] on a caller-provided connection.
+///
+/// Required wherever the caller already holds a transaction (and possibly an
+/// advisory lock): taking a second pool connection there deadlocks the pool
+/// once pool-size callers are waiting on the lock. gRPC maps
+/// [`LimitCheckError`] itself; HTTP uses [`check_new_queue_limit_conn`].
+pub async fn check_new_queue_limit_generic_conn(
     conn: &mut sqlx::PgConnection,
     org_id: &str,
     new_queues: u64,
-) -> Result<(), Response> {
+) -> Result<(), LimitCheckError> {
     if new_queues == 0 {
         return Ok(());
     }
-    let internal = |e: sqlx::Error| {
-        tracing::error!(error = %e, "Failed during queue limit check");
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
-    };
     let (plan_tier, custom_limits): (String, Option<serde_json::Value>) =
         sqlx::query_as("SELECT plan_tier, custom_limits FROM organizations WHERE id = $1")
             .bind(org_id)
             .fetch_one(&mut *conn)
             .await
-            .map_err(internal)?;
+            .map_err(|e| LimitCheckError::Database(e.to_string()))?;
     let limits = PlanLimits::for_tier_with_overrides(&plan_tier, custom_limits.as_ref());
     if limits.max_queues.is_none() {
         return Ok(());
@@ -502,10 +533,27 @@ pub async fn check_new_queue_limit_conn(
             .bind(org_id)
             .fetch_one(&mut *conn)
             .await
-            .map_err(internal)?;
+            .map_err(|e| LimitCheckError::Database(e.to_string()))?;
     limits
         .check_limit("queues", row.1 as u64, new_queues)
-        .map_err(|e| LimitExceededResponse::from(e).into_response())
+        .map_err(LimitCheckError::LimitExceeded)
+}
+
+/// HTTP wrapper around [`check_new_queue_limit_generic_conn`].
+pub async fn check_new_queue_limit_conn(
+    conn: &mut sqlx::PgConnection,
+    org_id: &str,
+    new_queues: u64,
+) -> Result<(), Response> {
+    check_new_queue_limit_generic_conn(conn, org_id, new_queues)
+        .await
+        .map_err(|e| match e {
+            LimitCheckError::LimitExceeded(err) => LimitExceededResponse::from(err).into_response(),
+            other => {
+                tracing::error!(error = %other, "Failed during queue limit check");
+                (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
+            }
+        })
 }
 
 /// Check payload size against plan limits - generic version (usable by HTTP, gRPC, etc.)

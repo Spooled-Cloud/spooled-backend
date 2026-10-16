@@ -15,9 +15,10 @@ use validator::Validate;
 
 use crate::api::handlers::require_queue_access;
 use crate::api::middleware::limits::{
-    check_job_limits, check_new_queue_limit, check_payload_size, check_resource_limit,
-    check_resource_limit_conn, daily_jobs_limit, increment_daily_jobs, lock_resource,
-    queue_job_defaults, refund_daily_jobs, resource_room_conn, try_increment_daily_jobs,
+    check_job_limits, check_new_queue_limit, check_new_queue_limit_conn, check_payload_size,
+    check_resource_limit, check_resource_limit_conn, daily_jobs_limit, increment_daily_jobs,
+    lock_resource, queue_job_defaults, queue_name_exists, refund_daily_jobs, resource_room_conn,
+    try_increment_daily_jobs,
 };
 use crate::api::middleware::ValidatedJson;
 use crate::api::AppState;
@@ -560,17 +561,52 @@ fn already_finished_error(status: &str) -> AppError {
     AppError::Conflict(format!("Job is already {}", status))
 }
 
-/// The job an idempotency key already names in this org, if any.
+/// The job an idempotency key already names in this org, if any: id and queue.
 async fn existing_idempotent_job(
     pool: &sqlx::PgPool,
     org_id: &str,
     key: &str,
-) -> Result<Option<String>, sqlx::Error> {
-    sqlx::query_scalar("SELECT id FROM jobs WHERE organization_id = $1 AND idempotency_key = $2")
-        .bind(org_id)
-        .bind(key)
-        .fetch_optional(pool)
+) -> Result<Option<(String, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT id, queue_name FROM jobs WHERE organization_id = $1 AND idempotency_key = $2",
+    )
+    .bind(org_id)
+    .bind(key)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Hold the per-org queues lock and re-check `max_queues` when this enqueue
+/// would be the first use of `queue_name`. No-op when the queue already
+/// exists: those enqueues must not wait on the lock. The pre-check can be
+/// stale, so existence is read again after the lock.
+async fn enforce_new_queue_on(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    org_id: &str,
+    queue_name: &str,
+    queue_is_new: bool,
+) -> Result<(), EnqueueGuardError> {
+    if !queue_is_new {
+        return Ok(());
+    }
+    lock_resource(&mut *tx, org_id, "queues")
         .await
+        .map_err(EnqueueGuardError::Database)?;
+    let still_new = match queue_name_exists(&mut *tx, org_id, queue_name).await {
+        Ok(exists) => !exists,
+        Err(e) => return Err(EnqueueGuardError::Database(e)),
+    };
+    if still_new {
+        if let Err(response) = check_new_queue_limit_conn(&mut *tx, org_id, 1).await {
+            return Err(EnqueueGuardError::Limit(response));
+        }
+    }
+    Ok(())
+}
+
+enum EnqueueGuardError {
+    Database(sqlx::Error),
+    Limit(axum::response::Response),
 }
 
 /// `expires_at` must lie in the future and after `scheduled_at`. Such a job
@@ -677,7 +713,7 @@ pub async fn create(
         )));
     }
 
-    let org_id = ctx.organization_id;
+    let org_id = ctx.organization_id.clone();
     let idempotency_key = normalize_idempotency_key(request.idempotency_key.clone());
 
     // A replay of a job that already exists is answered before any quota check.
@@ -685,7 +721,17 @@ pub async fn create(
     // new job: at a full active-jobs or daily cap it got 429 although its job
     // existed, and the producer took it for not enqueued.
     if let Some(ref key) = idempotency_key {
-        if let Some(existing_id) = existing_idempotent_job(state.db.pool(), &org_id, key).await? {
+        if let Some((existing_id, existing_queue)) =
+            existing_idempotent_job(state.db.pool(), &org_id, key).await?
+        {
+            // Org-wide key. A queue-scoped caller must not be handed a job id
+            // from a queue it cannot see. The queue in THIS request is allowed,
+            // so the answer is a conflict, not 403.
+            if !ctx.can_access_queue(&existing_queue) {
+                return Err(AppError::Conflict(
+                    crate::models::IDEMPOTENCY_KEY_IN_USE.to_string(),
+                ));
+            }
             return Ok((
                 StatusCode::OK,
                 Json(CreateJobResponse {
@@ -804,9 +850,36 @@ pub async fn create(
         }
     };
 
-    // Use FIXED idempotency pattern: DO UPDATE SET RETURNING
-    // This always returns an ID whether the job is new or existing
-    let inserted: Result<(String,), sqlx::Error> = sqlx::query_as(
+    // Insert under a transaction so a new queue name is capped while the lock
+    // is held, and so an out-of-scope idempotency conflict can leave the other
+    // row untouched (the WHERE skips the update and RETURNING is empty).
+    let mut tx = match state.db.pool().begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            refund_reserved_quota(&state, &org_id, quota_reserved, 1).await;
+            return Err(AppError::Database(e));
+        }
+    };
+    if let Err(guard) = enforce_new_queue_on(
+        &mut tx,
+        &org_id,
+        &request.queue_name,
+        !queue_defaults.exists,
+    )
+    .await
+    {
+        drop(tx);
+        refund_reserved_quota(&state, &org_id, quota_reserved, 1).await;
+        return Err(match guard {
+            EnqueueGuardError::Database(e) => AppError::Database(e),
+            EnqueueGuardError::Limit(response) => AppError::LimitExceeded(Box::new(response)),
+        });
+    }
+
+    // DO UPDATE SET RETURNING returns an id for a new row and for an in-scope
+    // replay. An existing job outside this key's queues matches the conflict
+    // but fails the WHERE, so nothing is written and RETURNING is empty.
+    let inserted: Result<Option<(String,)>, sqlx::Error> = sqlx::query_as(
         r#"
         INSERT INTO jobs (
             id, organization_id, queue_name, status, payload, priority,
@@ -818,6 +891,7 @@ pub async fn create(
         ON CONFLICT (organization_id, idempotency_key)
         WHERE idempotency_key IS NOT NULL
         DO UPDATE SET updated_at = NOW()
+        WHERE queue_in_key_scope(jobs.queue_name, $18::TEXT[])
         RETURNING id
         "#,
     )
@@ -843,17 +917,29 @@ pub async fn create(
     .bind(&request.completion_webhook_secret)
     .bind(request.expires_at)
     .bind(dependencies_met)
-    .fetch_one(state.db.pool())
+    .bind(ctx.queue_scope_filter())
+    .fetch_optional(&mut *tx)
     .await;
 
-    // Check if this was a new job or existing (idempotent)
     let returned_id = match inserted {
-        Ok((id,)) => id,
+        Ok(Some((id,))) => id,
+        Ok(None) => {
+            drop(tx);
+            refund_reserved_quota(&state, &org_id, quota_reserved, 1).await;
+            return Err(AppError::Conflict(
+                crate::models::IDEMPOTENCY_KEY_IN_USE.to_string(),
+            ));
+        }
         Err(e) => {
+            drop(tx);
             refund_reserved_quota(&state, &org_id, quota_reserved, 1).await;
             return Err(job_insert_error(e));
         }
     };
+    if let Err(e) = tx.commit().await {
+        refund_reserved_quota(&state, &org_id, quota_reserved, 1).await;
+        return Err(job_insert_error(e));
+    }
     let created = returned_id == job_id;
 
     // Update metrics and usage counters
@@ -1890,6 +1976,10 @@ pub async fn stats(
     }))
 }
 
+// (index, returned id, input id, idempotency key). The returned id is absent
+// when the key is already used by a queue this key cannot see.
+type BulkInsertRow = (i32, Option<String>, String, Option<String>);
+
 /// Bulk enqueue multiple jobs
 ///
 /// Uses batch INSERT with UNNEST for better performance (single round-trip).
@@ -1914,7 +2004,7 @@ pub async fn bulk_enqueue(
         )));
     }
 
-    let org_id = ctx.organization_id;
+    let org_id = ctx.organization_id.clone();
     let total = request.jobs.len();
 
     let mut failed: Vec<crate::models::BulkJobError> = Vec::new();
@@ -1956,19 +2046,29 @@ pub async fn bulk_enqueue(
         .iter()
         .filter_map(|(_, _, key)| key.as_deref())
         .collect();
-    let existing_keys: std::collections::HashSet<String> = if keys.is_empty() {
-        std::collections::HashSet::new()
+    let existing: Vec<(String, String)> = if keys.is_empty() {
+        Vec::new()
     } else {
-        sqlx::query_scalar::<_, String>(
-            "SELECT idempotency_key FROM jobs WHERE organization_id = $1 AND idempotency_key = ANY($2)",
+        sqlx::query_as(
+            "SELECT idempotency_key, queue_name FROM jobs WHERE organization_id = $1 AND idempotency_key = ANY($2)",
         )
         .bind(&org_id)
         .bind(&keys)
         .fetch_all(state.db.pool())
         .await?
-        .into_iter()
-        .collect()
     };
+    // One out-of-scope key fails the whole batch before any insert, so the
+    // response cannot carry that job's id and the other items are not applied.
+    if existing
+        .iter()
+        .any(|(_, queue)| !ctx.can_access_queue(queue))
+    {
+        return Err(AppError::Conflict(
+            crate::models::IDEMPOTENCY_KEY_IN_USE.to_string(),
+        ));
+    }
+    let existing_keys: std::collections::HashSet<String> =
+        existing.into_iter().map(|(key, _)| key).collect();
     let mut batch_keys = std::collections::HashSet::new();
     let creates: Vec<bool> = valid
         .iter()
@@ -2079,9 +2179,35 @@ pub async fn bulk_enqueue(
         }
     };
 
-    // Batch INSERT using UNNEST - single database round-trip
-    // Returns: (index, returned_job_id, input_job_id) to determine which were created vs deduplicated
-    let results: Result<Vec<(i32, String, String)>, sqlx::Error> = sqlx::query_as(
+    // One transaction: the new-queue lock covers the insert, and a racing
+    // out-of-scope idempotency conflict rolls the whole batch back (a skipped
+    // ON CONFLICT row is absent from RETURNING; COALESCE used to invent its id).
+    let mut tx = match state.db.pool().begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            refund_reserved_quota(&state, &org_id, quota_reserved, job_count as i64).await;
+            return Err(AppError::Database(e));
+        }
+    };
+    if let Err(guard) = enforce_new_queue_on(
+        &mut tx,
+        &org_id,
+        &request.queue_name,
+        job_count > 0 && !queue_defaults.exists,
+    )
+    .await
+    {
+        drop(tx);
+        refund_reserved_quota(&state, &org_id, quota_reserved, job_count as i64).await;
+        return Err(match guard {
+            EnqueueGuardError::Database(e) => AppError::Database(e),
+            EnqueueGuardError::Limit(response) => AppError::LimitExceeded(Box::new(response)),
+        });
+    }
+
+    // Batch INSERT using UNNEST - single database round-trip.
+    // Row: (index, returned_job_id, input_job_id, idempotency key)
+    let results = sqlx::query_as::<_, BulkInsertRow>(
         r#"
         WITH input_jobs AS (
             SELECT
@@ -2134,12 +2260,14 @@ pub async fn bulk_enqueue(
             ON CONFLICT (organization_id, idempotency_key)
             WHERE idempotency_key IS NOT NULL
             DO UPDATE SET updated_at = NOW()
+            WHERE queue_in_key_scope(jobs.queue_name, $13::TEXT[])
             RETURNING id, idempotency_key
         )
         SELECT
             ij.idx,
-            COALESCE(ins.id, ij.jid) as returned_id,
-            ij.jid as input_id
+            ins.id as returned_id,
+            ij.jid as input_id,
+            ij.idem as idem_key
         FROM input_jobs ij
         LEFT JOIN inserted ins ON (
             ins.idempotency_key IS NOT NULL AND ins.idempotency_key = ij.idem
@@ -2161,7 +2289,8 @@ pub async fn bulk_enqueue(
     .bind(default_max_retries)
     .bind(default_timeout)
     .bind(now)
-    .fetch_all(state.db.pool())
+    .bind(ctx.queue_scope_filter())
+    .fetch_all(&mut *tx)
     .await;
 
     // A failed batch INSERT created nothing: give the reservation back and say so
@@ -2169,15 +2298,37 @@ pub async fn bulk_enqueue(
     let rows = match results {
         Ok(rows) => rows,
         Err(e) => {
+            drop(tx);
             tracing::error!(error = %e, "Bulk enqueue batch insert failed");
             refund_reserved_quota(&state, &org_id, quota_reserved, job_count as i64).await;
             return Err(job_insert_error(e));
         }
     };
+    if rows
+        .iter()
+        .any(|(_, returned_id, _, _)| returned_id.is_none())
+    {
+        let out_of_scope = rows
+            .iter()
+            .any(|(_, returned_id, _, idem)| returned_id.is_none() && idem.is_some());
+        drop(tx);
+        refund_reserved_quota(&state, &org_id, quota_reserved, job_count as i64).await;
+        if out_of_scope {
+            return Err(AppError::Conflict(
+                crate::models::IDEMPOTENCY_KEY_IN_USE.to_string(),
+            ));
+        }
+        return Err(job_insert_error(sqlx::Error::RowNotFound));
+    }
+    if let Err(e) = tx.commit().await {
+        refund_reserved_quota(&state, &org_id, quota_reserved, job_count as i64).await;
+        return Err(job_insert_error(e));
+    }
 
     let mut succeeded = Vec::with_capacity(rows.len());
     let mut successful_count: u64 = 0;
-    for (index, returned_id, input_id) in rows {
+    for (index, returned_id, input_id, _) in rows {
+        let returned_id = returned_id.expect("missing id already rejected");
         let created = returned_id == input_id;
         if created {
             successful_count += 1;

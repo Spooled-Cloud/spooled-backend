@@ -1497,11 +1497,21 @@ paths:
         organization is at a limit. A key lives as long as its job row: there is no time-to-live,
         and a finished job (cancelled and dead-lettered ones included) keeps answering for its key
         until the plan's job retention removes it. An empty or
-        whitespace-only `idempotency_key` is treated as no key.
+        whitespace-only `idempotency_key` is treated as no key. A key whose
+        existing job is outside this API key's queue scope is `409 CONFLICT`
+        (`Idempotency key is already in use`) and does not return that job id.
+        The same answer is `FAILED_PRECONDITION` on gRPC Enqueue. A key that can
+        see the stored queue still gets `200` with `created: false`.
 
         `expires_at` must be in the future and later than `scheduled_at`, otherwise the request
         is a `400`. A payload or tags containing the NUL character (`\u0000`) is also a `400`.
         At the daily job limit the job is refused before it is created.
+
+        `completion_webhook` is POSTed once when the job completes, fails, or is dead-lettered.
+        The body that is signed (HMAC of `{timestamp}.{rawBody}` when `completion_webhook_secret`
+        is set) is `{id, event, created_at, data}`. `data` is `{job_id, queue_name, status, result}`
+        on success and `{job_id, queue_name, status, error}` on failure (`event` is then
+        `job.failed`; `data.status` may be `deadletter`). There is no `data.completed_at`.
       operationId: createJob
       requestBody:
         required: true
@@ -1912,7 +1922,9 @@ paths:
 
         An empty or whitespace-only `idempotency_key` is no key. Items whose key already exists
         come back with `created: false` and charge no quota; only the jobs a batch creates count
-        against the payload, active-job, daily and new-queue limits.
+        against the payload, active-job, daily and new-queue limits. If any of those keys belongs
+        to a job outside this API key's queue scope, the whole request is `409 CONFLICT`
+        (`Idempotency key is already in use`): no item is created and that job id is not returned.
 
         The request body may be up to 100 jobs at the largest plan payload cap (plus 4 KiB
         per job for the envelope), capped at 32 MiB, which is the current limit. A larger
@@ -2454,10 +2466,36 @@ paths:
     get:
       tags: [API Keys]
       summary: List API keys
+      description: |
+        API keys for the caller's organization, newest first
+        (`created_at` descending, then `id` descending). The body is a bare array.
+        `limit` is clamped to 1-100 (default 100) and `offset` to at least 0.
       operationId: listApiKeys
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 100
+          description: Page size. Values outside 1-100 are clamped.
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+          description: Keys to skip. Negative values are treated as 0.
       responses:
         '200':
           description: List of API keys (without secret values)
+          headers:
+            X-Has-More:
+              description: '`true` when another page follows, else `false`'
+              schema:
+                type: string
+                enum: ['true', 'false']
           content:
             application/json:
               schema:
@@ -4365,7 +4403,14 @@ components:
           format: uri
         completion_webhook_secret:
           type: string
-          description: Optional shared secret used to sign completion webhook callbacks.
+          description: >-
+            Optional shared secret. When set, the completion callback carries
+            `X-Spooled-Timestamp` and `X-Spooled-Signature` (`sha256=` HMAC of
+            `{timestamp}.{rawBody}`). The body is
+            `{id, event, created_at, data: {job_id, queue_name, status, result | error}}`.
+            Success sends `event: job.completed` and `data.result`; failure sends
+            `event: job.failed` and `data.error` (`data.status` may be `deadletter`).
+            There is no `data.completed_at`.
         idempotency_key:
           type: string
           maxLength: 255

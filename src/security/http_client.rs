@@ -4,8 +4,10 @@
 //! send requests to user-provided URLs (e.g., outgoing webhooks).
 //!
 //! # Security
-//! - Prevents SSRF via open redirects by validating redirect targets
-//! - Caps redirect chain length
+//! - Does not follow redirects. A 3xx is the response, so a webhook delivery
+//!   records that status and fails instead of replaying the body (reqwest
+//!   turns a redirected POST into a GET and drops it) at a URL the caller
+//!   did not configure.
 //! - Enforces sane timeouts
 
 use std::net::SocketAddr;
@@ -18,12 +20,7 @@ use reqwest::Client;
 use tracing::warn;
 
 use crate::security::url_validator::is_ip_allowed;
-use crate::security::{validate_webhook_url, UrlValidationOptions};
-
-/// Maximum redirects to follow for outbound webhook requests.
-///
-/// Keeping this low reduces SSRF surface area and avoids long redirect chains.
-const MAX_REDIRECTS: usize = 5;
+use crate::security::UrlValidationOptions;
 
 /// Upper bound on a single DNS lookup for a user-supplied host.
 ///
@@ -39,8 +36,8 @@ const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 /// the check, once for the connection — and an attacker who controls the zone
 /// can answer differently the second time, which is the whole attack. Because
 /// this runs inside the client's own resolution step, the address that gets
-/// connected to is necessarily the address that was validated, and it covers
-/// redirect hops for free.
+/// connected to is necessarily the address that was validated. Redirects are
+/// not followed, so there is no second hop to re-check.
 ///
 /// It is also the async fix for the previous blocking `to_socket_addrs()` call:
 /// resolution happens on a blocking thread pool, not on a runtime worker.
@@ -108,7 +105,8 @@ impl Resolve for SsrfGuardedResolver {
 /// Layers, outermost first:
 /// - a validating DNS resolver, so the connected address is always one that
 ///   passed the IP policy (no rebinding window, no blocking lookups);
-/// - a redirect policy that re-validates every hop and caps the chain;
+/// - no redirect following: the status the peer returns is the status stored
+///   on the delivery, including a 3xx;
 /// - explicit timeouts, so a slow peer cannot hold a delivery slot forever.
 pub fn build_outbound_http_client(
     timeout: Duration,
@@ -123,26 +121,10 @@ pub fn build_outbound_http_client(
         .timeout(timeout)
         .connect_timeout(connect_timeout)
         .dns_resolver(resolver)
-        .redirect(Policy::custom(|attempt| {
-            // Prevent long redirect chains.
-            if attempt.previous().len() >= MAX_REDIRECTS {
-                return attempt.stop();
-            }
-
-            // Scheme/host checks for the next hop. The IP policy for that hop is
-            // enforced by the resolver above when the connection is made, so
-            // this deliberately does NOT need to resolve anything itself — which
-            // is what kept a blocking DNS call inside this synchronous closure.
-            let next_url = attempt.url().as_str();
-            let opts = UrlValidationOptions {
-                check_dns_resolution: false,
-                ..UrlValidationOptions::default()
-            };
-            match validate_webhook_url(next_url, &opts) {
-                Ok(()) => attempt.follow(),
-                Err(_) => attempt.stop(),
-            }
-        }))
+        // Never follow. A 301/302 of a POST (and any 303) is retried by reqwest
+        // as a bodyless GET, so a delivery that "succeeded" never delivered the
+        // signed body, and the stored status was the final hop's, not the 3xx.
+        .redirect(Policy::none())
         .user_agent(user_agent)
         .build()
         .expect("Failed to create outbound HTTP client")
@@ -186,6 +168,45 @@ mod tests {
             .expect("request should succeed without following redirect");
 
         assert!(res.status().is_redirection());
+        assert_eq!(res.status().as_u16(), 302);
+    }
+
+    #[tokio::test]
+    async fn outbound_client_does_not_follow_redirects_to_allowed_hosts() {
+        // A 302 to a host the URL policy would allow must still not be followed:
+        // the delivery's status is the 3xx, and the next hop is never requested.
+        let next = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/landed"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&next)
+            .await;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/redirect"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/landed", next.uri())),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = build_outbound_http_client(
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+            "Spooled-Webhook-Test/1.0",
+        );
+
+        let res = client
+            .post(format!("{}/redirect", server.uri()))
+            .body("{}")
+            .send()
+            .await
+            .expect("request should succeed without following redirect");
+
         assert_eq!(res.status().as_u16(), 302);
     }
 }

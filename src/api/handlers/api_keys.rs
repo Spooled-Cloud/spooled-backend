@@ -1,11 +1,13 @@
 //! API key handlers
 
 use axum::{
-    extract::{Extension, Path, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
+    response::IntoResponse,
     Json,
 };
 use chrono::Utc;
+use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::api::middleware::limits::{check_resource_limit_conn, lock_resource};
@@ -32,39 +34,62 @@ fn require_unrestricted_key(ctx: &ApiKeyContext) -> AppResult<()> {
     crate::api::handlers::require_unrestricted_key(ctx, "administer API keys")
 }
 
-/// List all API keys (without sensitive data)
+/// Query of `GET /api-keys`. Out-of-range values are clamped, like `GET /jobs`.
+#[derive(Debug, Deserialize)]
+pub struct ListApiKeysQuery {
+    /// Page size, 1-100 (default 100)
+    pub limit: Option<i64>,
+    /// Keys to skip (default 0)
+    pub offset: Option<i64>,
+}
+
+/// List API keys (without sensitive data)
 ///
-/// Now filters by authenticated organization
-/// Now uses configurable limit constant
+/// Filters by the authenticated organization. Default page is the 100 newest
+/// keys, still a bare array; `X-Has-More` says whether another page follows.
+/// Order is `created_at DESC, id DESC` so equal timestamps stay stable.
 pub async fn list(
     State(state): State<AppState>,
     Extension(ctx): Extension<ApiKeyContext>,
-) -> AppResult<Json<Vec<ApiKeySummary>>> {
+    Query(query): Query<ListApiKeysQuery>,
+) -> AppResult<impl IntoResponse> {
     require_unrestricted_key(&ctx)?;
+
+    let limit = query
+        .limit
+        .unwrap_or(MAX_API_KEYS_PER_PAGE)
+        .clamp(1, MAX_API_KEYS_PER_PAGE);
+    let offset = query.offset.unwrap_or(0).max(0);
 
     tracing::debug!(
         organization_id = %ctx.organization_id,
         api_key_id = %ctx.api_key_id,
+        limit,
+        offset,
         "Listing API keys for organization"
     );
 
-    // Use constant instead of hardcoded value
     let keys = sqlx::query_as::<_, ApiKey>(
-        "SELECT * FROM api_keys WHERE organization_id = $1 ORDER BY created_at DESC LIMIT $2",
+        "SELECT * FROM api_keys WHERE organization_id = $1 \
+         ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3",
     )
     .bind(&ctx.organization_id)
-    .bind(MAX_API_KEYS_PER_PAGE)
+    .bind(limit + 1)
+    .bind(offset)
     .fetch_all(state.db.pool())
     .await?;
+
+    let (keys, has_more) = crate::api::handlers::jobs::split_page(keys, limit);
 
     tracing::debug!(
         organization_id = %ctx.organization_id,
         count = keys.len(),
+        has_more,
         "Found API keys"
     );
 
     let summaries: Vec<ApiKeySummary> = keys.into_iter().map(Into::into).collect();
-    Ok(Json(summaries))
+    Ok(crate::api::handlers::jobs::paged(summaries, has_more))
 }
 
 /// Create a new API key

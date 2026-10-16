@@ -48,6 +48,30 @@ const LANE_PRUNE_THRESHOLD: usize = 1024;
 const ORG_WEBHOOK_USER_AGENT: &str = "Spooled-OutgoingWebhook/1.0";
 const COMPLETION_WEBHOOK_USER_AGENT: &str = "Spooled-CompletionWebhook/1.0";
 
+/// Manual retries stop here. The HTTP handler reports the same cap.
+pub const MAX_MANUAL_RETRY_ATTEMPTS: i32 = 10;
+
+/// A manual retry lost the claim to another retry of the same delivery.
+/// The loser does not send and does not write the delivery row.
+#[derive(Debug)]
+pub struct RetryInProgress;
+
+impl std::fmt::Display for RetryInProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("A retry of this delivery is already in progress")
+    }
+}
+
+impl std::error::Error for RetryInProgress {}
+
+/// Claim held across one outbound request. The outcome write must present the
+/// same token, so a retry that lost the race cannot overwrite the row.
+#[derive(Clone, Copy)]
+struct DeliveryClaim {
+    attempts: i32,
+    token: i64,
+}
+
 /// Bounds on outgoing deliveries.
 ///
 /// Every delivery (one event for one webhook) is admitted into a bounded queue
@@ -174,6 +198,8 @@ enum Attempt {
     /// The URL fails the SSRF policy, so retrying cannot help. Still a failed
     /// delivery for the breaker, or such a webhook would never auto-disable.
     Rejected,
+    /// Another retry owns this delivery. Do not send, write, or count it.
+    Superseded,
 }
 
 impl OutgoingWebhookService {
@@ -377,6 +403,34 @@ impl OutgoingWebhookService {
             })
         };
 
+        // Claim before sending. The automatic retry of this row may already be
+        // in its backoff sleep; without the claim both POSTs run and both write
+        // the delivery. A miss means that other retry owns it (or the attempt
+        // cap was crossed). A success that landed since the read is not an error.
+        let claim = match self
+            .inner
+            .claim_retry(
+                &delivery_id.to_string(),
+                attempts,
+                Some(MAX_MANUAL_RETRY_ATTEMPTS),
+            )
+            .await?
+        {
+            Some(claim) => claim,
+            None => {
+                let status: Option<String> = sqlx::query_scalar(
+                    "SELECT status FROM outgoing_webhook_deliveries WHERE id = $1",
+                )
+                .bind(delivery_id.to_string())
+                .fetch_optional(&self.inner.pool)
+                .await?;
+                if status.as_deref() == Some("success") {
+                    return Ok(true);
+                }
+                return Err(RetryInProgress.into());
+            }
+        };
+
         // A manual retry is a real outbound request, so it must occupy a
         // delivery slot like any other — otherwise the cap is not process-wide
         // and the retry endpoint becomes an unmetered path to the same
@@ -387,8 +441,14 @@ impl OutgoingWebhookService {
             .acquire()
             .await
             .context("Outgoing webhook delivery semaphore closed")?;
-        let outcome = self.inner.try_deliver(&webhook, &body, attempts + 1).await;
+        let outcome = self
+            .inner
+            .try_deliver(&webhook, &body, claim.attempts, Some(claim))
+            .await;
         drop(slot);
+        if outcome == Attempt::Superseded {
+            return Err(RetryInProgress.into());
+        }
 
         let delivered = outcome == Attempt::Delivered;
         // A manual retry is a delivery too: a success here must clear the
@@ -641,6 +701,9 @@ impl Inner {
             Some(Attempt::Failed) if delivery.attempt < self.max_attempts => {
                 self.schedule_retry(delivery)
             }
+            // Another sender owns the retry. Counting it or scheduling again
+            // would double the POST and the row write.
+            Some(Attempt::Superseded) => {}
             // Account the DELIVERY, not each attempt. Bumping failure_count per
             // attempt multiplied every failed event by the retry count, so the
             // number the API reports was never "how many deliveries failed".
@@ -682,11 +745,97 @@ impl Inner {
             ),
         }
 
+        // Retries claim the row first. The manual endpoint claims the same way,
+        // so only one of them sends. Attempt 1 has no row yet (or is the insert).
+        let claim = if delivery.attempt > 1 {
+            let delivery_id = delivery.body["id"].as_str().unwrap_or_default();
+            if delivery_id.is_empty() {
+                None
+            } else {
+                match self
+                    .claim_retry(delivery_id, delivery.attempt - 1, None)
+                    .await
+                {
+                    Ok(Some(claim)) => {
+                        delivery.attempt = claim.attempts;
+                        Some(claim)
+                    }
+                    Ok(None) => {
+                        let exists: Option<i32> = sqlx::query_scalar(
+                            "SELECT 1 FROM outgoing_webhook_deliveries WHERE id = $1",
+                        )
+                        .bind(delivery_id)
+                        .fetch_optional(&self.pool)
+                        .await
+                        .ok()
+                        .flatten();
+                        if exists.is_some() {
+                            debug!(
+                                webhook_id = %delivery.webhook.id,
+                                delivery_id,
+                                "Webhook retry already claimed; not sending"
+                            );
+                            return None;
+                        }
+                        // The first attempt never managed to insert the row.
+                        // Send this one unclaimed, as that attempt did.
+                        None
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            webhook_id = %delivery.webhook.id,
+                            "Could not claim webhook retry; not sending"
+                        );
+                        return None;
+                    }
+                }
+            }
+        } else {
+            None
+        };
+
         let _slot = self.delivery_slots.acquire().await.ok()?;
         Some(
-            self.try_deliver(&delivery.webhook, &delivery.body, delivery.attempt)
+            self.try_deliver(&delivery.webhook, &delivery.body, delivery.attempt, claim)
                 .await,
         )
+    }
+
+    /// Take the right to send one retry. `observed_attempts` is the attempts
+    /// value the caller saw; the update matches it, so two callers cannot both
+    /// proceed. `max_attempts` caps a manual retry. A claim older than two
+    /// minutes can be taken again: that is past the outbound timeout, so the
+    /// previous sender is not still in flight.
+    async fn claim_retry(
+        &self,
+        delivery_id: &str,
+        observed_attempts: i32,
+        max_attempts: Option<i32>,
+    ) -> Result<Option<DeliveryClaim>, sqlx::Error> {
+        let row: Option<(i32, i64)> = sqlx::query_as(
+            r#"
+            UPDATE outgoing_webhook_deliveries
+            SET attempts = attempts + 1,
+                retry_claim_token = retry_claim_token + 1,
+                retry_claimed_at = NOW()
+            WHERE id = $1
+              AND status = 'failed'
+              AND attempts = $2
+              AND ($3::INT IS NULL OR attempts < $3)
+              AND (
+                    retry_claimed_at IS NULL
+                    OR retry_claimed_at < NOW() - INTERVAL '2 minutes'
+                  )
+            RETURNING attempts, retry_claim_token
+            "#,
+        )
+        .bind(delivery_id)
+        .bind(observed_attempts)
+        .bind(max_attempts)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(attempts, token)| DeliveryClaim { attempts, token }))
     }
 
     /// Re-queue `delivery` after its backoff. While it sleeps it keeps its
@@ -764,25 +913,35 @@ impl Inner {
     }
 
     /// Send one attempt and log it. The caller holds a delivery slot.
+    ///
+    /// `claim` is set for a retry. The row write has to match that token; if it
+    /// does not, the attempt was superseded and the caller must not count it.
     async fn try_deliver(
         &self,
         webhook: &OutgoingWebhook,
         body: &serde_json::Value,
         attempt: i32,
+        claim: Option<DeliveryClaim>,
     ) -> Attempt {
         let start = Utc::now();
 
         // Validate URL prevents SSRF
         if let Err(e) = self.validate_url(&webhook.url) {
-            self.record_attempt(
-                &webhook.id,
-                body,
-                AttemptLog::error(e.to_string()),
-                attempt,
-                start,
-            )
-            .await;
-            return Attempt::Rejected;
+            let applied = self
+                .record_attempt(
+                    &webhook.id,
+                    body,
+                    AttemptLog::error(e.to_string()),
+                    attempt,
+                    start,
+                    claim,
+                )
+                .await;
+            return if applied {
+                Attempt::Rejected
+            } else {
+                Attempt::Superseded
+            };
         }
 
         // `body` is the envelope, and it is what the delivery log keeps; the
@@ -809,9 +968,14 @@ impl Inner {
                     }
                     Err(e) => {
                         let log = AttemptLog::error(e.to_string());
-                        self.record_attempt(&webhook.id, body, log, attempt, start)
+                        let applied = self
+                            .record_attempt(&webhook.id, body, log, attempt, start, claim)
                             .await;
-                        return Attempt::Rejected;
+                        return if applied {
+                            Attempt::Rejected
+                        } else {
+                            Attempt::Superseded
+                        };
                     }
                 }
             }
@@ -825,9 +989,12 @@ impl Inner {
                     response_body: read_capped_body(res, MAX_STORED_RESPONSE_BODY_BYTES).await,
                     error: (!status.is_success()).then(|| format!("HTTP {}", status.as_u16())),
                 };
-                self.record_attempt(&webhook.id, body, log, attempt, start)
+                let applied = self
+                    .record_attempt(&webhook.id, body, log, attempt, start, claim)
                     .await;
-                if status.is_success() {
+                if !applied {
+                    Attempt::Superseded
+                } else if status.is_success() {
                     Attempt::Delivered
                 } else {
                     Attempt::Failed
@@ -835,9 +1002,14 @@ impl Inner {
             }
             Err(e) => {
                 let log = AttemptLog::error(describe_send_error(e));
-                self.record_attempt(&webhook.id, body, log, attempt, start)
+                let applied = self
+                    .record_attempt(&webhook.id, body, log, attempt, start, claim)
                     .await;
-                Attempt::Failed
+                if applied {
+                    Attempt::Failed
+                } else {
+                    Attempt::Superseded
+                }
             }
         }
     }
@@ -847,6 +1019,9 @@ impl Inner {
     /// A database error is logged, not returned: the request has already gone
     /// out, and failing here must neither re-send a delivery the receiver
     /// accepted nor abandon one that still has retries left.
+    ///
+    /// Returns false when a claimed retry no longer owns the row. The caller
+    /// must not schedule another attempt or bump `failure_count`.
     async fn record_attempt(
         &self,
         webhook_id: &str,
@@ -854,7 +1029,8 @@ impl Inner {
         log: AttemptLog,
         attempt_count: i32,
         started_at: chrono::DateTime<Utc>,
-    ) {
+        claim: Option<DeliveryClaim>,
+    ) -> bool {
         let status = match log.status_code {
             Some(code) if (200..300).contains(&code) => "success",
             _ => "failed",
@@ -866,38 +1042,79 @@ impl Inner {
             .map(|s| s.to_string())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-        let inserted = sqlx::query(
-            r#"
-            INSERT INTO outgoing_webhook_deliveries (
-                id, webhook_id, event, status, payload,
-                status_code, response_body, error, attempts,
-                created_at, delivered_at
+        // A claimed retry updates only its own token. The unconditional upsert
+        // is the first attempt, which inserts the row.
+        let owned = if let Some(claim) = claim {
+            match sqlx::query(
+                r#"
+                UPDATE outgoing_webhook_deliveries
+                SET status = $3,
+                    status_code = $4,
+                    response_body = $5,
+                    error = $6,
+                    attempts = $7,
+                    delivered_at = $8,
+                    retry_claimed_at = NULL
+                WHERE id = $1
+                  AND retry_claim_token = $2
+                  AND status = 'failed'
+                "#,
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-            ON CONFLICT (id) DO UPDATE SET
-                status = EXCLUDED.status,
-                status_code = EXCLUDED.status_code,
-                response_body = EXCLUDED.response_body,
-                error = EXCLUDED.error,
-                attempts = EXCLUDED.attempts,
-                delivered_at = EXCLUDED.delivered_at
-            "#,
-        )
-        .bind(&delivery_id)
-        .bind(webhook_id)
-        .bind(request_payload["event"].as_str().unwrap_or("unknown"))
-        .bind(status)
-        .bind(request_payload)
-        .bind(log.status_code)
-        .bind(log.response_body)
-        .bind(log.error)
-        .bind(attempt_count)
-        .bind(started_at)
-        .bind(Utc::now())
-        .execute(&self.pool)
-        .await;
-        if let Err(e) = inserted {
-            warn!(error = %e, webhook_id, delivery_id, "Failed to record webhook delivery attempt");
+            .bind(&delivery_id)
+            .bind(claim.token)
+            .bind(status)
+            .bind(log.status_code)
+            .bind(&log.response_body)
+            .bind(&log.error)
+            .bind(attempt_count)
+            .bind(Utc::now())
+            .execute(&self.pool)
+            .await
+            {
+                Ok(result) => result.rows_affected() > 0,
+                Err(e) => {
+                    warn!(error = %e, webhook_id, delivery_id, "Failed to record webhook delivery attempt");
+                    true
+                }
+            }
+        } else {
+            let inserted = sqlx::query(
+                r#"
+                INSERT INTO outgoing_webhook_deliveries (
+                    id, webhook_id, event, status, payload,
+                    status_code, response_body, error, attempts,
+                    created_at, delivered_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                ON CONFLICT (id) DO UPDATE SET
+                    status = EXCLUDED.status,
+                    status_code = EXCLUDED.status_code,
+                    response_body = EXCLUDED.response_body,
+                    error = EXCLUDED.error,
+                    attempts = EXCLUDED.attempts,
+                    delivered_at = EXCLUDED.delivered_at
+                "#,
+            )
+            .bind(&delivery_id)
+            .bind(webhook_id)
+            .bind(request_payload["event"].as_str().unwrap_or("unknown"))
+            .bind(status)
+            .bind(request_payload)
+            .bind(log.status_code)
+            .bind(&log.response_body)
+            .bind(&log.error)
+            .bind(attempt_count)
+            .bind(started_at)
+            .bind(Utc::now())
+            .execute(&self.pool)
+            .await;
+            if let Err(e) = inserted {
+                warn!(error = %e, webhook_id, delivery_id, "Failed to record webhook delivery attempt");
+            }
+            true
+        };
+        if !owned {
+            return false;
         }
 
         // Keep webhook summary fields current for dashboard / list views.
@@ -932,6 +1149,7 @@ impl Inner {
         if let Err(e) = summary {
             warn!(error = %e, webhook_id, "Failed to update webhook last status");
         }
+        true
     }
 
     /// Validate webhook URL to prevent SSRF attacks.
@@ -944,7 +1162,7 @@ impl Inner {
     ///
     /// The IP policy is still enforced for every connection, by
     /// `SsrfGuardedResolver` inside the HTTP client (`security::http_client`),
-    /// which is async, covers redirect hops, and — unlike a check performed here
+    /// which is async, does not follow redirects, and — unlike a check performed here
     /// — validates the address actually connected to rather than one resolved
     /// moments earlier. DNS validation still runs at configure time
     /// (create/update/test), where the user gets an immediate, clear error.

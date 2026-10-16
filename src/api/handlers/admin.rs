@@ -433,7 +433,7 @@ pub async fn update_organization(
     // and drops a change the org still had waiting for its code. Support uses
     // this to enable email login for an org whose address was never confirmed.
     let billing_email_vouched = request.billing_email.is_some();
-    let billing_email = request
+    let mut billing_email = request
         .billing_email
         .as_deref()
         .map(crate::api::handlers::organizations::normalize_billing_email)
@@ -448,6 +448,10 @@ pub async fn update_organization(
     let stripe_customer_id = request
         .stripe_customer_id
         .unwrap_or(existing.stripe_customer_id);
+    // Reconcile only a subscription id this request sets. Re-reading the stored
+    // id applied a canceled subscription's free tier over an explicit plan_tier.
+    let subscription_explicitly_set =
+        matches!(request.stripe_subscription_id.as_ref(), Some(Some(_)));
     let stripe_subscription_id = request
         .stripe_subscription_id
         .unwrap_or(existing.stripe_subscription_id);
@@ -468,6 +472,28 @@ pub async fn update_organization(
         && old_billing_email_verified
         && old_billing_email.as_deref().map(|e| e.to_lowercase())
             != billing_email.as_deref().map(|e| e.to_lowercase());
+    // Restoring a soft-deleted org keeps its verified billing email. If a live
+    // org took that address in the meantime, two live verified rows would share
+    // it and email login would pick one of them. Drop it on the restored org.
+    // Checked on the pool before the transaction so the lookup cannot deadlock
+    // against this connection.
+    let restoring = old_plan == "deleted" && plan_tier != "deleted";
+    let mut drop_verified_email = false;
+    if restoring && !billing_email_vouched {
+        if let Some(email) = billing_email.as_deref() {
+            if old_billing_email_verified
+                && crate::api::handlers::organizations::billing_email_taken(
+                    state.db.pool(),
+                    email,
+                    Some(&id),
+                )
+                .await?
+            {
+                drop_verified_email = true;
+                billing_email = None;
+            }
+        }
+    }
     let mut tx = state.db.pool().begin().await?;
     let mut updated: Organization = sqlx::query_as(
         r#"
@@ -476,11 +502,12 @@ pub async fn update_organization(
             plan_tier = $1,
             billing_email = $2,
             billing_email_verified_at = CASE
+                WHEN $9 THEN NULL
                 WHEN $8 THEN NOW()
                 ELSE billing_email_verified_at
             END,
             pending_billing_email = CASE
-                WHEN $8 THEN NULL
+                WHEN $8 OR $9 THEN NULL
                 ELSE pending_billing_email
             END,
             settings = $3,
@@ -500,6 +527,7 @@ pub async fn update_organization(
     .bind(&stripe_subscription_id)
     .bind(&id)
     .bind(billing_email_vouched)
+    .bind(drop_verified_email)
     .fetch_one(&mut *tx)
     .await?;
     let mut revoked_hashes = Vec::new();
@@ -518,24 +546,27 @@ pub async fn update_organization(
         }
     }
 
-    // Best-effort: if admin sets a subscription id, reconcile immediately from Stripe so the org
-    // reflects the correct plan_tier/status even if Stripe webhooks were missed (e.g. DB reset).
-    if let Some(ref sub_id) = stripe_subscription_id {
-        if state.stripe.secret_key.as_ref().is_some() {
-            if let Err(e) = reconcile_org_from_subscription_id(&state, &id, sub_id).await {
-                tracing::warn!(
-                    org_id = %id,
-                    subscription_id = %sub_id,
-                    error = %e,
-                    "Failed to reconcile org billing after admin update"
-                );
+    // Best-effort: if this request sets a subscription id, reconcile immediately
+    // from Stripe so the org reflects the correct plan_tier/status even if
+    // Stripe webhooks were missed (e.g. DB reset). A plan-only patch must not.
+    if subscription_explicitly_set {
+        if let Some(ref sub_id) = stripe_subscription_id {
+            if state.stripe.secret_key.as_ref().is_some() {
+                if let Err(e) = reconcile_org_from_subscription_id(&state, &id, sub_id).await {
+                    tracing::warn!(
+                        org_id = %id,
+                        subscription_id = %sub_id,
+                        error = %e,
+                        "Failed to reconcile org billing after admin update"
+                    );
+                }
+                // Reconcile may have overwritten plan_tier/status from Stripe. Re-read so the
+                // response reflects the actual persisted state, not the pre-reconcile snapshot.
+                updated = sqlx::query_as("SELECT * FROM organizations WHERE id = $1")
+                    .bind(&id)
+                    .fetch_one(state.db.pool())
+                    .await?;
             }
-            // Reconcile may have overwritten plan_tier/status from Stripe. Re-read so the
-            // response reflects the actual persisted state, not the pre-reconcile snapshot.
-            updated = sqlx::query_as("SELECT * FROM organizations WHERE id = $1")
-                .bind(&id)
-                .fetch_one(state.db.pool())
-                .await?;
         }
     }
 

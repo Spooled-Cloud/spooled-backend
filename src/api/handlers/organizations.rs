@@ -560,7 +560,31 @@ pub async fn create(
         "webhook_token": generate_webhook_token(),
     });
 
-    // Create organization
+    // Create initial API key for the organization. The org row is inserted in
+    // the same transaction, below, after the key is hashed.
+    let api_key_id = Uuid::new_v4().to_string();
+    // Uses sp_ prefix (new standard); sk_ is legacy and only accepted for backward compatibility
+    let raw_key = format!(
+        "sp_{}_{}",
+        if state.settings.server.environment == crate::config::Environment::Production {
+            "live"
+        } else {
+            "test"
+        },
+        generate_api_key()
+    );
+    let key_prefix: String = raw_key.chars().take(8).collect();
+    // Hash before the transaction so a slow bcrypt does not hold the connection.
+    let key_hash = bcrypt::hash(&raw_key, bcrypt::DEFAULT_COST)
+        .map_err(|e| AppError::Internal(format!("Failed to hash API key: {}", e)))?;
+    let lookup_hash = crate::models::api_key_lookup_hash(&raw_key);
+
+    let key_name = "Initial Admin Key".to_string();
+    let queues: Vec<String> = vec!["*".to_string()]; // Full access to all queues
+
+    // Org and its first key commit together. A failure on the key used to leave
+    // an organization that nobody could authenticate to.
+    let mut tx = state.db.pool().begin().await?;
     let org = sqlx::query_as::<_, Organization>(
         r#"
         INSERT INTO organizations (id, name, slug, plan_tier, billing_email, settings, created_at, updated_at)
@@ -574,7 +598,7 @@ pub async fn create(
     .bind(&billing_email)
     .bind(&org_settings)
     .bind(now)
-    .fetch_one(state.db.pool())
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| {
         if e.to_string().contains("duplicate key") {
@@ -583,26 +607,6 @@ pub async fn create(
             AppError::Database(e)
         }
     })?;
-
-    // Create initial API key for the organization
-    let api_key_id = Uuid::new_v4().to_string();
-    // Uses sp_ prefix (new standard); sk_ is legacy and only accepted for backward compatibility
-    let raw_key = format!(
-        "sp_{}_{}",
-        if state.settings.server.environment == crate::config::Environment::Production {
-            "live"
-        } else {
-            "test"
-        },
-        generate_api_key()
-    );
-    let key_prefix: String = raw_key.chars().take(8).collect();
-    let key_hash = bcrypt::hash(&raw_key, bcrypt::DEFAULT_COST)
-        .map_err(|e| AppError::Internal(format!("Failed to hash API key: {}", e)))?;
-    let lookup_hash = crate::models::api_key_lookup_hash(&raw_key);
-
-    let key_name = "Initial Admin Key".to_string();
-    let queues: Vec<String> = vec!["*".to_string()]; // Full access to all queues
 
     sqlx::query(
         r#"
@@ -621,8 +625,9 @@ pub async fn create(
     .bind(&queues)
     .bind(now)
     .bind(&lookup_hash)
-    .execute(state.db.pool())
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     Ok((
         StatusCode::CREATED,

@@ -287,6 +287,15 @@ pub struct OutgoingWebhookDelivery {
     pub created_at: DateTime<Utc>,
     /// Successful delivery timestamp
     pub delivered_at: Option<DateTime<Utc>>,
+    /// Bumped when a retry claims the row. Not part of the API response.
+    /// Missing from older SELECTs that list columns explicitly.
+    #[sqlx(default)]
+    #[serde(skip)]
+    pub retry_claim_token: i64,
+    /// When the current retry claim was taken. NULL means nobody is sending.
+    #[sqlx(default)]
+    #[serde(skip)]
+    pub retry_claimed_at: Option<DateTime<Utc>>,
 }
 
 // ============================================================================
@@ -338,41 +347,11 @@ pub struct WebhookDelivery {
 
 use validator::Validate;
 
-/// Validate queue name to prevent injection attacks
+/// Same queue names as `POST /jobs`. A reserved-name and `..` denylist here
+/// rejected names that endpoint accepts (`default`, `a..b`) and that workers
+/// can already claim.
 fn validate_queue_name(queue_name: &str) -> Result<(), validator::ValidationError> {
-    // Queue names should only contain safe characters
-    let is_valid = queue_name
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.');
-
-    if !is_valid {
-        let mut err = validator::ValidationError::new("invalid_queue_name");
-        err.message = Some(std::borrow::Cow::Borrowed(
-            "Queue name can only contain alphanumeric characters, dashes, underscores, and dots",
-        ));
-        return Err(err);
-    }
-
-    // Prevent path traversal attempts
-    if queue_name.contains("..") || queue_name.starts_with('.') || queue_name.starts_with('-') {
-        let mut err = validator::ValidationError::new("invalid_queue_name");
-        err.message = Some(std::borrow::Cow::Borrowed(
-            "Queue name cannot start with dots/dashes or contain path traversal patterns",
-        ));
-        return Err(err);
-    }
-
-    // Prevent reserved/dangerous names
-    let reserved_names = ["admin", "system", "internal", "root", "default"];
-    if reserved_names.contains(&queue_name.to_lowercase().as_str()) {
-        let mut err = validator::ValidationError::new("reserved_queue_name");
-        err.message = Some(std::borrow::Cow::Borrowed(
-            "Queue name is reserved and cannot be used",
-        ));
-        return Err(err);
-    }
-
-    Ok(())
+    crate::models::validate_queue_name_chars(queue_name)
 }
 
 /// Maximum custom webhook payload size (5MB)
@@ -390,6 +369,14 @@ fn validate_custom_payload_size(
             json_str.len(),
             MAX_CUSTOM_WEBHOOK_PAYLOAD_SIZE
         )));
+        return Err(err);
+    }
+    // Postgres jsonb rejects U+0000, so this used to fail the INSERT as a 500.
+    if crate::models::contains_nul(payload) {
+        let mut err = validator::ValidationError::new("payload_contains_nul");
+        err.message = Some(std::borrow::Cow::Borrowed(
+            "Payload must not contain the NUL character (\\u0000)",
+        ));
         return Err(err);
     }
     Ok(())
@@ -569,6 +556,7 @@ impl ListInboundDeliveriesQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use validator::Validate;
 
     #[test]
     fn test_webhook_provider_display() {
@@ -726,6 +714,52 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(zero.filter().unwrap().limit, 1);
+    }
+
+    fn custom_webhook(queue: &str, payload: serde_json::Value) -> CustomWebhookRequest {
+        CustomWebhookRequest {
+            queue_name: queue.to_string(),
+            event_type: Some("order.paid".to_string()),
+            payload,
+            idempotency_key: None,
+            priority: None,
+        }
+    }
+
+    #[test]
+    fn custom_webhook_accepts_the_same_queue_names_as_post_jobs() {
+        for name in ["default", "admin", "a..b", "prod.emails", "queue_1"] {
+            assert!(
+                custom_webhook(name, serde_json::json!({}))
+                    .validate()
+                    .is_ok(),
+                "{name}"
+            );
+        }
+        for name in [".hidden", "-bad", "has space", "bad/name"] {
+            assert!(
+                custom_webhook(name, serde_json::json!({}))
+                    .validate()
+                    .is_err(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_webhook_rejects_nul_in_payload() {
+        let err = custom_webhook("orders", serde_json::json!({"note": "a\u{0000}b"}))
+            .validate()
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("NUL") || text.contains("payload_contains_nul"),
+            "{text}"
+        );
+        let err = custom_webhook("orders", serde_json::json!({"a\u{0000}": 1}))
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("NUL") || err.to_string().contains("nul"));
     }
 
     #[test]

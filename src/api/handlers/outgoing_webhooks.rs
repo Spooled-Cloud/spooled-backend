@@ -541,8 +541,8 @@ pub struct RetryDeliveryResponse {
     pub message: String,
 }
 
-/// Maximum manual retry attempts allowed per delivery
-const MAX_MANUAL_RETRY_ATTEMPTS: i32 = 10;
+/// Maximum manual retry attempts allowed per delivery.
+const MAX_MANUAL_RETRY_ATTEMPTS: i32 = crate::outgoing_webhooks::service::MAX_MANUAL_RETRY_ATTEMPTS;
 
 /// Retry a specific webhook delivery
 ///
@@ -611,7 +611,15 @@ pub async fn retry_delivery(
         .outgoing_webhooks
         .retry_delivery(parsed_delivery_id)
         .await
-        .map_err(|e| AppError::Internal(format!("Failed to retry delivery: {}", e)))?;
+        .map_err(|e| {
+            if e.downcast_ref::<crate::outgoing_webhooks::service::RetryInProgress>()
+                .is_some()
+            {
+                AppError::Conflict("A retry of this delivery is already in progress".to_string())
+            } else {
+                AppError::Internal(format!("Failed to retry delivery: {}", e))
+            }
+        })?;
 
     Ok(Json(RetryDeliveryResponse {
         success: retry_success,

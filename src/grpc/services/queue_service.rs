@@ -22,9 +22,9 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info, warn};
 
 use crate::api::middleware::limits::{
-    check_job_limits_generic, check_new_queue_limit_generic, check_payload_size_generic,
-    daily_jobs_limit, queue_job_defaults, refund_daily_jobs, try_increment_daily_jobs,
-    LimitCheckError,
+    check_job_limits_generic, check_new_queue_limit_generic, check_new_queue_limit_generic_conn,
+    check_payload_size_generic, daily_jobs_limit, lock_resource, queue_job_defaults,
+    queue_name_exists, refund_daily_jobs, try_increment_daily_jobs, LimitCheckError,
 };
 use crate::cache::RedisCache;
 use crate::config::{PlanLimits, QueueSettings, WorkerSettings};
@@ -625,22 +625,25 @@ impl QueueService for QueueServiceImpl {
 
         // A replay is answered before the quota check. At a full daily cap the
         // limit check used to reject it with RESOURCE_EXHAUSTED even though the
-        // job already existed (REST looks the key up first).
-        let idempotency_key = if req.idempotency_key.is_empty() {
-            None
-        } else {
-            Some(req.idempotency_key.clone())
-        };
+        // job already existed (REST looks the key up first). Whitespace-only is
+        // no key, same as REST: storing " " made every such enqueue one job.
+        let idempotency_key =
+            crate::models::normalize_idempotency_key(Some(req.idempotency_key.clone()));
         if let Some(ref key) = idempotency_key {
-            match sqlx::query_scalar::<_, String>(
-                "SELECT id FROM jobs WHERE organization_id = $1 AND idempotency_key = $2",
+            match sqlx::query_as::<_, (String, String)>(
+                "SELECT id, queue_name FROM jobs WHERE organization_id = $1 AND idempotency_key = $2",
             )
             .bind(&auth.organization_id)
             .bind(key)
             .fetch_optional(self.pool.as_ref())
             .await
             {
-                Ok(Some(existing_id)) => {
+                Ok(Some((existing_id, existing_queue))) => {
+                    if !auth.can_access_queue(&existing_queue) {
+                        return Err(Status::failed_precondition(
+                            crate::models::IDEMPOTENCY_KEY_IN_USE,
+                        ));
+                    }
                     return Ok(Response::new(EnqueueResponse {
                         job_id: existing_id,
                         created: false,
@@ -748,6 +751,56 @@ impl QueueService for QueueServiceImpl {
             }
         };
 
+        // Same transaction as REST: lock max_queues only when the queue is new,
+        // and do not return (or touch) a job the key cannot see on conflict.
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
+            Err(e) => {
+                refund_enqueue_quota(self.pool.as_ref(), &auth.organization_id, quota_reserved)
+                    .await;
+                return Err(enqueue_db_error_status(&e));
+            }
+        };
+        if !queue_defaults.exists {
+            if let Err(e) = lock_resource(&mut tx, &auth.organization_id, "queues").await {
+                drop(tx);
+                refund_enqueue_quota(self.pool.as_ref(), &auth.organization_id, quota_reserved)
+                    .await;
+                error!(error = %e, "Failed to lock queue limit");
+                return Err(Status::internal("Failed to check limits"));
+            }
+            let still_new = match queue_name_exists(&mut tx, &auth.organization_id, &req.queue_name)
+                .await
+            {
+                Ok(exists) => !exists,
+                Err(e) => {
+                    drop(tx);
+                    refund_enqueue_quota(self.pool.as_ref(), &auth.organization_id, quota_reserved)
+                        .await;
+                    error!(error = %e, "Failed to re-check queue existence");
+                    return Err(Status::internal("Failed to check limits"));
+                }
+            };
+            if still_new {
+                if let Err(e) =
+                    check_new_queue_limit_generic_conn(&mut tx, &auth.organization_id, 1).await
+                {
+                    drop(tx);
+                    refund_enqueue_quota(self.pool.as_ref(), &auth.organization_id, quota_reserved)
+                        .await;
+                    return Err(match e {
+                        LimitCheckError::LimitExceeded(err) => {
+                            Status::resource_exhausted(err.to_string())
+                        }
+                        other => {
+                            error!(error = %other, "Failed to check queue limit");
+                            Status::internal("Failed to check limits")
+                        }
+                    });
+                }
+            }
+        }
+
         // Insert job with idempotency support
         let result = sqlx::query(
             r#"
@@ -759,6 +812,7 @@ impl QueueService for QueueServiceImpl {
             VALUES ($1, $2, $3, $4, $5::JSONB, $6, $7, $8, $9, $10, $11::JSONB, $12, $12)
             ON CONFLICT (organization_id, idempotency_key) WHERE idempotency_key IS NOT NULL
             DO UPDATE SET updated_at = EXCLUDED.updated_at
+            WHERE queue_in_key_scope(jobs.queue_name, $13::TEXT[])
             RETURNING id, (xmax = 0) as created
             "#,
         )
@@ -777,22 +831,31 @@ impl QueueService for QueueServiceImpl {
         .bind(&idempotency_key)
         .bind(&tags_json)
         .bind(now)
-        .fetch_one(self.pool.as_ref())
+        .bind(queue_scope_filter(&auth))
+        .fetch_optional(&mut *tx)
         .await;
 
         let result = match result {
-            Ok(row) => row,
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                drop(tx);
+                refund_enqueue_quota(self.pool.as_ref(), &auth.organization_id, quota_reserved)
+                    .await;
+                return Err(Status::failed_precondition(
+                    crate::models::IDEMPOTENCY_KEY_IN_USE,
+                ));
+            }
             Err(e) => {
-                if quota_reserved {
-                    if let Err(refund) =
-                        refund_daily_jobs(self.pool.as_ref(), &auth.organization_id, 1).await
-                    {
-                        tracing::warn!(error = %refund, org_id = %auth.organization_id, "Failed to refund an unused daily job reservation");
-                    }
-                }
+                drop(tx);
+                refund_enqueue_quota(self.pool.as_ref(), &auth.organization_id, quota_reserved)
+                    .await;
                 return Err(enqueue_db_error_status(&e));
             }
         };
+        if let Err(e) = tx.commit().await {
+            refund_enqueue_quota(self.pool.as_ref(), &auth.organization_id, quota_reserved).await;
+            return Err(enqueue_db_error_status(&e));
+        }
 
         use sqlx::Row;
         let returned_id: String = result.get("id");
@@ -2028,6 +2091,15 @@ async fn sleep_unless_closed<T>(tx: &mpsc::Sender<T>, delay: Duration) -> bool {
     tokio::select! {
         _ = tx.closed() => true,
         _ = tokio::time::sleep(delay) => false,
+    }
+}
+
+async fn refund_enqueue_quota(pool: &PgPool, org_id: &str, reserved: bool) {
+    if !reserved {
+        return;
+    }
+    if let Err(refund) = refund_daily_jobs(pool, org_id, 1).await {
+        tracing::warn!(error = %refund, org_id, "Failed to refund an unused daily job reservation");
     }
 }
 

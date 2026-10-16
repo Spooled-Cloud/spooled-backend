@@ -120,6 +120,9 @@ Job queue operations for enqueueing, processing, and managing jobs.
 characters, `max_retries` 0..100 (a negative value is rejected since 0.1.126; `0` means the queue
 default, as proto3 cannot tell it from an omitted field), `priority` -100..100, `idempotency_key` up to 255 characters, `tags` up to 64 KB
 as JSON, `scheduled_at` between years 1 and 9999 (an all-zero Timestamp means unset).
+An empty or whitespace-only `idempotency_key` is no key, as on REST. A replay whose job is
+outside the key's queue scope is `FAILED_PRECONDITION` `Idempotency key is already in use`
+and does not return that job id.
 A whole number below 2^53 in a Struct that a client sends (an `Enqueue` payload, a `Complete`
 result) is stored as a JSON integer, so REST reads `42`, not `42.0`. The way back to a worker
 is different, see "Numbers are doubles" below.

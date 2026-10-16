@@ -473,6 +473,10 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs \
   failed or dead-lettered) are removed after your plan's job retention (Free 3 days, Starter 14,
   Pro 30, Enterprise 90), and until then they keep answering for their key
 - An empty or whitespace-only `idempotency_key` counts as no key
+- A queue-scoped key whose key already belongs to a job in a queue it cannot see gets
+  `409` (`Idempotency key is already in use`) and not that job's id. gRPC `Enqueue` answers
+  `FAILED_PRECONDITION` with the same message. A replay the key can see stays `200` /
+  `created: false`, including when the request names a different in-scope queue
 
 **Best practices:**
 - Use deterministic keys based on the operation

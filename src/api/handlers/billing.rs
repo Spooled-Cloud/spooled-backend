@@ -467,6 +467,26 @@ pub async fn create_checkout(
         return Err(AppError::NotFound("Organization not found".to_string()).into());
     };
 
+    // An operator-set paid tier has no Stripe subscription to manage. Starting
+    // checkout would create a second, unlinked subscription for a plan the org
+    // already has. Support has to change that tier.
+    let paid_tier = matches!(
+        org.plan_tier.to_ascii_lowercase().as_str(),
+        "starter" | "pro" | "enterprise"
+    );
+    let has_subscription = org
+        .stripe_subscription_id
+        .as_deref()
+        .is_some_and(|id| !id.trim().is_empty());
+    if paid_tier && !has_subscription {
+        return Err(AppError::Conflict(
+            "This organization is on a paid plan set by an operator and has no Stripe \
+             subscription. Contact support to change plans."
+                .to_string(),
+        )
+        .into());
+    }
+
     let live = matches!(
         org.stripe_subscription_status.as_deref(),
         Some("active" | "trialing")
@@ -1399,8 +1419,12 @@ pub(crate) async fn cancel_subscription_before_org_delete(
     // protected), so without this a later hard delete would try to cancel the
     // same subscription again. Superseded ids are not the current one.
     if current.is_some() && !current_already_ended {
+        // Drop the id along with the status. Leaving it set made a later
+        // plan-only admin update reconcile the canceled subscription and
+        // overwrite the tier the operator just chose.
         sqlx::query(
-            "UPDATE organizations SET stripe_subscription_status = 'canceled', \
+            "UPDATE organizations SET stripe_subscription_id = NULL, \
+             stripe_subscription_status = 'canceled', \
              stripe_cancel_at_period_end = FALSE, updated_at = NOW() WHERE id = $1",
         )
         .bind(&org.id)
