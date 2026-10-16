@@ -172,6 +172,9 @@ pub struct SystemInfo {
 pub struct JobSummaryStats {
     pub total: i64,
     pub pending: i64,
+    /// Jobs waiting out a retry backoff (`status = 'scheduled'`). Kept apart
+    /// from `pending`: a waiting retry is not claimable yet.
+    pub scheduled: i64,
     pub processing: i64,
     pub completed_24h: i64,
     pub failed_24h: i64,
@@ -240,10 +243,11 @@ pub async fn dashboard_data(
     };
 
     // Get job stats filtered by organization (+ queue scope for restricted keys)
-    let job_stats: (i64, i64, i64, i64) = sqlx::query_as(
+    let job_stats: (i64, i64, i64, i64, i64) = sqlx::query_as(
         r#"
         SELECT 
             COUNT(*) FILTER (WHERE status = 'pending') as pending,
+            COUNT(*) FILTER (WHERE status = 'scheduled') as scheduled,
             COUNT(*) FILTER (WHERE status = 'processing') as processing,
             COUNT(*) FILTER (WHERE status = 'completed' AND completed_at > NOW() - INTERVAL '24 hours') as completed_24h,
             COUNT(*) FILTER (WHERE status IN ('failed', 'deadletter') AND updated_at > NOW() - INTERVAL '24 hours') as failed_24h
@@ -256,7 +260,7 @@ pub async fn dashboard_data(
     .bind(queue_scope)
     .fetch_one(state.db.pool())
     .await
-    .unwrap_or((0, 0, 0, 0));
+    .unwrap_or((0, 0, 0, 0, 0));
 
     let (total_jobs,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM jobs WHERE organization_id = $1 AND queue_in_key_scope(queue_name, $2::TEXT[])",
@@ -301,9 +305,10 @@ pub async fn dashboard_data(
     let jobs = JobSummaryStats {
         total: total_jobs,
         pending: job_stats.0,
-        processing: job_stats.1,
-        completed_24h: job_stats.2,
-        failed_24h: job_stats.3,
+        scheduled: job_stats.1,
+        processing: job_stats.2,
+        completed_24h: job_stats.3,
+        failed_24h: job_stats.4,
         deadletter: deadletter_count,
         avg_wait_time_ms: timing_stats.0,
         avg_processing_time_ms: timing_stats.1,
@@ -311,21 +316,47 @@ pub async fn dashboard_data(
 
     // Get queue summary filtered by organization
     // Now includes pause status from queue_config
+    // queue_config is the source, so a configured queue with no job rows
+    // (paused before the first job, or after retention) is still listed.
+    // Implicit queues (jobs and no config row) stay, as GET /queues does.
+    // Paused rows sort first so the 20-name cap does not hide them behind
+    // queues that still have jobs.
     let queues: Vec<QueueSummary> = sqlx::query_as(
         r#"
-        SELECT 
-            j.queue_name as name,
-            COUNT(*) FILTER (WHERE j.status = 'pending') as pending,
-            COUNT(*) FILTER (WHERE j.status = 'processing') as processing,
-            COALESCE(qc.enabled, TRUE) as enabled
-        FROM jobs j
-        LEFT JOIN queue_config qc ON qc.queue_name = j.queue_name AND qc.organization_id = j.organization_id
-        WHERE j.organization_id = $1
-          AND queue_in_key_scope(j.queue_name, $2::TEXT[])
-        GROUP BY j.queue_name, qc.enabled
-        ORDER BY j.queue_name
+        SELECT name, pending, processing, enabled
+        FROM (
+            SELECT
+                qc.queue_name AS name,
+                COUNT(j.id) FILTER (WHERE j.status = 'pending') AS pending,
+                COUNT(j.id) FILTER (WHERE j.status = 'processing') AS processing,
+                qc.enabled AS enabled
+            FROM queue_config qc
+            LEFT JOIN jobs j
+              ON j.organization_id = qc.organization_id
+             AND j.queue_name = qc.queue_name
+             AND queue_in_key_scope(j.queue_name, $2::TEXT[])
+            WHERE qc.organization_id = $1
+              AND queue_in_key_scope(qc.queue_name, $2::TEXT[])
+            GROUP BY qc.queue_name, qc.enabled
+            UNION ALL
+            SELECT
+                j.queue_name AS name,
+                COUNT(*) FILTER (WHERE j.status = 'pending') AS pending,
+                COUNT(*) FILTER (WHERE j.status = 'processing') AS processing,
+                TRUE AS enabled
+            FROM jobs j
+            WHERE j.organization_id = $1
+              AND queue_in_key_scope(j.queue_name, $2::TEXT[])
+              AND NOT EXISTS (
+                  SELECT 1 FROM queue_config qc
+                  WHERE qc.organization_id = j.organization_id
+                    AND qc.queue_name = j.queue_name
+              )
+            GROUP BY j.queue_name
+        ) queues
+        ORDER BY enabled ASC, name ASC
         LIMIT 20
-        "#
+        "#,
     )
     .bind(org_id)
     .bind(queue_scope)
@@ -333,12 +364,14 @@ pub async fn dashboard_data(
     .await
     .unwrap_or_default()
     .into_iter()
-    .map(|(name, pending, processing, enabled): (String, i64, i64, bool)| QueueSummary {
-        name,
-        pending,
-        processing,
-        paused: !enabled, // Paused = not enabled
-    })
+    .map(
+        |(name, pending, processing, enabled): (String, i64, i64, bool)| QueueSummary {
+            name,
+            pending,
+            processing,
+            paused: !enabled, // Paused = not enabled
+        },
+    )
     .collect();
 
     // Get worker summary filtered by organization (+ queue scope: every queue a
@@ -348,10 +381,12 @@ pub async fn dashboard_data(
             r#"
             SELECT 
                 COUNT(*) as total,
-                COUNT(*) FILTER (WHERE status = 'healthy') as healthy
+                COUNT(*) FILTER (
+                    WHERE status = 'healthy'
+                      AND last_heartbeat > NOW() - INTERVAL '2 minutes'
+                ) as healthy
             FROM workers
-            WHERE last_heartbeat > NOW() - INTERVAL '1 minute'
-              AND organization_id = $1
+            WHERE organization_id = $1
               AND NOT EXISTS (
                   SELECT 1
                   FROM unnest(
@@ -372,10 +407,12 @@ pub async fn dashboard_data(
             r#"
             SELECT 
                 COUNT(*) as total,
-                COUNT(*) FILTER (WHERE status = 'healthy') as healthy
+                COUNT(*) FILTER (
+                    WHERE status = 'healthy'
+                      AND last_heartbeat > NOW() - INTERVAL '2 minutes'
+                ) as healthy
             FROM workers
-            WHERE last_heartbeat > NOW() - INTERVAL '1 minute'
-              AND organization_id = $1
+            WHERE organization_id = $1
             "#,
         )
         .bind(org_id)

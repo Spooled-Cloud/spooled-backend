@@ -2340,6 +2340,12 @@ async fn handle_process_dequeue(
         };
     }
 
+    // Same queue-name rule as unary Dequeue. An illegal name used to come back
+    // as NO_JOBS, which a worker treats as an empty queue and polls again.
+    if let Err(status) = crate::grpc::validation::validate_queue_name(&req.queue_name) {
+        return process_status_error(&status);
+    }
+
     // A job too large for one response message is dead-lettered and the next
     // one tried. Each pass takes a job out of the queue, so this ends.
     loop {

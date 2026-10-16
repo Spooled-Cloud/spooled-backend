@@ -13,8 +13,8 @@ use crate::api::middleware::ValidatedJson;
 use crate::api::AppState;
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    ApiKeyContext, RegisterWorkerRequest, RegisterWorkerResponse, Worker, WorkerHeartbeatRequest,
-    WorkerResponse, WorkerSummary, WORKER_ID_UNAVAILABLE,
+    is_claimable_queue_name, ApiKeyContext, RegisterWorkerRequest, RegisterWorkerResponse, Worker,
+    WorkerHeartbeatRequest, WorkerResponse, WorkerSummary, WORKER_ID_UNAVAILABLE,
 };
 
 /// Maximum workers per page
@@ -102,12 +102,11 @@ pub async fn register(
     Extension(ctx): Extension<ApiKeyContext>,
     ValidatedJson(request): ValidatedJson<RegisterWorkerRequest>,
 ) -> AppResult<(StatusCode, Json<RegisterWorkerResponse>)> {
-    // Validate queue name characters
-    if !request
-        .queue_name
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
-    {
+    // Claim will not lease a name that starts with '.' or '-' or is outside
+    // 1-100 characters. Registering for one left a worker that could never be
+    // given a job. The request type checks the same rule; this is the backstop
+    // for a caller that built the value in process.
+    if !is_claimable_queue_name(&request.queue_name) {
         return Err(AppError::Validation(
             "Queue name contains invalid characters".to_string(),
         ));

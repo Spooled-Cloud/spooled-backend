@@ -72,6 +72,31 @@ pub const SCHEDULE_RUNS_RETENTION_SQL: &str = r#"
     ))
 "#;
 
+/// The next fire strictly after `at`.
+///
+/// Computed again at commit from the database clock. A slot taken from the
+/// clock at the start of the batch can already be due by the time the row is
+/// updated (a seconds-level cron, a slow insert), and storing it makes the
+/// next pass enqueue the same occurrence again.
+fn next_run_after_clock(
+    cron: Option<&CronSchedule>,
+    timezone: &str,
+    at: chrono::DateTime<Utc>,
+) -> Option<chrono::DateTime<Utc>> {
+    let cron = cron?;
+    let mut cursor = at;
+    for _ in 0..128 {
+        let candidate = cron.next_run_after_in_timezone(cursor, timezone)?;
+        if candidate > at {
+            return Some(candidate);
+        }
+        // `next_run_after` is exclusive, so this is a tie. Step so the loop
+        // cannot sit on one instant.
+        cursor = candidate + chrono::Duration::milliseconds(1);
+    }
+    None
+}
+
 /// Background scheduler that runs periodic maintenance tasks
 pub struct Scheduler {
     db: Arc<PgPool>,
@@ -606,9 +631,7 @@ impl Scheduler {
                     "Cron schedule queue name is not claimable"
                 );
                 let cron = CronSchedule::parse(&schedule.cron_expression).ok();
-                let next_run = cron
-                    .as_ref()
-                    .and_then(|c| c.next_run_after_in_timezone(now, &schedule.timezone));
+                let next_run = next_run_after_clock(cron.as_ref(), &schedule.timezone, Utc::now());
                 let run_id = uuid::Uuid::new_v4().to_string();
                 let _ = sqlx::query(
                     r#"
@@ -634,11 +657,11 @@ impl Scheduler {
 
             let cron = CronSchedule::parse(&schedule.cron_expression).ok();
 
-            // Calculate next run time FIRST (before any DB operations), in the
-            // schedule's own timezone (DST-aware); stored value is UTC.
-            let next_run = cron
-                .as_ref()
-                .and_then(|c| c.next_run_after_in_timezone(now, &schedule.timezone));
+            // Failure paths below store this. The success path recomputes it
+            // from the database clock at commit: this value is the batch-start
+            // clock, and a pass that outlasts the slot would otherwise store a
+            // next_run_at that is already due.
+            let next_run = next_run_after_clock(cron.as_ref(), &schedule.timezone, now);
 
             // Catch-up policy: fires missed while the scheduler was down are
             // SKIPPED, not backfilled — the schedule runs once now and advances
@@ -844,6 +867,19 @@ impl Scheduler {
                     // discarded, so no job exists, and the slot reserved above would
                     // otherwise stay burned for the rest of the day.
                     let commit_result: Result<(), sqlx::Error> = async {
+                        // clock_timestamp(), not NOW(): NOW() is this transaction's
+                        // start, taken before the insert. A slow insert can outlast
+                        // the slot computed from the batch clock, and storing that
+                        // slot makes the next pass enqueue the same occurrence again.
+                        let commit_at: chrono::DateTime<Utc> =
+                            sqlx::query_scalar("SELECT clock_timestamp()")
+                                .fetch_one(&mut *tx)
+                                .await?;
+                        let next_run = next_run_after_clock(
+                            cron.as_ref(),
+                            &schedule.timezone,
+                            commit_at,
+                        );
                         // Record successful run
                         sqlx::query(
                             r#"
@@ -1069,6 +1105,22 @@ impl Scheduler {
                     WHERE parent.id = child.parent_job_id
                       AND parent.organization_id = child.organization_id
                       AND parent.status IN ('failed', 'deadletter', 'cancelled')
+                )
+                -- dependency_mode any: another job_dependencies alternative that
+                -- can still complete means this parent failing is not fatal.
+                -- The edge sweep below already has this test; this one did not,
+                -- so an any-join was cancelled when its parent_job_id failed.
+                AND (
+                    COALESCE(child.dependency_mode, 'all') <> 'any'
+                    OR NOT EXISTS (
+                        SELECT 1
+                        FROM job_dependencies jd
+                        JOIN jobs dep ON dep.id = jd.depends_on_job_id
+                        WHERE jd.job_id = child.id
+                          AND dep.organization_id = child.organization_id
+                          AND dep.id IS DISTINCT FROM child.parent_job_id
+                          AND dep.status NOT IN ('failed', 'deadletter', 'cancelled')
+                    )
                 )
             RETURNING child.id, child.organization_id, child.queue_name
             "#,
@@ -1981,7 +2033,10 @@ impl Scheduler {
         .fetch_all(&mut *tx)
         .await?;
 
-        let mut expired_children: Vec<(String, String, String)> = Vec::new();
+        // (job id, org, queue, webhook reason). Parent-link children and
+        // job_dependencies children are both announced; the delete trigger
+        // cannot write the outbox, and it only sees rows still pending.
+        let mut expired_children: Vec<(String, String, String, String)> = Vec::new();
         let mut expired_cleaned = 0;
         if !expired_ids.is_empty() {
             expired_children = sqlx::query_as(
@@ -1994,8 +2049,81 @@ impl Scheduler {
                 WHERE child.parent_job_id = ANY($1)
                   AND child.status IN ('pending', 'scheduled')
                   AND child.dependencies_met IS NOT TRUE
-                RETURNING child.id, child.organization_id, child.queue_name
+                  -- any-mode: a live job_dependencies alternative can still
+                  -- complete, so this parent expiring is not fatal.
+                  AND (
+                      COALESCE(child.dependency_mode, 'all') <> 'any'
+                      OR NOT EXISTS (
+                          SELECT 1
+                          FROM job_dependencies jd
+                          JOIN jobs dep ON dep.id = jd.depends_on_job_id
+                          WHERE jd.job_id = child.id
+                            AND dep.organization_id = child.organization_id
+                            AND NOT (dep.id = ANY($1))
+                            AND dep.status NOT IN ('failed', 'deadletter', 'cancelled')
+                      )
+                  )
+                RETURNING child.id, child.organization_id, child.queue_name,
+                          'parent_expired'::TEXT
                 "#,
+            )
+            .bind(&expired_ids)
+            .fetch_all(&mut *tx)
+            .await?;
+
+            // Workflow dependents are job_dependencies rows, not parent_job_id.
+            // Cancel them here, with the same any/all test as the dependency
+            // sweep, so their job.cancelled is dispatched with the parent's.
+            // An any-join is cancelled only when no dependency outside this
+            // delete can still complete.
+            let expired_dependents: Vec<(String, String, String, String)> = sqlx::query_as(
+                r#"
+                UPDATE jobs child
+                SET status = 'cancelled',
+                    last_error = (
+                        SELECT 'Dependency job ' || dep.id || ' expired before it completed'
+                        FROM job_dependencies jd
+                        JOIN jobs dep ON dep.id = jd.depends_on_job_id
+                        WHERE jd.job_id = child.id
+                          AND dep.id = ANY($1)
+                        ORDER BY dep.id
+                        LIMIT 1
+                    ),
+                    completed_at = NOW(),
+                    updated_at = NOW()
+                WHERE child.status IN ('pending', 'scheduled')
+                  AND child.dependencies_met IS NOT TRUE
+                  AND EXISTS (
+                      SELECT 1
+                      FROM job_dependencies jd
+                      WHERE jd.job_id = child.id
+                        AND jd.depends_on_job_id = ANY($1)
+                  )
+                  AND (
+                      COALESCE(child.dependency_mode, 'all') <> 'any'
+                      OR NOT EXISTS (
+                          SELECT 1
+                          FROM job_dependencies jd
+                          JOIN jobs dep ON dep.id = jd.depends_on_job_id
+                          WHERE jd.job_id = child.id
+                            AND dep.organization_id = child.organization_id
+                            AND NOT (dep.id = ANY($1))
+                            AND dep.status NOT IN ('failed', 'deadletter', 'cancelled')
+                      )
+                  )
+                RETURNING child.id, child.organization_id, child.queue_name,
+                          'dependency_expired'::TEXT
+                "#,
+            )
+            .bind(&expired_ids)
+            .fetch_all(&mut *tx)
+            .await?;
+            expired_children.extend(expired_dependents);
+
+            // Captured before the delete: the rows are gone afterwards, and a
+            // workflow with no jobs left never gets a status UPDATE.
+            let workflow_ids: Vec<String> = sqlx::query_scalar(
+                "SELECT DISTINCT workflow_id FROM jobs WHERE id = ANY($1) AND workflow_id IS NOT NULL",
             )
             .bind(&expired_ids)
             .fetch_all(&mut *tx)
@@ -2006,10 +2134,34 @@ impl Scheduler {
                 .execute(&mut *tx)
                 .await?
                 .rows_affected();
+
+            // The progress trigger is AFTER UPDATE OF status, and the terminate
+            // sweep requires a remaining job. With none left the row stays
+            // pending and keeps a max_workflows slot.
+            let workflows_cancelled = sqlx::query(
+                r#"
+                UPDATE workflows w
+                SET status = 'cancelled',
+                    completed_at = COALESCE(w.completed_at, NOW())
+                WHERE w.id = ANY($1)
+                  AND w.status IN ('pending', 'running')
+                  AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.workflow_id = w.id)
+                "#,
+            )
+            .bind(&workflow_ids)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if workflows_cancelled > 0 {
+                debug!(
+                    count = workflows_cancelled,
+                    "Cancelled workflows whose jobs all expired"
+                );
+            }
         }
         tx.commit().await?;
 
-        for (job_id, org_id, queue_name) in &expired_children {
+        for (job_id, org_id, queue_name, reason) in &expired_children {
             self.outgoing_webhooks.spawn_dispatch(
                 org_id.clone(),
                 "job.cancelled".to_string(),
@@ -2018,7 +2170,7 @@ impl Scheduler {
                     "job_id": job_id,
                     "queue_name": queue_name,
                     "status": "cancelled",
-                    "reason": "parent_expired",
+                    "reason": reason,
                 }),
             );
         }

@@ -40,6 +40,14 @@ pub(crate) fn validate_worker_id(worker_id: &str) -> Result<(), validator::Valid
     Ok(())
 }
 
+/// Queue name on `POST /workers/register`: the same characters claim accepts.
+///
+/// Length (1-100) is the attribute on the field. A leading `.` or `-` used to
+/// pass that check and register a worker for a queue no job can be leased from.
+fn validate_register_queue_name(name: &str) -> Result<(), validator::ValidationError> {
+    super::job::validate_queue_name_chars(name)
+}
+
 /// Validate hostname for safe characters
 fn validate_hostname(hostname: &str) -> Result<(), validator::ValidationError> {
     // Hostnames should only contain alphanumeric, dots, dashes, and underscores
@@ -188,8 +196,9 @@ pub struct RegisterWorkerRequest {
     #[validate(custom(function = "validate_worker_id"))]
     pub worker_id: Option<String>,
 
-    /// Queue to process (required)
+    /// Queue to process (required). Same claimable-name rule as `POST /jobs`.
     #[validate(length(min = 1, max = 100, message = "Queue name must be 1-100 characters"))]
+    #[validate(custom(function = "validate_register_queue_name"))]
     pub queue_name: String,
 
     /// Hostname (required)
@@ -440,5 +449,42 @@ mod tests {
         assert_eq!(worker.queue_names.len(), 2);
         assert!(worker.queue_names.contains(&"emails".to_string()));
         assert!(worker.queue_names.contains(&"notifications".to_string()));
+    }
+
+    #[test]
+    fn test_register_queue_name_matches_claim_rules() {
+        let mut request = RegisterWorkerRequest {
+            worker_id: None,
+            queue_name: "default".to_string(),
+            hostname: "host".to_string(),
+            worker_type: None,
+            max_concurrency: None,
+            metadata: None,
+            version: None,
+        };
+        assert!(request.validate().is_ok());
+
+        request.queue_name = "a".repeat(100);
+        assert!(
+            request.validate().is_ok(),
+            "a 100-character name must stay valid"
+        );
+
+        request.queue_name = "a".repeat(101);
+        assert!(
+            request.validate().is_err(),
+            "a 101-character name must be rejected"
+        );
+
+        request.queue_name = "-lead".to_string();
+        assert!(
+            request.validate().is_err(),
+            "a name starting with '-' must be rejected"
+        );
+        request.queue_name = ".dots".to_string();
+        assert!(
+            request.validate().is_err(),
+            "a name starting with '.' must be rejected"
+        );
     }
 }

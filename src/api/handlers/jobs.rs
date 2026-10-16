@@ -1809,26 +1809,42 @@ pub async fn retry(
 ) -> AppResult<Json<Job>> {
     // Capture previous status for realtime event (failed vs deadletter) AND enforce
     // queue scope: a restricted key cannot retry jobs in queues outside its scope.
-    let before: Option<(String, String, Option<String>)> = sqlx::query_as(
-        "SELECT status, queue_name, workflow_id FROM jobs WHERE id = $1 AND organization_id = $2",
+    let before: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        r#"
+        SELECT j.status, j.queue_name, j.workflow_id, w.status
+        FROM jobs j
+        LEFT JOIN workflows w
+          ON w.id = j.workflow_id AND w.organization_id = j.organization_id
+        WHERE j.id = $1 AND j.organization_id = $2
+        "#,
     )
     .bind(&id)
     .bind(&ctx.organization_id)
     .fetch_optional(state.db.pool())
     .await?;
-    if let Some((_, ref queue_name, _)) = before {
+    if let Some((_, ref queue_name, _, _)) = before {
         if !ctx.can_access_queue(queue_name) {
             return Err(AppError::NotFound("Job not found".to_string()));
         }
     }
-    let before_status: Option<(String,)> = before.as_ref().map(|(s, _, _)| (s.clone(),));
+    // Cancelling a workflow leaves a step that already dead-lettered as
+    // deadletter. Retrying it would run the payload of a cancelled workflow.
+    if before
+        .as_ref()
+        .is_some_and(|(_, _, _, workflow_status)| workflow_status.as_deref() == Some("cancelled"))
+    {
+        return Err(AppError::Conflict(
+            "Job belongs to a cancelled workflow and cannot be retried".to_string(),
+        ));
+    }
+    let before_status: Option<(String,)> = before.as_ref().map(|(s, _, _, _)| (s.clone(),));
 
     // One transaction: the retry, re-opening the dependents its failure
     // cancelled, and putting its workflow back to running apply together.
     let mut tx = state.db.pool().begin().await?;
     if before
         .as_ref()
-        .is_some_and(|(_, _, workflow)| workflow.is_some())
+        .is_some_and(|(_, _, workflow, _)| workflow.is_some())
     {
         // Reviving a failed workflow pays a max_workflows slot; take the cap's
         // lock before any row lock, in the order workflow create/retry use.
@@ -1847,6 +1863,12 @@ pub async fn retry(
             last_error = NULL,
             updated_at = NOW()
         WHERE id = $1 AND organization_id = $2 AND status IN ('failed', 'deadletter')
+          AND NOT EXISTS (
+              SELECT 1 FROM workflows w
+              WHERE w.id = jobs.workflow_id
+                AND w.organization_id = jobs.organization_id
+                AND w.status = 'cancelled'
+          )
         RETURNING *
         "#,
     )
@@ -2636,7 +2658,8 @@ pub async fn retry_dlq(
     // Note: Using subquery with LIMIT since COUNT(*) ignores LIMIT clause
     let job_count: i64 = if let Some(ref job_ids) = request.job_ids {
         sqlx::query_scalar(
-            "SELECT COUNT(*) FROM jobs WHERE id = ANY($1) AND organization_id = $2 AND status = 'deadletter'"
+            "SELECT COUNT(*) FROM jobs WHERE id = ANY($1) AND organization_id = $2 AND status = 'deadletter' \
+             AND NOT EXISTS (SELECT 1 FROM workflows w WHERE w.id = jobs.workflow_id AND w.organization_id = jobs.organization_id AND w.status = 'cancelled')"
         )
         .bind(job_ids)
         .bind(&ctx.organization_id)
@@ -2644,7 +2667,8 @@ pub async fn retry_dlq(
         .await?
     } else if let Some(ref queue_name) = request.queue_name {
         sqlx::query_scalar(
-            "SELECT COUNT(*) FROM (SELECT 1 FROM jobs WHERE organization_id = $1 AND queue_name = $2 AND status = 'deadletter' LIMIT $3) sub"
+            "SELECT COUNT(*) FROM (SELECT 1 FROM jobs WHERE organization_id = $1 AND queue_name = $2 AND status = 'deadletter' \
+             AND NOT EXISTS (SELECT 1 FROM workflows w WHERE w.id = jobs.workflow_id AND w.organization_id = jobs.organization_id AND w.status = 'cancelled') LIMIT $3) sub"
         )
         .bind(&ctx.organization_id)
         .bind(queue_name)
@@ -2653,7 +2677,8 @@ pub async fn retry_dlq(
         .await?
     } else {
         sqlx::query_scalar(
-            "SELECT COUNT(*) FROM (SELECT 1 FROM jobs WHERE organization_id = $1 AND status = 'deadletter' LIMIT $2) sub"
+            "SELECT COUNT(*) FROM (SELECT 1 FROM jobs WHERE organization_id = $1 AND status = 'deadletter' \
+             AND NOT EXISTS (SELECT 1 FROM workflows w WHERE w.id = jobs.workflow_id AND w.organization_id = jobs.organization_id AND w.status = 'cancelled') LIMIT $2) sub"
         )
         .bind(&ctx.organization_id)
         .bind(limit)
@@ -2715,6 +2740,10 @@ pub async fn retry_dlq(
         qb.push_bind(revivable.as_slice());
         qb.push("))");
     }
+    // A dead-lettered step of a cancelled workflow stays in the DLQ. The
+    // filter above keeps `cancelled` (it is distinct from `failed`); this one
+    // drops it. A single POST /jobs/{id}/retry answers 409 for the same case.
+    qb.push(" AND w.status IS DISTINCT FROM 'cancelled'");
     qb.push(" ORDER BY j.created_at ASC, j.id LIMIT ");
     qb.push_bind(limit);
     qb.push(") AND organization_id = ");
@@ -2761,10 +2790,18 @@ pub async fn retry_dlq(
         // When a parent job is retried from DLQ, its child jobs (with dependencies_met = false)
         // should have their dependencies recalculated
         // SECURITY: Must include organization_id to prevent cross-tenant modification
+        // Gate children that were waiting on this parent. An any-mode child
+        // that another dependency already satisfied stays runnable:
+        // check_job_dependencies_met is true, and forcing FALSE here made the
+        // parent-failure sweep cancel it the next time this parent dead-letters.
         let reset_children = sqlx::query(
             r#"
             UPDATE jobs
-            SET dependencies_met = FALSE, updated_at = NOW()
+            SET dependencies_met = (
+                    COALESCE(dependency_mode, 'all') = 'any'
+                    AND check_job_dependencies_met(id)
+                ),
+                updated_at = NOW()
             WHERE parent_job_id = ANY($1)
               AND organization_id = $2
               AND status IN ('pending', 'scheduled')

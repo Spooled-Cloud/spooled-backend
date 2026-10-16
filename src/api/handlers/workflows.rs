@@ -30,6 +30,7 @@ use crate::{
         CreateWorkflowResponse, DependencyInfo, Job, JobErrorResponse, JobWithDependencies,
         Workflow, WorkflowDependencyResponse, WorkflowDetailResponse, WorkflowJobMapping,
         WorkflowJobResponse, WorkflowProgress, WorkflowResponse, WorkflowStatus,
+        DEPENDENCY_CANCEL_REASONS,
     },
     outgoing_webhooks::events,
 };
@@ -180,12 +181,16 @@ pub async fn get(
     let mut processing = 0;
     let mut completed = 0;
     let mut failed = 0;
+    let mut cancelled = 0;
     for job in &jobs {
         match job.status.as_str() {
             "pending" | "scheduled" => pending += 1,
             "processing" => processing += 1,
             "completed" => completed += 1,
-            "failed" | "deadletter" | "cancelled" => failed += 1,
+            // `failed` matches workflows.failed_jobs and the progress trigger
+            // (failed and deadletter only). A cancelled step is not a failure.
+            "failed" | "deadletter" => failed += 1,
+            "cancelled" => cancelled += 1,
             _ => pending += 1,
         }
     }
@@ -218,6 +223,7 @@ pub async fn get(
             failed,
             pending,
             processing,
+            cancelled,
         },
         created_at: workflow.created_at,
         started_at: workflow.started_at,
@@ -507,6 +513,8 @@ pub async fn create(
             .bind(&job_def.payload)
             .bind(job_def.priority)
             .bind(
+                // Client values outside 0..100 are rejected before this. The
+                // clamp only bounds a queue or server default.
                 job_def
                     .max_retries
                     .or(queue_defaults.get(&job_def.queue_name).map(|d| d.max_retries))
@@ -514,6 +522,7 @@ pub async fn create(
                     .clamp(0, 100),
             )
             .bind(
+                // Client values outside 1..86400 are rejected before this.
                 job_def
                     .timeout_seconds
                     .or(queue_defaults
@@ -701,14 +710,15 @@ pub async fn retry(
         return Err(AppError::LimitExceeded(Box::new(response)));
     }
 
-    // Reset every non-completed job back to pending — including jobs the failure
-    // cascade CANCELLED (dependents of the failed job). Previously only
-    // failed/deadletter were reset, so cancelled dependents stayed terminal and
-    // the retried workflow could never complete. `dependencies_met` is recomputed
-    // from the current dependency states via check_job_dependencies_met(id): a
-    // reset dependent whose parent is also being reset re-gates (FALSE) and is
-    // released by the completion trigger when the parent re-completes; one whose
-    // parent already completed is runnable immediately (TRUE).
+    // Reset failed and dead-lettered jobs, and dependents the failure cascade
+    // cancelled (`last_error` is one of the sweep reasons). A step someone
+    // cancelled keeps `last_error` NULL and stays cancelled: job retry and DLQ
+    // retry already reopen only those sweep reasons. `dependencies_met` is
+    // recomputed from the current dependency states via
+    // check_job_dependencies_met(id): a reset dependent whose parent is also
+    // being reset re-gates (FALSE) and is released by the completion trigger
+    // when the parent re-completes; one whose parent already completed is
+    // runnable immediately (TRUE).
     // RETURNING carries each job's status before the reset (from the FROM
     // list, read in the same statement) for its job.retried event.
     let retried: Vec<(String, String, String)> = sqlx::query_as(
@@ -725,17 +735,24 @@ pub async fn retry(
             SELECT id, status FROM jobs
             WHERE workflow_id = $1
               AND organization_id = $2
-              AND status IN ('failed', 'deadletter', 'cancelled')
+              AND (
+                  status IN ('failed', 'deadletter')
+                  OR (status = 'cancelled' AND last_error = ANY($3))
+              )
         ) AS prev
         WHERE jobs.id = prev.id
           AND jobs.workflow_id = $1
           AND jobs.organization_id = $2
-          AND jobs.status IN ('failed', 'deadletter', 'cancelled')
+          AND (
+              jobs.status IN ('failed', 'deadletter')
+              OR (jobs.status = 'cancelled' AND jobs.last_error = ANY($3))
+          )
         RETURNING jobs.id, jobs.queue_name, prev.status
         "#,
     )
     .bind(&workflow_id)
     .bind(&ctx.organization_id)
+    .bind(DEPENDENCY_CANCEL_REASONS)
     .fetch_all(&mut *tx)
     .await?;
 

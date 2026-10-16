@@ -69,6 +69,57 @@ fn validate_workflow_job_queue_names(
     Ok(())
 }
 
+/// Priority, retries, timeout and expiry for every job of a workflow.
+///
+/// These are not `nested` on [`WorkflowJobDefinition`]: that would also turn on
+/// the job-key and payload rules, which this request has never applied and
+/// which clients already rely on not applying. An out-of-range priority used
+/// to fail the jobs CHECK as a 500, and retries and timeout used to be stored
+/// clamped.
+#[allow(clippy::ptr_arg)]
+fn validate_workflow_job_limits(
+    jobs: &Vec<WorkflowJobDefinition>,
+) -> Result<(), validator::ValidationError> {
+    let now = Utc::now();
+    for job in jobs {
+        if !(-100..=100).contains(&job.priority) {
+            let mut err = validator::ValidationError::new("priority");
+            err.message = Some(std::borrow::Cow::Borrowed(
+                "Priority must be between -100 and 100",
+            ));
+            return Err(err);
+        }
+        if let Some(max_retries) = job.max_retries {
+            if !(0..=100).contains(&max_retries) {
+                let mut err = validator::ValidationError::new("max_retries");
+                err.message = Some(std::borrow::Cow::Borrowed(
+                    "Max retries must be between 0 and 100",
+                ));
+                return Err(err);
+            }
+        }
+        if let Some(timeout_seconds) = job.timeout_seconds {
+            if !(1..=86400).contains(&timeout_seconds) {
+                let mut err = validator::ValidationError::new("timeout_seconds");
+                err.message = Some(std::borrow::Cow::Borrowed(
+                    "Timeout must be between 1 and 86400 seconds",
+                ));
+                return Err(err);
+            }
+        }
+        // Same rule as POST /jobs. A past expires_at used to be stored, then
+        // deleted by the sweep, which left the workflow pending.
+        if job.expires_at.is_some_and(|expires_at| expires_at <= now) {
+            let mut err = validator::ValidationError::new("expires_at");
+            err.message = Some(std::borrow::Cow::Borrowed(
+                "expires_at must be in the future",
+            ));
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
 /// Workflow status
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -240,11 +291,14 @@ pub struct CreateWorkflowRequest {
     /// Jobs to create as part of this workflow
     /// Reduced from 1000 to 100 to prevent DoS.
     /// Each job's queue name is checked against the claim rules, or a queue
-    /// claim rejects is stored and then never leased. Not `nested`: that
-    /// would also switch on the job key, retry and payload rules, which never
-    /// ran here, and reject workflows clients already create.
+    /// claim rejects is stored and then never leased. Priority, retries,
+    /// timeout and expires_at are checked too (see
+    /// [`validate_workflow_job_limits`]). Not `nested`: that would also switch
+    /// on the job key and payload rules, which never ran here, and reject
+    /// workflows clients already create.
     #[validate(length(min = 1, max = 100, message = "Workflow must have 1-100 jobs"))]
     #[validate(custom(function = "validate_workflow_job_queue_names"))]
+    #[validate(custom(function = "validate_workflow_job_limits"))]
     pub jobs: Vec<WorkflowJobDefinition>,
 
     /// Optional metadata
@@ -420,9 +474,14 @@ pub struct WorkflowDependencyResponse {
 pub struct WorkflowProgress {
     pub total: i32,
     pub completed: i32,
+    /// Failed and dead-lettered jobs. Cancelled jobs are [`Self::cancelled`],
+    /// matching `workflows.failed_jobs` (the list) and the progress trigger.
     pub failed: i32,
     pub pending: i32,
     pub processing: i32,
+    /// Jobs cancelled without failing, including a step a user cancelled.
+    #[serde(default)]
+    pub cancelled: i32,
 }
 
 /// Request to add dependencies to an existing job
@@ -623,13 +682,35 @@ mod tests {
             "a 100-character queue must stay valid"
         );
 
-        // Only the queue name is checked per job. Keys, retries and payloads
-        // were never validated here, and clients already send these.
+        // The job key is still not checked: clients already send these.
         request.jobs[0].key = "step:one.a b".to_string();
-        request.jobs[0].max_retries = Some(150);
         assert!(
             request.validate().is_ok(),
-            "per-job key and retry rules must not start rejecting workflows"
+            "per-job key rules must not start rejecting workflows"
+        );
+
+        request.jobs[0].max_retries = Some(150);
+        assert!(
+            request.validate().is_err(),
+            "max_retries above 100 must be rejected"
+        );
+        request.jobs[0].max_retries = Some(100);
+        request.jobs[0].priority = 250;
+        assert!(
+            request.validate().is_err(),
+            "priority outside -100..100 must be rejected"
+        );
+        request.jobs[0].priority = 0;
+        request.jobs[0].timeout_seconds = Some(0);
+        assert!(
+            request.validate().is_err(),
+            "timeout_seconds below 1 must be rejected"
+        );
+        request.jobs[0].timeout_seconds = None;
+        request.jobs[0].expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
+        assert!(
+            request.validate().is_err(),
+            "a past expires_at must be rejected"
         );
     }
 

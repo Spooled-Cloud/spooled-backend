@@ -5152,7 +5152,7 @@ components:
           items:
             $ref: '#/components/schemas/WorkflowJobDefinition'
           minItems: 1
-          maxItems: 1000
+          maxItems: 100
         metadata:
           type: object
 
@@ -5185,11 +5185,24 @@ components:
           default: all
         priority:
           type: integer
+          minimum: -100
+          maximum: 100
           default: 0
+          description: Outside -100..100 is `400`. It used to fail the jobs check as `500`.
         max_retries:
           type: integer
+          minimum: 0
+          maximum: 100
+          description: Outside 0..100 is `400`. It used to be stored clamped.
         timeout_seconds:
           type: integer
+          minimum: 1
+          maximum: 86400
+          description: Outside 1..86400 is `400`. It used to be stored clamped.
+        expires_at:
+          type: string
+          format: date-time
+          description: Must be in the future. A time in the past is `400`.
 
     CreateWorkflowResponse:
       type: object
@@ -5342,12 +5355,16 @@ components:
 
     JobSummaryStats:
       type: object
-      required: [total, pending, processing, completed_24h, failed_24h, deadletter]
+      required: [total, pending, scheduled, processing, completed_24h, failed_24h, deadletter]
       properties:
         total:
           type: integer
         pending:
           type: integer
+        scheduled:
+          type: integer
+          description: >-
+            Jobs waiting out a retry backoff (`status` `scheduled`). Not included in `pending`.
         processing:
           type: integer
         completed_24h:

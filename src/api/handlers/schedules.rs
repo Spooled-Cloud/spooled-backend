@@ -335,6 +335,26 @@ pub async fn update(
     let current = current
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Schedule not found".to_string()).into_response())?;
 
+    // Create and each cron tick refuse a template over the plan's payload cap.
+    // This request only had the 1MB field check, so a free-plan template between
+    // that cap and 1MB was stored, and every later tick recorded a failed run
+    // and still advanced next_run_at. Reject it before the UPDATE, so a refusal
+    // leaves the stored fire time alone. A template already on the row is left
+    // to those later ticks: a name-only update of a grandfathered schedule
+    // should not start failing.
+    if let Some(payload) = &req.payload_template {
+        let payload_json = serde_json::to_string(payload).unwrap_or_default();
+        check_payload_size_generic(state.db.pool(), org_id, payload_json.len())
+            .await
+            .map_err(|e| match e {
+                LimitCheckError::Database(msg) => {
+                    error!(error = %msg, "Failed to check payload size for schedule update");
+                    internal("Failed to update schedule")
+                }
+                _ => (StatusCode::FORBIDDEN, e.to_string()).into_response(),
+            })?;
+    }
+
     // Recompute next_run_at when the cron expression OR the timezone changes —
     // both alter the next fire time. The effective values are the incoming ones
     // falling back to what is currently stored. Re-activating a paused schedule
