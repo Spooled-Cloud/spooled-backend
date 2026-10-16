@@ -198,6 +198,9 @@ enum Attempt {
     /// The URL fails the SSRF policy, so retrying cannot help. Still a failed
     /// delivery for the breaker, or such a webhook would never auto-disable.
     Rejected,
+    /// This attempt held the claim, the POST failed, and the row write failed.
+    /// The claim was released. Retry; do not count the attempt as recorded.
+    Released,
     /// Another retry owns this delivery. Do not send, write, or count it.
     Superseded,
 }
@@ -446,7 +449,10 @@ impl OutgoingWebhookService {
             .try_deliver(&webhook, &body, claim.attempts, Some(claim))
             .await;
         drop(slot);
-        if outcome == Attempt::Superseded {
+        // Superseded: another retry owns the row. Released: this retry's row
+        // write failed and the claim was cleared, so the caller may try again
+        // but this call did not record an outcome.
+        if matches!(outcome, Attempt::Superseded | Attempt::Released) {
             return Err(RetryInProgress.into());
         }
 
@@ -698,12 +704,14 @@ impl Inner {
                 self.record_delivery_outcome(&delivery.webhook.id, true)
                     .await
             }
-            Some(Attempt::Failed) if delivery.attempt < self.max_attempts => {
+            Some(Attempt::Failed | Attempt::Released) if delivery.attempt < self.max_attempts => {
                 self.schedule_retry(delivery)
             }
-            // Another sender owns the retry. Counting it or scheduling again
-            // would double the POST and the row write.
-            Some(Attempt::Superseded) => {}
+            // Another sender owns the retry, or this attempt's row write failed
+            // after the budget was used. Counting it or scheduling again would
+            // double the POST and the row write. A released claim is what lets
+            // an earlier continuation take the row; this branch does not start one.
+            Some(Attempt::Superseded | Attempt::Released) => {}
             // Account the DELIVERY, not each attempt. Bumping failure_count per
             // attempt multiplied every failed event by the retry count, so the
             // number the API reports was never "how many deliveries failed".
@@ -927,7 +935,7 @@ impl Inner {
 
         // Validate URL prevents SSRF
         if let Err(e) = self.validate_url(&webhook.url) {
-            let applied = self
+            let recorded = self
                 .record_attempt(
                     &webhook.id,
                     body,
@@ -937,11 +945,7 @@ impl Inner {
                     claim,
                 )
                 .await;
-            return if applied {
-                Attempt::Rejected
-            } else {
-                Attempt::Superseded
-            };
+            return settle(recorded, Attempt::Rejected);
         }
 
         // `body` is the envelope, and it is what the delivery log keeps; the
@@ -968,14 +972,10 @@ impl Inner {
                     }
                     Err(e) => {
                         let log = AttemptLog::error(e.to_string());
-                        let applied = self
+                        let recorded = self
                             .record_attempt(&webhook.id, body, log, attempt, start, claim)
                             .await;
-                        return if applied {
-                            Attempt::Rejected
-                        } else {
-                            Attempt::Superseded
-                        };
+                        return settle(recorded, Attempt::Rejected);
                     }
                 }
             }
@@ -989,27 +989,24 @@ impl Inner {
                     response_body: read_capped_body(res, MAX_STORED_RESPONSE_BODY_BYTES).await,
                     error: (!status.is_success()).then(|| format!("HTTP {}", status.as_u16())),
                 };
-                let applied = self
+                let recorded = self
                     .record_attempt(&webhook.id, body, log, attempt, start, claim)
                     .await;
-                if !applied {
-                    Attempt::Superseded
-                } else if status.is_success() {
-                    Attempt::Delivered
-                } else {
-                    Attempt::Failed
-                }
+                settle(
+                    recorded,
+                    if status.is_success() {
+                        Attempt::Delivered
+                    } else {
+                        Attempt::Failed
+                    },
+                )
             }
             Err(e) => {
                 let log = AttemptLog::error(describe_send_error(e));
-                let applied = self
+                let recorded = self
                     .record_attempt(&webhook.id, body, log, attempt, start, claim)
                     .await;
-                if applied {
-                    Attempt::Failed
-                } else {
-                    Attempt::Superseded
-                }
+                settle(recorded, Attempt::Failed)
             }
         }
     }
@@ -1020,8 +1017,14 @@ impl Inner {
     /// out, and failing here must neither re-send a delivery the receiver
     /// accepted nor abandon one that still has retries left.
     ///
-    /// Returns false when a claimed retry no longer owns the row. The caller
-    /// must not schedule another attempt or bump `failure_count`.
+    /// [`Recorded::Superseded`] means a claimed retry no longer owns the row.
+    /// The caller must not schedule another attempt or bump `failure_count`.
+    ///
+    /// [`Recorded::Released`] means this attempt held the claim but the row
+    /// write failed. `retry_claimed_at` is cleared first: leaving the stamp
+    /// set made the continuation miss the claim for two minutes and drop the
+    /// rest of the budget. The caller retries a failed POST and does not
+    /// count the attempt as recorded.
     async fn record_attempt(
         &self,
         webhook_id: &str,
@@ -1030,7 +1033,7 @@ impl Inner {
         attempt_count: i32,
         started_at: chrono::DateTime<Utc>,
         claim: Option<DeliveryClaim>,
-    ) -> bool {
+    ) -> Recorded {
         let status = match log.status_code {
             Some(code) if (200..300).contains(&code) => "success",
             _ => "failed",
@@ -1044,7 +1047,7 @@ impl Inner {
 
         // A claimed retry updates only its own token. The unconditional upsert
         // is the first attempt, which inserts the row.
-        let owned = if let Some(claim) = claim {
+        let recorded = if let Some(claim) = claim {
             match sqlx::query(
                 r#"
                 UPDATE outgoing_webhook_deliveries
@@ -1071,10 +1074,35 @@ impl Inner {
             .execute(&self.pool)
             .await
             {
-                Ok(result) => result.rows_affected() > 0,
+                Ok(result) if result.rows_affected() > 0 => Recorded::Applied,
+                Ok(_) => Recorded::Superseded,
                 Err(e) => {
                     warn!(error = %e, webhook_id, delivery_id, "Failed to record webhook delivery attempt");
-                    true
+                    // claim_retry already stamped retry_claimed_at. The
+                    // continuation cannot take a claim newer than two minutes,
+                    // then gives up. Clear the stamp so that continuation runs.
+                    if let Err(release_err) = sqlx::query(
+                        r#"
+                        UPDATE outgoing_webhook_deliveries
+                        SET retry_claimed_at = NULL
+                        WHERE id = $1
+                          AND retry_claim_token = $2
+                          AND status = 'failed'
+                        "#,
+                    )
+                    .bind(&delivery_id)
+                    .bind(claim.token)
+                    .execute(&self.pool)
+                    .await
+                    {
+                        warn!(
+                            error = %release_err,
+                            webhook_id,
+                            delivery_id,
+                            "Failed to release webhook retry claim"
+                        );
+                    }
+                    Recorded::Released
                 }
             }
         } else {
@@ -1111,10 +1139,10 @@ impl Inner {
             if let Err(e) = inserted {
                 warn!(error = %e, webhook_id, delivery_id, "Failed to record webhook delivery attempt");
             }
-            true
+            Recorded::Applied
         };
-        if !owned {
-            return false;
+        if !matches!(recorded, Recorded::Applied) {
+            return recorded;
         }
 
         // Keep webhook summary fields current for dashboard / list views.
@@ -1149,7 +1177,7 @@ impl Inner {
         if let Err(e) = summary {
             warn!(error = %e, webhook_id, "Failed to update webhook last status");
         }
-        true
+        Recorded::Applied
     }
 
     /// Validate webhook URL to prevent SSRF attacks.
@@ -1175,6 +1203,33 @@ impl Inner {
             warn!(url = %url, error = %e, "Webhook URL validation failed (SSRF protection)");
             anyhow::anyhow!("Invalid webhook URL: {}", e)
         })
+    }
+}
+
+/// Whether a claimed delivery-row write landed.
+enum Recorded {
+    /// The row now stores this attempt. The caller owns the result.
+    Applied,
+    /// Another retry owns the row.
+    Superseded,
+    /// This attempt held the claim, the write failed, and the claim was cleared.
+    Released,
+}
+
+/// Map a row-write result onto the attempt the caller should act on.
+///
+/// A failed POST whose write did not land is retried (`Released`): the claim
+/// is already clear, so the next claim can succeed. A success is not sent
+/// again. A rejected URL stays rejected so the breaker still sees it.
+fn settle(recorded: Recorded, applied: Attempt) -> Attempt {
+    match recorded {
+        Recorded::Applied => applied,
+        Recorded::Superseded => Attempt::Superseded,
+        Recorded::Released => match applied {
+            Attempt::Failed => Attempt::Released,
+            Attempt::Rejected => Attempt::Rejected,
+            Attempt::Delivered | Attempt::Superseded | Attempt::Released => Attempt::Superseded,
+        },
     }
 }
 

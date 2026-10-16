@@ -216,6 +216,13 @@ impl WorkerServiceImpl {
                 "Queue name can only contain alphanumeric characters, dashes, underscores, and dots",
             ));
         }
+        // Same rule as grpc::validation::validate_queue_name and REST. Claim
+        // rejects these, so a worker registered for one is never given a job.
+        if name.starts_with('.') || name.starts_with('-') {
+            return Err(Status::invalid_argument(
+                "Queue name cannot start with dots or dashes",
+            ));
+        }
         Ok(())
     }
 
@@ -822,6 +829,8 @@ mod tests {
 
         assert!(WorkerServiceImpl::validate_queue_name("").is_err());
         assert!(WorkerServiceImpl::validate_queue_name("bad@queue").is_err());
+        assert!(WorkerServiceImpl::validate_queue_name(".hidden").is_err());
+        assert!(WorkerServiceImpl::validate_queue_name("-hidden").is_err());
         let too_long = WorkerServiceImpl::validate_queue_name(&"q".repeat(101)).unwrap_err();
         assert_eq!(too_long.code(), tonic::Code::InvalidArgument);
         assert_eq!(too_long.message(), "Queue name must be 1-100 characters");

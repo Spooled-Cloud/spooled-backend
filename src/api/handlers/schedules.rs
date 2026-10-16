@@ -14,8 +14,9 @@ use tracing::{error, info};
 
 use crate::api::handlers::require_queue_access;
 use crate::api::middleware::limits::{
-    check_job_limits, check_payload_size, check_payload_size_generic, check_resource_limit_conn,
-    daily_jobs_limit, lock_resource, refund_daily_jobs, try_increment_daily_jobs, LimitCheckError,
+    check_job_limits, check_new_queue_limit_conn, check_payload_size, check_payload_size_generic,
+    check_resource_limit_conn, daily_jobs_limit, lock_resource, queue_name_exists,
+    refund_daily_jobs, try_increment_daily_jobs, LimitCheckError,
 };
 use crate::api::middleware::validation::ValidatedJson;
 use crate::api::AppState;
@@ -242,6 +243,28 @@ pub async fn create(
     // matching every other create handler — previously this returned a plain-text
     // 429 so SDKs classified schedule-quota errors as UNKNOWN_ERROR.
     check_resource_limit_conn(&mut tx, org_id, "schedules", 1).await?;
+    // Same queues lock as POST /jobs. The check above this transaction reads
+    // the count with no lock, so a first schedule for one name and a first
+    // job for another both saw zero and both committed. Re-check after the
+    // lock; an existing queue still does not take it.
+    if !queue_defaults.exists {
+        lock_resource(&mut tx, org_id, "queues")
+            .await
+            .map_err(|e| {
+                error!(error = %e, "Failed to acquire queue limit lock");
+                tx_err()
+            })?;
+        let still_new = match queue_name_exists(&mut tx, org_id, &req.queue_name).await {
+            Ok(exists) => !exists,
+            Err(e) => {
+                error!(error = %e, "Failed to re-check queue existence for schedule");
+                return Err(tx_err());
+            }
+        };
+        if still_new {
+            check_new_queue_limit_conn(&mut tx, org_id, 1).await?;
+        }
+    }
 
     sqlx::query(
         r#"

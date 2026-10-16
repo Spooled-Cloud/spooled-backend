@@ -13,11 +13,32 @@
 -- deleted can still complete. The edge to a surviving dependency stays, so
 -- the orphan sweep cannot release the child. all-mode is unchanged: one
 -- dependency deleted before it completed is fatal.
+--
+-- The child is locked before that decision. Concurrent deletes of the last
+-- two alternatives otherwise both see the other parent still pending, neither
+-- cancels the child, and after both commit the orphan sweep marks it runnable.
 
 CREATE OR REPLACE FUNCTION cancel_blocked_dependents_of_deleted_job()
 RETURNS TRIGGER AS $$
 BEGIN
     IF OLD.status IS DISTINCT FROM 'completed' THEN
+        -- Stable order so two deletes cannot deadlock on each other's children.
+        PERFORM 1
+        FROM jobs
+        WHERE organization_id = OLD.organization_id
+          AND status IN ('pending', 'scheduled')
+          AND dependencies_met IS NOT TRUE
+          AND (
+              parent_job_id = OLD.id
+              OR id IN (
+                  SELECT jd.job_id
+                  FROM job_dependencies jd
+                  WHERE jd.depends_on_job_id = OLD.id
+              )
+          )
+        ORDER BY id
+        FOR UPDATE;
+
         UPDATE jobs
         SET status = 'cancelled',
             last_error = 'Dependency job ' || OLD.id || ' was deleted before it completed',

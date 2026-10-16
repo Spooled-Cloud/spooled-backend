@@ -19,8 +19,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::api::handlers::health::RuntimeHealth;
 use crate::api::middleware::limits::{
-    check_job_limits_generic, check_payload_size_generic, daily_jobs_limit, refund_daily_jobs,
-    try_increment_daily_jobs,
+    check_job_limits_generic, check_new_queue_limit_generic_conn, check_payload_size_generic,
+    daily_jobs_limit, lock_resource, queue_name_exists, refund_daily_jobs,
+    try_increment_daily_jobs, LimitCheckError,
 };
 use crate::cache::RedisCache;
 use crate::models::{CronSchedule, DEPENDENCY_FAILED_CANCEL_REASON, PARENT_FAILED_CANCEL_REASON};
@@ -126,6 +127,29 @@ struct DeadletteredJob {
     retry_count: i32,
     completion_webhook: Option<String>,
     completion_webhook_secret: Option<String>,
+}
+
+/// `Some(message)` when this cron insert would open a queue the plan does not
+/// allow. Holds the same queues lock as `POST /jobs` until `tx` commits, and
+/// re-checks after the lock. An active schedule already counts as its queue,
+/// so the usual fire takes no lock.
+async fn cron_new_queue_refusal(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    org_id: &str,
+    queue_name: &str,
+) -> Result<Option<String>> {
+    if queue_name_exists(&mut *tx, org_id, queue_name).await? {
+        return Ok(None);
+    }
+    lock_resource(&mut *tx, org_id, "queues").await?;
+    if queue_name_exists(&mut *tx, org_id, queue_name).await? {
+        return Ok(None);
+    }
+    match check_new_queue_limit_generic_conn(&mut *tx, org_id, 1).await {
+        Ok(()) => Ok(None),
+        Err(LimitCheckError::LimitExceeded(err)) => Ok(Some(err.to_string())),
+        Err(other) => Err(anyhow::anyhow!(other.to_string())),
+    }
 }
 
 impl Scheduler {
@@ -832,6 +856,77 @@ impl Scheduler {
                         "Failed to reserve daily job quota for cron schedule; enqueueing without quota accounting"
                     );
                 }
+            }
+
+            // Same queues lock as POST /jobs, held until this transaction
+            // commits. A schedule normally already counts as its queue; this
+            // catches a name that does not, so the insert cannot pass the cap
+            // beside a concurrent first job.
+            let refusal = match cron_new_queue_refusal(
+                &mut tx,
+                &schedule.organization_id,
+                &schedule.queue_name,
+            )
+            .await
+            {
+                Ok(reason) => reason,
+                Err(e) => {
+                    tx.rollback().await?;
+                    if quota_reserved {
+                        if let Err(refund_err) =
+                            refund_daily_jobs(&self.db, &schedule.organization_id, 1).await
+                        {
+                            warn!(
+                                error = %refund_err,
+                                org_id = %schedule.organization_id,
+                                schedule_id = %schedule.id,
+                                "Failed to refund daily job quota after cron queue check failed"
+                            );
+                        }
+                    }
+                    return Err(e);
+                }
+            };
+            if let Some(reason) = refusal {
+                tx.rollback().await?;
+                if quota_reserved {
+                    if let Err(refund_err) =
+                        refund_daily_jobs(&self.db, &schedule.organization_id, 1).await
+                    {
+                        warn!(
+                            error = %refund_err,
+                            org_id = %schedule.organization_id,
+                            schedule_id = %schedule.id,
+                            "Failed to refund daily job quota after cron queue cap"
+                        );
+                    }
+                }
+                warn!(
+                    schedule_id = %schedule.id,
+                    org_id = %schedule.organization_id,
+                    "Cron schedule blocked by queue limit"
+                );
+                let run_id = uuid::Uuid::new_v4().to_string();
+                let _ = sqlx::query(
+                    r#"
+                    INSERT INTO schedule_runs (id, schedule_id, status, error_message, started_at, completed_at)
+                    VALUES ($1, $2, 'failed', $3, $4, $4)
+                    "#,
+                )
+                .bind(&run_id)
+                .bind(&schedule.id)
+                .bind(&reason)
+                .bind(now)
+                .execute(&*self.db)
+                .await;
+                let _ = sqlx::query(
+                    "UPDATE schedules SET next_run_at = $2, updated_at = NOW() WHERE id = $1",
+                )
+                .bind(&schedule.id)
+                .bind(next_run)
+                .execute(&*self.db)
+                .await;
+                continue;
             }
 
             // Transaction already started with lock - create job from schedule
@@ -2135,27 +2230,58 @@ impl Scheduler {
                 .await?
                 .rows_affected();
 
-            // The progress trigger is AFTER UPDATE OF status, and the terminate
-            // sweep requires a remaining job. With none left the row stays
-            // pending and keeps a max_workflows slot.
-            let workflows_cancelled = sqlx::query(
+            // The progress trigger is AFTER UPDATE OF status, so deleting the
+            // last open job never touches the workflow. The terminate sweep
+            // also skips a workflow whose other jobs are all completed (it
+            // requires a failed, dead-lettered or cancelled row). Finish every
+            // affected workflow that has nothing left to run, with the same
+            // status rule as update_workflow_progress. No rows left stays
+            // cancelled: every job was removed before it could complete.
+            let workflows_finished = sqlx::query(
                 r#"
                 UPDATE workflows w
-                SET status = 'cancelled',
+                SET
+                    completed_jobs = counts.completed::INT,
+                    failed_jobs = counts.failed::INT,
+                    -- A step the sweep deleted never ran, so a workflow with
+                    -- fewer rows than total_jobs did not complete.
+                    status = CASE
+                        WHEN counts.total = 0 THEN 'cancelled'
+                        WHEN counts.failed > 0 THEN 'failed'
+                        WHEN counts.cancelled > 0 OR counts.total < w.total_jobs THEN 'cancelled'
+                        ELSE 'completed'
+                    END,
                     completed_at = COALESCE(w.completed_at, NOW())
-                WHERE w.id = ANY($1)
+                FROM (
+                    SELECT
+                        w2.id,
+                        COUNT(j.id) AS total,
+                        COUNT(j.id) FILTER (
+                            WHERE j.status IN ('pending', 'scheduled', 'processing')
+                        ) AS active,
+                        COUNT(j.id) FILTER (WHERE j.status = 'completed') AS completed,
+                        COUNT(j.id) FILTER (
+                            WHERE j.status IN ('failed', 'deadletter')
+                        ) AS failed,
+                        COUNT(j.id) FILTER (WHERE j.status = 'cancelled') AS cancelled
+                    FROM workflows w2
+                    LEFT JOIN jobs j ON j.workflow_id = w2.id
+                    WHERE w2.id = ANY($1)
+                    GROUP BY w2.id
+                ) counts
+                WHERE w.id = counts.id
                   AND w.status IN ('pending', 'running')
-                  AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.workflow_id = w.id)
+                  AND counts.active = 0
                 "#,
             )
             .bind(&workflow_ids)
             .execute(&mut *tx)
             .await?
             .rows_affected();
-            if workflows_cancelled > 0 {
+            if workflows_finished > 0 {
                 debug!(
-                    count = workflows_cancelled,
-                    "Cancelled workflows whose jobs all expired"
+                    count = workflows_finished,
+                    "Finished workflows whose last open job expired"
                 );
             }
         }

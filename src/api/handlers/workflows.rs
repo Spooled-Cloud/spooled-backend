@@ -17,8 +17,9 @@ use crate::{
     api::{
         middleware::{
             limits::{
-                check_job_limits, check_payload_size, check_resource_limit_conn, daily_jobs_limit,
-                lock_resource, refund_daily_jobs, try_increment_daily_jobs,
+                check_job_limits, check_new_queue_limit_conn, check_payload_size,
+                check_resource_limit_conn, daily_jobs_limit, lock_resource, queue_name_exists,
+                refund_daily_jobs, try_increment_daily_jobs,
             },
             ValidatedJson,
         },
@@ -458,17 +459,28 @@ pub async fn create(
         }
         // Queues this workflow would create count against the plan's queue cap —
         // checked after the workflow feature/cap so a plan without workflows still
-        // gets `feature_disabled`, not a queue error. Runs on the transaction's own
-        // connection: a second pool connection here deadlocks the pool when pool-size
-        // creates queue behind the advisory lock.
-        if let Err(response) = crate::api::middleware::limits::check_new_queue_limit_conn(
-            &mut tx,
-            &ctx.organization_id,
-            new_queues,
-        )
-        .await
-        {
-            return Err(AppError::LimitExceeded(Box::new(response)));
+        // gets `feature_disabled`, not a queue error. The workflows lock does not
+        // cover POST /jobs, which takes the queues lock: without that same lock
+        // a first workflow queue and a first job queue both saw zero and both
+        // committed. Re-count under the lock; the pre-check can be stale.
+        if new_queues > 0 {
+            lock_resource(&mut tx, &ctx.organization_id, "queues").await?;
+            let mut seen: Vec<&str> = Vec::new();
+            let mut still_new = 0u64;
+            for job_def in &request.jobs {
+                if seen.iter().any(|name| *name == job_def.queue_name) {
+                    continue;
+                }
+                seen.push(job_def.queue_name.as_str());
+                if !queue_name_exists(&mut tx, &ctx.organization_id, &job_def.queue_name).await? {
+                    still_new += 1;
+                }
+            }
+            if let Err(response) =
+                check_new_queue_limit_conn(&mut tx, &ctx.organization_id, still_new).await
+            {
+                return Err(AppError::LimitExceeded(Box::new(response)));
+            }
         }
 
         sqlx::query(
