@@ -5011,7 +5011,14 @@ async fn w4_billing_checkout_validates_and_binds_the_session_to_the_org() {
     assert!(!form.contains_key("customer_email"), "{form:?}");
 
     // No customer yet: Checkout is prefilled with the verified billing email.
+    // A free org: a paid tier with no subscription is an operator-set plan,
+    // which checkout refuses (409).
     let fresh = seed_tenant(db.pool()).await;
+    sqlx::query("UPDATE organizations SET plan_tier = 'free' WHERE id = $1")
+        .bind(&fresh.org_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
     let (status, body) = checkout(
         app.clone(),
         bearer(&fresh.key),
@@ -12612,6 +12619,14 @@ mod wave5_retention {
         .await;
         finish_job(pool, &steps["a"], "deadletter", 20).await;
         finish_job(pool, &steps["b"], "cancelled", 1).await;
+        // The failure cascade records its reason; a workflow retry reopens
+        // only steps cancelled for that reason.
+        sqlx::query("UPDATE jobs SET last_error = $2 WHERE id = $1")
+            .bind(&steps["b"])
+            .bind("Dependency job failed or was deadlettered")
+            .execute(pool)
+            .await
+            .unwrap();
         finish_job(pool, &steps["c"], "completed", 1).await;
         finish_workflow(pool, &workflow, "failed", 1).await;
 
@@ -14768,20 +14783,24 @@ mod w8_events {
             uuid::Uuid::new_v4().to_string(),
             uuid::Uuid::new_v4().to_string(),
         );
-        for (id, status) in [
-            (&dead, "deadletter"),
-            (&cancelled, "cancelled"),
-            (&done, "completed"),
+        // The cancelled step was cancelled by the dependency sweep (its reason);
+        // a step a user cancelled is not reopened by a workflow retry.
+        let sweep_reason = "Dependency job failed or was deadlettered";
+        for (id, status, last_error) in [
+            (&dead, "deadletter", None),
+            (&cancelled, "cancelled", Some(sweep_reason)),
+            (&done, "completed", None),
         ] {
             sqlx::query(
                 "INSERT INTO jobs (id, organization_id, queue_name, payload, status, workflow_id, \
-                 retry_count, max_retries, completed_at, created_at, updated_at) \
-                 VALUES ($1, $2, 'w8q', '{}'::JSONB, $3, $4, 0, 3, NOW(), NOW(), NOW())",
+                 retry_count, max_retries, completed_at, created_at, updated_at, last_error) \
+                 VALUES ($1, $2, 'w8q', '{}'::JSONB, $3, $4, 0, 3, NOW(), NOW(), NOW(), $5)",
             )
             .bind(id)
             .bind(&t.org_id)
             .bind(status)
             .bind(&wf)
+            .bind(last_error)
             .execute(db.pool())
             .await
             .unwrap();

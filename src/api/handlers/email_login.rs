@@ -2469,11 +2469,15 @@ mod tests {
             checked < consumed,
             "the slug check must come before the token is consumed"
         );
-        // The organization is created after both.
+        // The token is burned in the same transaction as the organization and
+        // its key, after both inserts, so a failed insert leaves it unused.
         let created = body
             .find("INSERT INTO organizations")
             .expect("complete_signup creates the organization");
-        assert!(consumed < created);
+        let committed = body
+            .find("tx.commit().await?")
+            .expect("complete_signup commits one transaction");
+        assert!(checked < created && created < consumed && consumed < committed);
     }
 
     #[test]
