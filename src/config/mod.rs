@@ -1283,6 +1283,8 @@ mod tests {
             "GRPC_PORT",
             "GRPC_DEFAULT_LEASE_DURATION_SECS",
             "TURNSTILE_SECRET_KEY",
+            "DEFAULT_PLAN_TIER",
+            "SPOOLED_PLAN_LIMITS_JSON",
         ] {
             assert!(
                 compose.contains(&format!("      {name}: ${{{name}:-")),
