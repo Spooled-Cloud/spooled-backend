@@ -9,6 +9,10 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+---
+
+## [0.1.130] - 2026-11-16
+
 No route tells a caller without the admin key, or without the emailed code, whether an address has an account. No migration, no new route. Clients may notice: `GET /auth/check-email` without `X-Admin-Key` always answers `available: true, exists: false`; `PUT /organizations/{id}` with a billing email, `POST /organizations/billing-email/verification` and `POST /organizations` without the admin key no longer answer `409` for an address another organization has confirmed (the `409` comes from `POST /organizations/billing-email/verify`, after the code).
 
 ### Security
