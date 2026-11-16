@@ -9,6 +9,22 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+No route tells a caller without the admin key, or without the emailed code, whether an address has an account. No migration, no new route. Clients may notice: `GET /auth/check-email` without `X-Admin-Key` always answers `available: true, exists: false`; `PUT /organizations/{id}` with a billing email, `POST /organizations/billing-email/verification` and `POST /organizations` without the admin key no longer answer `409` for an address another organization has confirmed (the `409` comes from `POST /organizations/billing-email/verify`, after the code).
+
+### Security
+
+- **`GET /auth/check-email` no longer reveals which addresses have an account** (ENUM-01, external report). The route answered `exists` and `available` for any address to anyone, so registered emails could be listed by trying addresses (only a per-IP limit of 10 a minute and 60 an hour stood in the way). Without a valid `X-Admin-Key` it now answers `available: true, exists: false` for every well-formed address and reads no row, so neither the body nor the response time depends on the address; `signup_enabled` is unchanged. With the admin key the answer is the real one, as before. The fields stay, so the SDKs keep parsing the response. A user learns whether the address has an account from `POST /auth/email/verify` (`type: login` or `signup`), after the emailed code. Test: `r0130_email_enumeration_tests::enum01_check_email_tells_only_the_admin_whether_an_address_is_registered`.
+- **API key holders can no longer test addresses through the billing email** (ENUM-02). `PUT /organizations/{id}` with a `billing_email` and `POST /organizations/billing-email/verification` answered `409` ("Another account already uses this billing email") before any code was sent, so anyone with a free account could check addresses one by one. Both now answer as for a fresh address: the address is stored unconfirmed (or as the pending change) and the code is sent. `POST /organizations/billing-email/verify` still refuses an address another organization has confirmed (`409`, now worded "Another account already uses this billing email"), after the code, which only the mailbox owner has. Test: `r0130_email_enumeration_tests::enum02_billing_email_routes_do_not_reveal_a_registered_address`.
+- **`POST /organizations` answers `409` for a registered billing email only to the admin** (ENUM-03). In open registration (self-hosted) anyone could call it and read the `409`. Without a valid `X-Admin-Key` the address is now stored unconfirmed, which never resolves an email login; with the key (closed registration requires it) the `409` stays. Test: `r0130_email_enumeration_tests::enum03_public_org_create_tells_only_the_admin_about_a_registered_address`.
+
+### Dependencies
+
+- Lockfile updates for advisories published since 0.1.129: `rustls-webpki` 0.103.17 (RUSTSEC-2026-0382), `webpki-roots` 1.0.12 (RUSTSEC-2026-0381), `openssl` 0.10.82 (RUSTSEC-2026-0477, through `lettre`'s native-tls), `ctutils` 0.4.8 (RUSTSEC-2026-0385), `quinn-udp` 0.5.16 (RUSTSEC-2026-0538), `pulldown-cmark` 0.13.6 (RUSTSEC-2026-0414, -0433; build-time only). CI's `cargo audit` also ignores RUSTSEC-2026-0387 (`crypto-bigint` 0.5 under jsonwebtoken's ECDSA code; only HS256 is used) and RUSTSEC-2026-0459 (`libsqlite3-sys`, a lockfile entry: the sqlite driver is not built).
+
+### Documentation
+
+- `docs/openapi.yaml`: `check-email` describes the admin-only answer and the optional `X-Admin-Key` header; the `409` on billing-email verification start is gone and organization create's `409` says when it applies.
+
 ---
 
 ## [0.1.129] - 2026-10-16

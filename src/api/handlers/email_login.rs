@@ -174,11 +174,18 @@ pub struct CheckEmailRequest {
 }
 
 /// Check email availability response
+///
+/// `available` and `exists` describe the address only for a caller that sends
+/// the admin key. Everyone else gets `available: true, exists: false` for every
+/// address, so the route cannot be used to find out who has an account (email
+/// enumeration). The fields stay so existing SDK clients keep parsing it.
 #[derive(Debug, Serialize)]
 pub struct CheckEmailResponse {
-    /// Whether the email is available (no account exists)
+    /// Whether the email is available (no account exists). Always `true`
+    /// without the admin key.
     pub available: bool,
-    /// Whether an account exists with this email
+    /// Whether an account exists with this email. Always `false` without the
+    /// admin key.
     pub exists: bool,
     /// Whether the email signup flow is accepting new accounts.
     ///
@@ -188,11 +195,15 @@ pub struct CheckEmailResponse {
     pub signup_enabled: bool,
 }
 
-/// Check if an email is already registered
+/// Report whether email signup is open (and, to the operator, whether an
+/// address is registered)
 ///
 /// GET /api/v1/auth/check-email?email=...
 ///
-/// Rate limited to prevent email enumeration attacks.
+/// Only a request with a valid `X-Admin-Key` learns whether the address has an
+/// account. Anyone else gets the same answer for every well-formed address and
+/// learns it only from `/auth/email/verify`, after the emailed code proves they
+/// read that mailbox. Rate limited per client either way.
 pub async fn check_email(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -239,15 +250,21 @@ pub async fn check_email(
     )
     .await?;
 
-    // Check if email is associated with any organization
-    let exists: Option<(String,)> = sqlx::query_as(VERIFIED_ORG_BY_EMAIL)
-        .bind(&email)
-        .fetch_optional(state.db.pool())
-        .await?;
+    // Without the admin key the database is not read at all, so neither the
+    // body nor the response time depends on whether the address is registered.
+    let exists = if crate::api::middleware::admin_auth::request_has_admin_key(&state, &headers) {
+        let org: Option<(String,)> = sqlx::query_as(VERIFIED_ORG_BY_EMAIL)
+            .bind(&email)
+            .fetch_optional(state.db.pool())
+            .await?;
+        org.is_some()
+    } else {
+        false
+    };
 
     Ok(Json(CheckEmailResponse {
-        available: exists.is_none(),
-        exists: exists.is_some(),
+        available: !exists,
+        exists,
         signup_enabled: state.settings.registration.email_signup_enabled,
     }))
 }
@@ -1792,17 +1809,10 @@ pub async fn start_billing_email_verification(
     if verified {
         return Ok(verified_response());
     }
-    if crate::api::handlers::organizations::billing_email_taken(
-        state.db.pool(),
-        &email,
-        Some(&ctx.organization_id),
-    )
-    .await?
-    {
-        return Err(AppError::Conflict(
-            "Another account already uses this billing email".to_string(),
-        ));
-    }
+    // No duplicate check here: a 409 before the code is sent would tell any
+    // API key holder which addresses have an account (email enumeration). The
+    // code goes to the address either way, and `verify_billing_email` refuses
+    // a duplicate once the code proves the caller reads that mailbox.
 
     // Shares the per-address hourly budget with login codes, so this route
     // cannot be used to mail an address more often than the login flow can.
@@ -1957,7 +1967,7 @@ pub async fn verify_billing_email(
     .await?
     {
         return Err(AppError::Conflict(
-            "Another account verified this billing email first".to_string(),
+            "Another account already uses this billing email".to_string(),
         ));
     }
 

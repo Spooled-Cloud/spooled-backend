@@ -450,11 +450,16 @@ pub fn normalize_billing_email(email: &str) -> String {
 ///
 /// Email login resolves an account by its verified billing email (lower-cased),
 /// so two live orgs sharing one would make the login land in an arbitrary one of
-/// them. Every path that sets a billing email — public create, admin create, and
-/// both update routes — must refuse a duplicate. Unverified addresses do not
-/// count: they never resolve a login, and letting them block an address would
-/// let anyone stop its real owner from signing up. Soft-deleted orgs do not
-/// count either, matching the email-login lookups.
+/// them. Every path that makes an address verified (signup complete, billing
+/// email verify) and every operator route (admin create, admin update, public
+/// create with the admin key) must refuse a duplicate. Self-service routes that
+/// only store an address unverified (`PUT /organizations/{id}`, sending the
+/// confirmation code, public create without the admin key) do not ask: their
+/// answer would tell any caller which addresses have an account (email
+/// enumeration), and an unverified copy blocks nobody. Unverified addresses do
+/// not count: they never resolve a login, and letting them block an address
+/// would let anyone stop its real owner from signing up. Soft-deleted orgs do
+/// not count either, matching the email-login lookups.
 pub async fn billing_email_taken(
     pool: &sqlx::PgPool,
     email: &str,
@@ -537,12 +542,17 @@ pub async fn create(
     // Validate slug format
     validate_slug(&request.slug)?;
 
-    // Check for duplicate billing email
-    if let Some(ref email) = request.billing_email {
-        if billing_email_taken(state.db.pool(), email, None).await? {
-            return Err(AppError::Conflict(
-                "An account with this email already exists. Please log in instead.".to_string(),
-            ));
+    // Only the operator is told that an address already has an account. In
+    // open registration anyone can call this route, and a 409 would let them
+    // test addresses one by one; the address is stored unverified below, which
+    // never resolves an email login, so a duplicate does no harm there.
+    if crate::api::middleware::admin_auth::request_has_admin_key(&state, &headers) {
+        if let Some(ref email) = request.billing_email {
+            if billing_email_taken(state.db.pool(), email, None).await? {
+                return Err(AppError::Conflict(
+                    "An account with this email already exists. Please log in instead.".to_string(),
+                ));
+            }
         }
     }
 
@@ -773,13 +783,11 @@ pub async fn update(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Organization {} not found", id)))?;
 
-    if let Some(ref email) = request.billing_email {
-        if billing_email_taken(state.db.pool(), email, Some(&id)).await? {
-            return Err(AppError::Conflict(
-                "Another account already uses this billing email".to_string(),
-            ));
-        }
-    }
+    // No duplicate check: a 409 here would let any API key holder test which
+    // addresses have an account (email enumeration). The address is stored
+    // unverified (or as the pending change), which never resolves an email
+    // login; `verify_billing_email` refuses a duplicate once the emailed code
+    // proves the caller reads that mailbox.
 
     let name = request.name.unwrap_or(existing.name);
     // None keeps the billing email (and any pending change) as it is.

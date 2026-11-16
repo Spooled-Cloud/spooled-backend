@@ -18,7 +18,7 @@
 {"claim": "/auth/me accepts refresh", "memo": "07", "status": "FIXED", "evidence": "auth.rs:652-654"}
 {"claim": "query token on all protected routes", "memo": "07", "status": "SURVIVES", "evidence": "auth.rs:97-111", "sev": "P3"}
 {"claim": "admin unthrottled", "memo": "13", "status": "SURVIVES", "evidence": "api/mod.rs admin nest", "sev": "P3"}
-{"claim": "check-email enumeration", "memo": "13", "status": "SURVIVES", "evidence": "email_login.rs", "sev": "P3"}
+{"claim": "check-email enumeration", "memo": "13", "status": "FIXED 0.1.130 (ENUM-01)", "evidence": "email_login.rs check_email answers only an X-Admin-Key caller", "sev": "P3"}
 {"claim": "payload_too_large HTTP 200", "memo": "04", "status": "FIXED", "evidence": "limits.rs:407-413"}
 {"claim": "gRPC Register not worker-count gated", "memo": "04", "status": "FIXED", "evidence": "worker_service.rs:267-300"}
 {"claim": "retention ignores SPOOLED_PLAN_* env", "memo": "04", "status": "SURVIVES", "evidence": "scheduler/mod.rs:1010-1017", "sev": "P3"}

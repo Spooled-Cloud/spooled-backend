@@ -116,6 +116,27 @@ fn constant_time_compare(a: &str, b: &str) -> bool {
     result == 0
 }
 
+/// Whether the request carries the configured admin key in `X-Admin-Key`.
+///
+/// For public routes that tell the operator more than an anonymous caller
+/// (whether an address has an account, for example). An unset or empty
+/// `ADMIN_API_KEY` never matches, not even an empty header.
+pub fn request_has_admin_key(state: &AppState, headers: &HeaderMap) -> bool {
+    let Some(configured) = state
+        .settings
+        .registration
+        .admin_api_key
+        .as_deref()
+        .filter(|key| !key.is_empty())
+    else {
+        return false;
+    };
+    headers
+        .get("X-Admin-Key")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|provided| constant_time_compare(configured, provided))
+}
+
 /// Check if admin key is configured
 pub fn is_admin_configured(state: &AppState) -> bool {
     state

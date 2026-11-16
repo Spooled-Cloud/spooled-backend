@@ -438,7 +438,14 @@ paths:
     get:
       tags: [Authentication]
       summary: Check email availability
-      description: Check if an email is already registered
+      description: |
+        Reports whether email signup is open (`signup_enabled`). Whether the
+        address already has an account is reported only to a request with a
+        valid `X-Admin-Key`: without it, `available` is always `true` and
+        `exists` always `false`, so the route cannot be used to find out who
+        has an account. A user learns it from `POST /api/v1/auth/email/verify`
+        (`type: login` or `signup`), after the emailed code. Rate limited per
+        client IP (10 per minute, 60 per hour).
       operationId: checkEmail
       security: []
       parameters:
@@ -449,6 +456,12 @@ paths:
             type: string
             format: email
           description: Email address to check
+        - name: X-Admin-Key
+          in: header
+          required: false
+          schema:
+            type: string
+          description: The operator's admin key. Only with it do `available` and `exists` describe the address.
       responses:
         '200':
           description: Email check result
@@ -856,7 +869,12 @@ paths:
     post:
       tags: [Organizations]
       summary: Create organization
-      description: Create a new organization
+      description: |
+        Create a new organization. The billing email is stored unconfirmed.
+        With closed registration the request needs a valid `X-Admin-Key`.
+        Only a request with a valid `X-Admin-Key` gets `409` for a billing
+        email another organization has confirmed; without it the address is
+        stored unconfirmed like any other.
       operationId: createOrganization
       requestBody:
         required: true
@@ -872,7 +890,9 @@ paths:
               schema:
                 $ref: '#/components/schemas/Organization'
         '409':
-          description: Organization with this slug already exists
+          description: >-
+            Organization with this slug already exists, or (admin key only) the
+            billing email is confirmed by another organization
           content:
             application/json:
               schema:
@@ -999,7 +1019,9 @@ paths:
         pending address when there is one, otherwise to the unconfirmed
         `billing_email`. Shares the
         per-address hourly code budget with email login. Requires an
-        unrestricted API key or session.
+        unrestricted API key or session. The code is sent even when another
+        organization has confirmed the address; that is refused (`409`) only
+        by `POST /api/v1/organizations/billing-email/verify`, after the code.
       operationId: startBillingEmailVerification
       responses:
         '200':
@@ -1013,8 +1035,6 @@ paths:
                 email_sent_to: 'o***r@example.com'
         '400':
           description: The organization has no billing email
-        '409':
-          description: Another organization already confirmed this address
         '429':
           description: Too many codes sent to this address in the last hour
 
@@ -1054,7 +1074,7 @@ paths:
         '400':
           description: Invalid or expired code, or too many attempts
         '409':
-          description: Another organization confirmed this address first
+          description: Another organization has confirmed this address
 
   /api/v1/organizations/webhook-token:
     get:
@@ -6219,10 +6239,14 @@ components:
       properties:
         available:
           type: boolean
-          description: Whether the email is available (no account exists)
+          description: >-
+            Whether the email is available (no account exists). Always `true`
+            without a valid `X-Admin-Key`.
         exists:
           type: boolean
-          description: Whether an account exists with this email
+          description: >-
+            Whether an account exists with this email. Always `false` without a
+            valid `X-Admin-Key`.
         signup_enabled:
           type: boolean
           description: >-

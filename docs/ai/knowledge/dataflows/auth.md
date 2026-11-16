@@ -65,7 +65,12 @@ suffix. Every result passes `check-slug`, signup and `POST /organizations` (`SLU
 
 `GET /api/v1/auth/check-email` returns `available`, `exists`, and `signup_enabled`
 (`EMAIL_SIGNUP_ENABLED`). The marketing signup page gates on `signup_enabled === false`
-before sending a verification code.
+before sending a verification code. **Since 0.1.130 (ENUM-01)** `available`/`exists` describe the
+address only when the request carries a valid `X-Admin-Key` (`admin_auth::request_has_admin_key`);
+everyone else gets `available: true, exists: false` for every well-formed address and the database is
+not read, so neither the body nor the timing tells whether the address is registered. The fields stay
+for SDK parsing (Python's `CheckEmailResponse.exists` is required). The real answer reaches a user only
+through `/auth/email/verify` (`type: login` vs `signup`), after the emailed code.
 
 ## Sessions and logout (0.1.114)
 
@@ -178,6 +183,15 @@ Uniqueness (`organizations::billing_email_taken`) only counts verified addresses
 among live orgs: an unverified copy never resolves a login, so it must not block
 the real owner from signing up. Before 0.1.114 admin create/update accepted
 duplicates and the login landed in an arbitrary org.
+
+**Who is told about a duplicate (0.1.130, ENUM-02/03).** Only callers who proved the mailbox or who hold the
+admin key get the 409: `complete_signup` (signup token), `verify_billing_email` (emailed code), the admin
+routes, and `POST /organizations` with a valid `X-Admin-Key`. `PUT /organizations/{id}`,
+`POST /organizations/billing-email/verification` and `POST /organizations` without the admin key (open
+registration) no longer check: before, any API key holder (free signup) could test addresses one by one
+through the 409. The address is stored unverified (or as the pending change) and the code is sent as for a
+fresh address; `verify_billing_email` answers 409 "Another account already uses this billing email" after
+the code, so only the mailbox owner learns it.
 
 ## Organization create, signup and restore (0.1.128, R0128-ORG-01, -04, -05)
 

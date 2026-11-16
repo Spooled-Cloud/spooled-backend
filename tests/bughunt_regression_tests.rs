@@ -74,6 +74,16 @@ fn app(db: &TestDatabase) -> Router {
     app_with(db, Settings::load_for_testing())
 }
 
+/// Admin key for the tests that read `check-email`: only a caller with it
+/// learns whether an address has an account.
+const CHECK_EMAIL_ADMIN_KEY: &str = "bh-check-email-admin-key";
+
+fn app_with_admin_key(db: &TestDatabase) -> Router {
+    let mut settings = Settings::load_for_testing();
+    settings.registration.admin_api_key = Some(CHECK_EMAIL_ADMIN_KEY.to_string());
+    app_with(db, settings)
+}
+
 async fn call(
     app: &Router,
     method: &str,
@@ -129,7 +139,7 @@ async fn latest_code(pool: &sqlx::PgPool, email: &str) -> (String, Option<String
 async fn changed_billing_email_does_not_resolve_email_login_until_verified() {
     let db = TestDatabase::new().await;
     let squatter = seed_tenant(db.pool()).await;
-    let app = app(&db);
+    let app = app_with_admin_key(&db);
     let auth = bearer(&squatter.key);
     let victim = "victim-bh@example.com";
     // Without a verified address of its own, the squatter's change replaces the
@@ -159,7 +169,7 @@ async fn changed_billing_email_does_not_resolve_email_login_until_verified() {
         &app,
         "GET",
         &format!("/api/v1/auth/check-email?email={victim}"),
-        &[],
+        &[("X-Admin-Key", CHECK_EMAIL_ADMIN_KEY)],
         None,
     )
     .await;
@@ -213,7 +223,7 @@ async fn changed_billing_email_does_not_resolve_email_login_until_verified() {
 async fn billing_email_verification_code_flow() {
     let db = TestDatabase::new().await;
     let tenant = seed_tenant(db.pool()).await;
-    let app = app(&db);
+    let app = app_with_admin_key(&db);
     let auth = bearer(&tenant.key);
     let address = "owner-new-bh@example.com";
 
@@ -283,7 +293,7 @@ async fn billing_email_verification_code_flow() {
         &app,
         "GET",
         &format!("/api/v1/auth/check-email?email={address}"),
-        &[],
+        &[("X-Admin-Key", CHECK_EMAIL_ADMIN_KEY)],
         None,
     )
     .await;
@@ -10537,7 +10547,7 @@ mod wave5_keys {
             app,
             "GET",
             &format!("/api/v1/auth/check-email?email={email}"),
-            &[],
+            &[("X-Admin-Key", ADMIN_KEY)],
             None,
         )
         .await;

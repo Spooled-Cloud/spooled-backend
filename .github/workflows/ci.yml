@@ -103,9 +103,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: taiki-e/install-action@cargo-audit
-      # jsonwebtoken's RustCrypto backend includes RSA, but this service only
-      # signs and verifies HMAC JWTs, so the RSA private-key attack is unreachable.
-      - run: cargo audit --ignore RUSTSEC-2023-0071
+      # jsonwebtoken's RustCrypto backend includes RSA and ECDSA (p256 ->
+      # crypto-bigint 0.5), but this service only signs and verifies HMAC JWTs
+      # (HS256), so RUSTSEC-2023-0071 and RUSTSEC-2026-0387 are unreachable.
+      # RUSTSEC-2026-0459 (libsqlite3-sys) is a lockfile-only entry: sqlx's
+      # sqlite driver is not enabled, so `cargo tree -i libsqlite3-sys` is empty.
+      - run: cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0387 --ignore RUSTSEC-2026-0459
 
   # Docker build after tests pass
   docker:
