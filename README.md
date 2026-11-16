@@ -28,50 +28,126 @@ Spooled is a high-performance, multi-tenant job queue system designed for reliab
 - **Webhooks**: Outgoing webhook delivery with automatic retries and status tracking
 - **Billing**: Stripe integration for subscriptions and usage tracking
 
-## 🐳 Quick Start with Docker
+## 🚀 Try it in 2 minutes
 
-Zero-touch init: production Compose generates gRPC TLS into a Docker volume, and
-Prometheus/Grafana write their own scrape/datasource config on start. No busybox
-one-shots, no host PEM files, no extra clone of `deploy/` paths.
+Needs only Docker (with Compose v2), `curl` and `jq`. This runs the published backend and dashboard images with PostgreSQL and Redis on your machine, with no configuration:
 
-### Pull and Run
+```bash
+curl -O https://raw.githubusercontent.com/spooled-cloud/spooled-backend/main/docker-compose.quickstart.yml
+docker compose -f docker-compose.quickstart.yml up -d --wait
+
+curl http://localhost:8080/health
+# {"status":"healthy","database":true,"cache":true,"grpc":true,"scheduler":true}
+```
+
+Create an organization. The response holds your first API key in `api_key.key`; it is shown only once:
+
+```bash
+RESPONSE=$(curl -s -X POST http://localhost:8080/api/v1/organizations \
+  -H "Content-Type: application/json" \
+  -d '{"name": "My Company", "slug": "my-company"}')
+API_KEY=$(echo "$RESPONSE" | jq -r '.api_key.key')
+echo "$API_KEY"   # sp_test_... (sp_live_... when RUST_ENV=production)
+```
+
+Enqueue a job, claim it as a worker, and complete it:
+
+```bash
+# Enqueue -> {"id":"...","created":true}
+curl -s -X POST http://localhost:8080/api/v1/jobs \
+  -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
+  -d '{"queue_name": "emails", "payload": {"to": "user@example.com"}}'
+
+# Claim -> {"jobs":[{"id":"...","lease_id":"...","lease_expires_at":"...", ...}]}
+CLAIM=$(curl -s -X POST http://localhost:8080/api/v1/jobs/claim \
+  -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
+  -d '{"queue_name": "emails", "worker_id": "worker-1", "limit": 1}')
+JOB_ID=$(echo "$CLAIM" | jq -r '.jobs[0].id')
+LEASE_ID=$(echo "$CLAIM" | jq -r '.jobs[0].lease_id')
+
+# Complete -> {"success":true}
+curl -s -X POST "http://localhost:8080/api/v1/jobs/$JOB_ID/complete" \
+  -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
+  -d "{\"worker_id\": \"worker-1\", \"lease_id\": \"$LEASE_ID\", \"result\": {\"sent\": true}}"
+```
+
+Open the dashboard at **http://localhost:4321** and sign in with the API key.
+
+| Port | Service | Change it with |
+|------|---------|----------------|
+| `8080` | REST API | `SPOOLED_HTTP_PORT` |
+| `50051` | gRPC API (no TLS: `grpcurl -plaintext`) | `SPOOLED_GRPC_PORT` |
+| `4321` | Dashboard | `SPOOLED_DASHBOARD_PORT` |
+
+Ports bind to `127.0.0.1`. If one is taken, override it, for example `SPOOLED_HTTP_PORT=18080 docker compose -f docker-compose.quickstart.yml up -d --wait` (the dashboard follows the API port automatically).
+
+This stack is for trying Spooled locally, not for production: it runs with `RUST_ENV=development`, fixed local credentials, and the `console` email provider (email login codes are printed by `docker compose -f docker-compose.quickstart.yml logs backend`). New organizations start on the `enterprise` plan (`DEFAULT_PLAN_TIER`) so plan limits do not get in the way. Backend images up to `0.1.130` ignore `DEFAULT_PLAN_TIER` and put new organizations on the Free plan (2 queues, 1 worker, no workflows); see [Lifting plan limits](#lifting-plan-limits-self-hosted). Stop and delete everything with `docker compose -f docker-compose.quickstart.yml down -v`.
+
+## 🐳 Self-Hosting with Docker Compose (production)
+
+`docker-compose.prod.yml` runs the backend with PostgreSQL, Redis, an auto-generated gRPC TLS certificate, and optional Prometheus, Grafana and Cloudflare Tunnel. It is self-contained: a single downloaded file works (no `docker/` or `certs/` paths needed).
 
 > **Production gRPC TLS:** images from `v0.1.99` onward do not bake a historical `certs/grpc-key.pem` into the image. The production Compose stack automatically generates a private self-signed origin certificate in a Docker volume and renews it before expiration. No certificate setup is required. See [SECURITY.md](SECURITY.md#unresolved-operator-actions).
 
 ```bash
-# Pull the multi-arch image (supports amd64 and arm64)
-docker pull ghcr.io/spooled-cloud/spooled-backend:latest
-
-# Minimal path: one compose file + .env (configs are embedded / self-bootstrapped)
+mkdir spooled && cd spooled
 curl -O https://raw.githubusercontent.com/spooled-cloud/spooled-backend/main/docker-compose.prod.yml
+
 cat > .env << EOF
-POSTGRES_PASSWORD=$(openssl rand -base64 16)
-JWT_SECRET=$(openssl rand -base64 32)
+# --- Required ---
+POSTGRES_PASSWORD=$(openssl rand -hex 16)
+JWT_SECRET=$(openssl rand -hex 32)
 RUST_ENV=production
-# Required because docker-compose.prod.yml starts the cloudflared service.
-# Set this to a real tunnel token from your secret manager; do not commit it.
-CLOUDFLARE_TUNNEL_TOKEN=replace-with-cloudflare-tunnel-token
+# How login codes are emailed: smtp, resend, sendgrid or postmark
+# (the backend refuses to start with the default "console" in production)
+EMAIL_PROVIDER=smtp
+SMTP_HOST=smtp.example.com
+SMTP_PORT=587
+SMTP_USERNAME=replace-with-smtp-user
+SMTP_PASSWORD=replace-with-smtp-password
+EMAIL_FROM_ADDRESS=noreply@example.com
+# Or instead of SMTP_*: EMAIL_PROVIDER=resend and EMAIL_API_KEY=re_...
+
+# --- Recommended for a private install ---
+# New organizations start on this plan (default free: 2 queues, 1 worker, no workflows)
+DEFAULT_PLAN_TIER=enterprise
+# Enables /api/v1/admin/* (sent as the X-Admin-Key header; not an API key)
+ADMIN_API_KEY=$(openssl rand -hex 32)
 EOF
 
-# Without Cloudflare Tunnel, start only the application services and expose
-# REST/gRPC through your own ingress or compose override:
-docker compose -f docker-compose.prod.yml up -d db redis backend prometheus grafana
+# Backend + PostgreSQL + Redis (+ the gRPC certificate helper it depends on)
+docker compose -f docker-compose.prod.yml up -d --wait db redis backend
 
-# To use Cloudflare Tunnel, first replace the token placeholder and configure the
-# routes documented in docker-compose.prod.yml, then start the full stack instead:
-# docker compose -f docker-compose.prod.yml up -d
-
-# Verify from inside the backend container (the production stack exposes REST via Cloudflare)
-docker compose -f docker-compose.prod.yml exec backend curl -fsS http://localhost:8080/health
+curl http://localhost:8080/health
 ```
 
-Prefer a full Git clone (or Portainer Git stack) when you also want local/dev
-assets under `docker/prometheus` and `docker/grafana` (richer rules/dashboards).
-Those paths are optional for production — `docker-compose.prod.yml` is self-contained.
+Then create your organization and first API key exactly as in [Try it in 2 minutes](#-try-it-in-2-minutes) (the key starts with `sp_live_`).
+
+- **Secrets:** use `openssl rand -hex`, not `-base64`: a base64 value can contain `/` or `+`, which breaks the `DATABASE_URL` that Compose builds from `POSTGRES_PASSWORD`. `JWT_SECRET` must be at least 32 characters and must not contain words such as `secret`, `test` or `password`, or the backend refuses to start. Compose stops with an error if `POSTGRES_PASSWORD` or `JWT_SECRET` is missing. Do not copy `.env.example` here: it is the local development file (`RUST_ENV=development`).
+- **Email:** only checked at startup for "not `console`". Wrong SMTP or API-key values show up when someone asks for a login code (`docker compose -f docker-compose.prod.yml logs backend`). API keys work without any email setup.
+- **Host ports:** REST `127.0.0.1:8080` and gRPC `127.0.0.1:50051` (TLS). PostgreSQL is also published on `127.0.0.1:5432` for SSH tunnels. Change them with `SPOOLED_HTTP_PORT`, `SPOOLED_GRPC_PORT` and `POSTGRES_HOST_PORT`; set `SPOOLED_BIND_ADDRESS=0.0.0.0` to expose the API ports on every interface instead of putting your own reverse proxy in front. Redis is never published.
+- **Monitoring:** add `prometheus grafana` to the `up` command. They are not published on the host; reach Grafana through a tunnel or proxy (`grafana:3000` on the compose network).
+- **Cloudflare Tunnel:** set `CLOUDFLARE_TUNNEL_TOKEN`, configure the routes listed at the top of `docker-compose.prod.yml`, and run `docker compose -f docker-compose.prod.yml up -d` (all services). Without a token, leave `cloudflared` out as above.
+- **CORS:** if you serve the dashboard or your own browser app from another origin, list it in `CORS_ALLOWED_ORIGINS` (production only allows the listed origins).
+
+### gRPC on the production stack
+
+The production stack always serves gRPC over TLS with a self-signed certificate (`CN=backend`), so `grpcurl -plaintext` cannot connect. Either skip verification:
+
+```bash
+grpcurl -insecure localhost:50051 list
+```
+
+or verify against the generated certificate:
+
+```bash
+docker compose -f docker-compose.prod.yml cp backend:/run/secrets/grpc-cert.pem ./grpc-cert.pem
+grpcurl -cacert grpc-cert.pem -servername backend localhost:50051 list
+```
 
 ### Portainer
 
-Create a **Git** stack from this repository (compose file `docker-compose.prod.yml` at repo root) and set the required environment variables listed in that file. Then use **Pull and redeploy** like any other stack.
+Create a **Git** stack from this repository (compose file `docker-compose.prod.yml` at repo root) and set the environment variables from the `.env` above in the stack environment. Then use **Pull and redeploy** like any other stack.
 
 The stack:
 - generates and stores its gRPC origin certificate automatically (helper stays **Up / healthy**, not Exited 0)
@@ -88,13 +164,14 @@ Portainer details (Git stacks, ephemeral checkouts, recreate): [docs/guides/prod
 |----------|----------|---------|-------------|
 | `DATABASE_URL` | ✅ | - | PostgreSQL connection string |
 | `JWT_SECRET` | ✅ | - | 32+ char secret for JWT signing |
-| `ADMIN_API_KEY` | ❌ | - | Key for admin portal access |
+| `ADMIN_API_KEY` | ❌ | - | Value of the `X-Admin-Key` header for `/api/v1/admin/*` and for creating organizations when `REGISTRATION_MODE=closed`. Not an API key; unset = admin API off |
+| `DEFAULT_PLAN_TIER` | ❌ | `free` | Plan of every new organization (`free`/`starter`/`pro`/`enterprise`; an unknown value stops startup). Self-hosted organizations are **not** limit-free by default: set `enterprise` for a private install. Images up to `0.1.130` ignore it, see [Lifting plan limits](#lifting-plan-limits-self-hosted) |
 | `REDIS_URL` | ❌ | `redis://localhost:6379` | Redis for pub/sub & caching |
 | `RUST_ENV` | ❌ | `production` | `development`/`staging`/`production` (unset/unknown values fail safe to production) |
 | `REGISTRATION_MODE` | ❌ | `open` | `open`/`closed` - controls public registration |
 | `PORT` | ❌ | `8080` | REST API server port |
 | `GRPC_PORT` | ❌ | `50051` | gRPC API server port |
-| `GRPC_TLS_ENABLED` | ❌ | `true` (prod) | Enable TLS for gRPC (required for Cloudflare Tunnel) |
+| `GRPC_TLS_ENABLED` | ❌ | `false` | Enable TLS for gRPC (required for Cloudflare Tunnel). The default is `false` in every `RUST_ENV`; `docker-compose.prod.yml` sets it to `true` |
 | `GRPC_TLS_CERT_PATH` | ❌ | (Compose sets `/run/secrets/grpc-cert.pem`) | Path to TLS certificate (PEM); production Compose mounts the generated volume automatically |
 | `GRPC_TLS_KEY_PATH` | ❌ | (Compose sets `/run/secrets/grpc-key.pem`) | Path to TLS private key (PEM); production Compose mounts the generated volume read-only |
 | `METRICS_PORT` | ❌ | `9090` | Prometheus metrics port |
@@ -106,6 +183,9 @@ Portainer details (Git stacks, ephemeral checkouts, recreate): [docs/guides/prod
 | `TURNSTILE_SECRET_KEY` | ❌ | - | Cloudflare Turnstile secret. When set, `POST /auth/email/start` requires a valid `turnstile_token` (`400 CAPTCHA_FAILED` otherwise). Leave unset until the site and the dashboard both send the token |
 | `FRONTEND_URL` | ❌ | `https://spooled.cloud` | Website base URL Stripe Checkout returns to (`<FRONTEND_URL>/account/billing?checkout=success\|cancel`) |
 | `EMAIL_PROVIDER` | ✅ in production | `console` | `resend`/`sendgrid`/`postmark`/`smtp`. The backend refuses to start with `console` when `RUST_ENV=production` (login codes would only be logged) |
+| `EMAIL_API_KEY` | with `resend`/`sendgrid`/`postmark` | - | Provider API key |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_USERNAME` / `SMTP_PASSWORD` | with `smtp` | - / `587` / - / - | SMTP relay (STARTTLS on `SMTP_PORT`) |
+| `EMAIL_FROM_ADDRESS` / `EMAIL_FROM_NAME` | ❌ | `noreply@spooled.cloud` / `Spooled Cloud` | Sender of login-code emails |
 | `RATE_LIMIT_FAIL_CLOSED` | ❌ | `false` | `true` rejects requests while Redis cannot answer instead of letting them through |
 | `CORS_ALLOWED_ORIGINS` | ❌ | spooled.cloud origins | Comma-separated allowed origins; blank keeps the default list |
 | `EXTERNAL_URL` | ❌ | - | Public base URL of the API |
@@ -115,13 +195,42 @@ Portainer details (Git stacks, ephemeral checkouts, recreate): [docs/guides/prod
 | `WORKER_LEASE_DURATION_SECS` | ❌ | `30` | Default job lease for a REST claim that sends none |
 | `GRPC_DEFAULT_LEASE_DURATION_SECS` | ❌ | `300` | Lease for gRPC claims and renewals that send none (`0` = 300, at most 3600, must be greater than `WORKER_HEARTBEAT_INTERVAL_SECS`); reported by gRPC `Register` |
 
-A blank value counts as unset, so compose `${NAME:-}` forwarding is safe. `docker-compose.prod.yml` forwards all of the above.
+A blank value counts as unset, so compose `${NAME:-}` forwarding is safe. `docker-compose.prod.yml` forwards all of the above (it builds `DATABASE_URL` and `REDIS_URL` itself) plus the `SPOOLED_PLAN_LIMITS_JSON` / `SPOOLED_PLAN_<TIER>_LIMITS_JSON` overrides below.
+
+Host ports of the Compose files (they never change the ports inside the containers):
+
+| Variable | Default | Used by |
+|----------|---------|---------|
+| `SPOOLED_BIND_ADDRESS` | `127.0.0.1` | `docker-compose.quickstart.yml`, `docker-compose.prod.yml` (API ports) |
+| `SPOOLED_HTTP_PORT` | `8080` | quickstart, prod |
+| `SPOOLED_GRPC_PORT` | `50051` | quickstart, prod |
+| `SPOOLED_DASHBOARD_PORT` | `4321` | quickstart |
+| `POSTGRES_HOST_PORT` | `5432` (prod, on `127.0.0.1`), `5433` (dev) | prod, `docker-compose.yml` |
+| `PGBOUNCER_HOST_PORT` / `REDIS_HOST_PORT` | `6432` / `6379` | `docker-compose.yml` |
+| `PROMETHEUS_HOST_PORT` / `GRAFANA_HOST_PORT` | `9091` / `3000` | `docker-compose.yml` |
 
 The leftmost `X-Forwarded-For` entry is whatever the caller sent, so it is never trusted for rate limiting: set `TRUSTED_CLIENT_IP_HEADER` or `TRUSTED_PROXY_HOPS` if you terminate behind a proxy that sets neither `CF-Connecting-IP` nor `X-Real-IP`. `CF-Connecting-IP` and `X-Real-IP` are likewise believed only from a private TCP peer unless `TRUSTED_CLIENT_IP_HEADER` names the header, so a proxy that reaches the backend from a public address must set it. An IPv6 client is rate-limited per /64. Details in [docs/guides/operations.md](docs/guides/operations.md).
 
+### Lifting plan limits (self-hosted)
+
+Every organization has a plan (`free`, `starter`, `pro` or `enterprise`, limits in [Plan Limits & Tiers](#-plan-limits--tiers)). A self-hosted organization is **not** limit-free by default: it starts on `DEFAULT_PLAN_TIER`, which defaults to `free` (2 queues, 1 worker, no workflows, 5 requests/second). For a private install:
+
+- **New organizations:** set `DEFAULT_PLAN_TIER=enterprise` (unlimited counts, 1 MB payloads, 500 requests/second). Backend images up to `0.1.130` ignore this setting.
+- **An existing organization (any version):** set `ADMIN_API_KEY`, then move it to another plan:
+
+  ```bash
+  curl -X PATCH "http://localhost:8080/api/v1/admin/organizations/$ORG_ID" \
+    -H "X-Admin-Key: $ADMIN_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d '{"plan_tier": "enterprise"}'
+  ```
+
+  `ORG_ID` is `organization.id` from the `POST /api/v1/organizations` response (or `GET /api/v1/admin/organizations`).
+- **Change what a tier allows:** the environment variables below.
+
 ### Plan Limits via Environment Variables (Self-Hosted)
 
-Spooled ships with sensible built-in plan defaults (Free/Starter/Pro/Enterprise), but **you can override every plan limit via env vars**.
+Spooled ships with built-in plan defaults (Free/Starter/Pro/Enterprise), but **you can override every plan limit via env vars**. `docker-compose.prod.yml` and `docker-compose.quickstart.yml` forward the JSON variables (`SPOOLED_PLAN_LIMITS_JSON`, `SPOOLED_PLAN_<TIER>_LIMITS_JSON`); the per-field variables need your own `environment:` entries (or `cargo run` with them in `.env`).
 
 Limits resolution order (lowest → highest precedence):
 
@@ -173,29 +282,44 @@ Where `<TIER>` is one of: `FREE`, `STARTER`, `PRO`, `ENTERPRISE`.
 
 ## 🔧 Local Development
 
+Build and run the backend from source against PostgreSQL, PgBouncer and Redis in Docker. This is the one local development path; [CONTRIBUTING.md](CONTRIBUTING.md) and the [Quick Start Guide](docs/guides/quickstart.md) use the same steps.
+
 ### Prerequisites
 
 - Rust 1.96+
-- Docker & Docker Compose
-- PostgreSQL 16+ (or use Docker)
-- Redis 7+ (optional, for pub/sub)
+- Docker with Compose v2
 
 ### Setup
 
 ```bash
-# Clone repository
 git clone https://github.com/spooled-cloud/spooled-backend.git
 cd spooled-backend
 
-# Start dependencies
-docker compose up -d postgres redis
+# Local settings: RUST_ENV=development, console email, URLs that match docker-compose.yml
+cp .env.example .env
 
-# Run migrations and start server
+# PostgreSQL on localhost:5433, PgBouncer on localhost:6432, Redis on localhost:6379
+docker compose up -d --wait postgres redis pgbouncer
+
+# Runs migrations, then serves REST on :8080, gRPC on :50051 (no TLS), metrics on :9090
 cargo run
 
-# Run tests
+curl http://localhost:8080/health
+```
+
+`cargo run` reads `.env` (`DATABASE_URL` through PgBouncer, `DATABASE_DIRECT_URL` straight to Postgres for migrations). If a host port is taken, start Compose with `POSTGRES_HOST_PORT`, `PGBOUNCER_HOST_PORT` or `REDIS_HOST_PORT` and change the matching URL in `.env`. If port 8080 is taken, set `PORT` in `.env`.
+
+`docker compose up -d --wait` without service names also starts Prometheus (http://localhost:9091, scraping the backend on the host's `:9090`) and Grafana (http://localhost:3000, admin/admin, with the provisioned "Spooled Backend Overview" dashboard).
+
+Then create an organization and run jobs as in [Try it in 2 minutes](#-try-it-in-2-minutes). New organizations start on the Free plan; see [Lifting plan limits](#lifting-plan-limits-self-hosted).
+
+### Tests
+
+```bash
 cargo test
 ```
+
+Integration tests start their own PostgreSQL and Redis containers (testcontainers), so Docker must be running; see [CONTRIBUTING.md](CONTRIBUTING.md#testing).
 
 ### API Endpoints
 
@@ -299,8 +423,10 @@ RESPONSE=$(curl -s -X POST http://localhost:8080/api/v1/organizations \
   -H "Content-Type: application/json" \
   -d '{"name": "My Company", "slug": "my-company"}')
 echo "$RESPONSE"
-# Save the api_key from the response - it's only shown once!
-API_KEY=$(echo "$RESPONSE" | jq -r '.api_key')
+# {"organization":{"id":"...","plan_tier":"free",...},"api_key":{"id":"...","key":"sp_live_...","name":"Initial Admin Key","created_at":"..."}}
+# The key is only shown once!
+API_KEY=$(echo "$RESPONSE" | jq -r '.api_key.key')
+ORG_ID=$(echo "$RESPONSE" | jq -r '.organization.id')
 
 # 2. Create a job using the API key
 curl -X POST http://localhost:8080/api/v1/jobs \
@@ -332,6 +458,8 @@ curl -X POST http://localhost:8080/api/v1/schedules \
 
 #### Create a Workflow (Job Dependencies)
 
+Each job has a `key` that `depends_on` refers to. Workflows are not available on the Free plan (`403 FEATURE_DISABLED`); see [Lifting plan limits](#lifting-plan-limits-self-hosted).
+
 ```bash
 # User onboarding: create account → send email → setup defaults
 curl -X POST http://localhost:8080/api/v1/workflows \
@@ -341,18 +469,18 @@ curl -X POST http://localhost:8080/api/v1/workflows \
     "name": "user-onboarding",
     "jobs": [
       {
-        "name": "create-account",
+        "key": "create-account",
         "queue_name": "users",
         "payload": {"email": "user@example.com"}
       },
       {
-        "name": "send-welcome",
+        "key": "send-welcome",
         "queue_name": "emails",
         "depends_on": ["create-account"],
         "payload": {"template": "welcome"}
       },
       {
-        "name": "setup-defaults",
+        "key": "setup-defaults",
         "queue_name": "users",
         "depends_on": ["create-account"],
         "payload": {"settings": {}}
@@ -406,10 +534,7 @@ The production docker-compose includes:
 
 > **Note**: Cloudflare Tunnel requires HTTPS for HTTP/2 (gRPC). You cannot use plaintext HTTP with gRPC through Cloudflare.
 
-To disable TLS for local development (without Cloudflare):
-```bash
-GRPC_TLS_ENABLED=false cargo run
-```
+Outside the production Compose stack gRPC TLS is off by default (`GRPC_TLS_ENABLED=false`), which is what `cargo run` and `docker-compose.quickstart.yml` use.
 
 ### Proto Definition
 
@@ -452,6 +577,8 @@ service WorkerService {
 
 ### gRPC Quick Start
 
+Use `-plaintext` against `cargo run` and `docker-compose.quickstart.yml` (gRPC without TLS). The production Compose stack serves gRPC over TLS with a self-signed certificate: replace `-plaintext` with `-insecure` (or `-cacert grpc-cert.pem -servername backend`, see [gRPC on the production stack](#grpc-on-the-production-stack)).
+
 ```bash
 # Test with grpcurl (install: brew install grpcurl)
 # List services (reflection enabled)
@@ -459,7 +586,7 @@ grpcurl -plaintext localhost:50051 list
 
 # Enqueue a job
 grpcurl -plaintext \
-  -H "x-api-key: sp_live_your_key" \
+  -H "x-api-key: $API_KEY" \
   -d '{
     "queue_name": "emails",
     "payload": {"to": "user@example.com"},
@@ -470,13 +597,13 @@ grpcurl -plaintext \
 
 # Dequeue jobs
 grpcurl -plaintext \
-  -H "x-api-key: sp_live_your_key" \
+  -H "x-api-key: $API_KEY" \
   -d '{"queue_name": "emails", "worker_id": "worker-1", "batch_size": 10}' \
   localhost:50051 spooled.v1.QueueService/Dequeue
 
 # Stream jobs (server streaming)
 grpcurl -plaintext \
-  -H "x-api-key: sp_live_your_key" \
+  -H "x-api-key: $API_KEY" \
   -d '{"queue_name": "emails", "worker_id": "worker-1", "lease_duration_secs": 300}' \
   localhost:50051 spooled.v1.QueueService/StreamJobs
 ```
@@ -507,11 +634,16 @@ Spooled enforces tier-based limits automatically across all endpoints to prevent
 
 ### Available Tiers
 
-| Tier | Active Jobs | Daily Jobs | Queues | Workers | Webhooks | Schedules | Workflows |
-|------|-------------|------------|--------|---------|----------|-----------|-----------|
-| **Free** | 10 | 1,000 | 5 | 3 | 2 | 5 | 2 |
-| **Starter** | 100 | 100,000 | 25 | 25 | 10 | 25 | 10 |
-| **Enterprise** | Unlimited | Unlimited | Unlimited | Unlimited | Unlimited | Unlimited | Unlimited |
+Built-in defaults from [`src/config/plans.rs`](src/config/plans.rs) (self-hosters can change them, see [Lifting plan limits](#lifting-plan-limits-self-hosted)):
+
+| Tier | Active Jobs | Daily Jobs | Queues | Workers | API Keys | Webhooks | Schedules | Workflows | Max Payload | Rate Limit (req/s, burst) | Job / History Retention |
+|------|-------------|------------|--------|---------|----------|----------|-----------|-----------|-------------|---------------------------|-------------------------|
+| **Free** | 10 | 1,000 | 2 | 1 | 2 | 1 | 1 | 0 (disabled) | 64 KB | 5, 10 | 3 / 1 days |
+| **Starter** | 500 | 10,000 | 10 | 5 | 5 | 5 | 10 | 5 | 256 KB | 25, 50 | 14 / 7 days |
+| **Pro** | 5,000 | 100,000 | 50 | 25 | 25 | 20 | 50 | 25 | 1 MB | 100, 200 | 30 / 30 days |
+| **Enterprise** | Unlimited | Unlimited | Unlimited | Unlimited | Unlimited | Unlimited | Unlimited | Unlimited | 1 MB | 500, 1000 | 90 / 90 days |
+
+A new organization gets `DEFAULT_PLAN_TIER` (default `free`).
 
 ### Limit Enforcement
 
@@ -567,37 +699,26 @@ Prefer `PATCH /api/v1/admin/organizations/{id}`, which validates the object. The
 
 ### Docker Compose (Recommended for Single Server)
 
-```bash
-# Download production compose file
-curl -O https://raw.githubusercontent.com/spooled-cloud/spooled-backend/main/docker-compose.prod.yml
-
-# Configure environment
-cat > .env << EOF
-POSTGRES_PASSWORD=$(openssl rand -base64 16)
-JWT_SECRET=$(openssl rand -base64 32)
-RUST_ENV=production
-JSON_LOGS=true
-EOF
-
-# Deploy without the optional Cloudflare Tunnel sidecar
-docker compose -f docker-compose.prod.yml up -d db redis backend prometheus grafana
-
-# To start cloudflared too, add CLOUDFLARE_TUNNEL_TOKEN from your secret manager,
-# configure the documented routes, and run the full-stack command instead.
-# Prometheus and Grafana are included in the production stack
-```
+See [Self-Hosting with Docker Compose](#-self-hosting-with-docker-compose-production) for the complete `.env` (required: `POSTGRES_PASSWORD`, `JWT_SECRET`, `RUST_ENV=production`, `EMAIL_PROVIDER` with its SMTP or API-key settings; recommended: `DEFAULT_PLAN_TIER=enterprise` for a private install), host ports, gRPC TLS and Cloudflare Tunnel.
 
 ### Kubernetes
 
-```bash
-# Create the namespace and secret expected by the manifests
-kubectl create namespace spooled --dry-run=client -o yaml | kubectl apply -f -
-kubectl create secret generic spooled-secrets \
-  --namespace spooled \
-  --from-literal=database-url='postgres://user:pass@postgres:5432/spooled' \
-  --from-literal=jwt-secret="$(openssl rand -base64 32)"
+The manifests run the backend, PgBouncer and Redis; bring your own PostgreSQL. The production overlay deploys into namespace `spooled` and prefixes every name with `prod-` (services `prod-pgbouncer:5432`, `prod-redis:6379`).
 
-# Review the image tag and environment-specific values in the overlay, then deploy
+```bash
+kubectl create namespace spooled --dry-run=client -o yaml | kubectl apply -f -
+
+# Secrets: copy the template and fill in spooled-secrets (database-url via
+# prod-pgbouncer:5432, database-direct-url, redis-url redis://prod-redis:6379,
+# jwt-secret from `openssl rand -hex 32`, email-api-key) and pgbouncer-secrets
+# (your PostgreSQL host, database, user, password)
+cp k8s/base/secrets.yaml.template secrets.yaml
+"${EDITOR:-vi}" secrets.yaml
+kubectl apply -n spooled -f secrets.yaml
+
+# Review k8s/overlays/production/kustomization.yaml first: image tag, ingress host,
+# EMAIL_PROVIDER / EMAIL_FROM_ADDRESS (required with RUST_ENV=production) and
+# DEFAULT_PLAN_TIER. Render it without a cluster: kubectl kustomize k8s/overlays/production
 kubectl apply -k k8s/overlays/production
 
 # This repository currently ships Kustomize manifests; no Helm chart is included.
@@ -616,23 +737,27 @@ docker pull --platform linux/arm64 ghcr.io/spooled-cloud/spooled-backend:latest
 
 ### Prometheus Metrics
 
+The backend serves Prometheus metrics on `METRICS_PORT` (default `9090`). With `cargo run` that is `http://localhost:9090/metrics`; the Compose stacks do not publish it, so scrape it from the compose network (`backend:9090`) or read it inside the container:
+
 ```bash
-curl -H "Authorization: Bearer $METRICS_TOKEN" http://localhost:9090/metrics
+# cargo run (add -H "Authorization: Bearer $METRICS_TOKEN" when METRICS_TOKEN is set)
+curl http://localhost:9090/metrics
+
+# docker-compose.prod.yml
+docker compose -f docker-compose.prod.yml exec backend curl -s http://localhost:9090/metrics
 
 # Key metrics:
-# spooled_jobs_pending       - Jobs waiting
-# spooled_jobs_processing    - Jobs in progress
-# spooled_job_duration_seconds - Processing time histogram
-# spooled_workers_healthy    - Healthy worker count
+# spooled_jobs_pending             - Jobs waiting
+# spooled_jobs_processing          - Jobs in progress
+# spooled_jobs_deadlettered_total  - Jobs moved to the dead-letter queue (counter)
+# spooled_job_duration_seconds     - Processing time histogram
+# spooled_workers_healthy          - Healthy worker count
 ```
 
 ### Grafana Dashboard
 
-Access at http://localhost:3000 (admin/admin) when using `--profile monitoring`.
-
-Pre-configured dashboards:
-- **Spooled Overview**: Job throughput, queue depth, latency
-- **Worker Status**: Health, capacity, distribution
+- **Local development** (`docker compose up -d` with `docker-compose.yml`): http://localhost:3000 (admin/admin), Prometheus at http://localhost:9091. The provisioned **Spooled Backend Overview** dashboard shows job throughput, queue depth, latency and workers.
+- **Production Compose:** start `prometheus grafana` too; Grafana is not published on the host (route `grafana:3000` through your tunnel or proxy) and set `GRAFANA_PASSWORD`. It comes with the Prometheus datasource but no dashboards; import `docker/grafana/dashboards/spooled-overview.json` from this repository.
 
 ### Distributed Tracing (Jaeger)
 

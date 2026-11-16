@@ -296,11 +296,11 @@ except ValidationError as e:
 Set up alerts for:
 
 ```promql
-# Alert if DLQ has jobs
-spooled_jobs_dead_letter > 0
+# Alert if jobs reached the DLQ in the last 5 minutes
+increase(spooled_jobs_deadlettered_total[5m]) > 0
 
 # Alert if DLQ growing fast
-rate(spooled_jobs_dead_letter_total[5m]) > 1
+rate(spooled_jobs_deadlettered_total[5m]) > 1
 ```
 
 ### 4. Review DLQ Regularly

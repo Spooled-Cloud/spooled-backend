@@ -122,6 +122,21 @@ configMapGenerator:
       - RUST_LOG=info,spooled_backend=info
       - RUST_ENV=production
       - JSON_LOGS=true
+
+      # namePrefix renames the PgBouncer service to prod-pgbouncer
+      - PGBOUNCER_HOST=prod-pgbouncer
+
+      # Login-code email (required: the backend refuses to start with the
+      # default "console" provider when RUST_ENV=production). resend, sendgrid
+      # and postmark read EMAIL_API_KEY from the spooled-secrets key
+      # email-api-key; for smtp set SMTP_HOST/SMTP_PORT here and add
+      # SMTP_USERNAME/SMTP_PASSWORD to the Deployment.
+      - EMAIL_PROVIDER=resend
+      - EMAIL_FROM_ADDRESS=noreply@example.com
+
+      # Plan of every new organization (free|starter|pro|enterprise).
+      # enterprise = no plan limits, for a private install.
+      - DEFAULT_PLAN_TIER=free
       
       # Database pool (larger for production)
       - DATABASE_MAX_CONNECTIONS=50
@@ -145,4 +160,4 @@ configMapGenerator:
 
 images:
   - name: ghcr.io/spooled-cloud/spooled-backend
-    newTag: v0.1.102
+    newTag: v0.1.130

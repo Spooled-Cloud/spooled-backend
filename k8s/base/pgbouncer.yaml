@@ -39,7 +39,10 @@ spec:
       
       containers:
         - name: pgbouncer
-          image: bitnami/pgbouncer:1.22.0
+          # bitnami/pgbouncer no longer publishes tags on Docker Hub; the same image
+          # (same env interface) is frozen under bitnamilegacy. Replace it with a
+          # maintained PgBouncer image when you can.
+          image: bitnamilegacy/pgbouncer:1.24.1-debian-12-r10
           imagePullPolicy: IfNotPresent
           ports:
             - name: pgbouncer
@@ -93,6 +96,9 @@ spec:
               value: "120"
             - name: PGBOUNCER_SERVER_IDLE_TIMEOUT
               value: "600"
+            # sqlx uses named prepared statements; transaction pooling must track them
+            - name: PGBOUNCER_MAX_PREPARED_STATEMENTS
+              value: "200"
             
             # Stats and logging
             - name: PGBOUNCER_STATS_USERS

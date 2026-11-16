@@ -10,7 +10,7 @@ Complete guide to building and running workers with Spooled Cloud.
 4. [Worker Registration](#worker-registration)
 5. [Processing Jobs](#processing-jobs)
 6. [Concurrency](#concurrency)
-7. [Health & Heartbeats](#health-heartbeats)
+7. [Health & Heartbeats](#health--heartbeats)
 8. [Graceful Shutdown](#graceful-shutdown)
 9. [gRPC Workers](#grpc-workers)
 10. [Best Practices](#best-practices)
@@ -187,11 +187,20 @@ async function processJob(job) {
   try {
     const result = await doWork(job.payload);
     
-    await client.post(`/api/v1/jobs/${job.id}/complete`, { result });
+    // worker_id and the claim's lease_id are required
+    await client.post(`/api/v1/jobs/${job.id}/complete`, {
+      worker_id: WORKER_ID,
+      lease_id: job.lease_id,
+      result,
+    });
     console.log(`✓ Completed ${job.id}`);
     
   } catch (err) {
-    await client.post(`/api/v1/jobs/${job.id}/fail`, { reason: err.message });
+    await client.post(`/api/v1/jobs/${job.id}/fail`, {
+      worker_id: WORKER_ID,
+      lease_id: job.lease_id,
+      error: err.message,
+    });
     console.log(`✗ Failed ${job.id}: ${err.message}`);
   }
 }

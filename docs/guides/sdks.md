@@ -667,7 +667,8 @@ curl -X POST https://api.spooled.cloud/api/v1/jobs/claim \
 ```bash
 curl -X POST https://api.spooled.cloud/api/v1/jobs/job_xxx/complete \
   -H "Authorization: Bearer sp_live_YOUR_API_KEY" \
-  -d '{"result": {"sent": true}}'
+  -H "Content-Type: application/json" \
+  -d '{"worker_id": "worker-1", "lease_id": "lease_from_claim", "result": {"sent": true}}'
 ```
 
 See [API Usage Guide](./api-usage.md) for complete documentation.

@@ -153,6 +153,79 @@ spec:
                 secretKeyRef:
                   name: spooled-secrets
                   key: jwt-secret
+
+            # X-Admin-Key for /api/v1/admin/* (optional; unset = admin API off)
+            - name: ADMIN_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: spooled-secrets
+                  key: admin-api-key
+                  optional: true
+
+            # Registration and the plan of new organizations
+            - name: REGISTRATION_MODE
+              valueFrom:
+                configMapKeyRef:
+                  name: spooled-config
+                  key: REGISTRATION_MODE
+                  optional: true
+            - name: DEFAULT_PLAN_TIER
+              valueFrom:
+                configMapKeyRef:
+                  name: spooled-config
+                  key: DEFAULT_PLAN_TIER
+                  optional: true
+
+            # Login-code email. RUST_ENV=production refuses EMAIL_PROVIDER=console
+            # (the default), so production must set EMAIL_PROVIDER in spooled-config.
+            - name: EMAIL_PROVIDER
+              valueFrom:
+                configMapKeyRef:
+                  name: spooled-config
+                  key: EMAIL_PROVIDER
+                  optional: true
+            - name: EMAIL_FROM_ADDRESS
+              valueFrom:
+                configMapKeyRef:
+                  name: spooled-config
+                  key: EMAIL_FROM_ADDRESS
+                  optional: true
+            - name: EMAIL_FROM_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: spooled-config
+                  key: EMAIL_FROM_NAME
+                  optional: true
+            - name: SMTP_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: spooled-config
+                  key: SMTP_HOST
+                  optional: true
+            - name: SMTP_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: spooled-config
+                  key: SMTP_PORT
+                  optional: true
+            - name: EMAIL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: spooled-secrets
+                  key: email-api-key
+                  optional: true
+            - name: SMTP_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: spooled-secrets
+                  key: smtp-username
+                  optional: true
+            - name: SMTP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: spooled-secrets
+                  key: smtp-password
+                  optional: true
             
             # Webhook secrets (optional)
             - name: GITHUB_WEBHOOK_SECRET

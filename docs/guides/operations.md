@@ -5,13 +5,13 @@ This guide covers operational configuration, tuning, and best practices for runn
 ## Table of Contents
 
 1. [Connection Pooling (PgBouncer)](#connection-pooling-pgbouncer)
-2. [Rate Limiting & Backpressure](#rate-limiting-backpressure)
+2. [Rate Limiting & Backpressure](#rate-limiting--backpressure)
 3. [Redis Configuration](#redis-configuration)
 4. [Queue Partitioning](#queue-partitioning)
 5. [Autovacuum Tuning](#autovacuum-tuning)
-6. [Monitoring & Alerting](#monitoring-alerting)
+6. [Monitoring & Alerting](#monitoring--alerting)
 7. [Security Configuration](#security-configuration)
-8. [Backup & Disaster Recovery](#backup-disaster-recovery)
+8. [Backup & Disaster Recovery](#backup--disaster-recovery)
 
 ---
 
@@ -622,12 +622,32 @@ entry is not trusted.
 | `GRPC_HEALTH_ENABLED` | `true` | Enable gRPC health service |
 | `GRPC_REFLECTION_ENABLED` | `true` | Enable gRPC reflection (disable in prod if needed) |
 
+### Registration and Plans
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `REGISTRATION_MODE` | `open` | `open`: anyone can `POST /api/v1/organizations`; `closed`: only with `X-Admin-Key` |
+| `ADMIN_API_KEY` | Unset | Value of the `X-Admin-Key` header for `/api/v1/admin/*` and for closed-mode organization creation. Not an API key; unset turns the admin API off |
+| `DEFAULT_PLAN_TIER` | `free` | Plan of every new organization (public create, email signup, and admin create without `plan_tier`): `free`, `starter`, `pro` or `enterprise`; an unknown value stops the server at startup. Self-hosted organizations are **not** limit-free by default; set `enterprise` for a private install. Backend 0.1.130 and older ignore it |
+| `SPOOLED_PLAN_LIMITS_JSON`, `SPOOLED_PLAN_<TIER>_LIMITS_JSON`, `SPOOLED_PLAN_<TIER>_<FIELD>` | Unset | Override what each tier allows (README "Plan Limits via Environment Variables"); `docker-compose.prod.yml` forwards the JSON forms |
+
+The first API key of an organization comes from `POST /api/v1/organizations` (`api_key.key`, shown once). To move an existing organization to another plan:
+
+```bash
+curl -X PATCH "http://localhost:8080/api/v1/admin/organizations/$ORG_ID" \
+  -H "X-Admin-Key: $ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"plan_tier": "enterprise"}'
+```
+
 ### Email
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `EMAIL_PROVIDER` | `console` | `resend`, `sendgrid`, `postmark` or `smtp`. **Required when `RUST_ENV=production`**: the backend refuses to start with `console` (login codes would only be logged), and an unset or misspelled value resolves to `console` |
 | `EMAIL_API_KEY` | Unset | API key of the provider (SMTP uses `SMTP_*`) |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD` | Unset, `587`, Unset, Unset | SMTP relay for `EMAIL_PROVIDER=smtp` (STARTTLS on `SMTP_PORT`) |
+| `EMAIL_FROM_ADDRESS`, `EMAIL_FROM_NAME` | `noreply@spooled.cloud`, `Spooled Cloud` | Sender of login-code emails |
 | `TURNSTILE_SECRET_KEY` | Unset | Cloudflare Turnstile secret; when set, `POST /auth/email/start` requires a valid `turnstile_token` |
 
 ### Billing
