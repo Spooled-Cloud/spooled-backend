@@ -9,6 +9,10 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+---
+
+## [0.1.131] - 2026-11-16
+
 Fixes from a pre-release hunt of the job engine, the scheduler, limits and configuration, and a new setting, `DEFAULT_PLAN_TIER`. Five migrations (`20261116120000_workflow_progress_row_lock` and `20261116120100_deleted_dependency_closes_cancelled_dependents` replace the workflow progress and job-delete trigger functions; `20261116120200_worker_cap_ignores_silent_workers` replaces `worker_counts_toward_cap`; `20261116120300_expired_api_keys_leave_the_cap` replaces `get_org_resource_counts`; `20261116120400_dependent_jobs_trigger_scope` replaces `update_dependent_jobs`), no new route. Clients may notice: `POST /workflows/{id}/retry` answers `409` when every failed step was deleted (it returned `200` and a `running` workflow with nothing to run); `DELETE /queues/{name}` without `delete_jobs` answers `409` while the queue has `scheduled` jobs; `POST /webhooks/{org_id}/custom` to a queue name the organization does not have answers `429 QUOTA_EXCEEDED` over `max_queues`; a `completion_webhook` hostname is no longer resolved when the job is created (an address it resolves to is still refused at delivery), and outgoing webhook create, update and test give up resolving after 3 seconds; with `RUST_ENV` unset, unknown or `staging`, `http://` and loopback webhook URLs are refused; an idempotent replay no longer changes the existing job's `updated_at`; gRPC-run jobs have `GET /jobs/{id}/history` entries; workers silent for two minutes and expired API keys no longer count toward the plan caps. Operators: an unknown `REGISTRATION_MODE` or `DEFAULT_PLAN_TIER`, or a `HOST` that is not an IP address or `localhost`, now stops startup; the API server no longer releases jobs on shutdown.
 
 ### Security
@@ -38,6 +42,12 @@ Fixes from a pre-release hunt of the job engine, the scheduler, limits and confi
 - **A cron fire that runs late inside the repeated fall-back hour no longer fires again the same day** (CORE-5). The next run was computed from the commit clock: `59 1 * * *` in New York fired 01:59 EDT, and a tick that committed at 01:01 EST stored the repeated 01:59 EST an hour later. It is now counted from the occurrence that fired, stepping forward until it is after the clock (after more than 128 missed fires it falls back to the clock, as the skip-missed policy did). Test: `r0131_hunt_tests::core5_late_fire_in_repeated_hour_does_not_fire_again_the_same_day`.
 - **`DELETE /queues/{name}` refuses while a job waits for its retry** (CORE-6). The guard counted `pending` and `processing` jobs only; a retry waiting out its backoff has been `scheduled` since 0.1.126, so a paused queue whose jobs were all waiting retries lost its config row and with it the pause, and the retry ran. `scheduled` jobs now count (`409`, "... pending, scheduled or processing jobs"). Test: `r0131_hunt_tests::core6_queue_delete_refuses_while_a_retry_is_waiting`.
 - **A database error in a cron schedule's limit check no longer loses the fire** (CORE-8). The scheduler treated it like a plan refusal: it recorded a failed run and advanced `next_run_at`. It now rolls back and leaves the schedule due, so the next tick fires the occurrence. Test: `r0131_hunt_tests::core8_cron_limit_check_db_error_retries_on_the_next_tick`.
+
+### Documentation and self-hosting
+
+- **Every getting-started path runs as written.** Testers followed the README and the guides verbatim on a clean machine; most paths failed. Fixed: a new `docker-compose.quickstart.yml` (published backend and dashboard images, Postgres, Redis, development mode, `DEFAULT_PLAN_TIER=enterprise`) is the README's first section; the production `.env` now includes the email settings the production build requires and generates secrets with `openssl rand -hex` (a base64 password with `/` broke `DATABASE_URL` about one time in three); the development `docker-compose.yml` uses an existing PgBouncer tag and the right ports, and `.env.example` points at them; `docker-compose.prod.yml` publishes the API and gRPC ports on `127.0.0.1` (configurable), makes the database host port configurable, stops with a clear message when `POSTGRES_PASSWORD` or `JWT_SECRET` is missing, and forwards `DEFAULT_PLAN_TIER` and the plan-limit JSON variables; the API key is read with `.api_key.key`; worker examples send `queue_name`, `worker_id` and `lease_id` and read `{"jobs": [...]}`; workflow examples use `key`; package names, sample responses, metric names and the plan table match the code; the gRPC quick start shows `-insecure`/`-cacert` for the TLS-enabled compose stack.
+- **Kubernetes manifests deploy.** The PgBouncer image tag exists, the init container waits for the prefixed service name, the deployment receives the email, plan-tier and registration settings, and the README secret includes `redis-url`.
+- `SECURITY.md` keeps the guidance about the old development gRPC key pair and drops the internal remediation notes.
 
 ---
 
@@ -1890,7 +1900,7 @@ renamed, and every response change is additive except where noted.
 
 ## [0.1.111] - 2026-08-16
 
-Remediation of a full-backend audit (35 findings; see `AUDIT_2026-08-16_BUG_PLAN.md`).
+Remediation of a full-backend audit (35 findings).
 Four of the 35 were proved invalid during verification and one new finding was
 discovered while implementing.
 
@@ -2073,7 +2083,7 @@ discovered while implementing.
 
 ### Docs
 
-- Agent knowledge base under `docs/ai/knowledge/`; `certs/README.md` clarifies local-dev key material.
+- `certs/README.md` clarifies local-dev key material.
 
 ## [0.1.106] - 2026-07-15
 

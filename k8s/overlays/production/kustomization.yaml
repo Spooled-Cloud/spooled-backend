@@ -160,4 +160,4 @@ configMapGenerator:
 
 images:
   - name: ghcr.io/spooled-cloud/spooled-backend
-    newTag: v0.1.130
+    newTag: v0.1.131
