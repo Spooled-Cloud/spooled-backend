@@ -25,32 +25,34 @@ By participating in this project, you agree to abide by our [Code of Conduct](CO
 #### Prerequisites
 
 - Rust 1.96 or later
-- Docker and Docker Compose
-- PostgreSQL 16+ (via Docker)
-- Redis 7+ (via Docker)
+- Docker with Compose v2 (PostgreSQL, PgBouncer and Redis run in containers)
 
 #### Setup
+
+This is the same local development path as the README ("Local Development") and the Quick Start Guide.
 
 ```bash
 # Clone the repository
 git clone https://github.com/spooled-cloud/spooled-backend.git
 cd spooled-backend
 
-# Start dependencies
-docker compose up -d postgres redis pgbouncer
+# Local settings (RUST_ENV=development, console email, URLs matching docker-compose.yml)
+cp .env.example .env
 
-# Configure the local process (PostgreSQL is published on host port 5433)
-export DATABASE_URL=postgres://spooled:spooled_password@localhost:5433/spooled
-export REDIS_URL=redis://localhost:6379
-export RUST_ENV=development
-export JWT_SECRET=development-secret-change-in-production
+# PostgreSQL on localhost:5433, PgBouncer on localhost:6432, Redis on localhost:6379
+docker compose up -d --wait postgres redis pgbouncer
 
-# Run the server (migrations apply automatically)
+# Run the server (reads .env; migrations apply automatically)
 cargo run
 
-# Run tests
+# In another terminal
+curl http://localhost:8080/health
+
+# Run tests (integration tests start their own containers; Docker must be running)
 cargo test
 ```
+
+Host port taken? Start Compose with `POSTGRES_HOST_PORT`, `PGBOUNCER_HOST_PORT` or `REDIS_HOST_PORT` set and change the matching URL in `.env`.
 
 #### Development Workflow
 

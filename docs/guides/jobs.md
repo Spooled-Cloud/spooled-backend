@@ -577,7 +577,7 @@ except PermanentError as e:
 Watch these metrics:
 - `spooled_jobs_pending` - Jobs waiting
 - `spooled_job_max_age_seconds` - Oldest job age (alert if > 300s)
-- `spooled_jobs_dead_letter` - Failed jobs
+- `spooled_jobs_deadlettered_total` - Jobs moved to the dead-letter queue (counter)
 
 ### 6. Use Completion Webhooks
 

@@ -69,42 +69,33 @@ For teams that need self-hosting (air-gapped, data residency, etc.), continue to
 
 ## Local Development
 
+The same path as README "Local Development". To only try Spooled without building it, use `docker compose -f docker-compose.quickstart.yml up -d --wait` instead (README "Try it in 2 minutes").
+
 ### 1. Start Dependencies
 
 ```bash
-# From the spooled-backend repository root, start the local stack
-docker compose up -d
+# From the spooled-backend repository root
+cp .env.example .env
+docker compose up -d --wait          # or only: postgres redis pgbouncer
 
 # Verify services
 docker compose ps
 ```
 
-This starts:
-- **PostgreSQL 16** - Primary database (host port 5433)
-- **PgBouncer** - Connection pooler (host port 6432)
-- **Redis 7** - Cache and Pub/Sub (port 6379)
-- **Prometheus** - Metrics collection (port 9091)
-- **Grafana** - Dashboards (port 3000)
-
+This starts (host ports bind to 127.0.0.1; override with the variable in brackets):
+- **PostgreSQL 16** - Primary database (host port 5433, `POSTGRES_HOST_PORT`)
+- **PgBouncer** - Connection pooler, transaction mode (host port 6432, `PGBOUNCER_HOST_PORT`)
+- **Redis 7** - Cache and Pub/Sub (host port 6379, `REDIS_HOST_PORT`)
+- **Prometheus** - Metrics collection (host port 9091, `PROMETHEUS_HOST_PORT`), scraping the backend on the host's `:9090`
+- **Grafana** - Dashboards (host port 3000, `GRAFANA_HOST_PORT`, admin/admin) with the "Spooled Backend Overview" dashboard
 
 ### 2. Configure Environment
 
-```bash
-# Configure the local backend process
-cat > .env <<'EOF'
-DATABASE_URL=postgres://spooled:spooled_password@localhost:5433/spooled
-DATABASE_DIRECT_URL=postgres://spooled:spooled_password@localhost:5433/spooled
-REDIS_URL=redis://localhost:6379
-RUST_ENV=development
-JWT_SECRET=development-secret-change-in-production
-EOF
-```
-
-Required environment variables:
+`cp .env.example .env` (step 1) is all the configuration local development needs. `cargo run` reads `.env`; the values that matter:
 
 ```env
-# Database (the local backend process connects directly to the mapped PostgreSQL port)
-DATABASE_URL=postgres://spooled:spooled_password@localhost:5433/spooled
+# Through PgBouncer, and straight to Postgres for migrations
+DATABASE_URL=postgres://spooled:spooled_password@localhost:6432/spooled
 DATABASE_DIRECT_URL=postgres://spooled:spooled_password@localhost:5433/spooled
 
 # Redis
@@ -116,14 +107,14 @@ PORT=8080
 METRICS_PORT=9090
 RUST_ENV=development
 
-# Security (CHANGE IN PRODUCTION!)
-JWT_SECRET=your-secret-key-at-least-32-characters-long
+# Accepted only because RUST_ENV=development; production needs a random value
+JWT_SECRET=development-secret-change-in-production
 
-# Tracing (optional)
-OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
-OTEL_SERVICE_NAME=spooled-backend
-JSON_LOGS=false
+# Login codes are printed to the log
+EMAIL_PROVIDER=console
 ```
+
+If you changed a host port in step 1, change the matching URL. Tracing (`OTEL_EXPORTER_OTLP_ENDPOINT`) is optional and needs a build with `--features otel`.
 
 ### 3. Run Migrations
 
@@ -420,18 +411,26 @@ docker build -t spooled-backend:${RELEASE_TAG} .
 
 ### Run with Docker
 
+Ports: `8080` REST API, `9090` Prometheus metrics, `50051` gRPC. The database and Redis URLs must be reachable from inside the container (not `localhost`). Generate secrets with `openssl rand -hex`: `JWT_SECRET` needs 32+ characters and must not contain words such as `secret`, `test` or `password`, and production refuses `EMAIL_PROVIDER=console`.
+
 ```bash
 docker run -d \
   --name spooled-backend \
-  -p 8080:8080 \    # REST API
-  -p 9090:9090 \    # Prometheus metrics
-  -p 50051:50051 \  # gRPC API (HTTP/2 + Protobuf)
-  -e DATABASE_URL="postgres://user:pass@host:5432/spooled" \
-  -e REDIS_URL="redis://redis:6379" \
-  -e JWT_SECRET="your-production-secret" \
+  -p 8080:8080 \
+  -p 9090:9090 \
+  -p 50051:50051 \
+  -e DATABASE_URL="postgres://spooled:REPLACE_DB_PASSWORD@db.example.internal:5432/spooled" \
+  -e REDIS_URL="redis://redis.example.internal:6379" \
+  -e JWT_SECRET="$(openssl rand -hex 32)" \
   -e RUST_ENV="production" \
-  spooled-backend:latest
+  -e EMAIL_PROVIDER="resend" \
+  -e EMAIL_API_KEY="REPLACE_WITH_RESEND_KEY" \
+  -e EMAIL_FROM_ADDRESS="noreply@example.com" \
+  -e DEFAULT_PLAN_TIER="enterprise" \
+  ghcr.io/spooled-cloud/spooled-backend:latest
 ```
+
+`DEFAULT_PLAN_TIER=enterprise` puts every new organization on the unlimited plan, which suits a private install (the default is `free`; backend images up to 0.1.130 ignore the setting, see README "Lifting plan limits"). A `JWT_SECRET` generated inline like this changes on every `docker run`, which signs out existing sessions; keep it in your secret store instead.
 
 **Ports:**
 
@@ -443,55 +442,41 @@ docker run -d \
 
 ### Docker Compose (Full Stack)
 
-```yaml
-# docker-compose.prod.yml
-version: '3.8'
+Use the repository's [`docker-compose.prod.yml`](../../docker-compose.prod.yml): backend, PostgreSQL, Redis, generated gRPC TLS, optional Prometheus, Grafana and Cloudflare Tunnel. The complete `.env` and commands are in README "Self-Hosting with Docker Compose". In short:
 
-services:
-  backend:
-    image: spooled-backend:latest
-    ports:
-      - "8080:8080"
-      - "9090:9090"
-    environment:
-      DATABASE_URL: postgres://postgres:${DB_PASSWORD}@db:5432/spooled
-      REDIS_URL: redis://redis:6379
-      JWT_SECRET: ${JWT_SECRET}
-      RUST_ENV: production
-    depends_on:
-      - db
-      - redis
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      # /health is 503 while the database is down, so this marks the container unhealthy then.
-
-  db:
-    image: postgres:16-alpine
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    environment:
-      POSTGRES_PASSWORD: ${DB_PASSWORD}
-      POSTGRES_DB: spooled
-    restart: unless-stopped
-
-  redis:
-    image: redis:7-alpine
-    volumes:
-      - redis_data:/data
-    restart: unless-stopped
-
-volumes:
-  postgres_data:
-  redis_data:
+```bash
+curl -O https://raw.githubusercontent.com/spooled-cloud/spooled-backend/main/docker-compose.prod.yml
+cat > .env << EOF
+POSTGRES_PASSWORD=$(openssl rand -hex 16)
+JWT_SECRET=$(openssl rand -hex 32)
+RUST_ENV=production
+EMAIL_PROVIDER=smtp
+SMTP_HOST=smtp.example.com
+SMTP_PORT=587
+SMTP_USERNAME=replace-with-smtp-user
+SMTP_PASSWORD=replace-with-smtp-password
+EMAIL_FROM_ADDRESS=noreply@example.com
+DEFAULT_PLAN_TIER=enterprise
+ADMIN_API_KEY=$(openssl rand -hex 32)
+EOF
+docker compose -f docker-compose.prod.yml up -d --wait db redis backend
+curl http://localhost:8080/health
 ```
 
----
+| Variable | Required | Notes |
+|----------|----------|-------|
+| `POSTGRES_PASSWORD` | yes | Hex (`openssl rand -hex 16`); base64 can contain `/`, which breaks `DATABASE_URL`. Compose stops with an error when it is unset |
+| `JWT_SECRET` | yes | 32+ random characters (`openssl rand -hex 32`); weak values are refused at startup |
+| `RUST_ENV` | defaults to `production` | |
+| `EMAIL_PROVIDER` | yes in production | `smtp` (`SMTP_HOST`, `SMTP_PORT` 587 STARTTLS, `SMTP_USERNAME`, `SMTP_PASSWORD`) or `resend`/`sendgrid`/`postmark` (`EMAIL_API_KEY`) |
+| `DEFAULT_PLAN_TIER` | no (`free`) | Plan of new organizations; `enterprise` for a private install |
+| `ADMIN_API_KEY` | no | `X-Admin-Key` for `/api/v1/admin/*` (e.g. `PATCH /api/v1/admin/organizations/{id}` `{"plan_tier":"enterprise"}`) |
+| `SPOOLED_BIND_ADDRESS`, `SPOOLED_HTTP_PORT`, `SPOOLED_GRPC_PORT`, `POSTGRES_HOST_PORT` | no | Host publishing: `127.0.0.1`, `8080`, `50051` (gRPC TLS, `grpcurl -insecure`), `5432` (Postgres, loopback only) |
+| `CLOUDFLARE_TUNNEL_TOKEN` | only for `cloudflared` | Without it, start the services you need by name as above |
 
-## Production host + Portainer
+Do not copy `.env.example` for this file: it is the local development configuration (`RUST_ENV=development`, no `POSTGRES_PASSWORD`).
+
+---
 
 ## Production host + Portainer
 
@@ -523,7 +508,7 @@ Summary:
 
 No bind-mount of repo `deploy/` paths is required. A raw `curl` of the compose file + `.env` is enough; the stack then runs without Prometheus alert rules (the missing rules directory is not an error). Full Git clones also get the alert rules and Grafana assets under `docker/prometheus` and `docker/grafana`.
 
-Set `EMAIL_PROVIDER` (and `EMAIL_API_KEY`) in the stack environment: the backend refuses to start with the compose default `console` when `RUST_ENV=production`. The backend container has `stop_grace_period: 40s` so the 30 s shutdown drain is not cut by Docker's 10 s default.
+Set `EMAIL_PROVIDER` (and `EMAIL_API_KEY`, or `SMTP_*` for `smtp`) in the stack environment: the backend refuses to start with the compose default `console` when `RUST_ENV=production`. Self-hosted organizations are not limit-free by default: set `DEFAULT_PLAN_TIER=enterprise` for a private install, or move organizations with `ADMIN_API_KEY` and `PATCH /api/v1/admin/organizations/{id}`. The backend container has `stop_grace_period: 40s` so the 30 s shutdown drain is not cut by Docker's 10 s default.
 
 ---
 
@@ -543,13 +528,27 @@ kubectl create namespace spooled
 
 ### 2. Create Secrets
 
+The production overlay prefixes every name with `prod-`, so PgBouncer and Redis are `prod-pgbouncer:5432` and `prod-redis:6379`. PostgreSQL is not part of the manifests; `pgbouncer-secrets` points PgBouncer at it (see `k8s/base/secrets.yaml.template` for every key).
+
 ```bash
 kubectl create secret generic spooled-secrets \
   --namespace spooled \
-  --from-literal=database-url='postgres://user:pass@postgres:5432/spooled' \
-  --from-literal=redis-url='redis://redis:6379' \
-  --from-literal=jwt-secret='your-production-secret'
+  --from-literal=database-url='postgres://spooled:REPLACE_DB_PASSWORD@prod-pgbouncer:5432/spooled' \
+  --from-literal=database-direct-url='postgres://spooled:REPLACE_DB_PASSWORD@REPLACE_POSTGRES_HOST:5432/spooled' \
+  --from-literal=redis-url='redis://prod-redis:6379' \
+  --from-literal=jwt-secret="$(openssl rand -hex 32)" \
+  --from-literal=email-api-key='REPLACE_WITH_EMAIL_PROVIDER_KEY'
+
+kubectl create secret generic pgbouncer-secrets \
+  --namespace spooled \
+  --from-literal=POSTGRESQL_HOST='REPLACE_POSTGRES_HOST' \
+  --from-literal=POSTGRESQL_PORT='5432' \
+  --from-literal=POSTGRESQL_DATABASE='spooled' \
+  --from-literal=POSTGRESQL_USERNAME='spooled' \
+  --from-literal=POSTGRESQL_PASSWORD='REPLACE_DB_PASSWORD'
 ```
+
+Then review `k8s/overlays/production/kustomization.yaml`: `EMAIL_PROVIDER` and `EMAIL_FROM_ADDRESS` (required with `RUST_ENV=production`; the overlay uses `resend` with `email-api-key`), `DEFAULT_PLAN_TIER`, the ingress host and the image tag. `kubectl kustomize k8s/overlays/production` renders it without a cluster.
 
 ### 3. Deploy with Kustomize
 
