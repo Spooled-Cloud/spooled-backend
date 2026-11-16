@@ -1,0 +1,140 @@
+# =============================================================================
+# SPOOLED - TRY IT LOCALLY (zero configuration)
+# =============================================================================
+#
+# Runs the published backend and dashboard images with PostgreSQL and Redis on
+# your machine. No .env file, no build, no secrets to generate.
+#
+#   docker compose -f docker-compose.quickstart.yml up -d
+#   curl http://localhost:8080/health            # REST API
+#   open http://localhost:4321                   # dashboard
+#
+#   docker compose -f docker-compose.quickstart.yml down -v   # stop and delete data
+#
+# This stack is for local evaluation only:
+#   - RUST_ENV=development (permissive CORS, no JWT secret strength check)
+#   - EMAIL_PROVIDER=console: email login codes are printed to the backend log
+#     (`docker compose -f docker-compose.quickstart.yml logs backend`)
+#   - gRPC runs without TLS (use `grpcurl -plaintext`)
+#   - ports are published on 127.0.0.1 only
+#   - new organizations start on the enterprise plan (DEFAULT_PLAN_TIER), so no
+#     plan limits get in the way. Backend 0.1.130 and older ignore that setting
+#     and use the free plan (2 queues, 1 worker, no workflows); lift it with
+#     ADMIN_API_KEY and PATCH /api/v1/admin/organizations/{id} (README).
+#   - fixed local credentials; never expose this stack to a network
+# For a real deployment use docker-compose.prod.yml (see README "Production").
+#
+# Host ports (override any of them when the default is taken):
+#   SPOOLED_HTTP_PORT       REST API, default 8080
+#   SPOOLED_GRPC_PORT       gRPC API, default 50051
+#   SPOOLED_DASHBOARD_PORT  Dashboard, default 4321
+#   SPOOLED_BIND_ADDRESS    Host address the ports bind to, default 127.0.0.1
+# Example:
+#   SPOOLED_HTTP_PORT=18080 SPOOLED_DASHBOARD_PORT=14321 \
+#     docker compose -f docker-compose.quickstart.yml up -d
+#
+# Optional:
+#   ADMIN_API_KEY           Enables /api/v1/admin/* with header X-Admin-Key (not an API key)
+#   DEFAULT_PLAN_TIER       Plan of new organizations (default here: enterprise)
+#   SPOOLED_PLAN_*          Plan limit overrides (see README "Plan Limits")
+#   BACKEND_IMAGE / DASHBOARD_IMAGE   Pin image tags instead of :latest
+# =============================================================================
+
+name: spooled-quickstart
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: spooled
+      POSTGRES_PASSWORD: spooled
+      POSTGRES_DB: spooled
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U spooled -d spooled"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    image: ${BACKEND_IMAGE:-ghcr.io/spooled-cloud/spooled-backend:latest}
+    restart: unless-stopped
+    stop_grace_period: 40s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "${SPOOLED_BIND_ADDRESS:-127.0.0.1}:${SPOOLED_HTTP_PORT:-8080}:8080"
+      - "${SPOOLED_BIND_ADDRESS:-127.0.0.1}:${SPOOLED_GRPC_PORT:-50051}:50051"
+    environment:
+      RUST_ENV: development
+      RUST_LOG: ${RUST_LOG:-info,tower_http=info}
+      DATABASE_URL: postgres://spooled:spooled@postgres:5432/spooled
+      REDIS_URL: redis://redis:6379
+      HOST: 0.0.0.0
+      PORT: 8080
+      GRPC_PORT: 50051
+      GRPC_TLS_ENABLED: "false"
+      # Local-only signing key. Development mode accepts it; production refuses
+      # anything this weak.
+      JWT_SECRET: ${JWT_SECRET:-local-quickstart-only-do-not-use-in-production}
+      EMAIL_PROVIDER: console
+      REGISTRATION_MODE: open
+      DEFAULT_PLAN_TIER: ${DEFAULT_PLAN_TIER:-enterprise}
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-}
+      SPOOLED_PLAN_LIMITS_JSON: ${SPOOLED_PLAN_LIMITS_JSON:-}
+      SPOOLED_PLAN_FREE_LIMITS_JSON: ${SPOOLED_PLAN_FREE_LIMITS_JSON:-}
+      SPOOLED_PLAN_STARTER_LIMITS_JSON: ${SPOOLED_PLAN_STARTER_LIMITS_JSON:-}
+      SPOOLED_PLAN_PRO_LIMITS_JSON: ${SPOOLED_PLAN_PRO_LIMITS_JSON:-}
+      SPOOLED_PLAN_ENTERPRISE_LIMITS_JSON: ${SPOOLED_PLAN_ENTERPRISE_LIMITS_JSON:-}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  dashboard:
+    image: ${DASHBOARD_IMAGE:-ghcr.io/spooled-cloud/spooled-dashboard:latest}
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${SPOOLED_BIND_ADDRESS:-127.0.0.1}:${SPOOLED_DASHBOARD_PORT:-4321}:4321"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 4321
+      NODE_ENV: production
+      # The browser calls the API directly, so this must be the URL your browser
+      # can reach (not the in-network name `backend`).
+      PUBLIC_API_URL: ${SPOOLED_PUBLIC_API_URL:-http://localhost:${SPOOLED_HTTP_PORT:-8080}}
+      PUBLIC_SENTRY_ENVIRONMENT: local
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "require('http').get('http://127.0.0.1:4321/api/config', (r) => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  postgres_data:
