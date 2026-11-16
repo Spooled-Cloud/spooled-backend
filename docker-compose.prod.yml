@@ -20,9 +20,17 @@
 #   - No busybox one-shot Exited (0) containers; single-file curl of this compose works
 #   - Optional richer local assets: docker/prometheus, docker/grafana (dev compose)
 #
-# Quick start:
-#   1. Copy .env.example to .env and configure
-#   2. docker compose -f docker-compose.prod.yml up -d
+# Quick start (self-hosting; full walkthrough in README "Production Deployment"):
+#   1. Create .env next to this file. .env.example is the LOCAL DEVELOPMENT file
+#      (RUST_ENV=development, no POSTGRES_PASSWORD) - do not copy it here.
+#        POSTGRES_PASSWORD=<openssl rand -hex 16>   (hex: base64 may contain "/")
+#        JWT_SECRET=<openssl rand -hex 32>
+#        RUST_ENV=production
+#        EMAIL_PROVIDER=smtp|resend|sendgrid|postmark  (+ SMTP_* or EMAIL_API_KEY)
+#        DEFAULT_PLAN_TIER=enterprise   (private install: no plan limits)
+#   2. docker compose -f docker-compose.prod.yml up -d db redis backend
+#      (add prometheus grafana for monitoring; add cloudflared only with a token)
+#   3. curl http://localhost:8080/health
 #
 # For Portainer (preferred on prod host):
 #   Git stack → repository Spooled-Cloud/spooled-backend → this file at repo root
@@ -31,9 +39,19 @@
 #   Git stacks do not show the Web Editor tab (normal). See operator guide.
 #
 # Required Environment Variables:
-#   POSTGRES_PASSWORD       - Database password
-#   JWT_SECRET              - 32+ character secret for JWT signing
-#   CLOUDFLARE_TUNNEL_TOKEN - Cloudflare tunnel token (for cloudflared)
+#   POSTGRES_PASSWORD       - Database password (compose stops with an error when unset)
+#   JWT_SECRET              - 32+ character random secret for JWT signing; the backend
+#                             refuses weak values (e.g. containing "secret" or "test")
+#   EMAIL_PROVIDER          - see Email Configuration below
+#   CLOUDFLARE_TUNNEL_TOKEN - Cloudflare tunnel token (only for the cloudflared service)
+#
+# Host ports (published on the host; container ports never change):
+#   SPOOLED_BIND_ADDRESS - address the backend ports bind to (default 127.0.0.1;
+#                          0.0.0.0 exposes them on every interface)
+#   SPOOLED_HTTP_PORT    - REST API host port (default 8080)
+#   SPOOLED_GRPC_PORT    - gRPC host port (default 50051; TLS with the generated
+#                          self-signed certificate: grpcurl -insecure)
+#   POSTGRES_HOST_PORT   - Postgres host port, always on 127.0.0.1 (default 5432)
 #
 # gRPC TLS:
 #   A private self-signed origin certificate is generated automatically and persisted
@@ -44,13 +62,22 @@
 # Registration Mode (for SaaS vs Self-hosted):
 #   REGISTRATION_MODE    - "open" (default, anyone can create orgs)
 #                        - "closed" (only admin can create orgs - for SaaS)
-#   ADMIN_API_KEY        - Secret key for creating orgs when mode is "closed"
+#   ADMIN_API_KEY        - Optional. The X-Admin-Key value for /api/v1/admin/* and
+#                          for creating orgs when mode is "closed" (not an API key)
+#   DEFAULT_PLAN_TIER    - Plan of every new organization: free (default), starter,
+#                          pro or enterprise. Self-hosted orgs are NOT limit-free by
+#                          default; set enterprise for a private install. Backend
+#                          0.1.130 and older ignore it (use ADMIN_API_KEY +
+#                          PATCH /api/v1/admin/organizations/{id} {"plan_tier":"enterprise"}).
+#   SPOOLED_PLAN_LIMITS_JSON, SPOOLED_PLAN_<TIER>_LIMITS_JSON - plan limit overrides
+#                          (README "Plan Limits via Environment Variables")
 #
 # Email Configuration:
 #   EMAIL_PROVIDER       - resend, sendgrid, postmark or smtp (REQUIRED here: the backend
 #                          refuses to start with `console` when RUST_ENV=production, because
 #                          login codes would only be written to the log)
-#   EMAIL_API_KEY        - API key for the email provider
+#   EMAIL_API_KEY        - API key for resend, sendgrid or postmark
+#   SMTP_HOST, SMTP_PORT (587, STARTTLS), SMTP_USERNAME, SMTP_PASSWORD - for smtp
 #   EMAIL_FROM_ADDRESS   - From email address
 #   EMAIL_FROM_NAME      - From name
 #
@@ -63,7 +90,6 @@
 # Optional Environment Variables:
 #   BACKEND_IMAGE        - Docker image (default: ghcr.io/spooled-cloud/spooled-backend:latest)
 #                          Production Portainer workflow follows :latest on purpose.
-#   REDIS_PASSWORD       - Redis password (recommended for production)
 #   GRAFANA_USER         - Grafana admin username (default: admin)
 #   GRAFANA_PASSWORD     - Grafana admin password (default: admin) - CHANGE THIS!
 #   GRAFANA_URL          - Grafana public URL (e.g., https://grafana.spooled.cloud)
@@ -86,11 +112,11 @@ services:
     # (container IPs are Docker-assigned and move between redeploys).
     # NOT reachable off-host: bound to 127.0.0.1, never 0.0.0.0.
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-spooled}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (openssl rand -hex 16)}
       POSTGRES_DB: ${POSTGRES_DB:-spooled}
       POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=en_US.UTF-8"
     volumes:
@@ -111,6 +137,7 @@ services:
     container_name: spooled_redis
     restart: unless-stopped
     command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    # Not published on the host; reachable only on the compose network.
     volumes:
       - redis_data:/data
     healthcheck:
@@ -184,11 +211,16 @@ services:
         condition: service_healthy
       grpc-tls-init:
         condition: service_healthy
+    # Loopback by default: put your own reverse proxy / tunnel in front, or set
+    # SPOOLED_BIND_ADDRESS=0.0.0.0 to expose the ports directly.
+    ports:
+      - "${SPOOLED_BIND_ADDRESS:-127.0.0.1}:${SPOOLED_HTTP_PORT:-8080}:8080"
+      - "${SPOOLED_BIND_ADDRESS:-127.0.0.1}:${SPOOLED_GRPC_PORT:-50051}:${GRPC_PORT:-50051}"
     environment:
       # =====================
       # Database
       # =====================
-      DATABASE_URL: postgres://${POSTGRES_USER:-spooled}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-spooled}
+      DATABASE_URL: postgres://${POSTGRES_USER:-spooled}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (openssl rand -hex 16)}@db:5432/${POSTGRES_DB:-spooled}
       DATABASE_MAX_CONNECTIONS: ${DATABASE_MAX_CONNECTIONS:-25}
       DATABASE_MIN_CONNECTIONS: ${DATABASE_MIN_CONNECTIONS:-5}
       DATABASE_ACQUIRE_TIMEOUT_SECS: ${DATABASE_ACQUIRE_TIMEOUT_SECS:-30}
@@ -226,7 +258,7 @@ services:
       # =====================
       # Security
       # =====================
-      JWT_SECRET: ${JWT_SECRET}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env (openssl rand -hex 32)}
       JWT_EXPIRATION_HOURS: ${JWT_EXPIRATION_HOURS:-24}
       
       # =====================
@@ -272,6 +304,14 @@ services:
       REGISTRATION_MODE: ${REGISTRATION_MODE:-open}
       EMAIL_SIGNUP_ENABLED: ${EMAIL_SIGNUP_ENABLED:-true}
       ADMIN_API_KEY: ${ADMIN_API_KEY:-}
+      # Plan of every new organization (free|starter|pro|enterprise).
+      DEFAULT_PLAN_TIER: ${DEFAULT_PLAN_TIER:-free}
+      # Plan limit overrides (JSON; blank = built-in limits). See README "Plan Limits".
+      SPOOLED_PLAN_LIMITS_JSON: ${SPOOLED_PLAN_LIMITS_JSON:-}
+      SPOOLED_PLAN_FREE_LIMITS_JSON: ${SPOOLED_PLAN_FREE_LIMITS_JSON:-}
+      SPOOLED_PLAN_STARTER_LIMITS_JSON: ${SPOOLED_PLAN_STARTER_LIMITS_JSON:-}
+      SPOOLED_PLAN_PRO_LIMITS_JSON: ${SPOOLED_PLAN_PRO_LIMITS_JSON:-}
+      SPOOLED_PLAN_ENTERPRISE_LIMITS_JSON: ${SPOOLED_PLAN_ENTERPRISE_LIMITS_JSON:-}
       # Cloudflare Turnstile secret: when set, POST /auth/email/start requires a valid turnstile_token.
       TURNSTILE_SECRET_KEY: ${TURNSTILE_SECRET_KEY:-}
       # Website base URL Stripe Checkout returns the customer to; blank = https://spooled.cloud
@@ -331,7 +371,7 @@ services:
   # ===========================================
   # Cloudflare Tunnel (Zero Trust Access)
   # ===========================================
-  # Routes traffic to backend without exposing ports
+  # Routes traffic to backend over the compose network
   # Configure routes in Cloudflare Zero Trust dashboard:
   #   - api.yourdomain.com -> http://backend:8080
   #   - grpc.yourdomain.com -> https://backend:50051 (HTTP2 origin ON, No TLS Verify ON)
@@ -339,7 +379,7 @@ services:
     image: cloudflare/cloudflared:latest
     container_name: spooled_cloudflared
     restart: unless-stopped
-    command: --protocol http2 tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    command: --protocol http2 tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:-}
     depends_on:
       - backend
     networks:

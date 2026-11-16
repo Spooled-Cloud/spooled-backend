@@ -7,13 +7,20 @@
 # - Prometheus for metrics collection
 # - Grafana for visualization (optional)
 #
-# Usage:
-#   docker-compose up -d              # Start all services
-#   docker-compose up -d postgres redis pgbouncer  # Start minimal services
-#   docker-compose logs -f            # View logs
-#   docker-compose down -v            # Stop and remove volumes
-
-version: '3.8'
+# Usage (local development, see README "Local Development"):
+#   cp .env.example .env              # URLs in .env.example match the ports below
+#   docker compose up -d              # Start all services
+#   docker compose up -d postgres redis pgbouncer  # Start only what `cargo run` needs
+#   docker compose logs -f            # View logs
+#   docker compose down -v            # Stop and remove volumes
+#
+# Host ports (override when the default is taken; then update the matching URL in .env):
+#   POSTGRES_HOST_PORT    default 5433  -> DATABASE_DIRECT_URL
+#   PGBOUNCER_HOST_PORT   default 6432  -> DATABASE_URL
+#   REDIS_HOST_PORT       default 6379  -> REDIS_URL
+#   PROMETHEUS_HOST_PORT  default 9091
+#   GRAFANA_HOST_PORT     default 3000
+# Ports bind to 127.0.0.1 only. Credentials are fixed development values.
 
 services:
   # ==========================================================================
@@ -30,10 +37,9 @@ services:
       # PostgreSQL tuning for queue workloads
       POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=en_US.UTF-8"
     ports:
-      - "5433:5432"
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./docker/postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
     command: >
       postgres 
       -c shared_buffers=256MB
@@ -68,7 +74,7 @@ services:
   # PgBouncer - Connection Pooler (MANDATORY for production)
   # ==========================================================================
   pgbouncer:
-    image: edoburu/pgbouncer:1.21.0
+    image: edoburu/pgbouncer:v1.24.1-p1
     container_name: spooled-pgbouncer
     restart: unless-stopped
     environment:
@@ -80,13 +86,17 @@ services:
       SERVER_LIFETIME: 3600
       SERVER_IDLE_TIMEOUT: 600
       AUTH_TYPE: scram-sha-256
+      # sqlx uses named prepared statements; PgBouncer must track them in
+      # transaction mode.
+      MAX_PREPARED_STATEMENTS: 200
+    # PgBouncer listens on 5432 inside the container.
     ports:
-      - "6432:6432"
+      - "127.0.0.1:${PGBOUNCER_HOST_PORT:-6432}:5432"
     depends_on:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "pg_isready", "-h", "localhost", "-p", "6432", "-U", "spooled"]
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-p", "5432", "-U", "spooled"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -105,7 +115,7 @@ services:
       --maxmemory 256mb
       --maxmemory-policy allkeys-lru
     ports:
-      - "6379:6379"
+      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -122,9 +132,13 @@ services:
     container_name: spooled-prometheus
     restart: unless-stopped
     ports:
-      - "9091:9090"
+      - "127.0.0.1:${PROMETHEUS_HOST_PORT:-9091}:9090"
+    # Scrapes the backend you run on the host (`cargo run`, metrics on :9090).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./docker/prometheus/spooled-rules.yml:/etc/prometheus/spooled-rules.yml:ro
       - prometheus_data:/prometheus
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
@@ -145,7 +159,7 @@ services:
     container_name: spooled-grafana
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "127.0.0.1:${GRAFANA_HOST_PORT:-3000}:3000"
     environment:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: admin
@@ -153,6 +167,8 @@ services:
     volumes:
       - grafana_data:/var/lib/grafana
       - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      # "Spooled Overview" dashboard, loaded by provisioning/dashboards/dashboards.yml
+      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
     depends_on:
       - prometheus
 
