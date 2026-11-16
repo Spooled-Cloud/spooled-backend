@@ -661,3 +661,805 @@ fn core4_api_shutdown_does_not_release_jobs() {
         "src/main.rs must not change jobs on shutdown"
     );
 }
+
+fn app_with(db: &TestDatabase, settings: Settings) -> Router {
+    router(AppState::new(
+        Database::from_pool(Arc::clone(&db.pool)),
+        None,
+        Metrics::new(),
+        settings,
+    ))
+}
+
+/// Unauthenticated call (org create, signup).
+async fn call_anon(app: &Router, method: &str, uri: &str, body: Value) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("Content-Type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.expect("request");
+    let status = res.status();
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let json = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into()));
+    (status, json)
+}
+
+/// An organization from public `POST /organizations` and one from email
+/// signup completion: (org id, API key) each.
+async fn create_public_and_signup_orgs(db: &TestDatabase, app: &Router) -> [(String, String); 2] {
+    let slug = format!("pt{}", &uuid::Uuid::new_v4().simple().to_string()[..10]);
+    let (status, body) = call_anon(
+        app,
+        "POST",
+        "/api/v1/organizations",
+        json!({"name": "Plan Default", "slug": slug}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let public = (
+        body["organization"]["id"].as_str().unwrap().to_string(),
+        body["api_key"]["key"].as_str().unwrap().to_string(),
+    );
+
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let email = format!("{}@example.com", &token[..12]);
+    sqlx::query(
+        "INSERT INTO email_login_codes (email, code, expires_at) VALUES ($1, $2, NOW() + INTERVAL '1 hour')",
+    )
+    .bind(&email)
+    .bind(format!("signup:{token}"))
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let slug = format!("ps{}", &uuid::Uuid::new_v4().simple().to_string()[..10]);
+    let (status, body) = call_anon(
+        app,
+        "POST",
+        "/api/v1/auth/signup/complete",
+        json!({"signup_token": token, "name": "Plan Signup", "slug": slug}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let signup = (
+        body["organization"]["id"].as_str().unwrap().to_string(),
+        body["api_key"].as_str().unwrap().to_string(),
+    );
+    [public, signup]
+}
+
+async fn plan_tier(pool: &sqlx::PgPool, org_id: &str) -> String {
+    sqlx::query_scalar("SELECT plan_tier FROM organizations WHERE id = $1")
+        .bind(org_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn register_worker(app: &Router, key: &str, n: usize) -> (StatusCode, Value) {
+    call(
+        app,
+        "POST",
+        "/api/v1/workers/register",
+        key,
+        Some(json!({"queue_name": "plan-q", "hostname": format!("plan-host-{n}")})),
+    )
+    .await
+}
+
+/// DEFAULT_PLAN_TIER (owner decision): a self-hosted install is not stuck on
+/// the hosted Free plan. With `enterprise`, organizations from public create
+/// and from email signup get that plan and can register three workers and
+/// create a workflow.
+#[tokio::test]
+async fn default_plan_tier_applies_to_public_create_and_signup() {
+    let db = TestDatabase::new().await;
+    let mut settings = Settings::load_for_testing();
+    settings.registration.default_plan_tier = "enterprise".to_string();
+    let app = app_with(&db, settings);
+
+    for (org_id, key) in create_public_and_signup_orgs(&db, &app).await {
+        assert_eq!(plan_tier(db.pool(), &org_id).await, "enterprise");
+        for n in 1..=3 {
+            let (status, body) = register_worker(&app, &key, n).await;
+            assert!(status.is_success(), "worker {n}: {status} {body}");
+        }
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/api/v1/workflows",
+            &key,
+            Some(json!({"name": "wf", "jobs": [{"key": "a", "queue_name": "plan-q", "payload": {}}]})),
+        )
+        .await;
+        assert!(status.is_success(), "workflow: {status} {body}");
+    }
+}
+
+/// With the default setting new organizations stay on Free (spooled.cloud is
+/// unchanged): one worker, the second is refused.
+#[tokio::test]
+async fn default_plan_tier_unset_keeps_new_orgs_on_free() {
+    let db = TestDatabase::new().await;
+    let app = app(&db);
+
+    for (org_id, key) in create_public_and_signup_orgs(&db, &app).await {
+        assert_eq!(plan_tier(db.pool(), &org_id).await, "free");
+        let (status, body) = register_worker(&app, &key, 1).await;
+        assert!(status.is_success(), "{status} {body}");
+        let (status, body) = register_worker(&app, &key, 2).await;
+        assert!(
+            !status.is_success(),
+            "Free allows one worker: {status} {body}"
+        );
+    }
+}
+
+/// DEFAULT_PLAN_TIER parsing: trimmed, case-insensitive, unset or blank is
+/// free, an unknown plan stops startup with a message naming the setting.
+#[test]
+fn default_plan_tier_parsing() {
+    use spooled_backend::config::default_plan_tier_from;
+    assert_eq!(default_plan_tier_from(None).unwrap(), "free");
+    assert_eq!(default_plan_tier_from(Some("  ")).unwrap(), "free");
+    assert_eq!(
+        default_plan_tier_from(Some(" Enterprise ")).unwrap(),
+        "enterprise"
+    );
+    assert_eq!(default_plan_tier_from(Some("STARTER")).unwrap(), "starter");
+    let err = default_plan_tier_from(Some("gold"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("DEFAULT_PLAN_TIER") && err.contains("gold"),
+        "{err}"
+    );
+}
+
+/// NP-1: a worker stopped without deregistering (Ctrl+C) held the Free plan's
+/// only worker slot until the stale-worker sweep (every 5 minutes, 2-minute
+/// threshold) marked it offline, so restarting the worker failed with
+/// "workers limit reached (1/1)" for up to seven minutes. A worker silent past
+/// the sweep's threshold no longer counts.
+#[tokio::test]
+async fn np1_silent_worker_does_not_hold_the_free_worker_slot() {
+    let db = TestDatabase::new().await;
+    let t = seed_tenant(db.pool()).await;
+    sqlx::query("UPDATE organizations SET plan_tier = 'free' WHERE id = $1")
+        .bind(&t.org_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let app = app(&db);
+
+    let (status, body) = register_worker(&app, &t.key, 1).await;
+    assert!(status.is_success(), "{status} {body}");
+    // A second live worker is over Free's cap of one.
+    let (status, body) = register_worker(&app, &t.key, 2).await;
+    assert!(
+        !status.is_success(),
+        "Free allows one live worker: {status} {body}"
+    );
+
+    // The first worker was killed: no heartbeat for longer than the threshold.
+    sqlx::query("UPDATE workers SET last_heartbeat = NOW() - INTERVAL '3 minutes' WHERE organization_id = $1")
+        .bind(&t.org_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let (status, body) = register_worker(&app, &t.key, 3).await;
+    assert!(
+        status.is_success(),
+        "the restarted worker must get the dead one's slot: {status} {body}"
+    );
+    let (workers,): (i64,) = sqlx::query_as("SELECT workers FROM get_org_resource_counts($1)")
+        .bind(&t.org_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(workers, 1);
+}
+
+async fn custom_webhook(
+    app: &Router,
+    org_id: &str,
+    token: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/webhooks/{org_id}/custom"))
+        .header("X-Webhook-Token", token)
+        .header("Content-Type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.expect("request");
+    let status = res.status();
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let json = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into()));
+    (status, json)
+}
+
+/// API-1: inbound custom webhooks opened any number of queues (a Free org
+/// reached 5 of 2). A delivery to a queue name the org does not have is now
+/// charged against max_queues like `POST /jobs`; existing queues still work.
+#[tokio::test]
+async fn api1_custom_webhook_respects_the_queue_cap() {
+    let db = TestDatabase::new().await;
+    let t = seed_tenant(db.pool()).await;
+    sqlx::query(
+        "UPDATE organizations SET plan_tier = 'free', settings = '{\"webhook_token\":\"whk_r0131\"}'::JSONB WHERE id = $1",
+    )
+    .bind(&t.org_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let app = app(&db);
+    let max_queues = i64::from(
+        spooled_backend::config::PlanLimits::for_tier("free")
+            .max_queues
+            .expect("Free caps queues"),
+    );
+
+    for n in 0..max_queues {
+        let (status, body) = custom_webhook(
+            &app,
+            &t.org_id,
+            "whk_r0131",
+            json!({"queue_name": format!("hook-q{n}"), "payload": {"n": n}}),
+        )
+        .await;
+        assert!(status.is_success(), "queue {n}: {status} {body}");
+    }
+    let (status, body) = custom_webhook(
+        &app,
+        &t.org_id,
+        "whk_r0131",
+        json!({"queue_name": "hook-over", "payload": {}}),
+    )
+    .await;
+    assert!(
+        !status.is_success(),
+        "a third queue on Free: {status} {body}"
+    );
+    let queues: i64 = sqlx::query_scalar(
+        "SELECT COUNT(DISTINCT queue_name) FROM jobs WHERE organization_id = $1",
+    )
+    .bind(&t.org_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(queues, max_queues);
+    // An existing queue still takes deliveries.
+    let (status, body) = custom_webhook(
+        &app,
+        &t.org_id,
+        "whk_r0131",
+        json!({"queue_name": "hook-q0", "payload": {"again": true}}),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+}
+
+fn grpc_queue_service(db: &TestDatabase) -> spooled_backend::grpc::services::QueueServiceImpl {
+    spooled_backend::grpc::services::QueueServiceImpl::new(
+        Arc::clone(&db.pool),
+        Arc::new(Metrics::new()),
+        None,
+        Arc::new(OutgoingWebhookService::new((*db.pool).clone(), 1, 4)),
+        spooled_backend::config::QueueSettings {
+            default_max_retries: 3,
+            default_timeout_secs: 300,
+            max_payload_size_bytes: 1024 * 1024,
+        },
+        false,
+        spooled_backend::config::WorkerSettings {
+            heartbeat_interval_secs: 10,
+            lease_duration_secs: 30,
+            grpc_default_lease_duration_secs: 300,
+            max_concurrency: 10,
+            fallback_poll_interval_secs: 5,
+        },
+    )
+}
+
+fn grpc<T>(key: &str, body: T) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(body);
+    request
+        .metadata_mut()
+        .insert("x-api-key", key.parse().unwrap());
+    request
+}
+
+async fn history_events(pool: &sqlx::PgPool, job_id: &str) -> Vec<String> {
+    sqlx::query_scalar("SELECT event_type FROM job_history WHERE job_id = $1 ORDER BY event_type")
+        .bind(job_id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+/// NP-5: jobs claimed, completed and failed over gRPC had an empty
+/// `GET /jobs/{id}/history`; only the REST paths wrote job_history. gRPC
+/// Dequeue, Complete and Fail now write the same events.
+#[tokio::test]
+async fn np5_grpc_claim_complete_and_fail_write_job_history() {
+    use spooled_backend::grpc::proto::queue_service_server::QueueService;
+    use spooled_backend::grpc::proto::{CompleteRequest, DequeueRequest, FailRequest};
+
+    let db = TestDatabase::new().await;
+    let t = seed_tenant(db.pool()).await;
+    let svc = grpc_queue_service(&db);
+    insert_job(db.pool(), &t.org_id, "gq", "pending", None).await;
+    insert_job(db.pool(), &t.org_id, "gq", "pending", None).await;
+
+    let jobs = svc
+        .dequeue(grpc(
+            &t.key,
+            DequeueRequest {
+                queue_name: "gq".to_string(),
+                worker_id: "gw".to_string(),
+                lease_duration_secs: 60,
+                batch_size: 2,
+            },
+        ))
+        .await
+        .expect("dequeue")
+        .into_inner()
+        .jobs;
+    assert_eq!(jobs.len(), 2);
+    let (done, failed) = (&jobs[0], &jobs[1]);
+
+    svc.complete(grpc(
+        &t.key,
+        CompleteRequest {
+            job_id: done.id.clone(),
+            worker_id: "gw".to_string(),
+            lease_id: done.lease_id.clone(),
+            ..Default::default()
+        },
+    ))
+    .await
+    .expect("complete");
+    svc.fail(grpc(
+        &t.key,
+        FailRequest {
+            job_id: failed.id.clone(),
+            worker_id: "gw".to_string(),
+            error: "boom".to_string(),
+            lease_id: failed.lease_id.clone(),
+            ..Default::default()
+        },
+    ))
+    .await
+    .expect("fail");
+
+    assert_eq!(
+        history_events(db.pool(), &done.id).await,
+        ["completed", "processing"]
+    );
+    assert_eq!(
+        history_events(db.pool(), &failed.id).await,
+        ["processing", "retry_scheduled"]
+    );
+    let (org,): (String,) = sqlx::query_as(
+        "SELECT details->>'organization_id' FROM job_history WHERE job_id = $1 AND event_type = 'retry_scheduled'",
+    )
+    .bind(&failed.id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(org, t.org_id);
+}
+
+/// API-3: an expired API key authenticates nothing but still held a
+/// max_api_keys slot, so an organization at its limit could not create a key.
+#[tokio::test]
+async fn api3_expired_api_keys_do_not_count_toward_the_cap() {
+    let db = TestDatabase::new().await;
+    let t = seed_tenant(db.pool()).await;
+    sqlx::query("UPDATE organizations SET plan_tier = 'free' WHERE id = $1")
+        .bind(&t.org_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let cap = i64::from(
+        spooled_backend::config::PlanLimits::for_tier("free")
+            .max_api_keys
+            .expect("Free caps API keys"),
+    );
+    // Fill the cap with keys that expired yesterday (the seeded key is the 1st).
+    for n in 1..cap {
+        sqlx::query(
+            "INSERT INTO api_keys (id, organization_id, key_hash, key_prefix, name, queues, is_active, created_at, expires_at) \
+             VALUES ($1, $2, 'x', 'sp_test_', $3, ARRAY[]::TEXT[], TRUE, NOW(), NOW() - INTERVAL '1 day')",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&t.org_id)
+        .bind(format!("expired-{n}"))
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+    let (keys,): (i64,) = sqlx::query_as("SELECT api_keys FROM get_org_resource_counts($1)")
+        .bind(&t.org_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(keys, 1, "only the live key counts");
+
+    let app = app(&db);
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/v1/api-keys",
+        &t.key,
+        Some(json!({"name": "fresh"})),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+}
+
+/// API-2: request validation resolved webhook hostnames with blocking DNS on
+/// the async runtime (a slow name server stalled the worker thread). The
+/// synchronous check no longer resolves; the async one resolves with a
+/// timeout; IP literals and known-internal names are refused by both.
+#[tokio::test]
+async fn api2_url_validation_does_not_block_on_dns() {
+    use spooled_backend::security::{
+        validate_webhook_url, validate_webhook_url_resolved, UrlValidationOptions,
+    };
+    let options = UrlValidationOptions {
+        is_production: true,
+        allow_localhost_in_dev: false,
+        check_dns_resolution: true,
+    };
+    let unresolvable = "https://no-such-host.invalid/hook";
+    assert!(
+        validate_webhook_url(unresolvable, &options).is_ok(),
+        "the synchronous check must not resolve"
+    );
+    let started = std::time::Instant::now();
+    assert!(validate_webhook_url_resolved(unresolvable, &options)
+        .await
+        .is_err());
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "bounded by the 3 s timeout"
+    );
+    for blocked in [
+        "https://10.0.0.1/hook",
+        "https://127.0.0.1/hook",
+        "https://[::1]/hook",
+        "https://169.254.169.254/latest",
+        "https://metadata.google.internal/x",
+        "https://redis/x",
+    ] {
+        assert!(
+            validate_webhook_url(blocked, &options).is_err(),
+            "{blocked}"
+        );
+        assert!(
+            validate_webhook_url_resolved(blocked, &options)
+                .await
+                .is_err(),
+            "{blocked}"
+        );
+    }
+}
+
+/// API-4: the webhook URL policy treated only `RUST_ENV=production` as
+/// production, while the server treats unset or unknown RUST_ENV as
+/// production (fail-safe); with RUST_ENV unset or `staging`, loopback and
+/// plain-HTTP webhook targets were accepted. The policy now follows the
+/// server's environment. (nextest runs each test in its own process, so the
+/// process-wide policy set here does not leak into other tests.)
+#[test]
+fn api4_url_policy_follows_the_server_environment() {
+    use spooled_backend::config::Environment;
+    use spooled_backend::security::{
+        set_url_policy_environment, validate_webhook_url, UrlValidationOptions,
+    };
+    // Before any settings are applied: RUST_ENV with the server's own parse.
+    assert_eq!(Environment::from_rust_env(None), Environment::Production);
+    assert_eq!(
+        Environment::from_rust_env(Some("staging")),
+        Environment::Staging
+    );
+    assert_eq!(
+        Environment::from_rust_env(Some("prod")),
+        Environment::Production
+    );
+    assert_eq!(
+        Environment::from_rust_env(Some("dev")),
+        Environment::Development
+    );
+
+    set_url_policy_environment(&Environment::Staging);
+    let options = UrlValidationOptions::default();
+    assert!(options.is_production);
+    assert!(validate_webhook_url("http://127.0.0.1:9/hook", &options).is_err());
+    assert!(validate_webhook_url("http://example.com/hook", &options).is_err());
+
+    set_url_policy_environment(&Environment::Development);
+    let options = UrlValidationOptions::default();
+    assert!(!options.is_production);
+    assert!(validate_webhook_url("http://127.0.0.1:9/hook", &options).is_ok());
+}
+
+/// API-5 and API-6: settings that used to fail open or fail late.
+#[test]
+fn api5_api6_config_parsing() {
+    use spooled_backend::config::{
+        db_min_connections_from, registration_mode_from, server_host_from, RegistrationMode,
+    };
+    // REGISTRATION_MODE: trimmed, case-insensitive; a typo is an error, not `open`.
+    assert_eq!(
+        registration_mode_from(None).unwrap(),
+        RegistrationMode::Open
+    );
+    assert_eq!(
+        registration_mode_from(Some(" Closed ")).unwrap(),
+        RegistrationMode::Closed
+    );
+    assert_eq!(
+        registration_mode_from(Some("INVITE")).unwrap(),
+        RegistrationMode::Invite
+    );
+    assert_eq!(
+        registration_mode_from(Some("open")).unwrap(),
+        RegistrationMode::Open
+    );
+    let err = registration_mode_from(Some("close"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("REGISTRATION_MODE") && err.contains("close"),
+        "{err}"
+    );
+
+    // HOST: localhost binds 127.0.0.1; a name that is not an IP is refused at load.
+    assert_eq!(server_host_from(None).unwrap(), "0.0.0.0");
+    assert_eq!(server_host_from(Some("localhost")).unwrap(), "127.0.0.1");
+    assert_eq!(server_host_from(Some(" :: ")).unwrap(), "::");
+    assert_eq!(server_host_from(Some("[::1]")).unwrap(), "::1");
+    let err = server_host_from(Some("api.example.com"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("HOST"), "{err}");
+
+    // DATABASE_MIN_CONNECTIONS defaults to min(5, max); an explicit value stays.
+    assert_eq!(db_min_connections_from(None, 25).unwrap(), 5);
+    assert_eq!(db_min_connections_from(None, 3).unwrap(), 3);
+    assert_eq!(db_min_connections_from(Some("2"), 3).unwrap(), 2);
+    assert_eq!(db_min_connections_from(Some("9"), 3).unwrap(), 9);
+}
+
+/// API-7 and API-8, pinned in the source: key creation hashes through the
+/// bounded blocking-pool gate (bcrypt cost 12 inline parked an async worker
+/// ~250 ms per call, reachable without a key via public org create), and the
+/// login rate-limit warning logs a masked address.
+#[test]
+fn api7_api8_key_hashing_off_the_runtime_and_masked_email_log() {
+    for (file, src) in [
+        (
+            "organizations.rs",
+            include_str!("../src/api/handlers/organizations.rs"),
+        ),
+        (
+            "api_keys.rs",
+            include_str!("../src/api/handlers/api_keys.rs"),
+        ),
+        (
+            "email_login.rs",
+            include_str!("../src/api/handlers/email_login.rs"),
+        ),
+        ("admin.rs", include_str!("../src/api/handlers/admin.rs")),
+    ] {
+        assert!(
+            !src.contains("bcrypt::hash("),
+            "{file} must hash through bcrypt_gate::hash"
+        );
+    }
+    let email_login = include_str!("../src/api/handlers/email_login.rs");
+    assert!(!email_login.contains("warn!(email = %email,"));
+}
+
+async fn updated_at(pool: &sqlx::PgPool, job_id: &str) -> chrono::DateTime<chrono::Utc> {
+    sqlx::query_scalar("SELECT updated_at FROM jobs WHERE id = $1")
+        .bind(job_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// Make a job look finished long ago.
+async fn age_finished(
+    pool: &sqlx::PgPool,
+    job_id: &str,
+    status: &str,
+) -> chrono::DateTime<chrono::Utc> {
+    sqlx::query(
+        "UPDATE jobs SET status = $2, completed_at = NOW() - INTERVAL '2 days', \
+         assigned_worker_id = NULL, lease_id = NULL, lease_expires_at = NULL WHERE id = $1",
+    )
+    .bind(job_id)
+    .bind(status)
+    .execute(pool)
+    .await
+    .unwrap();
+    // The jobs_updated_at trigger stamps every UPDATE; disable it for the backdate.
+    sqlx::query("ALTER TABLE jobs DISABLE TRIGGER jobs_updated_at")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE jobs SET updated_at = NOW() - INTERVAL '2 days' WHERE id = $1")
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE jobs ENABLE TRIGGER jobs_updated_at")
+        .execute(pool)
+        .await
+        .unwrap();
+    updated_at(pool, job_id).await
+}
+
+/// CORE-7: an idempotent replay (REST create and bulk, gRPC Enqueue, inbound
+/// webhook) rewrote `updated_at` of the existing job, however long ago it
+/// finished, and retention, `failed_24h` and DLQ purge `older_than` age
+/// finished jobs by it. A replay now leaves the row as it is and still
+/// answers with its id.
+#[tokio::test]
+async fn core7_idempotent_replays_leave_a_finished_job_untouched() {
+    use spooled_backend::grpc::proto::queue_service_server::QueueService;
+    use spooled_backend::grpc::proto::EnqueueRequest;
+
+    let db = TestDatabase::new().await;
+    let t = seed_tenant(db.pool()).await;
+    sqlx::query(
+        "UPDATE organizations SET settings = '{\"webhook_token\":\"whk_c7\"}'::JSONB WHERE id = $1",
+    )
+    .bind(&t.org_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let app = app(&db);
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/v1/jobs",
+        &t.key,
+        Some(json!({"queue_name": "c7", "payload": {"n": 1}, "idempotency_key": "c7-key"})),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+    let job_id = body["id"].as_str().unwrap().to_string();
+    let aged = age_finished(db.pool(), &job_id, "deadletter").await;
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/v1/jobs",
+        &t.key,
+        Some(json!({"queue_name": "c7", "payload": {"n": 1}, "idempotency_key": "c7-key"})),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+    assert_eq!(body["id"], job_id.as_str());
+    assert_eq!(body["created"], false);
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/v1/jobs/bulk",
+        &t.key,
+        Some(json!({"queue_name": "c7", "jobs": [
+            {"payload": {"n": 1}, "idempotency_key": "c7-key"},
+            {"payload": {"n": 2}, "idempotency_key": "c7-new"}
+        ]})),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+    assert_eq!(body["succeeded"][0]["job_id"], job_id.as_str(), "{body}");
+    assert_eq!(body["succeeded"][0]["created"], false, "{body}");
+    assert_eq!(body["succeeded"][1]["created"], true, "{body}");
+
+    let (status, body) = custom_webhook(
+        &app,
+        &t.org_id,
+        "whk_c7",
+        json!({"queue_name": "c7", "payload": {}, "idempotency_key": "c7-key"}),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+    assert_eq!(body["job_id"], job_id.as_str());
+    assert_eq!(body["status"], "deadletter");
+
+    let svc = grpc_queue_service(&db);
+    let res = svc
+        .enqueue(grpc(
+            &t.key,
+            EnqueueRequest {
+                queue_name: "c7".to_string(),
+                idempotency_key: "c7-key".to_string(),
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("enqueue")
+        .into_inner();
+    assert_eq!(res.job_id, job_id);
+    assert!(!res.created);
+
+    assert_eq!(
+        updated_at(db.pool(), &job_id).await,
+        aged,
+        "no replay touched the job"
+    );
+}
+
+/// CORE-7: a dependency completing recomputed `dependencies_met` of every
+/// dependent, so a dependent that had long finished got a fresh `updated_at`.
+/// Only waiting (pending or scheduled) dependents are touched now.
+#[tokio::test]
+async fn core7_dependency_completion_leaves_finished_dependents_untouched() {
+    let db = TestDatabase::new().await;
+    let t = seed_tenant(db.pool()).await;
+    let dep = insert_job(db.pool(), &t.org_id, "default", "processing", None).await;
+    let finished = insert_job(db.pool(), &t.org_id, "default", "pending", None).await;
+    let waiting = insert_job(db.pool(), &t.org_id, "default", "pending", None).await;
+    for child in [&finished, &waiting] {
+        sqlx::query(
+            "INSERT INTO job_dependencies (job_id, depends_on_job_id, dependency_type) VALUES ($1, $2, 'all')",
+        )
+        .bind(child)
+        .bind(&dep)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("UPDATE jobs SET dependencies_met = FALSE WHERE id = $1")
+            .bind(child)
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
+    let aged = age_finished(db.pool(), &finished, "failed").await;
+
+    sqlx::query("UPDATE jobs SET status = 'completed', completed_at = NOW() WHERE id = $1")
+        .bind(&dep)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    assert_eq!(updated_at(db.pool(), &finished).await, aged);
+    let (met,): (Option<bool>,) = sqlx::query_as("SELECT dependencies_met FROM jobs WHERE id = $1")
+        .bind(&waiting)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(met, Some(true), "a waiting dependent is still released");
+}
+
+/// CORE-2: the delete trigger repeats the sweep's cancel reasons as SQL
+/// strings; they must stay the ones the retries re-open.
+#[test]
+fn core2_delete_trigger_names_the_sweep_reasons() {
+    let migration = include_str!(
+        "../migrations/20261116120100_deleted_dependency_closes_cancelled_dependents.sql"
+    );
+    for reason in spooled_backend::models::DEPENDENCY_CANCEL_REASONS {
+        assert!(
+            migration.contains(&format!("'{reason}'")),
+            "the delete trigger must name the sweep reason {reason:?}"
+        );
+    }
+}

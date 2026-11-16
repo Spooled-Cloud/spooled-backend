@@ -58,6 +58,10 @@ impl AppState {
         settings: Settings,
     ) -> Self {
         let stripe = settings.stripe.clone();
+        // Webhook URL checks (completion webhooks, outgoing webhooks, the
+        // connect-time resolver) follow the configured environment: anything
+        // but Development requires HTTPS and refuses loopback (API-4).
+        crate::security::set_url_policy_environment(&settings.server.environment);
         // Sample pool usage on every scrape (spooled_database_connections_*).
         metrics.attach_pool(db.pool().clone());
         let outgoing_webhooks = Arc::new(OutgoingWebhookService::new(

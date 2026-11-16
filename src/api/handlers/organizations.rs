@@ -585,7 +585,8 @@ pub async fn create(
     );
     let key_prefix: String = raw_key.chars().take(8).collect();
     // Hash before the transaction so a slow bcrypt does not hold the connection.
-    let key_hash = bcrypt::hash(&raw_key, bcrypt::DEFAULT_COST)
+    let key_hash = crate::api::middleware::bcrypt_gate::hash(&raw_key, bcrypt::DEFAULT_COST)
+        .await
         .map_err(|e| AppError::Internal(format!("Failed to hash API key: {}", e)))?;
     let lookup_hash = crate::models::api_key_lookup_hash(&raw_key);
 
@@ -598,7 +599,7 @@ pub async fn create(
     let org = sqlx::query_as::<_, Organization>(
         r#"
         INSERT INTO organizations (id, name, slug, plan_tier, billing_email, settings, created_at, updated_at)
-        VALUES ($1, $2, $3, 'free', $4, $5, $6, $6)
+        VALUES ($1, $2, $3, $7, $4, $5, $6, $6)
         RETURNING *
         "#,
     )
@@ -608,6 +609,8 @@ pub async fn create(
     .bind(&billing_email)
     .bind(&org_settings)
     .bind(now)
+    // DEFAULT_PLAN_TIER (free unless the install sets another plan).
+    .bind(&state.settings.registration.default_plan_tier)
     .fetch_one(&mut *tx)
     .await
     .map_err(|e| {

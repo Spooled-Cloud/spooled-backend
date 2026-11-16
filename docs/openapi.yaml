@@ -2755,6 +2755,15 @@ paths:
                 message: Invalid or missing X-Webhook-Token
         '404':
           description: Organization not found, or soft-deleted
+        '429':
+          description: >-
+            `QUOTA_EXCEEDED`: the daily or active job limit is full, or the delivery names a queue
+            the organization does not have yet and the plan's `max_queues` is full (resource
+            `queues`, as on `POST /jobs`). Nothing is stored.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /api/v1/webhooks/deliveries:
     get:

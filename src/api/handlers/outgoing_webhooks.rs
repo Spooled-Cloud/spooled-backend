@@ -29,7 +29,9 @@ use crate::models::{
     OutgoingWebhookDelivery, OutgoingWebhookSummary, TestWebhookResponse,
     UpdateOutgoingWebhookRequest, WebhookFormat, VALID_WEBHOOK_EVENTS,
 };
-use crate::security::{build_outbound_http_client, validate_webhook_url, UrlValidationOptions};
+use crate::security::{
+    build_outbound_http_client, validate_webhook_url_resolved, UrlValidationOptions,
+};
 
 /// Validate that all event types are valid
 fn validate_events(events: &[String]) -> AppResult<()> {
@@ -99,15 +101,17 @@ pub async fn create(
 
     // SECURITY: Validate URL against SSRF attacks
     let url_options = UrlValidationOptions::default();
-    validate_webhook_url(&request.url, &url_options).map_err(|e| {
-        tracing::warn!(
-            url = %request.url,
-            error = %e,
-            organization_id = %ctx.organization_id,
-            "Webhook URL rejected (SSRF protection)"
-        );
-        AppError::Validation(format!("Invalid webhook URL: {}", e))
-    })?;
+    validate_webhook_url_resolved(&request.url, &url_options)
+        .await
+        .map_err(|e| {
+            tracing::warn!(
+                url = %request.url,
+                error = %e,
+                organization_id = %ctx.organization_id,
+                "Webhook URL rejected (SSRF protection)"
+            );
+            AppError::Validation(format!("Invalid webhook URL: {}", e))
+        })?;
 
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
@@ -219,16 +223,18 @@ pub async fn update(
     // SECURITY: Validate URL against SSRF attacks if being updated
     if let Some(ref url) = request.url {
         let url_options = UrlValidationOptions::default();
-        validate_webhook_url(url, &url_options).map_err(|e| {
-            tracing::warn!(
-                url = %url,
-                error = %e,
-                organization_id = %ctx.organization_id,
-                webhook_id = %id,
-                "Webhook URL update rejected (SSRF protection)"
-            );
-            AppError::Validation(format!("Invalid webhook URL: {}", e))
-        })?;
+        validate_webhook_url_resolved(url, &url_options)
+            .await
+            .map_err(|e| {
+                tracing::warn!(
+                    url = %url,
+                    error = %e,
+                    organization_id = %ctx.organization_id,
+                    webhook_id = %id,
+                    "Webhook URL update rejected (SSRF protection)"
+                );
+                AppError::Validation(format!("Invalid webhook URL: {}", e))
+            })?;
     }
 
     // Check if webhook exists
@@ -387,16 +393,18 @@ pub async fn test(
 
     // SECURITY: Re-validate URL before making request
     let url_options = UrlValidationOptions::default();
-    validate_webhook_url(&webhook.url, &url_options).map_err(|e| {
-        tracing::warn!(
-            url = %webhook.url,
-            error = %e,
-            webhook_id = %id,
-            organization_id = %ctx.organization_id,
-            "Webhook test blocked (SSRF protection)"
-        );
-        AppError::Validation(format!("Webhook URL no longer valid: {}", e))
-    })?;
+    validate_webhook_url_resolved(&webhook.url, &url_options)
+        .await
+        .map_err(|e| {
+            tracing::warn!(
+                url = %webhook.url,
+                error = %e,
+                webhook_id = %id,
+                organization_id = %ctx.organization_id,
+                "Webhook test blocked (SSRF protection)"
+            );
+            AppError::Validation(format!("Webhook URL no longer valid: {}", e))
+        })?;
 
     // Create test payload
     let test_payload = serde_json::json!({

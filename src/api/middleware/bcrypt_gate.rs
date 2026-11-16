@@ -73,6 +73,17 @@ pub(crate) async fn verify(token: &str, hash: &str) -> anyhow::Result<bool> {
     .await
 }
 
+/// Hash a new key secret at `cost` without blocking an async worker: on the
+/// blocking pool, behind the same permits as [`verify`]. Key creation
+/// (`POST /organizations`, `POST /api-keys`, email signup and login, admin
+/// create and key rotation) hashed inline at cost 12, parking a runtime
+/// thread for ~250 ms per call; public organization create made that
+/// reachable without a key (API-7).
+pub(crate) async fn hash(secret: &str, cost: u32) -> anyhow::Result<String> {
+    let secret = secret.to_owned();
+    Ok(run_bounded(move || bcrypt::hash(secret, cost)).await??)
+}
+
 /// Run `work` on the blocking pool once a verify permit is free.
 ///
 /// The permit moves into the blocking task, so a caller that is cancelled

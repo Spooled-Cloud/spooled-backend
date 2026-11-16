@@ -88,6 +88,88 @@ pub const CLAIM_BATCH_SQL: &str = r#"
     RETURNING jobs.*
 "#;
 
+/// The job that already holds an idempotency key, found after an
+/// `INSERT ... ON CONFLICT DO NOTHING` that inserted nothing.
+#[derive(Debug, sqlx::FromRow)]
+pub struct IdempotentReplay {
+    pub id: String,
+    pub queue_name: String,
+    pub status: String,
+    /// Whether the caller's key scope (`None` = every queue) covers its queue.
+    pub in_scope: bool,
+}
+
+/// Look up the job holding `key` in `org_id` for an idempotent replay.
+///
+/// Every enqueue path inserts with `ON CONFLICT ... DO NOTHING` and calls this
+/// when nothing was inserted. They used `DO UPDATE SET updated_at = NOW()` to
+/// get the existing id back, which rewrote `updated_at` of jobs that had
+/// long finished (the `jobs_updated_at` trigger stamps every update), and
+/// retention, the dashboard's `failed_24h` and DLQ purge `older_than` age
+/// finished jobs by it (CORE-7). Run as its own statement, so under READ
+/// COMMITTED it sees a conflicting insert that committed after the INSERT's
+/// snapshot. `FOR KEY SHARE` keeps the row from being deleted until the
+/// caller's transaction ends without blocking status changes or writing it.
+pub async fn find_idempotent_replay<'e, E>(
+    executor: E,
+    org_id: &str,
+    key: &str,
+    scope: Option<&[String]>,
+) -> Result<Option<IdempotentReplay>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_as(
+        "SELECT id, queue_name, status, queue_in_key_scope(queue_name, $3::TEXT[]) AS in_scope \
+         FROM jobs WHERE organization_id = $1 AND idempotency_key = $2 FOR KEY SHARE",
+    )
+    .bind(org_id)
+    .bind(key)
+    .bind(scope)
+    .fetch_optional(executor)
+    .await
+}
+
+/// Append a `job_history` event: the row `GET /jobs/{id}/history` reads.
+/// REST writes it through [`QueueManager`]'s claim, complete and fail; gRPC
+/// `Dequeue`, `StreamJobs`, `ProcessJobs`, `Complete` and `Fail` call this
+/// directly (NP-5: they wrote none, so a job run over gRPC had an empty
+/// history). `details` gets the job's `organization_id`. Best-effort: a
+/// failure is logged and the operation it records stands.
+pub async fn record_job_history(
+    pool: &PgPool,
+    job_id: &str,
+    event_type: &str,
+    details: serde_json::Value,
+) {
+    let result = sqlx::query(
+        r#"
+        INSERT INTO job_history (id, job_id, event_type, details, created_at)
+        SELECT
+            gen_random_uuid()::TEXT,
+            $1,
+            $2,
+            jsonb_set($3::jsonb, '{organization_id}', to_jsonb(j.organization_id)),
+            NOW()
+        FROM jobs j WHERE j.id = $1
+        "#,
+    )
+    .bind(job_id)
+    .bind(event_type)
+    .bind(&details)
+    .execute(pool)
+    .await;
+
+    if let Err(e) = result {
+        warn!(
+            job_id = %job_id,
+            event_type = %event_type,
+            error = %e,
+            "Failed to record job history - continuing with main operation"
+        );
+    }
+}
+
 /// Release jobs whose worker is deregistering, and return how many moved.
 ///
 /// A live lease means the process may still be inside the handler. The worker
@@ -206,8 +288,9 @@ impl QueueManager {
             "pending"
         };
 
-        // FIXED: Always return job ID (new or existing) with DO UPDATE
-        let (returned_id,): (String,) = sqlx::query_as(
+        // A replay inserts nothing and leaves the existing row untouched;
+        // its id comes from find_idempotent_replay (CORE-7).
+        let inserted: Option<(String,)> = sqlx::query_as(
             r#"
             INSERT INTO jobs (
                 id, organization_id, queue_name, status, payload, priority,
@@ -217,7 +300,7 @@ impl QueueManager {
             VALUES ($1, $2, $3, $4, $5::JSONB, $6, $7, $8, $9, $10, $11, $9)
             ON CONFLICT (organization_id, idempotency_key)
             WHERE idempotency_key IS NOT NULL
-            DO UPDATE SET updated_at = NOW()
+            DO NOTHING
             RETURNING id
             "#,
         )
@@ -232,8 +315,17 @@ impl QueueManager {
         .bind(now)
         .bind(scheduled_at)
         .bind(idempotency_key)
-        .fetch_one(&*self.db)
+        .fetch_optional(&*self.db)
         .await?;
+        let returned_id = match inserted {
+            Some((id,)) => id,
+            None => {
+                find_idempotent_replay(&*self.db, org_id, idempotency_key.unwrap_or_default(), None)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("idempotent job vanished during replay"))?
+                    .id
+            }
+        };
 
         // Check if this was a new job or an idempotent duplicate
         let is_new = returned_id == job_id;
@@ -1384,47 +1476,15 @@ impl QueueManager {
         Ok(count)
     }
 
-    /// Record job history event
-    ///
-    /// Now includes organization context in details for audit trail
-    /// Now handles errors gracefully - history recording failures
-    /// should not fail the main operation (dequeue, complete, fail)
+    /// Record job history event (see [`record_job_history`]). Never fails
+    /// the main operation (dequeue, complete, fail).
     async fn record_history(
         &self,
         job_id: &str,
         event_type: &str,
         details: serde_json::Value,
     ) -> Result<()> {
-        // Include job's org_id in history for audit purposes
-        // Handle errors gracefully - history is secondary
-        let result = sqlx::query(
-            r#"
-            INSERT INTO job_history (id, job_id, event_type, details, created_at)
-            SELECT
-                gen_random_uuid()::TEXT,
-                $1,
-                $2,
-                jsonb_set($3::jsonb, '{organization_id}', to_jsonb(j.organization_id)),
-                NOW()
-            FROM jobs j WHERE j.id = $1
-            "#,
-        )
-        .bind(job_id)
-        .bind(event_type)
-        .bind(&details)
-        .execute(&*self.db)
-        .await;
-
-        // Log error but don't fail the main operation
-        if let Err(e) = result {
-            warn!(
-                job_id = %job_id,
-                event_type = %event_type,
-                error = %e,
-                "Failed to record job history - continuing with main operation"
-            );
-        }
-
+        record_job_history(&self.db, job_id, event_type, details).await;
         Ok(())
     }
 

@@ -9837,6 +9837,13 @@ mod wave5_hooks {
 
     impl Endpoint {
         pub(super) async fn start(status: u16, delay: Duration, body: String) -> Self {
+            // A loopback http:// target is allowed only under the development
+            // URL policy. These tests build the delivery services without an
+            // AppState (which applies the configured environment), and with
+            // RUST_ENV unset the policy is production (API-4).
+            spooled_backend::security::set_url_policy_environment(
+                &spooled_backend::config::Environment::Development,
+            );
             let stats = Arc::new(EndpointStats::default());
             let shared = Arc::clone(&stats);
             let app = Router::new().fallback(move |ConnectInfo(peer): ConnectInfo<SocketAddr>| {
@@ -14343,8 +14350,10 @@ mod w8_jobsapi {
             .await
             .unwrap();
 
-        // ... while J completes over REST, on a second connection: the
-        // dependents trigger waits for D.
+        // ... while J completes over REST, on a second connection. The
+        // dependents trigger used to wait for D here; since CORE-7 it skips a
+        // dependent that is already running, so J may also finish without
+        // waiting. Either way neither side may deadlock.
         let j_done = tokio::spawn({
             let (app, auth, worker) = (app.clone(), auth.clone(), worker.clone());
             async move {
@@ -14366,12 +14375,12 @@ mod w8_jobsapi {
             .fetch_one(pool)
             .await
             .unwrap();
-            if waiting > 0 {
+            if waiting > 0 || j_done.is_finished() {
                 break;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "J's completion never waited for D"
+                "J's completion neither waited for D nor finished"
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }

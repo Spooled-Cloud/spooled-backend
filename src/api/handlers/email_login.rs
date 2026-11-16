@@ -501,7 +501,7 @@ pub async fn start(
     .await?;
 
     if recent_codes.0 >= MAX_CODES_PER_HOUR {
-        warn!(email = %email, "Email login rate limit exceeded");
+        warn!(email = %mask_email(&email), "Email login rate limit exceeded");
         return Err(AppError::RateLimit(
             "Too many login attempts. Please try again later.".to_string(),
         )
@@ -1184,7 +1184,8 @@ pub async fn complete_signup(
     );
     let key_prefix: String = raw_key.chars().take(8).collect();
     // Hash before the transaction so bcrypt does not hold the connection.
-    let key_hash = bcrypt::hash(&raw_key, bcrypt::DEFAULT_COST)
+    let key_hash = crate::api::middleware::bcrypt_gate::hash(&raw_key, bcrypt::DEFAULT_COST)
+        .await
         .map_err(|e| AppError::Internal(format!("Failed to hash API key: {}", e)))?;
     let lookup_hash = crate::models::api_key_lookup_hash(&raw_key);
 
@@ -1192,7 +1193,7 @@ pub async fn complete_signup(
     sqlx::query(
         r#"
         INSERT INTO organizations (id, name, slug, plan_tier, billing_email, billing_email_verified_at, settings, created_at, updated_at)
-        VALUES ($1, $2, $3, 'free', $4, $6, $5, $6, $6)
+        VALUES ($1, $2, $3, $7, $4, $6, $5, $6, $6)
         "#,
     )
     .bind(&org_id)
@@ -1201,6 +1202,8 @@ pub async fn complete_signup(
     .bind(&email)
     .bind(&initial_settings)
     .bind(now)
+    // DEFAULT_PLAN_TIER (free unless the install sets another plan).
+    .bind(&state.settings.registration.default_plan_tier)
     .execute(&mut *tx)
     .await
     .map_err(|e| {
@@ -1675,7 +1678,8 @@ async fn get_or_create_email_api_key(
     // Generate a random key (we won't expose it, just for internal use)
     // Uses sp_ prefix (new standard)
     let raw_key = format!("sp_email_{}", Uuid::new_v4().to_string().replace('-', ""));
-    let key_hash = bcrypt::hash(&raw_key, 10)
+    let key_hash = crate::api::middleware::bcrypt_gate::hash(&raw_key, 10)
+        .await
         .map_err(|e| AppError::Internal(format!("Failed to hash key: {}", e)))?;
     let key_prefix = raw_key.chars().take(8).collect::<String>();
     let lookup_hash = crate::models::api_key_lookup_hash(&raw_key);

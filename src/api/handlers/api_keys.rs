@@ -132,7 +132,8 @@ pub async fn create(
 
     // Hash the key using bcrypt (verification happens in Rust, NOT in database).
     // Done BEFORE the transaction so the advisory lock below is held minimally.
-    let key_hash = bcrypt::hash(&raw_key, bcrypt::DEFAULT_COST)
+    let key_hash = crate::api::middleware::bcrypt_gate::hash(&raw_key, bcrypt::DEFAULT_COST)
+        .await
         .map_err(|e| AppError::Internal(format!("Failed to hash API key: {}", e)))?;
     // Fast-lookup hash so authentication resolves this key by a unique index instead
     // of bcrypt-scanning every key sharing the `sp_live_`/`sp_test_` prefix.

@@ -580,7 +580,7 @@ async fn existing_idempotent_job(
 /// would be the first use of `queue_name`. No-op when the queue already
 /// exists: those enqueues must not wait on the lock. The pre-check can be
 /// stale, so existence is read again after the lock.
-async fn enforce_new_queue_on(
+pub(crate) async fn enforce_new_queue_on(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     org_id: &str,
     queue_name: &str,
@@ -604,7 +604,7 @@ async fn enforce_new_queue_on(
     Ok(())
 }
 
-enum EnqueueGuardError {
+pub(crate) enum EnqueueGuardError {
     Database(sqlx::Error),
     Limit(axum::response::Response),
 }
@@ -876,9 +876,9 @@ pub async fn create(
         });
     }
 
-    // DO UPDATE SET RETURNING returns an id for a new row and for an in-scope
-    // replay. An existing job outside this key's queues matches the conflict
-    // but fails the WHERE, so nothing is written and RETURNING is empty.
+    // RETURNING has an id only for a new row. A replay writes nothing (its
+    // updated_at stays, CORE-7) and is resolved by find_idempotent_replay,
+    // which also tells whether this key may see the existing job's queue.
     let inserted: Result<Option<(String,)>, sqlx::Error> = sqlx::query_as(
         r#"
         INSERT INTO jobs (
@@ -890,8 +890,7 @@ pub async fn create(
         VALUES ($1, $2, $3, $4, $5::JSONB, $6, $7, $8, $9, $10, $11, $9, $12::JSONB, $13, $14, $15, $16, $17)
         ON CONFLICT (organization_id, idempotency_key)
         WHERE idempotency_key IS NOT NULL
-        DO UPDATE SET updated_at = NOW()
-        WHERE queue_in_key_scope(jobs.queue_name, $18::TEXT[])
+        DO NOTHING
         RETURNING id
         "#,
     )
@@ -917,12 +916,24 @@ pub async fn create(
     .bind(&request.completion_webhook_secret)
     .bind(request.expires_at)
     .bind(dependencies_met)
-    .bind(ctx.queue_scope_filter())
     .fetch_optional(&mut *tx)
     .await;
+    let inserted = match inserted {
+        Ok(None) => crate::queue::find_idempotent_replay(
+            &mut *tx,
+            &org_id,
+            idempotency_key.as_deref().unwrap_or_default(),
+            ctx.queue_scope_filter(),
+        )
+        .await
+        .map(|replay| replay.filter(|r| r.in_scope).map(|r| (r.id,))),
+        other => other,
+    };
 
     let returned_id = match inserted {
         Ok(Some((id,))) => id,
+        // The existing job is outside this key's queues (or was deleted
+        // between the insert and the lookup).
         Ok(None) => {
             drop(tx);
             refund_reserved_quota(&state, &org_id, quota_reserved, 1).await;
@@ -2250,9 +2261,8 @@ pub async fn bulk_enqueue(
                 $7::TEXT[]
             ) AS t(idx, jid, stat, pay, pri, sch, idem)
         ),
-        -- Deduplicate within the batch: two items sharing one idempotency_key would
-        -- make `ON CONFLICT DO UPDATE` "affect a row a second time" and abort the whole
-        -- INSERT. Keep only the first row per key (null keys stay distinct via their jid);
+        -- Deduplicate within the batch: two items sharing one idempotency_key insert one
+        -- job. Keep only the first row per key (null keys stay distinct via their jid);
         -- the final SELECT below still maps every input row to the resulting job id.
         dedup_input AS (
             SELECT DISTINCT ON (COALESCE(idem, jid)) idx, jid, stat, pay, pri, sch, idem
@@ -2281,8 +2291,7 @@ pub async fn bulk_enqueue(
             FROM dedup_input ij
             ON CONFLICT (organization_id, idempotency_key)
             WHERE idempotency_key IS NOT NULL
-            DO UPDATE SET updated_at = NOW()
-            WHERE queue_in_key_scope(jobs.queue_name, $13::TEXT[])
+            DO NOTHING
             RETURNING id, idempotency_key
         )
         SELECT
@@ -2311,9 +2320,42 @@ pub async fn bulk_enqueue(
     .bind(default_max_retries)
     .bind(default_timeout)
     .bind(now)
-    .bind(ctx.queue_scope_filter())
     .fetch_all(&mut *tx)
     .await;
+
+    // Items whose key an existing job holds inserted nothing (RETURNING lacks
+    // them, and the existing row is not written: CORE-7). Resolve each to
+    // that job when this key may see its queue; otherwise leave it unresolved
+    // so the batch is refused below.
+    let results = match results {
+        Ok(mut rows) => {
+            let mut lookup = Ok(());
+            for row in rows.iter_mut() {
+                let (_, returned_id, _, idem) = row;
+                let (None, Some(key)) = (returned_id.as_ref(), idem.as_deref()) else {
+                    continue;
+                };
+                match crate::queue::find_idempotent_replay(
+                    &mut *tx,
+                    &org_id,
+                    key,
+                    ctx.queue_scope_filter(),
+                )
+                .await
+                {
+                    Ok(replay) => {
+                        *returned_id = replay.filter(|r| r.in_scope).map(|r| r.id);
+                    }
+                    Err(e) => {
+                        lookup = Err(e);
+                        break;
+                    }
+                }
+            }
+            lookup.map(|()| rows)
+        }
+        Err(e) => Err(e),
+    };
 
     // A failed batch INSERT created nothing: give the reservation back and say so
     // with an error status (it was a 200 listing every item as failed).

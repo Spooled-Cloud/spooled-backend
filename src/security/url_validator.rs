@@ -8,11 +8,51 @@
 //! - Blocks internal hostnames (postgres, redis, etc.)
 //! - Enforces HTTPS in production
 //! - Validates URL format and scheme
-//! - DNS rebinding protection (resolves hostname and validates IP)
+//! - Resolved-address check at configure time ([`validate_webhook_url_resolved`],
+//!   async with a timeout) and at every connect (`SsrfGuardedResolver` in
+//!   `security::http_client`)
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::Duration;
 use thiserror::Error;
 use tracing::warn;
+
+/// How long [`validate_webhook_url_resolved`] waits for DNS.
+const DNS_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The server's environment as the URL policy sees it: 0 = not set,
+/// 1 = development, 2 = staging or production.
+static ENVIRONMENT_POLICY: AtomicU8 = AtomicU8::new(0);
+
+/// Apply the server's configured environment to every
+/// [`UrlValidationOptions::default`]: anything but Development enforces
+/// HTTPS and blocks loopback targets. `AppState::new` calls it with
+/// `settings.server.environment`.
+pub fn set_url_policy_environment(environment: &crate::config::Environment) {
+    let value = if *environment == crate::config::Environment::Development {
+        1
+    } else {
+        2
+    };
+    ENVIRONMENT_POLICY.store(value, Ordering::Relaxed);
+}
+
+/// Whether the URL policy is the production one. Before the settings are
+/// applied it reads `RUST_ENV` with the settings' own parse, so unset or an
+/// unknown value is production (fail-safe), as it is for the server (API-4:
+/// it used to be production only for exactly `RUST_ENV=production`, so with
+/// RUST_ENV unset or `staging` loopback webhook targets were allowed).
+fn url_policy_is_production() -> bool {
+    match ENVIRONMENT_POLICY.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            crate::config::Environment::from_rust_env(std::env::var("RUST_ENV").ok().as_deref())
+                != crate::config::Environment::Development
+        }
+    }
+}
 
 /// Errors from URL validation
 #[derive(Debug, Error)]
@@ -46,18 +86,16 @@ pub struct UrlValidationOptions {
     pub is_production: bool,
     /// Allow localhost in development mode
     pub allow_localhost_in_dev: bool,
-    /// Perform DNS resolution to check for rebinding attacks
+    /// Resolve the hostname and check its addresses. Only
+    /// [`validate_webhook_url_resolved`] (async, with a timeout) does;
+    /// the synchronous [`validate_webhook_url`] never resolves.
     pub check_dns_resolution: bool,
 }
 
 impl Default for UrlValidationOptions {
     fn default() -> Self {
-        let is_production = std::env::var("RUST_ENV")
-            .map(|v| v == "production")
-            .unwrap_or(false);
-
         Self {
-            is_production,
+            is_production: url_policy_is_production(),
             allow_localhost_in_dev: true,
             check_dns_resolution: true,
         }
@@ -202,11 +240,35 @@ pub fn validate_webhook_url(
     // including redirects. Keep this check anyway: it rejects bad URLs at
     // configuration time, where the user gets a clear error instead of a
     // delivery failure hours later.
-    if options.check_dns_resolution {
-        validate_dns_resolution(host, parsed.port_or_known_default().unwrap_or(443), options)?;
-    }
-
+    // No DNS here: this runs inside request validation on the async runtime,
+    // and a blocking lookup of a hostname whose name server stalls held a
+    // runtime thread for the resolver's whole timeout (API-2). Delivery
+    // checks every address it connects to (`SsrfGuardedResolver`);
+    // configure-time callers that want an early answer use
+    // `validate_webhook_url_resolved`.
     Ok(())
+}
+
+/// [`validate_webhook_url`], then, when `options.check_dns_resolution` is
+/// set, resolve the hostname without blocking (at most 3 s) and refuse it if
+/// it does not resolve or any address is not allowed. For create, update and
+/// test of an outgoing webhook, where the user gets the error at once.
+pub async fn validate_webhook_url_resolved(
+    url: &str,
+    options: &UrlValidationOptions,
+) -> Result<(), UrlValidationError> {
+    validate_webhook_url(url, options)?;
+    if !options.check_dns_resolution {
+        return Ok(());
+    }
+    let parsed =
+        url::Url::parse(url).map_err(|e| UrlValidationError::InvalidFormat(e.to_string()))?;
+    let host = parsed.host_str().ok_or(UrlValidationError::MissingHost)?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    validate_dns_resolution(host, parsed.port_or_known_default().unwrap_or(443), options).await
 }
 
 /// Validate an already-resolved address against the same policy the URL
@@ -490,7 +552,7 @@ fn validate_ipv6(ip: &Ipv6Addr) -> Result<(), UrlValidationError> {
 ///
 /// This prevents DNS rebinding attacks where a hostname initially resolves to a public IP
 /// but later resolves to an internal IP.
-fn validate_dns_resolution(
+async fn validate_dns_resolution(
     host: &str,
     port: u16,
     options: &UrlValidationOptions,
@@ -500,12 +562,20 @@ fn validate_dns_resolution(
         return Ok(());
     }
 
-    // Resolve hostname
-    let addr = format!("{}:{}", host, port);
-    let resolved: Vec<_> = match addr.to_socket_addrs() {
-        Ok(addrs) => addrs.collect(),
-        Err(e) => {
+    // Resolve hostname on tokio's blocking pool, bounded by a timeout.
+    let resolved: Vec<_> = match tokio::time::timeout(
+        DNS_CHECK_TIMEOUT,
+        tokio::net::lookup_host((host, port)),
+    )
+    .await
+    {
+        Ok(Ok(addrs)) => addrs.collect(),
+        Ok(Err(e)) => {
             warn!(host = %host, error = %e, "DNS resolution failed for webhook URL");
+            return Err(UrlValidationError::DnsResolutionBlocked);
+        }
+        Err(_) => {
+            warn!(host = %host, "DNS resolution timed out for webhook URL");
             return Err(UrlValidationError::DnsResolutionBlocked);
         }
     };

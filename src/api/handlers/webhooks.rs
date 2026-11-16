@@ -188,10 +188,11 @@ pub async fn custom(
         };
 
     // Insert job with idempotency support and return ID to detect new vs duplicate.
-    // Retry/timeout come from the target queue's config when it has one. Webhook
-    // ingest is not charged against the queue cap: bouncing a delivery would only
-    // make the sender retry it. A lookup failure falls back to server defaults
-    // rather than rejecting the delivery.
+    // Retry/timeout come from the target queue's config when it has one. A lookup
+    // failure falls back to server defaults rather than rejecting the delivery.
+    // A queue name the organization does not have yet opens a queue, so it is
+    // charged against the plan's queue cap exactly as `POST /jobs` does (API-1:
+    // deliveries used to open any number of queues, a Free org reached 5 of 2).
     let queue_defaults = crate::api::middleware::limits::queue_job_defaults(
         state.db.pool(),
         &state.settings.queue,
@@ -210,28 +211,67 @@ pub async fn custom(
     // conflicting row is an existing job that may already be processing/completed and
     // may live in a different queue, so answering a hardcoded "pending" and echoing the
     // request's queue would report a state the caller does not have.
-    let insert_result = sqlx::query_as::<_, (String, String, String)>(
-        r#"
-        INSERT INTO jobs (
-            id, organization_id, queue_name, status, payload, priority,
-            max_retries, timeout_seconds, created_at, updated_at, idempotency_key
+    let insert_result: Result<(String, String, String), AppError> = async {
+        let mut tx = state.db.pool().begin().await?;
+        // The queues lock and the cap check stay held until the insert commits,
+        // so concurrent deliveries to new names cannot pass the cap together.
+        crate::api::handlers::jobs::enforce_new_queue_on(
+            &mut tx,
+            &org_id,
+            &request.queue_name,
+            !queue_defaults.exists,
         )
-        VALUES ($1, $2, $3, 'pending', $4::JSONB, $5, $6, $7, $8, $8, $9)
-        ON CONFLICT (organization_id, idempotency_key) WHERE idempotency_key IS NOT NULL
-        DO UPDATE SET updated_at = NOW()
-        RETURNING id, queue_name, status
-        "#,
-    )
-    .bind(&job_id)
-    .bind(&org_id) // Use org_id from path
-    .bind(&request.queue_name)
-    .bind(&payload_json)
-    .bind(priority)
-    .bind(max_retries)
-    .bind(timeout_seconds)
-    .bind(now)
-    .bind(&idempotency_key)
-    .fetch_one(state.db.pool())
+        .await
+        .map_err(|guard| match guard {
+            crate::api::handlers::jobs::EnqueueGuardError::Database(e) => AppError::Database(e),
+            crate::api::handlers::jobs::EnqueueGuardError::Limit(response) => {
+                AppError::LimitExceeded(Box::new(response))
+            }
+        })?;
+        let row = sqlx::query_as::<_, (String, String, String)>(
+            r#"
+            INSERT INTO jobs (
+                id, organization_id, queue_name, status, payload, priority,
+                max_retries, timeout_seconds, created_at, updated_at, idempotency_key
+            )
+            VALUES ($1, $2, $3, 'pending', $4::JSONB, $5, $6, $7, $8, $8, $9)
+            ON CONFLICT (organization_id, idempotency_key) WHERE idempotency_key IS NOT NULL
+            DO NOTHING
+            RETURNING id, queue_name, status
+            "#,
+        )
+        .bind(&job_id)
+        .bind(&org_id) // Use org_id from path
+        .bind(&request.queue_name)
+        .bind(&payload_json)
+        .bind(priority)
+        .bind(max_retries)
+        .bind(timeout_seconds)
+        .bind(now)
+        .bind(&idempotency_key)
+        .fetch_optional(&mut *tx)
+        .await?;
+        // A replay inserts nothing and leaves the existing job untouched
+        // (CORE-7); the delivery resolves to it, in whatever queue it is.
+        let row = match row {
+            Some(row) => row,
+            None => {
+                let replay = crate::queue::find_idempotent_replay(
+                    &mut *tx,
+                    &org_id,
+                    idempotency_key.as_deref().unwrap_or_default(),
+                    None,
+                )
+                .await?
+                .ok_or_else(|| {
+                    AppError::Conflict(crate::models::IDEMPOTENCY_KEY_IN_USE.to_string())
+                })?;
+                (replay.id, replay.queue_name, replay.status)
+            }
+        };
+        tx.commit().await?;
+        Ok(row)
+    }
     .await;
 
     let (returned_id, returned_queue, returned_status): (String, String, String) =
@@ -245,7 +285,7 @@ pub async fn custom(
                             "Failed to refund daily job quota after webhook insert failure");
                     }
                 }
-                return Err(e.into());
+                return Err(e);
             }
         };
 

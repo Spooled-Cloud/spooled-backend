@@ -9,4 +9,7 @@ pub mod http_client;
 pub mod url_validator;
 
 pub use http_client::build_outbound_http_client;
-pub use url_validator::{validate_webhook_url, UrlValidationOptions};
+pub use url_validator::{
+    set_url_policy_environment, validate_webhook_url, validate_webhook_url_resolved,
+    UrlValidationOptions,
+};

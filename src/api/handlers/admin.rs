@@ -1023,7 +1023,7 @@ pub async fn create_organization(
 
     let plan_tier = match &request.plan_tier {
         Some(tier) => {
-            let valid_plans = ["free", "starter", "pro", "enterprise"];
+            let valid_plans = crate::config::PLAN_TIERS;
             if !valid_plans.contains(&tier.to_lowercase().as_str()) {
                 return Err(AppError::Validation(format!(
                     "Invalid plan tier: {}. Valid options: {:?}",
@@ -1032,7 +1032,8 @@ pub async fn create_organization(
             }
             tier.to_lowercase()
         }
-        None => "free".to_string(),
+        // An explicit plan wins; otherwise the install's DEFAULT_PLAN_TIER.
+        None => state.settings.registration.default_plan_tier.clone(),
     };
 
     let org_id = Uuid::new_v4().to_string();
@@ -1093,7 +1094,8 @@ pub async fn create_organization(
         generate_secure_key()
     );
     let key_prefix: String = raw_key.chars().take(8).collect();
-    let key_hash = bcrypt::hash(&raw_key, bcrypt::DEFAULT_COST)
+    let key_hash = crate::api::middleware::bcrypt_gate::hash(&raw_key, bcrypt::DEFAULT_COST)
+        .await
         .map_err(|e| AppError::Internal(format!("Failed to hash API key: {}", e)))?;
     let lookup_hash = crate::models::api_key_lookup_hash(&raw_key);
 
@@ -1212,7 +1214,8 @@ pub async fn create_api_key(
         generate_secure_key()
     );
     let key_prefix: String = raw_key.chars().take(8).collect();
-    let key_hash = bcrypt::hash(&raw_key, bcrypt::DEFAULT_COST)
+    let key_hash = crate::api::middleware::bcrypt_gate::hash(&raw_key, bcrypt::DEFAULT_COST)
+        .await
         .map_err(|e| AppError::Internal(format!("Failed to hash API key: {}", e)))?;
     let lookup_hash = crate::models::api_key_lookup_hash(&raw_key);
 

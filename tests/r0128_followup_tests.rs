@@ -194,6 +194,11 @@ async fn insert_workflow(pool: &sqlx::PgPool, org_id: &str, status: &str, total:
 /// the rest of the attempt budget never ran.
 #[tokio::test]
 async fn failed_delivery_write_releases_the_claim_and_retries() {
+    // The mock endpoint is loopback http://, allowed only under the
+    // development URL policy; no AppState applies it here (API-4).
+    spooled_backend::security::set_url_policy_environment(
+        &spooled_backend::config::Environment::Development,
+    );
     let db = TestDatabase::new().await;
     let server = MockServer::start().await;
     Mock::given(method("POST"))

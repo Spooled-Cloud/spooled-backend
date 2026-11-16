@@ -811,9 +811,8 @@ impl QueueService for QueueServiceImpl {
             )
             VALUES ($1, $2, $3, $4, $5::JSONB, $6, $7, $8, $9, $10, $11::JSONB, $12, $12)
             ON CONFLICT (organization_id, idempotency_key) WHERE idempotency_key IS NOT NULL
-            DO UPDATE SET updated_at = EXCLUDED.updated_at
-            WHERE queue_in_key_scope(jobs.queue_name, $13::TEXT[])
-            RETURNING id, (xmax = 0) as created
+            DO NOTHING
+            RETURNING id
             "#,
         )
         .bind(&job_id)
@@ -831,9 +830,25 @@ impl QueueService for QueueServiceImpl {
         .bind(&idempotency_key)
         .bind(&tags_json)
         .bind(now)
-        .bind(queue_scope_filter(&auth))
         .fetch_optional(&mut *tx)
         .await;
+        // A replay inserts nothing and leaves the existing row as it is
+        // (CORE-7); the lookup also applies the key's queue scope.
+        let result: Result<Option<(String, bool)>, sqlx::Error> = match result {
+            Ok(Some(row)) => {
+                use sqlx::Row;
+                Ok(Some((row.get("id"), true)))
+            }
+            Ok(None) => crate::queue::find_idempotent_replay(
+                &mut *tx,
+                &auth.organization_id,
+                idempotency_key.as_deref().unwrap_or_default(),
+                queue_scope_filter(&auth),
+            )
+            .await
+            .map(|replay| replay.filter(|r| r.in_scope).map(|r| (r.id, false))),
+            Err(e) => Err(e),
+        };
 
         let result = match result {
             Ok(Some(row)) => row,
@@ -857,9 +872,7 @@ impl QueueService for QueueServiceImpl {
             return Err(enqueue_db_error_status(&e));
         }
 
-        use sqlx::Row;
-        let returned_id: String = result.get("id");
-        let created: bool = result.get("created");
+        let (returned_id, created) = result;
 
         // Update metrics and usage counters
         if created {
@@ -988,6 +1001,17 @@ impl QueueService for QueueServiceImpl {
             }
 
             self.metrics.jobs_processing.inc();
+            crate::queue::record_job_history(
+                self.pool.as_ref(),
+                &job_proto.id,
+                "processing",
+                serde_json::json!({
+                    "worker_id": req.worker_id,
+                    "lease_id": job_proto.lease_id,
+                    "source": "grpc",
+                }),
+            )
+            .await;
             response_bytes += size;
             jobs.push(job_proto);
         }
@@ -1094,6 +1118,13 @@ impl QueueService for QueueServiceImpl {
         self.metrics.jobs_completed.inc();
         self.metrics.jobs_processing.dec();
         self.settle_signals.settled(&req.job_id);
+        crate::queue::record_job_history(
+            self.pool.as_ref(),
+            &req.job_id,
+            "completed",
+            serde_json::json!({}),
+        )
+        .await;
 
         info!(job_id = %req.job_id, "Job completed via gRPC");
 
@@ -1303,6 +1334,15 @@ impl QueueService for QueueServiceImpl {
             // set this status — see the CTE above.
             self.metrics.jobs_deadlettered.inc();
         }
+        record_fail_history(
+            self.pool.as_ref(),
+            &req.job_id,
+            &result.new_status,
+            &error_message,
+            result.new_retry_count,
+            result.retry_delay_secs,
+        )
+        .await;
 
         info!(
             job_id = %req.job_id,
@@ -1963,6 +2003,17 @@ impl QueueServiceImpl {
                 break;
             }
             self.metrics.jobs_processing.inc();
+            crate::queue::record_job_history(
+                self.pool.as_ref(),
+                &job.id,
+                "processing",
+                serde_json::json!({
+                    "worker_id": worker_id,
+                    "lease_id": lease_id,
+                    "source": "grpc",
+                }),
+            )
+            .await;
             debug!(job_id = %job.id, queue = %queue_name, "Streaming job to worker");
 
             let watch = self.settle_signals.watch(&job.id);
@@ -2411,6 +2462,17 @@ async fn handle_process_dequeue(
                     continue;
                 }
                 metrics.jobs_processing.inc();
+                crate::queue::record_job_history(
+                    pool,
+                    &job.id,
+                    "processing",
+                    serde_json::json!({
+                        "worker_id": req.worker_id,
+                        "lease_id": job_proto.lease_id,
+                        "source": "grpc",
+                    }),
+                )
+                .await;
                 outgoing_webhooks.spawn_dispatch(
                     org_id.to_string(),
                     "job.started".to_string(),
@@ -2505,6 +2567,40 @@ fn complete_result_text(result: Option<&prost_types::Struct>) -> Result<Option<S
         ));
     }
     Ok(Some(result_str))
+}
+
+/// The `job_history` row a gRPC failure writes, as REST's `fail_by_worker`
+/// does: `retry_scheduled` for a retry, `deadlettered` otherwise.
+async fn record_fail_history(
+    pool: &PgPool,
+    job_id: &str,
+    new_status: &str,
+    error: &str,
+    retry_count: i32,
+    retry_delay_secs: Option<i64>,
+) {
+    let (event, details) = if new_status == "scheduled" {
+        (
+            "retry_scheduled",
+            serde_json::json!({
+                "error": error,
+                "retry_count": retry_count,
+                "next_run": retry_delay_secs
+                    .map(|secs| (chrono::Utc::now() + chrono::Duration::seconds(secs)).to_rfc3339()),
+                "source": "grpc",
+            }),
+        )
+    } else {
+        (
+            "deadlettered",
+            serde_json::json!({
+                "error": error,
+                "total_retries": retry_count,
+                "source": "grpc",
+            }),
+        )
+    };
+    crate::queue::record_job_history(pool, job_id, event, details).await;
 }
 
 /// Classify why a worker-scoped UPDATE affected zero rows into a
@@ -2710,6 +2806,8 @@ async fn handle_process_complete(
             }
             metrics.jobs_completed.inc();
             metrics.jobs_processing.dec();
+            crate::queue::record_job_history(pool, &req.job_id, "completed", serde_json::json!({}))
+                .await;
 
             type CompletionJobRow = (
                 String,
@@ -2932,6 +3030,15 @@ async fn handle_process_fail(
             if update_result.new_status == "deadletter" {
                 metrics.jobs_deadlettered.inc();
             }
+            record_fail_history(
+                pool,
+                &req.job_id,
+                &update_result.new_status,
+                &error_message,
+                update_result.new_retry_count,
+                update_result.retry_delay_secs,
+            )
+            .await;
 
             if update_result.new_status == "deadletter" || update_result.new_status == "failed" {
                 let job_data: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(

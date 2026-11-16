@@ -51,6 +51,85 @@ pub struct RegistrationSettings {
     /// Admin API key for creating organizations when mode is "closed"
     /// This key bypasses registration restrictions
     pub admin_api_key: Option<String>,
+    /// Plan tier of every organization created without an explicit plan
+    /// (`DEFAULT_PLAN_TIER`): public `POST /organizations`, email signup, and
+    /// `POST /admin/organizations` when the request names no `plan_tier`.
+    /// One of `free`, `starter`, `pro`, `enterprise` (trimmed,
+    /// case-insensitive); default `free`, the hosted service's plan. A
+    /// self-hosted install sets `enterprise` so new organizations are not
+    /// held to the hosted Free limits. An unknown value stops startup.
+    pub default_plan_tier: String,
+}
+
+/// `REGISTRATION_MODE`: unset or blank is `open`; otherwise `open`, `closed`
+/// or `invite`, trimmed and case-insensitive. Anything else is an error
+/// (API-5: a typo such as `close` used to fall back to `open`, letting anyone
+/// create organizations on an install meant to be closed).
+pub fn registration_mode_from(raw: Option<&str>) -> Result<RegistrationMode> {
+    let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(RegistrationMode::Open);
+    };
+    match raw.to_ascii_lowercase().as_str() {
+        "open" => Ok(RegistrationMode::Open),
+        "closed" => Ok(RegistrationMode::Closed),
+        "invite" => Ok(RegistrationMode::Invite),
+        _ => anyhow::bail!("REGISTRATION_MODE must be one of open, closed, invite (got '{raw}')"),
+    }
+}
+
+/// `HOST`: unset or blank is `0.0.0.0`; `localhost` is `127.0.0.1`; anything
+/// else must be an IP address, because the listeners bind to one (API-6:
+/// `HOST=localhost` passed config and then failed to parse at bind time with
+/// an unhelpful "invalid IP address syntax").
+pub fn server_host_from(raw: Option<&str>) -> Result<String> {
+    let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok("0.0.0.0".to_string());
+    };
+    if raw.eq_ignore_ascii_case("localhost") {
+        return Ok("127.0.0.1".to_string());
+    }
+    let unbracketed = raw
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(raw);
+    match unbracketed.parse::<std::net::IpAddr>() {
+        Ok(ip) => Ok(ip.to_string()),
+        Err(_) => anyhow::bail!(
+            "HOST must be an IP address to bind to (0.0.0.0, 127.0.0.1, ::) or localhost (got '{raw}')"
+        ),
+    }
+}
+
+/// `DATABASE_MIN_CONNECTIONS`: unset or blank is 5, lowered to
+/// `DATABASE_MAX_CONNECTIONS` when that is smaller (API-6: a pool of 4 or
+/// fewer failed validation unless the minimum was set too). An explicit
+/// value is kept, and [`Settings::validate`] still refuses one above the
+/// maximum.
+pub fn db_min_connections_from(raw: Option<&str>, max_connections: u32) -> Result<u32> {
+    match raw {
+        Some(_) => parse_setting("DATABASE_MIN_CONNECTIONS", raw, "5"),
+        None => Ok(5.min(max_connections)),
+    }
+}
+
+/// Plan tiers an organization can be created with.
+pub const PLAN_TIERS: [&str; 4] = ["free", "starter", "pro", "enterprise"];
+
+/// `DEFAULT_PLAN_TIER`: unset or blank is `free`; otherwise one of
+/// [`PLAN_TIERS`], trimmed and case-insensitive. Anything else is an error,
+/// so a typo cannot silently give every new organization the wrong plan.
+pub fn default_plan_tier_from(raw: Option<&str>) -> Result<String> {
+    let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok("free".to_string());
+    };
+    let tier = raw.to_ascii_lowercase();
+    if PLAN_TIERS.contains(&tier.as_str()) {
+        Ok(tier)
+    } else {
+        anyhow::bail!(
+            "DEFAULT_PLAN_TIER must be one of free, starter, pro, enterprise (got '{raw}')"
+        )
+    }
 }
 
 /// Registration mode
@@ -97,6 +176,20 @@ pub enum Environment {
     Development,
     Staging,
     Production,
+}
+
+impl Environment {
+    /// `RUST_ENV` as the server reads it: `production`, `staging`,
+    /// `development` (or `dev`); unset or anything else is Production
+    /// (fail-safe). The one parse for both the settings and the webhook URL
+    /// policy (`security::url_validator`).
+    pub fn from_rust_env(raw: Option<&str>) -> Self {
+        match raw {
+            Some("staging") => Environment::Staging,
+            Some("development") | Some("dev") => Environment::Development,
+            _ => Environment::Production,
+        }
+    }
 }
 
 impl std::fmt::Display for Environment {
@@ -446,9 +539,10 @@ fn parse_cors_origins(raw: Option<&str>) -> Vec<String> {
 impl Settings {
     /// Load settings from environment variables
     pub fn load() -> Result<Self> {
+        let db_max_connections: u32 = env_parse("DATABASE_MAX_CONNECTIONS", "25")?;
         let settings = Settings {
             server: ServerSettings {
-                host: env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
+                host: server_host_from(non_empty_env("HOST").as_deref())?,
                 port: env_parse("PORT", "8080")?,
                 metrics_port: env_parse("METRICS_PORT", "9090")?,
                 grpc_port: env_parse("GRPC_PORT", "50051")?,
@@ -463,24 +557,20 @@ impl Settings {
                 // that forgets (or typos) RUST_ENV must not silently fall into it.
                 // Local dev opts in explicitly (`.env.example` sets
                 // RUST_ENV=development).
-                environment: match env::var("RUST_ENV").as_deref() {
-                    Ok("production") => Environment::Production,
-                    Ok("staging") => Environment::Staging,
-                    Ok("development") | Ok("dev") => Environment::Development,
-                    Ok(other) => {
-                        eprintln!(
+                environment: {
+                    let raw = env::var("RUST_ENV").ok();
+                    match raw.as_deref() {
+                        Some("production" | "staging" | "development" | "dev") => {}
+                        Some(other) => eprintln!(
                             "WARNING: RUST_ENV=\"{other}\" is unrecognized; defaulting to \
                              production (fail-safe). Set RUST_ENV=development for local dev."
-                        );
-                        Environment::Production
-                    }
-                    Err(_) => {
-                        eprintln!(
+                        ),
+                        None => eprintln!(
                             "WARNING: RUST_ENV is not set; defaulting to production (fail-safe). \
                              Set RUST_ENV=development for local dev."
-                        );
-                        Environment::Production
+                        ),
                     }
+                    Environment::from_rust_env(raw.as_deref())
                 },
             },
             database: DatabaseSettings {
@@ -489,8 +579,11 @@ impl Settings {
                     anyhow::anyhow!("DATABASE_URL environment variable must be set")
                 })?,
                 direct_url: non_empty_env("DATABASE_DIRECT_URL"),
-                max_connections: env_parse("DATABASE_MAX_CONNECTIONS", "25")?,
-                min_connections: env_parse("DATABASE_MIN_CONNECTIONS", "5")?,
+                max_connections: db_max_connections,
+                min_connections: db_min_connections_from(
+                    non_empty_env("DATABASE_MIN_CONNECTIONS").as_deref(),
+                    db_max_connections,
+                )?,
                 acquire_timeout_secs: env_parse("DATABASE_ACQUIRE_TIMEOUT_SECS", "30")?,
                 list_statement_timeout_ms: env_parse("DATABASE_LIST_STATEMENT_TIMEOUT_MS", "5000")?,
             },
@@ -543,19 +636,14 @@ impl Settings {
                     .unwrap_or(false),
             },
             registration: RegistrationSettings {
-                mode: match env::var("REGISTRATION_MODE")
-                    .unwrap_or_else(|_| "open".to_string())
-                    .to_lowercase()
-                    .as_str()
-                {
-                    "closed" => RegistrationMode::Closed,
-                    "invite" => RegistrationMode::Invite,
-                    _ => RegistrationMode::Open,
-                },
+                mode: registration_mode_from(non_empty_env("REGISTRATION_MODE").as_deref())?,
                 email_signup_enabled: env::var("EMAIL_SIGNUP_ENABLED")
                     .map(|v| v == "true" || v == "1" || v == "yes")
                     .unwrap_or(true),
                 admin_api_key: non_empty_env("ADMIN_API_KEY"),
+                default_plan_tier: default_plan_tier_from(
+                    non_empty_env("DEFAULT_PLAN_TIER").as_deref(),
+                )?,
             },
             stripe: StripeSettings {
                 secret_key: non_empty_env("STRIPE_SECRET_KEY"),
@@ -840,6 +928,7 @@ impl Settings {
                 mode: RegistrationMode::Open,
                 email_signup_enabled: true,
                 admin_api_key: None,
+                default_plan_tier: "free".to_string(),
             },
             stripe: StripeSettings {
                 secret_key: None,
