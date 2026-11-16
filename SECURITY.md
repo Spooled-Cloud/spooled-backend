@@ -50,14 +50,13 @@ When deploying Spooled Backend, please follow these security guidelines:
 - **Database Passwords**: Use strong, unique passwords
 - **RUST_ENV**: Set to `production` in production environments
 
-### Unresolved Operator Actions
+### gRPC TLS Key Material
 
-The following credential-remediation work remains open. Do not place current or replacement secret values in this repository, documentation, tickets, logs, or chat transcripts.
-
-- **`ADMIN_API_KEY` rotated 2026-07-14.** Prior value appeared in a chat transcript and is revoked (prod rejects it with 401). New value lives only in the production host backend `.env` and the local workspace `.env` (mode 600). Do not paste it into chats, commits, or public repos. If another copy exists in Portainer stack env UI, sync or clear it so the next Pull does not revive the old key.
-- **Replace the tracked gRPC origin private key.** Treat the historical `certs/grpc-key.pem` and its certificate as compromised because the private key was tracked and copied into old container images. Production Compose now generates a replacement keypair in a private Docker volume and mounts it read-only into the backend. Other platforms must generate a replacement outside Git and provide it through their secret manager. The file was removed from the tree on 2026-10-12 (production's own key was confirmed different); that does not erase Git or image history.
-
-These are current actions, not instructions to expose either credential. Coordinate rotation to avoid locking out the admin portal or interrupting hosted gRPC.
+Never deploy with a key pair taken from this repository or its history. Releases before
+2026-10-12 shipped a development key pair under `certs/`; it is public and must not protect any
+deployment. The production Compose file generates a fresh key pair in a private Docker volume on
+first start; other platforms should generate one outside Git and provide it through their secret
+manager.
 
 ### Network Security
 

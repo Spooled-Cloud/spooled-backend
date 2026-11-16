@@ -7,6 +7,11 @@
 //! the document that makes it, so a change to one has to change the other.
 //!
 //! These tests need no Docker, database or network.
+//!
+//! The internal maintainer notes (the bug ledger and the dataflow notes) are kept outside the
+//! public repository. A maintainer's checkout links them in at `docs/ai/knowledge/`; without them
+//! (CI, a fresh clone) the checks that read them are skipped and only the public documents, the
+//! code and the migrations are checked.
 
 use serde_json::{json, Value};
 
@@ -14,25 +19,37 @@ use prost_types::value::Kind;
 use spooled_backend::grpc::convert::{json_to_struct, struct_to_json, struct_to_json_opt};
 
 const GRPC_GUIDE: &str = include_str!("../docs/guides/grpc-server.md");
-const GRPC_DATAFLOW: &str = include_str!("../docs/ai/knowledge/dataflows/grpc-rest.md");
 const OPERATIONS_GUIDE: &str = include_str!("../docs/guides/operations.md");
 const ARCHITECTURE_GUIDE: &str = include_str!("../docs/guides/architecture.md");
-const CHESTERTON_FENCES: &str = include_str!("../docs/ai/knowledge/risk/chesterton-fences.md");
-const JOBS_DATAFLOW: &str = include_str!("../docs/ai/knowledge/dataflows/jobs-queue.md");
-const FINDINGS_JSONL: &str = include_str!("../docs/ai/knowledge/bugs/findings.jsonl");
-const FINDINGS_MD: &str = include_str!("../docs/ai/knowledge/bugs/findings.md");
 const OPENAPI: &str = include_str!("../docs/openapi.yaml");
 const PROTO: &str = include_str!("../proto/spooled.proto");
 const SERVER_CONVERT: &str = include_str!("../src/grpc/convert.rs");
 const EMAIL_LOGIN: &str = include_str!("../src/api/handlers/email_login.rs");
 const ORGANIZATIONS: &str = include_str!("../src/api/handlers/organizations.rs");
-const AUTH_DATAFLOW: &str = include_str!("../docs/ai/knowledge/dataflows/auth.md");
 const CHANGELOG: &str = include_str!("../CHANGELOG.md");
 const WORKFLOW_HANDLERS: &str = include_str!("../src/api/handlers/workflows.rs");
 const SCHEDULER: &str = include_str!("../src/scheduler/mod.rs");
 const QUEUE: &str = include_str!("../src/queue/mod.rs");
 const INITIAL_SCHEMA: &str = include_str!("../migrations/20241209000001_initial_schema.sql");
 const PARTITIONED_JOBS: &str = include_str!("../migrations/20241209000009_partitioned_jobs.sql");
+
+/// An internal maintainer note under `docs/ai/knowledge/`, when the checkout has the notes.
+fn internal_note(path: &str) -> Option<String> {
+    std::fs::read_to_string(format!(
+        "{}/docs/ai/knowledge/{path}",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .ok()
+}
+
+/// An internal note, or "" without the notes (`assert_mentions` skips an empty document).
+fn kb_note(path: &str) -> String {
+    internal_note(path).unwrap_or_default()
+}
+
+fn notes_present() -> bool {
+    internal_note("bugs/findings.jsonl").is_some()
+}
 
 /// Statuses `findings.jsonl` uses. A new one is added here and described in
 /// `docs/ai/knowledge/MAINTENANCE.md` first.
@@ -46,7 +63,7 @@ const FINDING_STATUSES: [&str; 6] = [
 ];
 
 fn findings() -> Vec<Value> {
-    FINDINGS_JSONL
+    kb_note("bugs/findings.jsonl")
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).expect("a findings.jsonl line is a JSON value"))
@@ -61,17 +78,24 @@ fn finding(id: &str) -> Value {
 }
 
 fn assert_mentions(what: &str, doc: &str, needles: &[&str]) {
+    // Only an absent internal note reads as empty; every public document has content.
+    if doc.is_empty() {
+        return;
+    }
     let missing: Vec<&&str> = needles.iter().filter(|n| !doc.contains(**n)).collect();
     assert!(missing.is_empty(), "{what} must mention {missing:?}");
 }
 
 fn assert_finding(id: &str, status: &str, note_mentions: &[&str]) {
+    if !notes_present() {
+        return;
+    }
     let f = finding(id);
     assert_eq!(f["status"], status, "{id} status in findings.jsonl");
     let note = f["note"].as_str().expect("note");
     assert_mentions(&format!("the {id} note"), note, note_mentions);
     assert!(
-        FINDINGS_MD.contains(&format!("| {id} |")),
+        kb_note("bugs/findings.md").contains(&format!("| {id} |")),
         "{id} has a row in findings.md"
     );
 }
@@ -119,6 +143,9 @@ fn squash(sql: &str) -> String {
 // ---------------------------------------------------------------------------
 #[test]
 fn findings_jsonl_rows_are_well_formed() {
+    if !notes_present() {
+        return;
+    }
     let rows = findings();
     assert!(rows.len() > 150, "read {} findings", rows.len());
     let mut seen = std::collections::HashSet::new();
@@ -265,7 +292,7 @@ fn grpc_struct_limits_are_true_and_documented() {
     }
     assert_mentions(
         "dataflows/grpc-rest.md",
-        &squash(GRPC_DATAFLOW),
+        &squash(&kb_note("dataflows/grpc-rest.md")),
         &[
             "Only a JSON object is a Struct",
             "**open (documented)**",
@@ -298,8 +325,10 @@ fn signup_reserved_slugs_are_recorded() {
         ],
     );
 
-    let fixed = finding("FESF-17");
-    assert_eq!(fixed["fixed_in"], "0.1.123", "{fixed}");
+    if notes_present() {
+        let fixed = finding("FESF-17");
+        assert_eq!(fixed["fixed_in"], "0.1.123", "{fixed}");
+    }
     assert_finding(
         "FESF-17",
         "fixed",
@@ -312,7 +341,7 @@ fn signup_reserved_slugs_are_recorded() {
     );
     assert_mentions(
         "dataflows/auth.md",
-        AUTH_DATAFLOW,
+        &kb_note("dataflows/auth.md"),
         &[
             "`normalize_signup_slug`",
             "`RESERVED_SLUGS`",
@@ -422,12 +451,12 @@ fn partitioned_jobs_scaffolding_is_fenced_in_the_docs() {
     );
     assert_mentions(
         "dataflows/jobs-queue.md",
-        JOBS_DATAFLOW,
+        &kb_note("dataflows/jobs-queue.md"),
         &["`jobs_partitioned`", "BEJOB-17"],
     );
     assert_mentions(
         "risk/chesterton-fences.md",
-        CHESTERTON_FENCES,
+        &kb_note("risk/chesterton-fences.md"),
         &["33. **`jobs_partitioned` is dormant scaffolding"],
     );
     assert_finding(
@@ -466,7 +495,7 @@ fn scale_costs_are_recorded_as_deferred() {
     );
     assert_mentions(
         "dataflows/jobs-queue.md",
-        JOBS_DATAFLOW,
+        &kb_note("dataflows/jobs-queue.md"),
         &["Known costs at scale (BEJOB-21, **deferred**"],
     );
 }
@@ -498,8 +527,10 @@ fn signup_slug_rules_agree_is_recorded() {
     );
 
     for id in ["W9-R1", "W9-R2"] {
-        let fixed = finding(id);
-        assert_eq!(fixed["fixed_in"], "0.1.124", "{fixed}");
+        if notes_present() {
+            let fixed = finding(id);
+            assert_eq!(fixed["fixed_in"], "0.1.124", "{fixed}");
+        }
     }
     assert_finding(
         "W9-R1",
@@ -517,7 +548,7 @@ fn signup_slug_rules_agree_is_recorded() {
     );
     assert_mentions(
         "dataflows/auth.md",
-        AUTH_DATAFLOW,
+        &kb_note("dataflows/auth.md"),
         &[
             "W9-R1 fixed",
             "W9-R2 fixed",

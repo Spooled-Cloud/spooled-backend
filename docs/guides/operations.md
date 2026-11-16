@@ -229,7 +229,7 @@ appendfsync everysec
 >   workflow progress, dependent-job release and the worker counters rely on.
 >
 > Partitioning the live table would need a purpose-built migration, planned and tested against a
-> copy of production data; it is deferred (BEJOB-17 in `docs/ai/knowledge/bugs`). The functions
+> copy of production data; it is deferred (BEJOB-17). The functions
 > below are safe to leave alone: `maintain_jobs_partitions()` only drops partitions of the
 > unused table.
 

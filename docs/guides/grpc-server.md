@@ -152,7 +152,7 @@ Jobs that carry non-object payloads or integers of 2^53 or more (snowflake ids, 
 counters) belong on REST, or the value has to be wrapped: put the array in an object
 (`{"items": [1, 2]}`) and send a large integer as a string. Lifting the limit needs new proto
 fields (for example `bytes payload_json`) and matching changes in every SDK, so it is
-documented here rather than changed (tracked as BEGRPC-05 in `docs/ai/knowledge`).
+documented here rather than changed (tracked as BEGRPC-05).
 
 **Responses and messages**: a `Dequeue` batch stops at about 3 MiB so it fits the 4 MiB
 message limit (it always returns at least one job; the rest stay pending). A job too large for
