@@ -98,6 +98,38 @@ fn next_run_after_clock(
     None
 }
 
+/// The next fire strictly after `at`, counted from the occurrence that fired.
+///
+/// A fixed-time schedule inside a repeated fall-back hour shows why the
+/// occurrence matters: `59 1 * * *` in New York fires 01:59 EDT on the
+/// fall-back day. A tick that commits late, at 01:01 EST, and counts from
+/// that clock gets the repeated 01:59 (EST) an hour later, so the schedule
+/// fired twice that day (CORE-5). Counting from the fired occurrence skips the
+/// repeat, as an on-time tick does. Steps forward from it until past `at`;
+/// after long downtime (more than 128 missed fires) or without a stored
+/// occurrence it falls back to the clock.
+pub fn next_run_after_occurrence(
+    cron: Option<&CronSchedule>,
+    timezone: &str,
+    fired: Option<chrono::DateTime<Utc>>,
+    at: chrono::DateTime<Utc>,
+) -> Option<chrono::DateTime<Utc>> {
+    let schedule = cron?;
+    if let Some(fired) = fired {
+        let mut cursor = fired;
+        for _ in 0..128 {
+            let Some(candidate) = schedule.next_run_after_in_timezone(cursor, timezone) else {
+                break;
+            };
+            if candidate > at {
+                return Some(candidate);
+            }
+            cursor = candidate.max(cursor + chrono::Duration::milliseconds(1));
+        }
+    }
+    next_run_after_clock(cron, timezone, at)
+}
+
 /// Background scheduler that runs periodic maintenance tasks
 pub struct Scheduler {
     db: Arc<PgPool>,
@@ -655,7 +687,12 @@ impl Scheduler {
                     "Cron schedule queue name is not claimable"
                 );
                 let cron = CronSchedule::parse(&schedule.cron_expression).ok();
-                let next_run = next_run_after_clock(cron.as_ref(), &schedule.timezone, Utc::now());
+                let next_run = next_run_after_occurrence(
+                    cron.as_ref(),
+                    &schedule.timezone,
+                    schedule.next_run_at,
+                    Utc::now(),
+                );
                 let run_id = uuid::Uuid::new_v4().to_string();
                 let _ = sqlx::query(
                     r#"
@@ -685,7 +722,12 @@ impl Scheduler {
             // from the database clock at commit: this value is the batch-start
             // clock, and a pass that outlasts the slot would otherwise store a
             // next_run_at that is already due.
-            let next_run = next_run_after_clock(cron.as_ref(), &schedule.timezone, now);
+            let next_run = next_run_after_occurrence(
+                cron.as_ref(),
+                &schedule.timezone,
+                schedule.next_run_at,
+                now,
+            );
 
             // Catch-up policy: fires missed while the scheduler was down are
             // SKIPPED, not backfilled — the schedule runs once now and advances
@@ -717,6 +759,20 @@ impl Scheduler {
             // Important: cron-triggered jobs must count toward daily quota + payload limits.
             if let Err(e) = check_job_limits_generic(&self.db, &schedule.organization_id, 1).await {
                 tx.rollback().await?;
+
+                // The check could not run (a database error), which is not a
+                // refusal: leave next_run_at as it is so the next tick fires
+                // this occurrence, instead of recording a failed run and
+                // losing it (CORE-8).
+                if let LimitCheckError::Database(msg) = &e {
+                    warn!(
+                        schedule_id = %schedule.id,
+                        org_id = %schedule.organization_id,
+                        error = %msg,
+                        "Cron schedule limit check failed; retrying on the next tick"
+                    );
+                    continue;
+                }
 
                 warn!(
                     schedule_id = %schedule.id,
@@ -757,6 +813,16 @@ impl Scheduler {
                     .await
             {
                 tx.rollback().await?;
+
+                if let LimitCheckError::Database(msg) = &e {
+                    warn!(
+                        schedule_id = %schedule.id,
+                        org_id = %schedule.organization_id,
+                        error = %msg,
+                        "Cron schedule payload check failed; retrying on the next tick"
+                    );
+                    continue;
+                }
 
                 warn!(
                     schedule_id = %schedule.id,
@@ -970,9 +1036,10 @@ impl Scheduler {
                             sqlx::query_scalar("SELECT clock_timestamp()")
                                 .fetch_one(&mut *tx)
                                 .await?;
-                        let next_run = next_run_after_clock(
+                        let next_run = next_run_after_occurrence(
                             cron.as_ref(),
                             &schedule.timezone,
+                            schedule.next_run_at,
                             commit_at,
                         );
                         // Record successful run
@@ -1381,8 +1448,8 @@ impl Scheduler {
 
         // A workflow starts when its first job is claimed. Nothing ever set
         // `started_at`, and `status` read `pending` until the progress trigger saw
-        // a job finish. This is done here rather than in that trigger, whose
-        // status write already races on concurrent completions (BEFLOW-03): this
+        // a job finish. This is done here rather than in that trigger (which
+        // locks the workflow row only on terminal step transitions): this
         // statement only moves `pending` to `running` and fills a NULL
         // started_at, so it never overwrites an outcome the trigger computed.
         // Workflows that finished within the last hour are included so one that
@@ -1420,10 +1487,14 @@ impl Scheduler {
             );
         }
 
-        // Terminate workflows stuck non-terminal: the progress trigger only fires
-        // on transitions to completed/failed, so cancellations (above or manual)
-        // never close the workflow. A workflow with jobs but nothing left to run
-        // is 'failed' if anything failed/deadlettered, else 'cancelled'.
+        // Close workflows stuck non-terminal with nothing left to run. The
+        // progress trigger normally closes them; this repairs the ones it
+        // missed: a step deleted or moved without a status transition, and
+        // workflows left `running` before 0.1.131 by two steps completing at
+        // the same time (CORE-1: each trigger run counted on a snapshot that
+        // still showed the other step processing). Same outcome rule as the
+        // trigger: 'failed' if a step failed or dead-lettered, else
+        // 'cancelled' if a step was cancelled, else 'completed'.
         let terminated = sqlx::query(
             r#"
             UPDATE workflows w
@@ -1433,7 +1504,11 @@ impl Scheduler {
                         SELECT 1 FROM jobs j
                         WHERE j.workflow_id = w.id AND j.status IN ('failed', 'deadletter')
                     ) THEN 'failed'
-                    ELSE 'cancelled'
+                    WHEN EXISTS (
+                        SELECT 1 FROM jobs j
+                        WHERE j.workflow_id = w.id AND j.status = 'cancelled'
+                    ) THEN 'cancelled'
+                    ELSE 'completed'
                 END,
                 completed_jobs = (
                     SELECT COUNT(*) FROM jobs j
@@ -1451,11 +1526,6 @@ impl Scheduler {
                     SELECT 1 FROM jobs j
                     WHERE j.workflow_id = w.id
                       AND j.status IN ('pending', 'scheduled', 'processing')
-                )
-                AND EXISTS (
-                    SELECT 1 FROM jobs j
-                    WHERE j.workflow_id = w.id
-                      AND j.status IN ('failed', 'deadletter', 'cancelled')
                 )
             "#,
         )

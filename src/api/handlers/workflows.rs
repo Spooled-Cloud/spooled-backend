@@ -798,6 +798,17 @@ pub async fn retry(
 
     let jobs_retried = retried.len() as u64;
 
+    // Nothing to run again: the failed steps were deleted (DLQ purge, queue
+    // delete, DELETE /jobs/{id}), and the delete trigger gave their
+    // dependents a reason no retry re-opens. Flipping the workflow to
+    // running would only leave it for the sweep to close as cancelled.
+    // Dropping the transaction rolls back the lock and leaves it failed.
+    if retried.is_empty() {
+        return Err(AppError::Conflict(
+            "Workflow has no failed steps left to retry".to_string(),
+        ));
+    }
+
     // Update workflow status back to running. NOTE: the workflows table has no
     // `updated_at` column — referencing it here raised 42703 (undefined_column)
     // and 500'd every retry. Only touch columns that exist (cancel() is the model).
@@ -1178,6 +1189,21 @@ pub async fn add_dependencies(
             .await?
         }
     };
+
+    // Hold the dependencies still until commit. A dependency completing
+    // concurrently otherwise left the job gated for ever: its completion
+    // trigger could not see the uncommitted edge, and the recompute below
+    // could not see the uncommitted completion. FOR SHARE waits for a running
+    // status change to commit (the recompute is a later statement, so it sees
+    // it) and makes a later one wait for this commit (its trigger then sees
+    // the edge). Locked in id order so two calls cannot deadlock each other.
+    sqlx::query(
+        "SELECT 1 FROM jobs WHERE id = ANY($1) AND organization_id = $2 ORDER BY id FOR SHARE",
+    )
+    .bind(&request.depends_on)
+    .bind(&ctx.organization_id)
+    .execute(&mut *tx)
+    .await?;
 
     // Add dependencies
     let mut added = 0;

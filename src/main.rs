@@ -239,8 +239,11 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Release jobs held by this instance (if any workers are running locally)
-    release_local_jobs(&state.db).await;
+    // Jobs are not released here. The API process runs no worker, so any job
+    // `processing` under a worker with this hostname belongs to an external
+    // worker that may still be running it; putting it back to pending ran it
+    // twice (CORE-4). Leases, the offline-worker sweep and deregistration
+    // return abandoned jobs.
 
     // Close database connections
     state.db.close().await;
@@ -252,54 +255,6 @@ async fn main() -> Result<()> {
 
     info!("Server shutdown complete");
     Ok(())
-}
-
-/// Release any jobs that were being processed by local workers
-///
-/// Now validates organization matches between worker and job
-/// to prevent cross-tenant job release during shutdown
-async fn release_local_jobs(db: &Database) {
-    // Get local hostname to identify jobs held by this instance
-    let hostname = hostname::get()
-        .ok()
-        .and_then(|h| h.into_string().ok())
-        .unwrap_or_else(|| "unknown".to_string());
-
-    // This ensures jobs are only released if they belong to the same org as the worker
-    let result = sqlx::query(
-        r#"
-        UPDATE jobs
-        SET 
-            status = 'pending',
-            assigned_worker_id = NULL,
-            lease_id = NULL,
-            lease_expires_at = NULL,
-            last_error = 'Server shutdown - job released',
-            updated_at = NOW()
-        WHERE status = 'processing'
-          AND EXISTS (
-              SELECT 1 FROM workers w
-              WHERE w.id = jobs.assigned_worker_id
-                AND w.hostname = $1
-                AND w.organization_id = jobs.organization_id
-          )
-        "#,
-    )
-    .bind(&hostname)
-    .execute(db.pool())
-    .await;
-
-    match result {
-        Ok(res) if res.rows_affected() > 0 => {
-            info!(count = res.rows_affected(), hostname = %hostname, "Released jobs held by local workers (with org validation)");
-        }
-        Ok(_) => {
-            info!(hostname = %hostname, "No jobs to release during shutdown");
-        }
-        Err(e) => {
-            warn!(error = %e, "Failed to release local jobs during shutdown");
-        }
-    }
 }
 
 /// How a supervised task ended.

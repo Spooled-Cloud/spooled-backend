@@ -2977,7 +2977,10 @@ paths:
         resumes the workflow. Steps the scheduler cancelled because a dependency failed are
         reopened too; a step someone cancelled stays cancelled.
 
-        Only workflows with status 'failed' can be retried.
+        Only workflows with status 'failed' can be retried. A failed workflow whose failed steps
+        were deleted (DLQ purge, queue delete with `delete_jobs`, `DELETE /jobs/{id}`) has nothing
+        left to run: its dependents stay cancelled ("Dependency job ... was deleted before it
+        completed") and the call answers `409`, leaving the workflow failed.
 
         A running workflow counts toward the plan's `max_workflows` (only pending and running
         workflows count), so retrying takes a slot: the call is refused with `429 QUOTA_EXCEEDED`
@@ -3004,6 +3007,8 @@ paths:
           description: Workflows are not available on the organization's plan (`feature_disabled`)
         '404':
           description: Workflow not found
+        '409':
+          description: The workflow has no failed steps left to retry (they were deleted)
         '429':
           description: >-
             `QUOTA_EXCEEDED` (resource `workflows`): retrying would exceed the plan's limit of

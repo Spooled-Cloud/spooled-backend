@@ -561,9 +561,12 @@ pub async fn delete(
 
         tx.commit().await?;
     } else {
-        // Check if queue has pending jobs
+        // Refuse while the queue still has work: pending, processing, or
+        // scheduled (a delayed job, or a retry waiting out its backoff since
+        // 0.1.126). Deleting the config row under a waiting retry dropped the
+        // queue's pause and settings (CORE-6).
         let (pending_count,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM jobs WHERE queue_name = $1 AND organization_id = $2 AND status IN ('pending', 'processing')"
+            "SELECT COUNT(*) FROM jobs WHERE queue_name = $1 AND organization_id = $2 AND status IN ('pending', 'scheduled', 'processing')"
         )
         .bind(&name)
         .bind(&ctx.organization_id)
@@ -572,7 +575,7 @@ pub async fn delete(
 
         if pending_count > 0 {
             return Err(AppError::Conflict(format!(
-                "Cannot delete queue {} with {} pending/processing jobs",
+                "Cannot delete queue {} with {} pending, scheduled or processing jobs",
                 name, pending_count
             )));
         }
