@@ -56,7 +56,7 @@ bcrypt = "0.19"
 hmac = "0.13"
 sha2 = "0.11"
 hex = "0.4"
-jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+jsonwebtoken = { version = "12", features = ["rust_crypto"] }
 subtle = "2.5"  # Constant-time comparison for crypto
 
 # Time
